@@ -1,0 +1,9 @@
+/build/
+/out/
+# The reference oracle is a private verification tool — never committed.
+/oracle/
+*.o
+*.obj
+*.exe
+*.bin
+*.log

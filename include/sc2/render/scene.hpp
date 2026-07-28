@@ -1,0 +1,46 @@
+#pragma once
+
+#include <array>
+#include <cstdint>
+#include <string>
+#include <vector>
+
+#include "sc2/formats/m3.hpp"
+#include "sc2/render/mat4.hpp"
+#include "sc2/render/offscreen.hpp"
+
+namespace sc2::casc {
+class Storage;
+}
+
+namespace sc2::render {
+
+struct SceneInstance {
+    const formats::Model* model = nullptr;
+    Mat4 world = Mat4::identity();
+    std::array<float, 4> team = {0, 0, 0, -1};
+    int seq = -1;
+    float time_ms = 0.0f;
+};
+
+struct Camera {
+    Vec3 eye{0, 0, 0};
+    Vec3 center{0, 0, 0};
+    Vec3 up{0, 0, 1};
+    float fovy = 0.7854f;
+    float znear = 0.1f;
+    float zfar = 1000.0f;
+
+    Mat4 view_proj(float aspect) const {
+        return perspective(fovy, aspect, znear, zfar) * look_at(eye, center, up);
+    }
+};
+
+RenderResult render_scene(const std::vector<SceneInstance>& instances,
+                          uint32_t width, uint32_t height,
+                          const Camera* cam = nullptr,
+                          const casc::Storage* storage = nullptr,
+                          const std::string& texture_root = "",
+                          bool enable_particles = false);
+
+}
