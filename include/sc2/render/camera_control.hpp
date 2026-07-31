@@ -24,6 +24,7 @@ struct CameraControl {
     float znear = 0.1f;
     float zfar = 1000.0f;
     Vec3 world_up{0, 0, 1};
+    bool mirror_x = false;
 
     Vec3 offset_dir() const {
         float cp = std::cos(pitch), sp = std::sin(pitch);
@@ -56,8 +57,9 @@ struct CameraControl {
 
     void pan(float right_amt, float forward_amt) {
         Vec3 gr = ground_right(), gf = ground_forward();
-        focus.x += gr.x * right_amt + gf.x * forward_amt;
-        focus.y += gr.y * right_amt + gf.y * forward_amt;
+        const float rx = mirror_x ? -right_amt : right_amt;
+        focus.x += gr.x * rx + gf.x * forward_amt;
+        focus.y += gr.y * rx + gf.y * forward_amt;
     }
     void pan_world(float dx, float dy) {
         focus.x += dx;
@@ -81,6 +83,7 @@ struct CameraControl {
         c.fovy = fovy;
         c.znear = znear;
         c.zfar = zfar;
+        c.mirror_x = mirror_x;
         return c;
     }
     Mat4 view_proj(float aspect) const { return camera().view_proj(aspect); }

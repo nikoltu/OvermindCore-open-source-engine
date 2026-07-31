@@ -152,4 +152,40 @@ int select_sequence(const formats::Model& m, const std::vector<std::string>& tok
     return cands[0];
 }
 
+void collect_events(const formats::Model& m, uint32_t seq, float t0, float t1,
+                    std::vector<formats::M3Event>& out) {
+    if (seq >= m.sequences.size()) return;
+    const float start = float(m.sequences[seq].start_ms);
+    for (const formats::M3Event& e : m.events_for_sequence(seq)) {
+        float local = float(e.time_ms);
+        if (local >= start) local -= start;
+        if (local > t0 && local <= t1) out.push_back(e);
+    }
+}
+
+int attachment_index(const formats::Model& m, const std::string& name) {
+    auto lower = [](std::string s) {
+        for (char& c : s)
+            if (c >= 'A' && c <= 'Z') c = char(c + 32);
+        return s;
+    };
+    const std::string q = lower(name);
+    for (size_t i = 0; i < m.attachments.size(); ++i)
+        if (lower(m.attachments[i].name) == q) return int(i);
+    for (size_t i = 0; i < m.attachments.size(); ++i)
+        if (lower(m.attachments[i].name).find(q) != std::string::npos) return int(i);
+    return -1;
+}
+
+bool attachment_transform(const formats::Model& m, const std::string& name, uint32_t seq,
+                          float time_ms, Mat4& out) {
+    int ai = attachment_index(m, name);
+    if (ai < 0) return false;
+    uint32_t bone = m.attachments[size_t(ai)].bone;
+    std::vector<Mat4> world = pose_world(m, seq, time_ms);
+    if (bone >= world.size()) return false;
+    out = world[bone];
+    return true;
+}
+
 }

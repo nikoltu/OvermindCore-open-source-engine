@@ -273,8 +273,6 @@ void M3::decode_materials(Model& m) const {
     uint32_t mat_count = mat_ref.count ? mat_ref.count : mats->count;
     if (mat_count == 0) return;
     size_t mat_span = section_bytes(mat_idx).size();
-    uint32_t mat_rec = uint32_t((mat_span + mat_count / 2) / mat_count);
-    if (mat_rec < 24) return;
 
     std::vector<const char*> slots;
     for (const LayerSlot& s : kLayerSlots)
@@ -285,22 +283,35 @@ void M3::decode_materials(Model& m) const {
         if (r.count == 0 && r.index == 0) return true;
         return r.index < sections.size() && m3_tag(sections[r.index].tag) == "LAYR";
     };
-
-    for (uint32_t mi = 0; mi < mat_count; ++mi) {
-        size_t rec = mats->offset + size_t(mi) * mat_rec;
-        if (rec + mat_rec > data.size()) break;
-        M3Material mat;
-        mat.name = read_char(read_ref(rec));
-        size_t block = 0;
-        for (size_t off = rec + 12; off + L * 12 <= rec + mat_rec; off += 4) {
+    auto scan_block = [&](size_t base, size_t limit) -> size_t {
+        for (size_t off = base + 12; off + L * 12 <= limit; off += 4) {
             bool all = true, any_real = false;
             for (size_t k = 0; k < L; ++k) {
                 M3Ref r = read_ref(off + k * 12);
                 if (!is_layer_like(r)) { all = false; break; }
                 if (r.count != 0 && layr_idx != UINT32_MAX) any_real = true;
             }
-            if (all && any_real) { block = off; break; }
+            if (all && any_real) return off;
         }
+        return 0;
+    };
+
+    uint32_t mat_rec = 0;
+    if (size_t b0 = scan_block(mats->offset, mats->offset + mat_span)) {
+        if (size_t b1 = scan_block(b0 + L * 12, mats->offset + mat_span))
+            mat_rec = uint32_t(b1 - b0);
+    }
+    if (mat_rec == 0 || size_t(mat_count) * mat_rec > mat_span ||
+        mat_span - size_t(mat_count) * mat_rec >= 16)
+        mat_rec = uint32_t(mat_span / mat_count);
+    if (mat_rec < 24) return;
+
+    for (uint32_t mi = 0; mi < mat_count; ++mi) {
+        size_t rec = mats->offset + size_t(mi) * mat_rec;
+        if (rec + mat_rec > data.size()) break;
+        M3Material mat;
+        mat.name = read_char(read_ref(rec));
+        size_t block = scan_block(rec, rec + mat_rec);
         if (block) {
             for (size_t k = 0; k < L; ++k) {
                 M3Ref lr = read_ref(block + k * 12);
@@ -349,6 +360,12 @@ void M3::decode_animation(Model& m) const {
         for (int i = 0; i < comps && i < 4; ++i)
             a.init[i] = rd_f32(&data[off + 8 + i * 4]);
         return a;
+    };
+    auto is_printable = [](const std::string& s) {
+        if (s.empty()) return false;
+        for (unsigned char ch : s)
+            if (ch < 32 || ch > 126) return false;
+        return true;
     };
 
     uint32_t bone_idx = find_tag("BONE");
@@ -445,6 +462,28 @@ void M3::decode_animation(Model& m) const {
                             size_t o = vs->offset + size_t(j) * 4;
                             if (o + 4 <= data.size()) tr.values.push_back(rd_f32(&data[o]));
                         }
+                    if (slot == 0 && vs && vref.count > 0) {
+                        const uint32_t erec =
+                            vs->version >= 2 ? 108 : (vs->version == 1 ? 104 : 100);
+                        for (uint32_t e = 0; e < vref.count; ++e) {
+                            size_t base = vs->offset + size_t(e) * erec;
+                            if (base + erec > data.size()) break;
+                            M3Event ev;
+                            std::string nm = char_ref(read_ref(base));
+                            if (!is_printable(nm)) nm = char_ref(read_ref(base + 4));
+                            ev.name = nm;
+                            int bi = int16_t(rd16(&data[base + 18]));
+                            if (bi < 0 || bi >= int(m.bones.size())) {
+                                int bi2 = int16_t(rd16(&data[base + 16]));
+                                if (bi2 >= 0 && bi2 < int(m.bones.size())) bi = bi2;
+                            }
+                            ev.bone = (bi >= 0 && bi < int(m.bones.size())) ? bi : -1;
+                            for (int k = 0; k < 16; ++k)
+                                ev.matrix[k] = rd_f32(&data[base + 20 + size_t(k) * 4]);
+                            ev.time_ms = e < tr.keys.size() ? tr.keys[e] : 0;
+                            tr.events.push_back(std::move(ev));
+                        }
+                    }
                     c.sd[slot].push_back(std::move(tr));
                 }
             }
@@ -475,6 +514,43 @@ void M3::decode_animation(Model& m) const {
                 m.bone_lookup.push_back(o + 2 <= data.size() ? rd16(&data[o]) : 0);
             }
     }
+
+    uint32_t att_idx = find_tag("ATT_");
+    if (att_idx != UINT32_MAX) {
+        const M3Section* as = section_by_index(att_idx);
+        for (uint32_t i = 0; i < as->count; ++i) {
+            size_t r = as->offset + size_t(i) * 20;
+            if (r + 20 > data.size()) break;
+            M3Attachment a;
+            a.name = read_char(read_ref(r + 4));
+            a.bone = rd32(&data[r + 16]);
+            m.attachments.push_back(std::move(a));
+        }
+        if (!m.attachments.empty()) {
+            uint32_t bl_index = read_ref(mo + 124).index;
+            for (uint32_t si = 0; si < sections.size(); ++si) {
+                if (si == bl_index || m3_tag(sections[si].tag) != "U16_") continue;
+                if (sections[si].count != uint32_t(m.attachments.size())) continue;
+                const M3Section* us = &sections[si];
+                for (uint32_t k = 0; k < us->count; ++k) {
+                    size_t o = us->offset + size_t(k) * 2;
+                    m.attachment_lookup.push_back(o + 2 <= data.size() ? rd16(&data[o]) : 0);
+                }
+                break;
+            }
+        }
+    }
+}
+
+std::vector<M3Event> Model::events_for_sequence(size_t seq) const {
+    std::vector<M3Event> out;
+    if (seq >= stg.size()) return out;
+    for (uint32_t j : stg[seq].stc_indices) {
+        if (j >= stc.size()) continue;
+        for (const M3Track& tr : stc[j].sd[0])
+            for (const M3Event& ev : tr.events) out.push_back(ev);
+    }
+    return out;
 }
 
 namespace {

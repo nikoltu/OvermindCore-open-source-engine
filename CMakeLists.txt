@@ -21,9 +21,14 @@ add_library(sc2core STATIC
   src/formats/m3.cpp
   src/formats/dds.cpp
   src/formats/mpq.cpp
+  src/formats/sc2map.cpp
   src/formats/terrain.cpp
   src/formats/terrain_grid.cpp
+  src/render/fog.cpp
+  src/render/unit_overlay.cpp
   src/formats/minimap.cpp
+  src/app/synth_map.cpp
+  src/app/test_map.cpp
   src/casc/idx.cpp
   src/casc/blte.cpp
   src/casc/encoding.cpp
@@ -42,18 +47,35 @@ add_library(sc2core STATIC
   src/data/sound_events.cpp
   src/sim/world.cpp
   src/sim/vision.cpp
+  src/sim/detection.cpp
   src/sim/trigger.cpp
   src/ai/macro.cpp
   src/ai/melee_ai.cpp
   src/app/spawn.cpp
   src/app/install.cpp
   src/app/boot.cpp
+  src/app/melee_commands.cpp
+  src/app/match_result.cpp
   src/app/replay.cpp
   src/app/control.cpp
+  src/app/game.cpp
+  src/app/melee.cpp
+  src/app/melee_game.cpp
+  src/app/sandbox_game.cpp
+  src/app/front_end.cpp
+  src/app/hud.cpp
+  src/app/hud_render.cpp
+  src/app/menu.cpp
+  src/app/control_groups.cpp
+  src/render/anim.cpp
+  src/render/actor.cpp
+  src/render/actor_rules.cpp
   src/formats/png.cpp
   src/asset/manager.cpp
+  src/app/melee_models.cpp
   src/ui/layout.cpp
   src/ui/interact.cpp
+  src/audio/mixer.cpp
   src/platform/file_desktop.cpp
 )
 target_include_directories(sc2core PUBLIC include)
@@ -65,7 +87,7 @@ find_package(Vulkan COMPONENTS glslc QUIET)
 if(Vulkan_FOUND AND Vulkan_GLSLC_EXECUTABLE)
   set(SHADER_OUT ${CMAKE_BINARY_DIR}/shaders)
   file(MAKE_DIRECTORY ${SHADER_OUT})
-  foreach(shader mesh.vert mesh.frag particle.vert particle.frag)
+  foreach(shader mesh.vert mesh.frag particle.vert particle.frag overlay.vert overlay.frag)
     add_custom_command(
       OUTPUT ${SHADER_OUT}/${shader}.spv.h
       COMMAND ${Vulkan_GLSLC_EXECUTABLE} ${CMAKE_SOURCE_DIR}/shaders/${shader}
@@ -78,14 +100,16 @@ if(Vulkan_FOUND AND Vulkan_GLSLC_EXECUTABLE)
     src/render/vulkan_scene.cpp
     src/render/vulkan_offscreen.cpp
     src/render/window.cpp
-    src/render/anim.cpp
-    src/render/actor.cpp
-    src/render/actor_rules.cpp
+    src/render/game_window.cpp
     src/render/overlay.cpp
+    src/render/overlay_pass.cpp
+    src/render/terrain_tex.cpp
     ${SHADER_OUT}/mesh.vert.spv.h
     ${SHADER_OUT}/mesh.frag.spv.h
     ${SHADER_OUT}/particle.vert.spv.h
-    ${SHADER_OUT}/particle.frag.spv.h)
+    ${SHADER_OUT}/particle.frag.spv.h
+    ${SHADER_OUT}/overlay.vert.spv.h
+    ${SHADER_OUT}/overlay.frag.spv.h)
   target_include_directories(sc2render PUBLIC include PRIVATE ${SHADER_OUT})
   target_link_libraries(sc2render PUBLIC sc2core Vulkan::Vulkan)
   target_compile_options(sc2render PRIVATE -Wno-missing-field-initializers)
@@ -98,6 +122,12 @@ if(Vulkan_FOUND AND Vulkan_GLSLC_EXECUTABLE)
 
   add_executable(sc2window tools/sc2window.cpp)
   target_link_libraries(sc2window PRIVATE sc2render sc2core)
+
+  add_executable(sc2game tools/sc2game.cpp)
+  target_link_libraries(sc2game PRIVATE sc2render sc2core)
+
+  add_executable(sc2melee tools/sc2melee.cpp)
+  target_link_libraries(sc2melee PRIVATE sc2render sc2core)
   set(SC2_HAVE_VULKAN ON)
 endif()
 

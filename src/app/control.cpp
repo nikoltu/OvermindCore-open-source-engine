@@ -12,6 +12,8 @@ using sim::OrderType;
 
 namespace {
 
+constexpr float kSelectHeightPerRadius = 3.0f;
+
 bool invert4(const std::array<float, 16>& m, std::array<float, 16>& out) {
     std::array<float, 16> inv;
     inv[0] = m[5] * m[10] * m[15] - m[5] * m[11] * m[14] - m[9] * m[6] * m[15] +
@@ -93,10 +95,16 @@ std::vector<uint32_t> Control::box_select(const sim::World& world,
     std::vector<uint32_t> hits;
     for (const sim::Unit& u : world.units()) {
         if (!u.alive || u.player != player_) continue;
-        float px, py;
-        if (!project(float(u.x.to_double()), float(u.y.to_double()), 0.0f, px, py))
-            continue;
-        if (px >= minx && px <= maxx && py >= miny && py <= maxy) hits.push_back(u.id);
+        const float ux = float(u.x.to_double()), uy = float(u.y.to_double());
+        float fx, fy;
+        if (!project(ux, uy, 0.0f, fx, fy)) continue;
+        float xlo = fx, xhi = fx, ylo = fy, yhi = fy;
+        float tx, ty;
+        if (project(ux, uy, float(u.radius.to_double()) * kSelectHeightPerRadius, tx, ty)) {
+            xlo = std::min(fx, tx); xhi = std::max(fx, tx);
+            ylo = std::min(fy, ty); yhi = std::max(fy, ty);
+        }
+        if (xhi >= minx && xlo <= maxx && yhi >= miny && ylo <= maxy) hits.push_back(u.id);
     }
     return hits;
 }

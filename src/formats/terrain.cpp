@@ -57,6 +57,46 @@ TerrainQuantize parse_terrain_quantize(const std::vector<uint8_t>& t3terrain_xml
     return q;
 }
 
+std::string parse_terrain_tileset(const std::vector<uint8_t>& t3terrain_xml) {
+    core::XmlNode root =
+        core::xml_parse(std::string(t3terrain_xml.begin(), t3terrain_xml.end()));
+    std::vector<const core::XmlNode*> stack{&root};
+    while (!stack.empty()) {
+        const core::XmlNode* n = stack.back();
+        stack.pop_back();
+        if (const std::string* t = n->attr("tileSet"); t && !t->empty() && *t != "0")
+            return *t;
+        for (const core::XmlNode& c : n->children) stack.push_back(&c);
+    }
+    return {};
+}
+
+std::vector<std::string> parse_terrain_textures(const std::vector<uint8_t>& t3terrain_xml) {
+    core::XmlNode root =
+        core::xml_parse(std::string(t3terrain_xml.begin(), t3terrain_xml.end()));
+    std::vector<std::pair<int, std::string>> slots;
+    std::vector<const core::XmlNode*> stack{&root};
+    while (!stack.empty()) {
+        const core::XmlNode* n = stack.back();
+        stack.pop_back();
+        if (n->name == "texture") {
+            const std::string* nm = n->attr("name");
+            if (nm && !nm->empty()) {
+                int idx = 0;
+                if (const std::string* i = n->attr("i")) idx = std::atoi(i->c_str());
+                slots.emplace_back(idx, *nm);
+            }
+        }
+        for (const core::XmlNode& c : n->children) stack.push_back(&c);
+    }
+    std::sort(slots.begin(), slots.end(),
+              [](const auto& a, const auto& b) { return a.first < b.first; });
+    std::vector<std::string> out;
+    out.reserve(slots.size());
+    for (auto& s : slots) out.push_back(std::move(s.second));
+    return out;
+}
+
 Model build_terrain_mesh(const HeightMap& hm, const std::vector<uint8_t>& data,
                          float cell, float quantize_scale, float quantize_bias,
                          uint32_t max_dim) {

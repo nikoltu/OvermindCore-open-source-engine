@@ -1,5 +1,6 @@
 #include "sc2/sim/vision.hpp"
 
+#include "sc2/sim/terrain_map.hpp"
 #include "sc2/sim/world.hpp"
 
 namespace sc2::sim {
@@ -26,7 +27,7 @@ void VisionGrid::reconfigure(Fixed cell_size, const Bounds& bounds) {
 }
 
 void VisionGrid::compute(const World& world, int32_t player, Fixed sight_radius,
-                         Fixed cell_size, const Bounds& bounds) {
+                         Fixed cell_size, const Bounds& bounds, const TerrainMap* terrain) {
     reconfigure(cell_size, bounds);
     if (cells_.empty()) return;
 
@@ -41,6 +42,8 @@ void VisionGrid::compute(const World& world, int32_t player, Fixed sight_radius,
 
     for (const Unit& u : world.units()) {
         if (!u.alive || u.player != player) continue;
+
+        const std::uint8_t viewer_level = terrain ? terrain->level_at(u.x, u.y) : 0;
 
         int ix0 = ((u.x - sight_radius - bounds_.min_x) / cell_).floor();
         int ix1 = ((u.x + sight_radius - bounds_.min_x) / cell_).floor();
@@ -57,8 +60,9 @@ void VisionGrid::compute(const World& world, int32_t player, Fixed sight_radius,
             for (int cx = ix0; cx <= ix1; ++cx) {
                 Fixed centre_x = bounds_.min_x + cell_ * Fixed::from_int(cx) + half;
                 int64_t dx = int64_t((centre_x - u.x).raw());
-                if (dx * dx + dy * dy <= r2)
-                    cells_[size_t(cy) * size_t(w_) + size_t(cx)] = Visibility::Visible;
+                if (dx * dx + dy * dy > r2) continue;
+                if (terrain && !terrain->vision_reaches(viewer_level, cx, cy)) continue;
+                cells_[size_t(cy) * size_t(w_) + size_t(cx)] = Visibility::Visible;
             }
         }
     }

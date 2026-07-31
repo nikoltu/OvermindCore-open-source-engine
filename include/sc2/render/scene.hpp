@@ -30,9 +30,12 @@ struct Camera {
     float fovy = 0.7854f;
     float znear = 0.1f;
     float zfar = 1000.0f;
+    bool mirror_x = false;
 
     Mat4 view_proj(float aspect) const {
-        return perspective(fovy, aspect, znear, zfar) * look_at(eye, center, up);
+        Mat4 p = perspective(fovy, aspect, znear, zfar);
+        if (mirror_x) p.m[0] = -p.m[0];
+        return p * look_at(eye, center, up);
     }
 };
 

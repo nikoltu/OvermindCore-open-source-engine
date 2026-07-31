@@ -8,6 +8,7 @@
 namespace sc2::sim {
 
 class World;
+class TerrainMap;
 
 enum class Visibility : uint8_t {
     Hidden = 0,
@@ -22,7 +23,7 @@ struct Bounds {
 class VisionGrid {
 public:
     void compute(const World& world, int32_t player, Fixed sight_radius,
-                 Fixed cell_size, const Bounds& bounds);
+                 Fixed cell_size, const Bounds& bounds, const TerrainMap* terrain = nullptr);
 
     int width() const { return w_; }
     int height() const { return h_; }

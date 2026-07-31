@@ -7,6 +7,7 @@ layout(set = 0, binding = 0) uniform sampler2D diffuse;
 layout(set = 0, binding = 1) uniform sampler2D normalMap;
 layout(set = 0, binding = 2) uniform sampler2D emissive;
 void main() {
+    if (pc.team.a >= 1.5) { outColor = vec4(pc.team.rgb, 1.0); return; }
     vec3 n = normalize(vNormal);
     vec3 nt = texture(normalMap, vUV).xyz * 2.0 - 1.0;
     n = normalize(n + vec3(nt.x, nt.y, 0.0) * 0.5);

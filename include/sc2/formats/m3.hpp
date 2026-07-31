@@ -117,9 +117,17 @@ struct M3Bone {
     M3AnimRef scale;
 };
 
+struct M3Event {
+    std::string name;
+    int32_t bone = -1;
+    int32_t time_ms = 0;
+    float matrix[16] = {};
+};
+
 struct M3Track {
     std::vector<int32_t> keys;
     std::vector<float> values;
+    std::vector<M3Event> events;
     uint8_t comps = 0;
 };
 
@@ -132,6 +140,11 @@ struct M3STC {
 
 struct M3STG {
     std::vector<uint32_t> stc_indices;
+};
+
+struct M3Attachment {
+    std::string name;
+    uint32_t bone = 0;
 };
 
 struct Model {
@@ -160,7 +173,12 @@ struct Model {
     std::vector<M3STG> stg;
     std::vector<M3STC> stc;
 
+    std::vector<M3Attachment> attachments;
+    std::vector<uint16_t> attachment_lookup;
+
     std::vector<M3Particle> particles;
+
+    std::vector<M3Event> events_for_sequence(size_t seq) const;
 };
 
 std::string m3_tag(uint32_t tag);

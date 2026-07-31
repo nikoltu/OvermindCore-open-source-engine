@@ -198,9 +198,16 @@ Catalog::UnitStats Catalog::unit_stats(const std::string& unit_id) const {
     s.shields_max = scalar_num("CUnit", unit_id, "ShieldsMax").value_or(0);
     s.speed = scalar_num("CUnit", unit_id, "Speed").value_or(0);
     s.radius = scalar_num("CUnit", unit_id, "Radius");
+    bool primary_weapon = true;
     for (const std::string& wl : array_links("CUnit", unit_id, "WeaponArray"))
-        if (!wl.empty())
+        if (!wl.empty()) {
             if (auto d = weapon_damage(wl)) s.weapon_damage.push_back(*d);
+            if (primary_weapon) {
+                s.weapon_period = scalar_num("CWeapon", wl, "Period").value_or(0);
+                s.weapon_range = scalar_num("CWeapon", wl, "Range").value_or(0);
+                primary_weapon = false;
+            }
+        }
     return s;
 }
 

@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstdint>
+#include <string>
 #include <vector>
 
 #include "sc2/formats/m3.hpp"
@@ -27,6 +28,10 @@ struct TerrainQuantize {
 };
 
 TerrainQuantize parse_terrain_quantize(const std::vector<uint8_t>& t3terrain_xml);
+
+std::string parse_terrain_tileset(const std::vector<uint8_t>& t3terrain_xml);
+
+std::vector<std::string> parse_terrain_textures(const std::vector<uint8_t>& t3terrain_xml);
 
 Model build_terrain_mesh(const HeightMap& hm, const std::vector<uint8_t>& data,
                          float cell = 1.0f, float quantize_scale = 1.0f / 512.0f,

@@ -1,5 +1,7 @@
 #include "sc2/ai/melee_ai.hpp"
 
+#include "sc2/ai/defense.hpp"
+
 namespace sc2::ai {
 
 using sim::Fixed;
@@ -26,7 +28,7 @@ bool MeleeAI::is_structure(uint32_t id) const {
 }
 
 bool MeleeAI::is_army(const Unit& u) const {
-    return u.alive && u.player == player_ && u.speed.raw() > 0 &&
+    return u.alive && u.player == player_ && u.speed.raw() > 0 && !u.is_worker &&
            !is_worker(u.id) && !is_structure(u.id);
 }
 
@@ -46,20 +48,57 @@ bool MeleeAI::supply_ok(const sim::World& w, const BuildItem& it) const {
     return (w.supply_used(player_) + it.proto.supply_uses) <= w.supply_max(player_);
 }
 
+int MeleeAI::worker_count(const sim::World& w) const {
+    int n = 0;
+    for (const Unit& u : w.units())
+        if (u.alive && u.player == player_ && u.is_worker) ++n;
+    return n;
+}
+
 void MeleeAI::run_workers(sim::World& w) {
-    for (uint32_t wid : base_.workers) {
-        if (wid >= w.units().size()) continue;
-        Unit& u = w.unit(wid);
-        if (u.alive && u.orders.empty()) {
+    for (uint32_t id = 0; id < w.units().size(); ++id) {
+        Unit& u = w.unit(id);
+        if (!u.alive || u.player != player_ || !u.is_worker) continue;
+        if (u.orders.empty()) {
             u.home_depot = base_.depot;
             u.gather_target = base_.mineral;
-            w.issue(wid, Order{OrderType::Gather, Fixed(), Fixed(), sim::kNoTarget});
+            w.issue(id, Order{OrderType::Gather, Fixed(), Fixed(), sim::kNoTarget});
         }
     }
 }
 
 void MeleeAI::run_production(sim::World& w) {
-    if (base_.producer >= w.units().size() || !w.unit(base_.producer).alive) return;
+    if (cfg_.worker_target > 0 && base_.depot < w.units().size() &&
+        w.unit(base_.depot).alive && worker_count(w) < cfg_.worker_target &&
+        int(w.pending_count()) < cfg_.max_pending && afford(w, cfg_.worker_unit) &&
+        supply_ok(w, cfg_.worker_unit)) {
+        w.queue_train(base_.depot, cfg_.worker_unit.proto, cfg_.worker_unit.minerals,
+                      cfg_.worker_unit.gas, cfg_.worker_unit.build_time);
+    }
+
+    if (base_.producer >= w.units().size() || !w.unit(base_.producer).alive) {
+        base_.producer = sim::kNoTarget;
+        if (producer_pending_) {
+            for (const Unit& u : w.units()) {
+                if (u.alive && u.player == player_ && u.speed.raw() == 0 &&
+                    u.id != base_.depot) {
+                    base_.producer = u.id;
+                    producer_pending_ = false;
+                    break;
+                }
+            }
+        }
+        if (base_.producer == sim::kNoTarget) {
+            if (cfg_.has_producer && !producer_pending_ &&
+                base_.depot < w.units().size() && afford(w, cfg_.producer_unit)) {
+                if (w.queue_train(base_.depot, cfg_.producer_unit.proto,
+                                  cfg_.producer_unit.minerals, cfg_.producer_unit.gas,
+                                  cfg_.producer_unit.build_time))
+                    producer_pending_ = true;
+            }
+            return;
+        }
+    }
     if (int(w.pending_count()) >= cfg_.max_pending) return;
 
     if (cfg_.has_supply) {
@@ -111,6 +150,28 @@ void MeleeAI::run_army(sim::World& w) {
     auto needs = [](const Unit& u, OrderType want) {
         return u.orders.empty() || u.orders.front().type != want;
     };
+
+    if (cfg_.smart_combat && attacking_) {
+        std::vector<uint32_t> army;
+        for (const Unit& u : w.units())
+            if (is_army(u)) army.push_back(u.id);
+
+        Fixed adv_x = tx, adv_y = ty;
+        uint32_t threat_enemy = sim::kNoTarget;
+        const uint32_t base = threatened_base(w, player_, cfg_.defense_radius, threat_enemy);
+        if (base != sim::kNoTarget) {
+            adv_x = w.unit(base).x;
+            adv_y = w.unit(base).y;
+        }
+
+        if (combat_.command(w, army, player_, cfg_.rally_x, cfg_.rally_y) ==
+            CombatController::Stance::Idle) {
+            for (uint32_t id : army)
+                if (needs(w.unit(id), OrderType::AttackMove))
+                    w.issue(id, Order{OrderType::AttackMove, adv_x, adv_y, sim::kNoTarget});
+        }
+        return;
+    }
 
     for (const Unit& u : w.units()) {
         if (!is_army(u)) continue;

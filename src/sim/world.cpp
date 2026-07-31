@@ -1,5 +1,7 @@
 #include "sc2/sim/world.hpp"
 
+#include <algorithm>
+
 #include "sc2/sim/combat.hpp"
 
 namespace sc2::sim {
@@ -28,11 +30,24 @@ int World::winner() const {
     return found;
 }
 
+bool World::visible_to(int32_t player, const Unit& target) const {
+    for (const Unit& a : units_) {
+        if (!a.alive || a.sight.raw() <= 0) continue;
+        if (!are_allied(a.player, player)) continue;
+        const Fixed dx = target.x - a.x, dy = target.y - a.y;
+        if (dx * dx + dy * dy <= a.sight * a.sight) return true;
+    }
+    return false;
+}
+
 uint32_t World::acquire_target(const Unit& u) const {
     uint32_t best = kNoTarget;
     Fixed best_d2;
     for (const Unit& o : units_) {
-        if (!o.alive || o.player == u.player) continue;
+        if (!o.alive || are_allied(o.player, u.player)) continue;
+        if (o.loaded || o.burrowed) continue;
+        if (o.flying ? !(u.wpn_target_filter & 2u) : !(u.wpn_target_filter & 1u)) continue;
+        if (fog_acquire_ && !visible_to(u.player, o)) continue;
         Fixed d2 = dist2(u, o);
         if (best == kNoTarget || d2 < best_d2) {
             best = o.id;
@@ -63,6 +78,7 @@ bool move_toward(Unit& u, Fixed tx, Fixed ty, Fixed step) {
 Fixed World::move_step(const Unit& u, Fixed dt) const {
     Fixed speed = u.speed;
     if (creep_.is_creep(u.x, u.y)) speed = speed * u.speed_mult_creep;
+    if (!u.behaviors.empty()) speed = speed * behavior_speed_mult(u);
     return speed * dt;
 }
 
@@ -137,12 +153,24 @@ void World::apply_separation() {
                 nx = Fixed::from_int(1);
                 ny = Fixed();
             }
-            const Fixed push = pen / Fixed::from_int(4);
-            const Fixed px = nx * push, py = ny * push;
-            ax[i] = ax[i] - px;
-            ay[i] = ay[i] - py;
-            ax[j] = ax[j] + px;
-            ay[j] = ay[j] + py;
+            const bool mov_i = a.speed.raw() != 0;
+            const bool mov_j = b.speed.raw() != 0;
+            if (!mov_i && !mov_j) continue;
+            Fixed pi, pj;
+            if (mov_i && mov_j) {
+                pi = pen / Fixed::from_int(4);
+                pj = pi;
+            } else if (mov_i) {
+                pi = pen / Fixed::from_int(2);
+                pj = Fixed();
+            } else {
+                pi = Fixed();
+                pj = pen / Fixed::from_int(2);
+            }
+            ax[i] = ax[i] - nx * pi;
+            ay[i] = ay[i] - ny * pi;
+            ax[j] = ax[j] + nx * pj;
+            ay[j] = ay[j] + ny * pj;
         }
     }
     for (size_t i = 0; i < n; ++i) {
@@ -164,6 +192,59 @@ const Player& World::player(int32_t p) const {
     return players_[p];
 }
 
+int32_t World::team_of(int32_t p) const {
+    if (p < 0 || p >= int32_t(players_.size())) return -1;
+    return players_[p].team;
+}
+
+bool World::are_allied(int32_t a, int32_t b) const {
+    if (a == b) return true;
+    const int32_t ta = team_of(a);
+    return ta >= 0 && ta == team_of(b);
+}
+
+int32_t World::upgrade_level(int32_t player, int32_t upgrade_id) const {
+    if (player < 0 || player >= int32_t(players_.size()) || upgrade_id < 0) return 0;
+    const std::vector<int32_t>& up = players_[player].upgrades;
+    return upgrade_id < int32_t(up.size()) ? up[upgrade_id] : 0;
+}
+
+void World::set_upgrade_level(int32_t player_id, int32_t upgrade_id, int32_t level) {
+    if (upgrade_id < 0) return;
+    Player& pl = player(player_id);
+    if (int32_t(pl.upgrades.size()) <= upgrade_id) pl.upgrades.resize(upgrade_id + 1, 0);
+    pl.upgrades[upgrade_id] = level;
+}
+
+Order World::smart_order(uint32_t actor, uint32_t target, Fixed tx, Fixed ty) const {
+    if (target < units_.size() && units_[target].alive) {
+        const Unit& t = units_[target];
+        if (t.resource_left > 0) {
+            Order o;
+            o.type = OrderType::Gather;
+            o.target = target;
+            return o;
+        }
+        const int32_t ap = actor < units_.size() ? units_[actor].player : 0;
+        if (!are_allied(t.player, ap)) {
+            Order o;
+            o.type = OrderType::Attack;
+            o.target = target;
+            return o;
+        }
+        Order o;
+        o.type = OrderType::Move;
+        o.tx = t.x;
+        o.ty = t.y;
+        return o;
+    }
+    Order o;
+    o.type = OrderType::Move;
+    o.tx = tx;
+    o.ty = ty;
+    return o;
+}
+
 Fixed World::supply_used(int32_t p) const {
     Fixed s;
     for (const Unit& u : units_)
@@ -174,7 +255,7 @@ Fixed World::supply_used(int32_t p) const {
 Fixed World::supply_max(int32_t p) const {
     Fixed s;
     for (const Unit& u : units_)
-        if (u.alive && u.player == p) s = s + u.supply_provides;
+        if (u.alive && u.player == p && !u.constructing) s = s + u.supply_provides;
     Fixed cap = Fixed::from_int(200);
     return s > cap ? cap : s;
 }
@@ -187,6 +268,41 @@ int32_t World::add_veterancy(VeterancyDef def) {
 int32_t World::add_ability(AbilityDef def) {
     abilities_.push_back(def);
     return int32_t(abilities_.size()) - 1;
+}
+
+void World::add_behavior(uint32_t id, const BehaviorInstance& b) {
+    if (id >= units_.size()) return;
+    Unit& u = units_[id];
+    if (b.kind != 0) {
+        for (BehaviorInstance& e : u.behaviors) {
+            if (e.kind == b.kind) {
+                e = b;
+                return;
+            }
+        }
+    }
+    u.behaviors.push_back(b);
+}
+
+Fixed World::behavior_speed_mult(const Unit& u) {
+    Fixed m = Fixed::from_int(1);
+    for (const BehaviorInstance& b : u.behaviors) m = m * b.speed_mult;
+    return m;
+}
+bool World::behavior_stunned(const Unit& u) {
+    for (const BehaviorInstance& b : u.behaviors)
+        if (b.stun) return true;
+    return false;
+}
+bool World::behavior_rooted(const Unit& u) {
+    for (const BehaviorInstance& b : u.behaviors)
+        if (b.root || b.stun) return true;
+    return false;
+}
+
+int32_t World::add_persistent(PersistentInstance p) {
+    persistents_.push_back(p);
+    return int32_t(persistents_.size()) - 1;
 }
 
 void World::step_cast(Unit& u, Fixed dt) {
@@ -267,7 +383,7 @@ void World::award_kill_xp(Unit& killer, int64_t victim_xp) {
 
 bool World::queue_train(uint32_t producer, const Unit& proto, int32_t mineral_cost,
                         int32_t gas_cost, Fixed build_time) {
-    if (producer >= units_.size()) return false;
+    if (producer >= units_.size() || units_[producer].constructing) return false;
     int32_t pl = units_[producer].player;
     Player& pp = player(pl);
     pp.minerals -= mineral_cost;
@@ -278,18 +394,88 @@ bool World::queue_train(uint32_t producer, const Unit& proto, int32_t mineral_co
     return true;
 }
 
+void World::step_construction(Unit& u, Fixed dt) {
+    if (u.build_time.raw() <= 0) {
+        u.build_progress = Fixed::from_int(1);
+        u.hp = u.hp_max;
+        u.constructing = false;
+        return;
+    }
+    const Fixed dp = dt / u.build_time;
+    u.build_progress = u.build_progress + dp;
+    u.hp = u.hp + (u.hp_max - u.build_hp0) * dp;
+    if (u.build_progress >= Fixed::from_int(1)) {
+        u.build_progress = Fixed::from_int(1);
+        u.hp = u.hp_max;
+        u.constructing = false;
+    } else if (u.hp > u.hp_max) {
+        u.hp = u.hp_max;
+    }
+}
+
+void World::step_persistents(Fixed dt) {
+    for (size_t i = 0; i < persistents_.size();) {
+        PersistentInstance& p = persistents_[i];
+        if (p.count <= 0) {
+            persistents_.erase(persistents_.begin() + i);
+            continue;
+        }
+        p.timer = p.timer - dt;
+        if (p.timer.raw() <= 0) {
+            p.timer = p.timer + p.period;
+            for (Unit& u : units_) {
+                if (!u.alive || u.player == p.owner) continue;
+                const Fixed dx = u.x - p.x, dy = u.y - p.y;
+                const Fixed reach = p.radius + u.radius;
+                if (dx * dx + dy * dy > reach * reach) continue;
+                if (p.amount.raw() > 0) {
+                    Fixed dmg = p.amount;
+                    if (u.shields.raw() > 0) {
+                        if (u.shields >= dmg) {
+                            u.shields = u.shields - dmg;
+                            dmg = Fixed();
+                        } else {
+                            dmg = dmg - u.shields;
+                            u.shields = Fixed();
+                        }
+                    }
+                    if (dmg.raw() > 0) u.hp = u.hp - dmg;
+                    if (u.hp.raw() <= 0 && u.alive) u.alive = false;
+                }
+                if (p.on_hit.timer.raw() > 0) add_behavior(u.id, p.on_hit);
+            }
+            p.count -= 1;
+        }
+        ++i;
+    }
+}
+
 void World::step_production(Fixed dt) {
     for (size_t i = 0; i < pending_.size();) {
         Pending& pd = pending_[i];
         pd.timer = pd.timer - dt;
         if (pd.timer.raw() <= 0) {
             Unit u = pd.proto;
+            bool rally = false;
+            Fixed rx, ry;
             if (pd.producer < units_.size()) {
                 const Unit& pr = units_[pd.producer];
                 u.x = pr.x + pr.radius + Fixed::from_int(1);
                 u.y = pr.y;
+                if (pr.has_rally) {
+                    rally = true;
+                    rx = pr.rally_x;
+                    ry = pr.rally_y;
+                }
             }
-            add_unit(u);
+            uint32_t nid = add_unit(u);
+            if (rally) {
+                Order o;
+                o.type = OrderType::Move;
+                o.tx = rx;
+                o.ty = ry;
+                issue(nid, o, false);
+            }
             pending_.erase(pending_.begin() + i);
         } else {
             ++i;
@@ -319,6 +505,7 @@ void World::step_gather(Unit& u, Fixed dt) {
         Fixed bd;
         for (const Unit& o : units_) {
             if (o.resource_left <= 0) continue;
+            if (o.is_gas != u.gathers_gas) continue;
             Fixed d = dist2(u, o);
             if (best == kNoTarget || d < bd) {
                 best = o.id;
@@ -331,9 +518,10 @@ void World::step_gather(Unit& u, Fixed dt) {
     if (u.carrying > 0) {
         if (u.home_depot >= units_.size() || !units_[u.home_depot].alive) return;
         Unit& d = units_[u.home_depot];
-        Fixed reach = u.radius + d.radius + Fixed::from_int(1);
+        Fixed reach = u.radius + d.radius + Fixed::from_ratio(1, 4);
         if (dist2(u, d) <= reach * reach) {
-            player(u.player).minerals += u.carrying;
+            if (u.gathers_gas) player(u.player).gas += u.carrying;
+            else player(u.player).minerals += u.carrying;
             u.carrying = 0;
         } else {
             move_unit_toward(u, d.x, d.y, move_step(u, dt));
@@ -353,8 +541,42 @@ void World::step() {
     const Fixed dt = World::dt();
     creep_.tick();
     step_production(dt);
+    step_persistents(dt);
     for (Unit& u : units_) {
         if (!u.alive) continue;
+
+        if (u.life_regen.raw() > 0 && u.hp.raw() > 0 && u.hp < u.hp_max) {
+            u.hp = u.hp + u.life_regen * dt;
+            if (u.hp > u.hp_max) u.hp = u.hp_max;
+        }
+        if (u.time_life.raw() > 0) {
+            u.time_life = u.time_life - dt;
+            if (u.time_life.raw() <= 0) {
+                u.time_life = Fixed();
+                u.alive = false;
+                continue;
+            }
+        }
+
+        if (u.loaded || u.burrowed) continue;
+
+        if (u.constructing) {
+            step_construction(u, dt);
+            continue;
+        }
+
+        if (u.energy_max.raw() > 0 && u.energy < u.energy_max) {
+            u.energy = u.energy + u.energy_regen * dt;
+            if (u.energy > u.energy_max) u.energy = u.energy_max;
+        }
+
+        if (!u.behaviors.empty()) {
+            for (BehaviorInstance& b : u.behaviors) b.timer = b.timer - dt;
+            u.behaviors.erase(
+                std::remove_if(u.behaviors.begin(), u.behaviors.end(),
+                               [](const BehaviorInstance& b) { return b.timer.raw() <= 0; }),
+                u.behaviors.end());
+        }
 
         if (u.buff_timer.raw() > 0) {
             u.buff_timer = u.buff_timer - dt;
@@ -365,7 +587,12 @@ void World::step() {
             }
         }
 
+        if (behavior_stunned(u)) continue;
+
         if (!u.orders.empty() && u.orders.front().type == OrderType::Gather) {
+            const Order& go = u.orders.front();
+            if (go.target < units_.size() && units_[go.target].resource_left > 0)
+                u.gather_target = go.target;
             step_gather(u, dt);
             continue;
         }
@@ -423,11 +650,30 @@ void World::step() {
                     dy_dest = u.orders.front().ty;
                 }
                 break;
+            case OrderType::Patrol: {
+                atk = acquire_target(u);
+                if (atk == kNoTarget) {
+                    Order& o = u.orders.front();
+                    const Fixed ddx = o.tx - u.x, ddy = o.ty - u.y;
+                    const Fixed near = u.radius + Fixed::from_ratio(1, 8);
+                    if (ddx * ddx + ddy * ddy <= near * near) {
+                        const Fixed sx = o.tx, sy = o.ty;
+                        o.tx = o.px; o.ty = o.py;
+                        o.px = sx; o.py = sy;
+                    }
+                    has_dest = true;
+                    dx_dest = o.tx;
+                    dy_dest = o.ty;
+                }
+                break;
+            }
             case OrderType::Idle:
             default:
                 atk = acquire_target(u);
                 break;
         }
+
+        if (behavior_rooted(u)) can_move = false;
 
         u.target = atk;
 
@@ -437,7 +683,7 @@ void World::step() {
             bool in_range = dist2(u, tgt) <= reach * reach;
             if (in_range) {
                 if (u.cooldown.raw() == 0 && u.wpn_damage.raw() > 0) {
-                    Defender d{tgt.hp, tgt.shields, tgt.armor};
+                    Defender d{tgt.hp, tgt.shields, tgt.armor, tgt.damage_reduction};
                     apply_hit(Weapon{u.wpn_damage, u.wpn_period}, d);
                     tgt.hp = d.life;
                     tgt.shields = d.shields;
@@ -445,7 +691,9 @@ void World::step() {
                         tgt.alive = false;
                         award_kill_xp(u, tgt.kill_xp);
                     }
-                    u.cooldown = u.wpn_period;
+                    u.cooldown = u.atk_speed_mult.raw() == Fixed::from_int(1).raw()
+                                     ? u.wpn_period
+                                     : u.wpn_period / u.atk_speed_mult;
                 }
             } else if (can_move) {
                 move_unit_toward(u, tgt.x, tgt.y, move_step(u, dt));
@@ -466,6 +714,7 @@ uint64_t World::state_hash() const {
     uint64_t h = 1469598103934665603ull;
     h = mix(h, uint64_t(tick_));
     h = mix(h, rng_.state());
+    if (fog_acquire_) h = mix(h, 0xF06Au);
     for (const Unit& u : units_) {
         h = mix(h, u.id);
         h = mix(h, uint32_t(u.player));
@@ -480,6 +729,8 @@ uint64_t World::state_hash() const {
         h = mix(h, uint32_t(u.carrying));
         h = mix(h, uint32_t(u.mine_cd.raw()));
         h = mix(h, u.gather_target);
+        if (u.is_gas) h = mix(h, 0x6A5Eu);
+        if (u.gathers_gas) h = mix(h, 0x6A5Fu);
         h = mix(h, uint64_t(u.xp));
         h = mix(h, uint32_t(u.level));
         h = mix(h, uint32_t(u.hp_max.raw()));
@@ -487,14 +738,45 @@ uint64_t World::state_hash() const {
             h = mix(h, uint32_t(u.buff_timer.raw()));
             h = mix(h, uint32_t(u.buff_damage.raw()));
         }
+        if (u.constructing) {
+            h = mix(h, uint32_t(u.build_progress.raw()));
+            h = mix(h, uint32_t(u.build_time.raw()));
+        }
+        if (u.energy_max.raw() != 0) h = mix(h, uint32_t(u.energy.raw()));
+        if (u.cloaked) h = mix(h, 0xC10Au);
+        if (u.shields_max.raw() != 0) h = mix(h, uint32_t(u.shields_max.raw()));
+        if (u.atk_speed_mult.raw() != Fixed::from_int(1).raw())
+            h = mix(h, uint32_t(u.atk_speed_mult.raw()));
+        if (u.damage_reduction.raw() != 0) h = mix(h, uint32_t(u.damage_reduction.raw()));
+        if (u.loaded) h = mix(h, 0x10ADu);
+        if (u.burrowed) h = mix(h, 0xB020u);
+        if (u.time_life.raw() > 0) h = mix(h, uint32_t(u.time_life.raw()));
+        for (const BehaviorInstance& b : u.behaviors) {
+            h = mix(h, b.kind);
+            h = mix(h, uint32_t(b.timer.raw()));
+            h = mix(h, uint32_t(b.speed_mult.raw()));
+            h = mix(h, uint32_t((b.root ? 1u : 0u) | (b.stun ? 2u : 0u)));
+        }
     }
     for (const Player& p : players_) {
         h = mix(h, uint32_t(p.minerals));
         h = mix(h, uint32_t(p.gas));
+        if (p.team != -1) h = mix(h, uint32_t(p.team));
+        for (size_t i = 0; i < p.upgrades.size(); ++i)
+            if (p.upgrades[i] != 0) {
+                h = mix(h, uint32_t(i));
+                h = mix(h, uint32_t(p.upgrades[i]));
+            }
     }
     for (const Pending& pd : pending_) {
         h = mix(h, pd.producer);
         h = mix(h, uint32_t(pd.timer.raw()));
+    }
+    for (const PersistentInstance& p : persistents_) {
+        h = mix(h, uint32_t(p.x.raw()));
+        h = mix(h, uint32_t(p.y.raw()));
+        h = mix(h, uint32_t(p.timer.raw()));
+        h = mix(h, uint32_t(p.count));
     }
     h = mix(h, creep_.checksum());
     return h;

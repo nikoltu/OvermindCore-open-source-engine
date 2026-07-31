@@ -1,18 +1,21 @@
 #include "sc2/render/actor.hpp"
 
 #include "sc2/render/actor_rules.hpp"
+#include "sc2/render/audio_sink.hpp"
 
 namespace sc2::render {
 
 namespace {
 const std::vector<std::string>& tokens_for(AnimState s) {
     static const std::vector<std::string> birth{"Birth"}, stand{"Stand"}, walk{"Walk"},
-        attack{"Attack"}, death{"Death"};
+        attack{"Attack"}, death{"Death"},
+        gather{"Work", "Stand Gather", "Gather"};
     switch (s) {
         case AnimState::Birth: return birth;
         case AnimState::Walk: return walk;
         case AnimState::Attack: return attack;
         case AnimState::Death: return death;
+        case AnimState::Gather: return gather;
         case AnimState::Stand: default: return stand;
     }
 }
@@ -53,11 +56,30 @@ void ActorInstance::set_moving(bool moving) {
     baseline = moving ? AnimState::Walk : AnimState::Stand;
 }
 
+void ActorInstance::set_activity(bool moving, bool gathering) {
+    if (dead) return;
+    baseline = moving ? AnimState::Walk
+                      : (gathering ? AnimState::Gather : AnimState::Stand);
+}
+
 void ActorInstance::advance(float dt_ms) {
+    last_events.clear();
     if (!model) return;
-    clock += dt_ms;
-    int seq = sequence_of(current());
-    float len = clip_len(*model, seq);
+    const int seq = sequence_of(current());
+    const float len = clip_len(*model, seq);
+    const float from = clock;
+    const float to = clock + dt_ms;
+    if (to <= len) {
+        collect_events(*model, uint32_t(seq), from, to, last_events);
+    } else {
+        collect_events(*model, uint32_t(seq), from, len, last_events);
+        if (!has_oneshot) {
+            float rem = to - len;
+            if (rem > len) rem = len;
+            collect_events(*model, uint32_t(seq), 0.0f, rem, last_events);
+        }
+    }
+    clock = to;
     if (has_oneshot) {
         if (current() == AnimState::Death) {
             if (clock > len) clock = len;
@@ -75,7 +97,12 @@ std::vector<Mat4> ActorInstance::pose_now() {
     return pose(*model, uint32_t(sequence_of(current())), clock);
 }
 
-void ActorDriver::observe(const sim::World& world, float dt_ms) {
+bool ActorInstance::attachment(const std::string& name, Mat4& out) {
+    if (!model) return false;
+    return attachment_transform(*model, name, uint32_t(sequence_of(current())), clock, out);
+}
+
+void ActorDriver::observe(const sim::World& world, float dt_ms, bool sim_ticked) {
     const std::vector<sim::Unit>& units = world.units();
     if (shadows.size() < units.size()) shadows.resize(units.size());
     if (actors.size() < units.size()) actors.resize(units.size());
@@ -89,24 +116,31 @@ void ActorDriver::observe(const sim::World& world, float dt_ms) {
             a.model = (u.id < models.size() && models[u.id]) ? models[u.id] : default_model;
             a.rules = (u.id < rules.size() && rules[u.id]) ? rules[u.id] : default_rules;
             a.seed = u.id + 1;
-            a.trigger(AnimState::Birth);
+            if (a.model && select_sequence(*a.model, a.tokens_of(AnimState::Birth), a.seed) >= 0)
+                a.trigger(AnimState::Birth);
+            else
+                a.has_oneshot = false;
             s.known = true;
             s.alive = u.alive;
             s.x = u.x; s.y = u.y; s.cooldown = u.cooldown;
         }
 
-        if (s.alive && !u.alive) a.trigger(AnimState::Death);
+        if (sim_ticked) {
+            if (s.alive && !u.alive) a.trigger(AnimState::Death);
 
-        if (u.cooldown > s.cooldown && s.cooldown == sim::Fixed::from_int(0) && u.alive)
-            a.trigger(AnimState::Attack);
+            if (u.cooldown > s.cooldown && s.cooldown == sim::Fixed::from_int(0) && u.alive)
+                a.trigger(AnimState::Attack);
 
-        bool moving = (u.x != s.x || u.y != s.y);
-        a.set_moving(moving);
+            bool moving = (u.x != s.x || u.y != s.y);
+            a.set_activity(moving, u.mine_cd.raw() > 0);
+
+            s.alive = u.alive;
+            s.x = u.x; s.y = u.y; s.cooldown = u.cooldown;
+        }
 
         a.advance(dt_ms);
-
-        s.alive = u.alive;
-        s.x = u.x; s.y = u.y; s.cooldown = u.cooldown;
+        if (audio && !a.last_events.empty())
+            emit_event_cues(*audio, a.last_events, u.id);
     }
 }
 

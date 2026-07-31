@@ -10,6 +10,7 @@ struct Defender {
     Fixed life;
     Fixed shields;
     Fixed armor;
+    Fixed damage_reduction = Fixed();
 };
 
 struct Weapon {
@@ -20,7 +21,7 @@ struct Weapon {
 inline Fixed min_damage() { return Fixed::from_ratio(1, 2); }
 
 inline void apply_hit(const Weapon& w, Defender& d) {
-    Fixed eff = w.damage - d.armor;
+    Fixed eff = w.damage - d.armor - d.damage_reduction;
     if (eff < min_damage()) eff = min_damage();
     if (d.shields.raw() > 0) {
         if (eff <= d.shields) {

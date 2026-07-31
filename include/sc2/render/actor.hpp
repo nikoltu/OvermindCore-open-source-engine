@@ -12,7 +12,9 @@ namespace sc2::render {
 
 struct ActorRules;
 
-enum class AnimState { Birth, Stand, Walk, Attack, Death };
+struct AudioSink;
+
+enum class AnimState { Birth, Stand, Walk, Attack, Death, Gather };
 
 struct ActorInstance {
     const formats::Model* model = nullptr;
@@ -23,15 +25,19 @@ struct ActorInstance {
     bool has_oneshot = true;
     bool dead = false;
     float clock = 0;
-    int cached_seq[5] = {-2, -2, -2, -2, -2};
+    int cached_seq[6] = {-2, -2, -2, -2, -2, -2};
+
+    std::vector<formats::M3Event> last_events;
 
     AnimState current() const { return has_oneshot ? oneshot : baseline; }
     const std::vector<std::string>& tokens_of(AnimState s) const;
     int sequence_of(AnimState s);
     void trigger(AnimState s);
     void set_moving(bool moving);
+    void set_activity(bool moving, bool gathering);
     void advance(float dt_ms);
     std::vector<Mat4> pose_now();
+    bool attachment(const std::string& name, Mat4& out);
 };
 
 struct ActorDriver {
@@ -46,6 +52,7 @@ struct ActorDriver {
     std::vector<const ActorRules*> rules;
     const formats::Model* default_model = nullptr;
     const ActorRules* default_rules = nullptr;
+    AudioSink* audio = nullptr;
 
     void set_model(uint32_t unit_id, const formats::Model* m) {
         if (unit_id >= models.size()) models.resize(unit_id + 1, nullptr);
@@ -55,7 +62,7 @@ struct ActorDriver {
         if (unit_id >= rules.size()) rules.resize(unit_id + 1, nullptr);
         rules[unit_id] = r;
     }
-    void observe(const sim::World& world, float dt_ms);
+    void observe(const sim::World& world, float dt_ms, bool sim_ticked = true);
 };
 
 }

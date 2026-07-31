@@ -1,0 +1,236 @@
+#include "sc2/app/hud_render.hpp"
+
+#include <algorithm>
+#include <cstddef>
+#include <cstdlib>
+#include <string>
+
+#include "sc2/sim/world.hpp"
+#include "sc2/ui/font.hpp"
+
+namespace sc2::app {
+
+namespace {
+
+constexpr int kPad = 6;
+
+int panel_height(std::uint32_t out_h) {
+    int h = int(out_h) / 4;
+    int lo = 40;
+    if (h < lo) h = lo;
+    if (h > int(out_h)) h = int(out_h);
+    return h;
+}
+
+void blend(std::vector<std::uint8_t>& img, std::uint32_t w, std::uint32_t h, int x, int y,
+           std::uint8_t r, std::uint8_t g, std::uint8_t b, float a) {
+    if (x < 0 || y < 0 || x >= int(w) || y >= int(h) || a <= 0.0f) return;
+    if (a > 1.0f) a = 1.0f;
+    std::size_t i = (std::size_t(y) * w + x) * 4;
+    float da = img[i + 3] / 255.0f;
+    float oa = a + da * (1.0f - a);
+    if (oa <= 0.0f) return;
+    auto comp = [&](std::uint8_t sc, std::uint8_t dc) {
+        float v = (sc * a + dc * da * (1.0f - a)) / oa;
+        if (v < 0.0f) v = 0.0f;
+        else if (v > 255.0f) v = 255.0f;
+        return std::uint8_t(v + 0.5f);
+    };
+    img[i]     = comp(r, img[i]);
+    img[i + 1] = comp(g, img[i + 1]);
+    img[i + 2] = comp(b, img[i + 2]);
+    img[i + 3] = std::uint8_t(oa * 255.0f + 0.5f);
+}
+
+void fill_rect(std::vector<std::uint8_t>& img, std::uint32_t w, std::uint32_t h,
+               int x0, int y0, int x1, int y1,
+               std::uint8_t r, std::uint8_t g, std::uint8_t b, float a) {
+    for (int y = y0; y < y1; ++y)
+        for (int x = x0; x < x1; ++x) blend(img, w, h, x, y, r, g, b, a);
+}
+
+void stroke_rect(std::vector<std::uint8_t>& img, std::uint32_t w, std::uint32_t h,
+                 int x0, int y0, int x1, int y1,
+                 std::uint8_t r, std::uint8_t g, std::uint8_t b, float a) {
+    if (x1 <= x0 || y1 <= y0) return;
+    for (int x = x0; x < x1; ++x) {
+        blend(img, w, h, x, y0, r, g, b, a);
+        blend(img, w, h, x, y1 - 1, r, g, b, a);
+    }
+    for (int y = y0; y < y1; ++y) {
+        blend(img, w, h, x0, y, r, g, b, a);
+        blend(img, w, h, x1 - 1, y, r, g, b, a);
+    }
+}
+
+void draw_line(std::vector<std::uint8_t>& img, std::uint32_t w, std::uint32_t h, int x0, int y0,
+               int x1, int y1, int cx0, int cy0, int cx1, int cy1, std::uint8_t r,
+               std::uint8_t g, std::uint8_t b, float a) {
+    int dx = std::abs(x1 - x0), sx = x0 < x1 ? 1 : -1;
+    int dy = -std::abs(y1 - y0), sy = y0 < y1 ? 1 : -1;
+    int err = dx + dy;
+    for (int guard = 0; guard < 4096; ++guard) {
+        if (x0 >= cx0 && x0 < cx1 && y0 >= cy0 && y0 < cy1) blend(img, w, h, x0, y0, r, g, b, a);
+        if (x0 == x1 && y0 == y1) break;
+        int e2 = 2 * err;
+        if (e2 >= dy) { err += dy; x0 += sx; }
+        if (e2 <= dx) { err += dx; y0 += sy; }
+    }
+}
+
+int draw_text(std::vector<std::uint8_t>& img, std::uint32_t w, std::uint32_t h, int x, int y,
+              const std::string& text, int scale, std::uint8_t r, std::uint8_t g,
+              std::uint8_t b, int cx0, int cy0, int cx1, int cy1) {
+    const int advance = (ui::kFontW + 1) * scale;
+    int gx = x;
+    for (char ch : text) {
+        if (gx >= cx1) break;
+        for (int ry = 0; ry < ui::kFontH; ++ry)
+            for (int rx = 0; rx < ui::kFontW; ++rx) {
+                if (!ui::font_pixel(ch, rx, ry)) continue;
+                for (int sy = 0; sy < scale; ++sy)
+                    for (int sx = 0; sx < scale; ++sx) {
+                        int px = gx + rx * scale + sx;
+                        int py = y + ry * scale + sy;
+                        if (px < cx0 || px >= cx1 || py < cy0 || py >= cy1) continue;
+                        blend(img, w, h, px, py, r, g, b, 1.0f);
+                    }
+            }
+        gx += advance;
+    }
+    return gx;
+}
+
+}
+
+int hud_panel_height(std::uint32_t out_h) { return panel_height(out_h); }
+
+HudRect hud_minimap_rect(std::uint32_t out_w, std::uint32_t out_h) {
+    (void)out_w;
+    const int ph = panel_height(out_h);
+    int side = ph - 2 * kPad;
+    if (side < 1) side = 1;
+    HudRect r;
+    r.x0 = kPad;
+    r.y0 = int(out_h) - ph + kPad;
+    r.x1 = r.x0 + side;
+    r.y1 = r.y0 + side;
+    return r;
+}
+
+HudRect hud_command_cell(std::uint32_t out_w, std::uint32_t out_h, int index) {
+    HudRect r;
+    if (index < 0 || index >= kCommandCols * kCommandRows) return r;
+    const int W = int(out_w);
+    const int ph = panel_height(out_h);
+    const int panel_y0 = int(out_h) - ph;
+    const int gap = 3;
+    int cell = (ph - 2 * kPad - (kCommandRows - 1) * gap) / kCommandRows;
+    if (cell < 8) cell = 8;
+    const int grid_w = kCommandCols * cell + (kCommandCols - 1) * gap;
+    const int x0 = W - kPad - grid_w;
+    const int y0 = panel_y0 + kPad;
+    const int cc = index % kCommandCols, cr = index / kCommandCols;
+    r.x0 = x0 + cc * (cell + gap);
+    r.y0 = y0 + cr * (cell + gap);
+    r.x1 = r.x0 + cell;
+    r.y1 = r.y0 + cell;
+    return r;
+}
+
+std::vector<std::uint8_t> HudRender::render(const HudContent& content, const sim::World& world,
+                                            float map_w, float map_h, std::uint32_t out_w,
+                                            std::uint32_t out_h, const CameraFootprint* cam) {
+    std::vector<std::uint8_t> img(std::size_t(out_w) * out_h * 4, 0);
+    if (out_w == 0 || out_h == 0) return img;
+
+    const int W = int(out_w), H = int(out_h);
+    const int ph = panel_height(out_h);
+    const int panel_y0 = H - ph;
+
+    fill_rect(img, out_w, out_h, 0, panel_y0, W, H, 14, 16, 22, 0.72f);
+    for (int x = 0; x < W; ++x) blend(img, out_w, out_h, x, panel_y0, 90, 120, 160, 0.85f);
+
+    const std::string res = "MIN " + std::to_string(content.minerals) + "   GAS " +
+                            std::to_string(content.gas) + "   SUP " +
+                            std::to_string(content.supply_used) + "/" +
+                            std::to_string(content.supply_max);
+    const int strip_h = ui::kFontH * 2 + 8;
+    const int res_w = int(res.size()) * (ui::kFontW + 1) * 2;
+    const int res_x0 = W - kPad - res_w - 8;
+    fill_rect(img, out_w, out_h, res_x0, 0, W, strip_h, 14, 16, 22, 0.55f);
+    draw_text(img, out_w, out_h, res_x0 + 4, 4, res, 2, 235, 236, 210, res_x0, 0, W, strip_h);
+
+    const HudRect mm = hud_minimap_rect(out_w, out_h);
+    fill_rect(img, out_w, out_h, mm.x0, mm.y0, mm.x1, mm.y1, 8, 10, 14, 0.92f);
+    stroke_rect(img, out_w, out_h, mm.x0, mm.y0, mm.x1, mm.y1, 70, 90, 120, 0.9f);
+    if (map_w > 0.0f && map_h > 0.0f && mm.w() > 1 && mm.h() > 1) {
+        for (const sim::Unit& u : world.units()) {
+            if (!u.alive) continue;
+            float fx = float(u.x.to_double()) / map_w;
+            float fy = float(u.y.to_double()) / map_h;
+            if (fx < 0.0f) fx = 0.0f;
+            else if (fx > 1.0f) fx = 1.0f;
+            if (fy < 0.0f) fy = 0.0f;
+            else if (fy > 1.0f) fy = 1.0f;
+            const int bx = mm.x0 + int(fx * float(mm.w() - 1));
+            const int by = mm.y0 + int(fy * float(mm.h() - 1));
+            std::uint8_t r, g, b;
+            if (u.player == 0) { r = 230; g = 40; b = 40; }
+            else if (u.player == 1) { r = 60; g = 90; b = 230; }
+            else { r = 150; g = 150; b = 150; }
+            for (int dy = 0; dy < 2; ++dy)
+                for (int dx = 0; dx < 2; ++dx) {
+                    const int px = bx + dx, py = by + dy;
+                    if (px >= mm.x0 && px < mm.x1 && py >= mm.y0 && py < mm.y1)
+                        blend(img, out_w, out_h, px, py, r, g, b, 1.0f);
+                }
+        }
+
+        if (cam && cam->valid) {
+            int px[4], py[4];
+            for (int k = 0; k < 4; ++k) {
+                px[k] = mm.x0 + int(cam->x[k] / map_w * float(mm.w() - 1));
+                py[k] = mm.y0 + int(cam->y[k] / map_h * float(mm.h() - 1));
+            }
+            for (int k = 0; k < 4; ++k)
+                draw_line(img, out_w, out_h, px[k], py[k], px[(k + 1) % 4], py[(k + 1) % 4],
+                          mm.x0, mm.y0, mm.x1, mm.y1, 240, 240, 240, 0.95f);
+        }
+    }
+
+    const int info_x = mm.x1 + kPad * 2;
+    const int info_y = panel_y0 + kPad;
+    draw_text(img, out_w, out_h, info_x, info_y, content.selection_summary, 2, 220, 224, 232,
+              info_x, panel_y0, W, H);
+
+    {
+        int err_y = panel_y0 - ui::kFontH * 2 - 8;
+        int ul_y = kPad + 2;
+        const int adv = (ui::kFontW + 1) * 2;
+        for (const HudMessageLine& m : content.messages) {
+            const int tw = int(m.text.size()) * adv;
+            if (m.zone == MsgZone::Error) {
+                int x = (W - tw) / 2;
+                if (x < kPad) x = kPad;
+                fill_rect(img, out_w, out_h, x - 4, err_y - 2, x + tw + 4,
+                          err_y + ui::kFontH * 2 + 2, 60, 12, 12, 0.65f);
+                draw_text(img, out_w, out_h, x, err_y, m.text, 2, 255, 130, 130, 0, 0, W, H);
+                err_y -= ui::kFontH * 2 + 6;
+            } else {
+                std::uint8_t r = 235, g = 225, b = 130;
+                if (m.zone == MsgZone::Transmission) {
+                    r = 150;
+                    g = 210;
+                    b = 240;
+                }
+                draw_text(img, out_w, out_h, kPad, ul_y, m.text, 2, r, g, b, 0, 0, W, H);
+                ul_y += ui::kFontH * 2 + 4;
+            }
+        }
+    }
+
+    return img;
+}
+
+}

@@ -66,6 +66,7 @@ public:
         double life_max = 0, life_armor = 0, shields_max = 0, speed = 0;
         std::optional<double> radius;
         std::vector<int> weapon_damage;
+        double weapon_period = 0, weapon_range = 0;
     };
     UnitStats unit_stats(const std::string& unit_id) const;
 
