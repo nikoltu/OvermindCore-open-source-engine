@@ -21,7 +21,8 @@ void Production::build(const Catalog& cat) {
         const Catalog::Entry* e = cat.find("CAbil", id);
         if (!e) continue;
         const std::string& tag = e->tag;
-        if (tag != "CAbilBuild" && tag != "CAbilTrain" && tag != "CAbilWarpTrain")
+        if (tag != "CAbilBuild" && tag != "CAbilTrain" && tag != "CAbilWarpTrain" &&
+            tag != "CAbilMorph")
             continue;
 
         std::unordered_map<std::string, ProductInfo> by_index;
@@ -37,10 +38,29 @@ void Production::build(const Catalog& cat) {
             std::string req;
             if (const XmlNode* b = find_child(c, "Button"))
                 req = b->attr_or("Requirements", "");
-            if (product.empty()) continue;
+            double warp_charge = 0;
+            if (tag == "CAbilWarpTrain") {
+                if (const XmlNode* ch = find_child(c, "Charge")) {
+                    std::string v = ch->attr_or("TimeUse", "");
+                    if (v.empty())
+                        if (const XmlNode* tu = find_child(*ch, "TimeUse"))
+                            v = tu->text.empty() ? tu->attr_or("value", "") : tu->text;
+                    if (!v.empty()) warp_charge = std::strtod(v.c_str(), nullptr);
+                }
+            }
+            if (product.find("##") != std::string::npos) continue;
+            if (product.empty()) {
+                auto it = by_index.find(index);
+                if (it != by_index.end() && warp_charge > 0) it->second.warp_charge = warp_charge;
+                continue;
+            }
             double time = std::strtod(c.attr_or("Time", "0").c_str(), nullptr);
+            if (warp_charge == 0) {
+                auto it = by_index.find(index);
+                if (it != by_index.end()) warp_charge = it->second.warp_charge;
+            }
             if (by_index.find(index) == by_index.end()) order.push_back(index);
-            by_index[index] = ProductInfo{id, index, product, req, time};
+            by_index[index] = ProductInfo{id, index, product, req, time, warp_charge};
         }
         for (const std::string& idx : order) {
             const ProductInfo& pi = by_index[idx];

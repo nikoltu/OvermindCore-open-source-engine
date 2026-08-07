@@ -12,10 +12,11 @@ public:
     struct MuleStats {
         int32_t carry_amount = 25;
         Fixed hp = Fixed::from_int(60);
-        Fixed speed = Fixed::from_int(3);
+        Fixed speed = Fixed::from_ratio(63, 16);
         Fixed mine_time = Fixed::from_ratio(1, 2);
-        Fixed radius = Fixed::from_ratio(1, 2);
+        Fixed radius = Fixed::from_ratio(3, 8);
     };
+    static constexpr int kLifetimeSeconds = 90;
 
     std::uint32_t calldown(World& world, int32_t player, Fixed x, Fixed y, std::uint32_t node,
                            std::uint32_t depot, Fixed lifetime) {

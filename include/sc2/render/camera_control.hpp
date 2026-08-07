@@ -20,7 +20,7 @@ struct CameraControl {
     float min_pitch = 0.15f;
     float max_pitch = 1.55f;
 
-    float fovy = 0.7854f;
+    float fovy = 0.654498f;
     float znear = 0.1f;
     float zfar = 1000.0f;
     Vec3 world_up{0, 0, 1};

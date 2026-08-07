@@ -32,6 +32,12 @@ public:
         if (it->second.larva > inject_cap) it->second.larva = inject_cap;
     }
 
+    void inject(std::uint32_t id, int32_t count, Fixed delay) {
+        if (delay.raw() <= 0) { inject(id, count); return; }
+        if (hatch_.find(id) == hatch_.end()) return;
+        injects_.push_back(Inject{id, count, delay});
+    }
+
     std::uint32_t begin_morph(World& world, std::uint32_t hatchery, const Unit& finished,
                               Fixed ex, Fixed ey, Fixed build_time) {
         auto it = hatch_.find(hatchery);
@@ -82,6 +88,16 @@ public:
                 ++i;
             }
         }
+        for (std::size_t i = 0; i < injects_.size();) {
+            Inject& in = injects_[i];
+            in.timer = in.timer - dt;
+            if (in.timer.raw() <= 0) {
+                inject(in.hatch, in.count);
+                injects_.erase(injects_.begin() + std::ptrdiff_t(i));
+            } else {
+                ++i;
+            }
+        }
     }
 
 private:
@@ -92,6 +108,11 @@ private:
     struct Pending {
         std::uint32_t egg = kNoTarget;
         Unit finished;
+        Fixed timer;
+    };
+    struct Inject {
+        std::uint32_t hatch = kNoTarget;
+        int32_t count = 0;
         Fixed timer;
     };
 
@@ -109,6 +130,7 @@ private:
 
     std::unordered_map<std::uint32_t, Hatch> hatch_;
     std::vector<Pending> pending_;
+    std::vector<Inject> injects_;
 };
 
 }

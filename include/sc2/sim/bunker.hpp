@@ -50,6 +50,7 @@ public:
 
             Unit& tgt = world.unit(best);
             Defender d{tgt.hp, tgt.shields, tgt.armor, tgt.damage_reduction};
+            d.shield_armor = tgt.shield_armor;
             apply_hit(Weapon{p.wpn_damage, p.wpn_period}, d);
             tgt.hp = d.life;
             tgt.shields = d.shields;

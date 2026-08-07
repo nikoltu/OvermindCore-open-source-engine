@@ -138,10 +138,27 @@ private:
     sim::Unit human_supply_proto_;
     int human_supply_cost_ = 100;
     sim::Fixed human_supply_build_time_ = sim::Fixed::from_int(21);
+    sim::Unit human_producer_proto_;
+    sim::Fixed human_producer_build_time_ = sim::Fixed::from_int(46);
     bool ui_trainworker_ = false;
     bool ui_buildsupply_ = false;
     bool pending_attack_ = false;
     bool pending_patrol_ = false;
+    bool pending_build_ = false;
+    sim::Unit build_proto_;
+    int build_cost_ = 0;
+    sim::Fixed build_time_;
+    bool build_valid_ = false;
+    sim::Fixed build_px_, build_py_;
+    struct QueuedBuild {
+        std::uint32_t worker;
+        sim::Fixed x, y;
+        sim::Unit proto;
+        int cost;
+        sim::Fixed time;
+        bool is_producer;
+    };
+    std::vector<QueuedBuild> build_queue_;
     bool prev_num_[10] = {};
 
     MeleeCommandContext command_context();

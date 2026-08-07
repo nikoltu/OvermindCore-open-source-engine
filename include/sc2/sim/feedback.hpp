@@ -12,14 +12,15 @@ struct FeedbackResult {
     bool had_energy = false;
 };
 
-inline FeedbackResult feedback(World& world, std::uint32_t target) {
+inline FeedbackResult feedback(World& world, std::uint32_t target,
+                               Fixed energy_fraction = Fixed::from_ratio(1, 2)) {
     FeedbackResult r;
     if (target >= world.units().size()) return r;
     Unit& t = world.unit(target);
     if (!t.alive || t.energy.raw() <= 0) return r;
 
     r.had_energy = true;
-    Fixed dmg = t.energy;
+    Fixed dmg = t.energy * energy_fraction;
     r.damage_dealt = dmg;
     t.energy = Fixed();
 

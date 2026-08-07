@@ -15,6 +15,7 @@ struct ProductInfo {
     std::string product;
     std::string requirement;
     double time = 0;
+    double warp_charge = 0;
 };
 
 class Production {
@@ -23,6 +24,19 @@ public:
 
     const std::vector<ProductInfo>& products_of(const std::string& ability) const;
     const std::vector<ProductInfo>& producers_of(const std::string& product) const;
+
+    double time_of(const std::string& product) const {
+        auto it = by_product_.find(product);
+        return (it == by_product_.end() || it->second.empty()) ? 0.0 : it->second.front().time;
+    }
+
+    double warp_charge_time(const std::string& product) const {
+        auto it = by_product_.find(product);
+        if (it == by_product_.end()) return 0.0;
+        for (const ProductInfo& pi : it->second)
+            if (pi.warp_charge > 0) return pi.warp_charge;
+        return 0.0;
+    }
 
     bool can_produce(const Catalog& cat, const std::string& ability,
                      const std::string& product, const TechState& st) const;

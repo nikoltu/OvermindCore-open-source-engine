@@ -1,5 +1,8 @@
 #include "sc2/app/spawn.hpp"
 
+#include <algorithm>
+#include <vector>
+
 #include "sc2/data/economy.hpp"
 #include "sc2/sim/weapon.hpp"
 
@@ -89,29 +92,79 @@ sim::Unit make_unit(const data::Catalog& cat, const std::string& unit_id,
     u.y = y;
     u.hp = field(cat, "CUnit", unit_id, "LifeMax");
     u.hp_max = u.hp;
-    u.shields = field(cat, "CUnit", unit_id, "ShieldsMax");
+    u.shields_max = field(cat, "CUnit", unit_id, "ShieldsMax");
+    u.shields = u.shields_max;
+    if (u.shields_max.raw() > 0) {
+        const auto sr = cat.shield_regen(unit_id);
+        u.shield_regen_rate = Fixed::from_double(sr.rate);
+        u.shield_regen_delay = Fixed::from_double(sr.delay);
+    }
+    for (const std::string& abil : cat.array_links("CUnit", unit_id, "AbilArray")) {
+        if (abil.empty()) continue;
+        if (auto d = cat.cloak_drain(abil)) { u.cloak_drain = Fixed::from_double(*d); break; }
+    }
+    for (const std::string& abil : cat.array_links("CUnit", unit_id, "AbilArray")) {
+        const data::Catalog::Entry* e = abil.empty() ? nullptr : cat.find("CAbil", abil);
+        if (e && e->tag == "CAbilHarvest") { u.is_worker = true; break; }
+    }
+    if (const double dr = cat.detector_range(unit_id); dr > 0) {
+        u.detector = true;
+        u.detect_range = Fixed::from_double(dr);
+    }
     u.armor = field(cat, "CUnit", unit_id, "LifeArmor");
     u.speed = field(cat, "CUnit", unit_id, "Speed");
     u.radius = field(cat, "CUnit", unit_id, "Radius", Fixed::from_ratio(1, 2));
 
+    u.sight = field(cat, "CUnit", unit_id, "Sight");
+    u.life_regen = field(cat, "CUnit", unit_id, "LifeRegenRate");
+    u.energy_max = field(cat, "CUnit", unit_id, "EnergyMax");
+    if (u.energy_max.raw() > 0) {
+        u.energy = field(cat, "CUnit", unit_id, "EnergyStart");
+        u.energy_regen = field(cat, "CUnit", unit_id, "EnergyRegenRate",
+                               Fixed::from_ratio(5625, 10000));
+    }
+
     u.supply_provides = data::supply_provided(cat, unit_id);
     u.supply_uses = data::unit_cost(cat, unit_id).supply;
 
-    auto weapons = cat.array_links("CUnit", unit_id, "WeaponArray");
-    for (const std::string& w : weapons) {
+    int filled = 0;
+    for (const std::string& w : cat.array_links("CUnit", unit_id, "WeaponArray")) {
         if (w.empty()) continue;
-        if (auto dmg = cat.weapon_damage(w)) {
-            u.wpn_damage = Fixed::from_int(*dmg);
-            u.wpn_period = field(cat, "CWeapon", w, "Period", Fixed::from_int(1));
-            u.wpn_range = field(cat, "CWeapon", w, "Range", Fixed::from_int(1));
-            if (auto tf = cat.scalar("CWeapon", w, "TargetFilters"); tf && !tf->empty())
-                u.wpn_target_filter = parse_target_filter(*tf);
-            break;
+        auto dmg = cat.weapon_damage(w);
+        if (!dmg) continue;
+        const Fixed damage = Fixed::from_int(*dmg);
+        const Fixed period = field(cat, "CWeapon", w, "Period", Fixed::from_int(1));
+        const Fixed range = field(cat, "CWeapon", w, "Range", Fixed::from_int(5));
+        uint32_t filter = 3;
+        if (auto tf = cat.scalar("CWeapon", w, "TargetFilters"); tf && !tf->empty())
+            filter = parse_target_filter(*tf);
+        if (filled == 0) {
+            u.wpn_damage = damage;
+            u.wpn_period = period;
+            u.wpn_range = range;
+            u.wpn_target_filter = filter;
+            u.wpn_damage_point = field(cat, "CWeapon", w, "DamagePoint");
+            auto rings = cat.weapon_splash(w);
+            if (rings.size() >= 2) {
+                std::vector<double> radii;
+                for (auto& [r, frac] : rings) { (void)frac; radii.push_back(r); }
+                std::sort(radii.begin(), radii.end());
+                u.splash_inner = Fixed::from_double(radii.front());
+                u.splash_outer = Fixed::from_double(radii.back());
+                u.splash_mid = Fixed::from_double(radii[radii.size() / 2]);
+            }
+        } else {
+            u.wpn2_damage = damage;
+            u.wpn2_period = period;
+            u.wpn2_range = range;
+            u.wpn2_target_filter = filter;
         }
+        if (++filled == 2) break;
     }
 
     read_attributes(cat, unit_id, u);
     u.flying = read_flying(cat, unit_id);
+    u.speed_mult_creep = field(cat, "CUnit", unit_id, "SpeedMultiplierCreep", Fixed::from_int(1));
     return u;
 }
 

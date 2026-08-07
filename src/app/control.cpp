@@ -140,7 +140,27 @@ uint32_t Control::pick_target(const sim::World& world, const ScreenPoint& p) con
     uint32_t best = kNoTarget;
     Fixed best_d2;
     for (const sim::Unit& u : world.units()) {
-        if (!u.alive || u.player == player_) continue;
+        if (!u.alive || u.player == player_ || u.resource_left > 0) continue;
+        Fixed r = std::max(u.radius, pick_radius_);
+        Fixed dx = u.x - gx, dy = u.y - gy;
+        Fixed d2 = dx * dx + dy * dy;
+        if (d2 > r * r) continue;
+        if (best == kNoTarget || d2 < best_d2) {
+            best = u.id;
+            best_d2 = d2;
+        }
+    }
+    return best;
+}
+
+uint32_t Control::pick_resource(const sim::World& world, const ScreenPoint& p) const {
+    Fixed gx, gy;
+    if (!ground_point(world, p, gx, gy)) return kNoTarget;
+
+    uint32_t best = kNoTarget;
+    Fixed best_d2;
+    for (const sim::Unit& u : world.units()) {
+        if (!u.alive || u.resource_left <= 0) continue;
         Fixed r = std::max(u.radius, pick_radius_);
         Fixed dx = u.x - gx, dy = u.y - gy;
         Fixed d2 = dx * dx + dy * dy;
@@ -162,6 +182,12 @@ Command Control::resolve_command(const sim::World& world, const ScreenPoint& p,
         cmd.target = enemy;
         return cmd;
     }
+    uint32_t node = pick_resource(world, p);
+    if (node != kNoTarget) {
+        cmd.kind = CommandKind::Gather;
+        cmd.target = node;
+        return cmd;
+    }
     Fixed gx, gy;
     if (ground_point(world, p, gx, gy)) {
         cmd.kind = attack_move ? CommandKind::AttackMove : CommandKind::Move;
@@ -176,6 +202,36 @@ Command Control::issue_command(sim::World& world,
                                const ScreenPoint& p, bool attack_move) const {
     Command cmd = resolve_command(world, p, attack_move);
     if (cmd.kind == CommandKind::None) return cmd;
+
+    if (cmd.kind == CommandKind::Gather) {
+        for (uint32_t id : selection) {
+            if (id >= world.units().size()) continue;
+            sim::Unit& u = world.unit(id);
+            if (u.is_worker) {
+                u.gather_target = cmd.target;
+                if (u.home_depot >= world.units().size()) {
+                    uint32_t hall = kNoTarget;
+                    Fixed bd;
+                    for (const sim::Unit& o : world.units()) {
+                        if (!o.alive || o.player != player_ || o.is_worker ||
+                            o.resource_left > 0 || o.id == id)
+                            continue;
+                        Fixed dx = o.x - u.x, dy = o.y - u.y, d = dx * dx + dy * dy;
+                        if (hall == kNoTarget || d < bd) { hall = o.id; bd = d; }
+                    }
+                    if (hall != kNoTarget) u.home_depot = hall;
+                }
+                world.issue(id, Order{OrderType::Gather, Fixed(), Fixed(), kNoTarget});
+            } else if (cmd.target < world.units().size()) {
+                Order mv;
+                mv.type = OrderType::Move;
+                mv.tx = world.unit(cmd.target).x;
+                mv.ty = world.unit(cmd.target).y;
+                world.issue(id, mv);
+            }
+        }
+        return cmd;
+    }
 
     Order order;
     switch (cmd.kind) {
@@ -193,6 +249,7 @@ Command Control::issue_command(sim::World& world,
             order.tx = cmd.x;
             order.ty = cmd.y;
             break;
+        case CommandKind::Gather:
         case CommandKind::None:
             return cmd;
     }

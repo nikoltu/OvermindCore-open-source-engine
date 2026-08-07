@@ -5,10 +5,16 @@
 #include <cstdlib>
 #include <utility>
 
+#include <string>
+#include <vector>
+
+#include "sc2/app/ability.hpp"
 #include "sc2/app/melee.hpp"
 #include "sc2/app/spawn.hpp"
 #include "sc2/data/catalog.hpp"
 #include "sc2/data/economy.hpp"
+#include "sc2/data/production.hpp"
+#include "sc2/data/upgrades.hpp"
 #include "sc2/formats/map_archive.hpp"
 #include "sc2/sim/world.hpp"
 
@@ -132,7 +138,10 @@ inline MeleeSetup melee_setup_for_map(const formats::LoadedMap& map, int worker_
 }
 
 inline MeleeSetup melee_setup_for_map(const formats::LoadedMap& map, const data::Catalog& cat,
-                                      int worker_count = 12, int patches = 8) {
+                                      int worker_count = 12, int patches = 8,
+                                      const data::UpgradeCatalog* up = nullptr,
+                                      const std::vector<std::string>* researched_p0 = nullptr,
+                                      const std::vector<std::string>* researched_p1 = nullptr) {
     using sim::Fixed;
     MapMeleeStarts st = map_melee_starts(map);
 
@@ -160,20 +169,37 @@ inline MeleeSetup melee_setup_for_map(const formats::LoadedMap& map, const data:
     const data::UnitCost mcost = data::unit_cost(cat, "Marine");
     const data::UnitCost scost = data::unit_cost(cat, "SCV");
     const data::UnitCost dcost = data::unit_cost(cat, "SupplyDepot");
+    const data::UnitCost bcost = data::unit_cost(cat, "Barracks");
+
+    data::Production prod;
+    prod.build(cat);
+    auto secs = [&](const char* id, int fallback) {
+        double t = prod.time_of(id);
+        return t > 0.0 ? Fixed::from_raw(int(t * double(Fixed::kOne) + 0.5)) : Fixed::from_int(fallback);
+    };
 
     MeleeSetup s;
     for (int side = 0; side < 2; ++side) {
         const int sx = side ? st.s1x : st.s0x, sy = side ? st.s1y : st.s0y;
         MeleePlayerSetup p = map_melee_player(pr, sx, sy, st.cx, st.cy, worker_count, patches);
         p.worker_mineral_cost = scost.minerals > 0 ? scost.minerals : 50;
+        p.worker_build_time = secs("SCV", 12);
         p.supply_mineral_cost = dcost.minerals > 0 ? dcost.minerals : 100;
-        p.producer_mineral_cost = 150;
-        p.producer_gas_cost = 0;
-        p.producer_build_time = Fixed::from_int(46);
+        p.supply_build_time = secs("SupplyDepot", 21);
+        p.producer_mineral_cost = bcost.minerals > 0 ? bcost.minerals : 150;
+        p.producer_gas_cost = bcost.gas;
+        p.producer_build_time = secs("Barracks", 46);
         p.army_mineral_cost = mcost.minerals;
         p.army_gas_cost = mcost.gas;
-        p.army_build_time = Fixed::from_int(18);
+        p.army_build_time = secs("Marine", 18);
         p.army_threshold = 5;
+        if (const std::vector<std::string>* r = side == 0 ? researched_p0 : researched_p1;
+            up && r && !r->empty()) {
+            apply_unit_upgrades(cat, *up, "Marine", *r, p.army_unit);
+            apply_unit_upgrades(cat, *up, "SCV", *r, p.worker);
+            apply_unit_upgrades(cat, *up, "Barracks", *r, p.producer);
+            apply_unit_upgrades(cat, *up, "SupplyDepot", *r, p.supply_unit);
+        }
         s.players.push_back(p);
     }
     return s;

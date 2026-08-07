@@ -17,7 +17,13 @@ public:
     void assign(std::uint32_t repairer, std::uint32_t target) {
         for (const Job& j : jobs_)
             if (j.repairer == repairer && j.target == target) return;
-        jobs_.push_back(Job{repairer, target, Fixed()});
+        jobs_.push_back(Job{repairer, target, Fixed(), rate_, cost_per_hp_, Fixed()});
+    }
+    void assign(std::uint32_t repairer, std::uint32_t target, Fixed hp_per_sec, Fixed mineral_per_hp,
+                Fixed gas_per_hp) {
+        for (const Job& j : jobs_)
+            if (j.repairer == repairer && j.target == target) return;
+        jobs_.push_back(Job{repairer, target, Fixed(), hp_per_sec, mineral_per_hp, gas_per_hp});
     }
     int active_count() const { return int(jobs_.size()); }
 
@@ -39,30 +45,47 @@ public:
                 continue;
             }
 
-            Fixed heal = rate_ * dt;
+            Fixed heal = j.rate * dt;
             const Fixed missing = t.hp_max - t.hp;
             if (heal > missing) heal = missing;
 
             Player& p = world.player(t.player);
-            if (cost_per_hp_.raw() > 0) {
+            if (j.mineral_per_hp.raw() > 0) {
                 const Fixed budget = Fixed::from_int(p.minerals) - j.cost_accum;
                 if (budget.raw() <= 0) {
                     kept.push_back(j);
                     continue;
                 }
-                const Fixed affordable_hp = budget / cost_per_hp_;
+                const Fixed affordable_hp = budget / j.mineral_per_hp;
                 if (heal > affordable_hp) heal = affordable_hp;
-                if (heal.raw() <= 0) {
+            }
+            if (j.gas_per_hp.raw() > 0) {
+                const Fixed budget = Fixed::from_int(p.gas) - j.gas_accum;
+                if (budget.raw() <= 0) {
                     kept.push_back(j);
                     continue;
                 }
+                const Fixed affordable_hp = budget / j.gas_per_hp;
+                if (heal > affordable_hp) heal = affordable_hp;
+            }
+            if (heal.raw() <= 0) {
+                kept.push_back(j);
+                continue;
             }
 
-            j.cost_accum = j.cost_accum + heal * cost_per_hp_;
+            j.cost_accum = j.cost_accum + heal * j.mineral_per_hp;
             const int due = j.cost_accum.floor();
             if (due > 0) {
                 p.minerals -= due;
                 j.cost_accum = j.cost_accum - Fixed::from_int(due);
+            }
+            if (j.gas_per_hp.raw() > 0) {
+                j.gas_accum = j.gas_accum + heal * j.gas_per_hp;
+                const int gdue = j.gas_accum.floor();
+                if (gdue > 0) {
+                    p.gas -= gdue;
+                    j.gas_accum = j.gas_accum - Fixed::from_int(gdue);
+                }
             }
 
             t.hp = t.hp + heal;
@@ -77,6 +100,10 @@ private:
         std::uint32_t repairer = kNoTarget;
         std::uint32_t target = kNoTarget;
         Fixed cost_accum;
+        Fixed rate;
+        Fixed mineral_per_hp;
+        Fixed gas_per_hp;
+        Fixed gas_accum;
     };
     Fixed rate_, cost_per_hp_, range_;
     std::vector<Job> jobs_;

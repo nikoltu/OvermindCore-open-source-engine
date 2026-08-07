@@ -21,6 +21,9 @@ public:
     static constexpr Fixed from_ratio(int32_t num, int32_t den) {
         return from_raw(int32_t((int64_t(num) << kShift) / den));
     }
+    static Fixed from_double(double v) {
+        return from_raw(int32_t(v * kOne + (v >= 0 ? 0.5 : -0.5)));
+    }
 
     constexpr int32_t raw() const { return raw_; }
 

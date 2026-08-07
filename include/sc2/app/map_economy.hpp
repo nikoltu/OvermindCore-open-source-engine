@@ -72,7 +72,8 @@ inline MapEconomy setup_economy_on_map(const formats::LoadedMap& map, int worker
             w.speed = sim::Fixed::from_int(3);
             w.radius = sim::Fixed::from_ratio(1, 2);
             w.carry_amount = 5;
-            w.mine_time = sim::Fixed::from_ratio(1, 2);
+            w.mine_time = sim::Fixed::parse("2.786");
+            w.return_delay = sim::Fixed::from_ratio(1, 2);
             w.gather_target = minerals[std::size_t(i) % minerals.size()];
             w.home_depot = hall;
             w.alive = true;

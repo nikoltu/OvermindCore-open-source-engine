@@ -31,6 +31,8 @@ public:
                 if (seen[i]) continue;
                 const Unit& u = world.units()[i];
                 if (!u.alive || u.loaded || world.are_allied(u.player, viewer)) continue;
+                if (u.player < 0) continue;
+                if (u.cloaked_effective() || u.burrowed) continue;
                 const Fixed dx = u.x - t.x, dy = u.y - t.y;
                 if ((dx * dx + dy * dy).raw() > r2.raw()) continue;
                 seen[i] = 1;

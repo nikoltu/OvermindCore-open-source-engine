@@ -1,6 +1,10 @@
 #include "sc2/ai/melee_ai.hpp"
 
+#include <utility>
+#include <vector>
+
 #include "sc2/ai/defense.hpp"
+#include "sc2/ai/economy.hpp"
 
 namespace sc2::ai {
 
@@ -56,12 +60,18 @@ int MeleeAI::worker_count(const sim::World& w) const {
 }
 
 void MeleeAI::run_workers(sim::World& w) {
-    for (uint32_t id = 0; id < w.units().size(); ++id) {
+    const std::size_t U = w.units().size();
+    auto live_node = [&](uint32_t nid) {
+        return nid < U && w.units()[nid].alive && w.units()[nid].resource_left > 0;
+    };
+    for (uint32_t id = 0; id < U; ++id) {
         Unit& u = w.unit(id);
         if (!u.alive || u.player != player_ || !u.is_worker) continue;
         if (u.orders.empty()) {
-            u.home_depot = base_.depot;
-            u.gather_target = base_.mineral;
+            if (!live_node(u.gather_target)) {
+                u.home_depot = base_.depot;
+                u.gather_target = base_.mineral;
+            }
             w.issue(id, Order{OrderType::Gather, Fixed(), Fixed(), sim::kNoTarget});
         }
     }
@@ -72,8 +82,18 @@ void MeleeAI::run_production(sim::World& w) {
         w.unit(base_.depot).alive && worker_count(w) < cfg_.worker_target &&
         int(w.pending_count()) < cfg_.max_pending && afford(w, cfg_.worker_unit) &&
         supply_ok(w, cfg_.worker_unit)) {
-        w.queue_train(base_.depot, cfg_.worker_unit.proto, cfg_.worker_unit.minerals,
-                      cfg_.worker_unit.gas, cfg_.worker_unit.build_time);
+        uint32_t hall = base_.depot;
+        Unit wp = cfg_.worker_unit.proto;
+        if (base_.expansion < w.units().size() && w.unit(base_.expansion).alive &&
+            base_.expansion_mineral < w.units().size() &&
+            w.unit(base_.expansion_mineral).alive &&
+            w.unit(base_.expansion_mineral).resource_left > 0) {
+            hall = base_.expansion;
+            wp.home_depot = base_.expansion;
+            wp.gather_target = base_.expansion_mineral;
+        }
+        w.queue_train(hall, wp, cfg_.worker_unit.minerals, cfg_.worker_unit.gas,
+                      cfg_.worker_unit.build_time);
     }
 
     if (base_.producer >= w.units().size() || !w.unit(base_.producer).alive) {
@@ -195,9 +215,83 @@ void MeleeAI::run_army(sim::World& w) {
     }
 }
 
+int MeleeAI::patches_near(const sim::World& w, Fixed x, Fixed y, Fixed radius) const {
+    const Fixed r2 = radius * radius;
+    int n = 0;
+    for (const Unit& u : w.units()) {
+        if (!u.alive || u.player >= 0 || u.resource_left <= 0) continue;
+        const Fixed dx = u.x - x, dy = u.y - y;
+        if (dx * dx + dy * dy <= r2) ++n;
+    }
+    return n;
+}
+
+uint32_t MeleeAI::nearest_mineral(const sim::World& w, Fixed x, Fixed y) const {
+    uint32_t best = sim::kNoTarget;
+    Fixed best_d2;
+    for (const Unit& u : w.units()) {
+        if (!u.alive || u.player >= 0 || u.resource_left <= 0) continue;
+        const Fixed dx = u.x - x, dy = u.y - y, d2 = dx * dx + dy * dy;
+        if (best == sim::kNoTarget || d2 < best_d2) {
+            best = u.id;
+            best_d2 = d2;
+        }
+    }
+    return best;
+}
+
+void MeleeAI::run_expansion(sim::World& w) {
+    if (!cfg_.has_expansion) return;
+    const std::size_t U = w.units().size();
+
+    if (expansion_pending_ && base_.expansion == sim::kNoTarget) {
+        const Fixed tol = Fixed::from_int(3);
+        for (const Unit& u : w.units()) {
+            if (!u.alive || u.player != player_ || u.speed.raw() != 0) continue;
+            if (u.id == base_.depot || u.id == base_.producer) continue;
+            const Fixed dx = u.x - expand_x_, dy = u.y - expand_y_;
+            if (dx * dx + dy * dy <= tol * tol) {
+                base_.expansion = u.id;
+                base_.expansion_mineral = nearest_mineral(w, u.x, u.y);
+                expansion_pending_ = false;
+                cfg_.worker_target += cfg_.expansion_worker_bonus;
+                break;
+            }
+        }
+    }
+
+    if (base_.expansion != sim::kNoTarget || expansion_pending_) return;
+    if (base_.depot >= U || !w.unit(base_.depot).alive) return;
+    const Unit& depot = w.unit(base_.depot);
+
+    const int patches =
+        patches_near(w, depot.x, depot.y, cfg_.expansion_occupied_radius + Fixed::from_int(4));
+    if (!should_expand(worker_count(w), patches, w.player(player_).minerals,
+                       cfg_.expansion_unit.minerals))
+        return;
+
+    std::vector<std::pair<Fixed, Fixed>> bases;
+    for (const Unit& u : w.units())
+        if (u.alive && u.speed.raw() == 0 && u.supply_provides.raw() > 0)
+            bases.push_back({u.x, u.y});
+
+    const int idx = nearest_expansion(cfg_.expansion_sites, bases, depot.x, depot.y,
+                                      cfg_.expansion_occupied_radius);
+    if (idx < 0) return;
+    const auto& site = cfg_.expansion_sites[std::size_t(idx)];
+    if (w.queue_train_at(base_.depot, cfg_.expansion_unit.proto, cfg_.expansion_unit.minerals,
+                         cfg_.expansion_unit.gas, cfg_.expansion_unit.build_time, site.first,
+                         site.second)) {
+        expansion_pending_ = true;
+        expand_x_ = site.first;
+        expand_y_ = site.second;
+    }
+}
+
 void MeleeAI::update(sim::World& w) {
     run_workers(w);
     run_production(w);
+    run_expansion(w);
     run_army(w);
 }
 

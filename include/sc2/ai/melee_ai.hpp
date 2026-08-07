@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstdint>
+#include <utility>
 #include <vector>
 
 #include "sc2/ai/combat.hpp"
@@ -32,6 +33,12 @@ struct MeleeConfig {
     sim::Fixed supply_margin = sim::Fixed::from_int(2);
     sim::Fixed rally_x, rally_y;
     sim::Fixed enemy_x, enemy_y;
+
+    bool has_expansion = false;
+    BuildItem expansion_unit;
+    std::vector<std::pair<sim::Fixed, sim::Fixed>> expansion_sites;
+    sim::Fixed expansion_occupied_radius = sim::Fixed::from_int(6);
+    int expansion_worker_bonus = 10;
 };
 
 struct MeleeBase {
@@ -40,6 +47,8 @@ struct MeleeBase {
     uint32_t mineral = sim::kNoTarget;
     std::vector<uint32_t> workers;
     std::vector<uint32_t> structures;
+    uint32_t expansion = sim::kNoTarget;
+    uint32_t expansion_mineral = sim::kNoTarget;
 };
 
 class MeleeAI {
@@ -62,7 +71,10 @@ private:
     bool supply_ok(const sim::World& w, const BuildItem& it) const;
     void run_workers(sim::World& w);
     void run_production(sim::World& w);
+    void run_expansion(sim::World& w);
     void run_army(sim::World& w);
+    int patches_near(const sim::World& w, sim::Fixed x, sim::Fixed y, sim::Fixed radius) const;
+    uint32_t nearest_mineral(const sim::World& w, sim::Fixed x, sim::Fixed y) const;
     bool enemy_target(const sim::World& w, sim::Fixed& tx, sim::Fixed& ty) const;
 
     int player_;
@@ -72,6 +84,8 @@ private:
     size_t build_idx_ = 0;
     bool attacking_ = false;
     bool producer_pending_ = false;
+    bool expansion_pending_ = false;
+    sim::Fixed expand_x_, expand_y_;
 };
 
 }

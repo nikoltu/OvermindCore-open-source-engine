@@ -215,6 +215,11 @@ void MeleeGame::setup(const MeleeSetup& setup, const MeleeModels* models,
     map_h_ = map_h;
     if (nav) world_.nav() = *nav;
     world_.set_separation(true);
+    world_.set_game_speed(sim::Fixed::from_ratio(7, 5));
+
+    if (cfg_.human_player >= 0 && size_t(cfg_.human_player) < layout_.players.size())
+        for (std::uint32_t id : layout_.players[size_t(cfg_.human_player)].workers)
+            world_.stop(id);
 
     driver_.default_model = models ? models->model_for("Marine") : nullptr;
     for (uint32_t id = 0; id < layout_.unit_type.size(); ++id) {
@@ -248,6 +253,9 @@ void MeleeGame::setup(const MeleeSetup& setup, const MeleeModels* models,
         human_supply_proto_ = hp.supply_unit;
         human_supply_cost_ = hp.supply_mineral_cost;
         human_supply_build_time_ = hp.supply_build_time;
+        human_producer_proto_ = hp.producer;
+        human_producer_proto_.speed = sim::Fixed();
+        human_producer_build_time_ = hp.producer_build_time;
     }
 
     if (cfg_.human_player >= 0 && size_t(cfg_.human_player) < setup.players.size()) {
@@ -334,6 +342,26 @@ void MeleeGame::handle_commands(const render::InputState& in, float aspect) {
     prev_stop_ = in.key_stop;
     prev_patrol_ = in.key_patrol;
 
+    if (pending_build_) {
+        sim::Fixed wx, wy;
+        if (!over_bar && ctrl.ground_point(world_, ScreenPoint{in.mouse_x, in.mouse_y}, wx, wy)) {
+            build_px_ = wx;
+            build_py_ = wy;
+            bool clear = wx.to_double() >= 0.0 && wy.to_double() >= 0.0 &&
+                         wx.to_double() <= double(map_w_) && wy.to_double() <= double(map_h_);
+            if (clear)
+                for (const Unit& u : world_.units()) {
+                    if (!u.alive) continue;
+                    const sim::Fixed dx = u.x - wx, dy = u.y - wy;
+                    const sim::Fixed rr = build_proto_.radius + u.radius;
+                    if (dx * dx + dy * dy < rr * rr) { clear = false; break; }
+                }
+            build_valid_ = clear && world_.player(cfg_.human_player).minerals >= build_cost_;
+        } else {
+            build_valid_ = false;
+        }
+    }
+
     if (over_minimap && map_w_ > 0.0f && map_h_ > 0.0f) {
         if (in.left_pressed) {
             float wx, wy; minimap_world(wx, wy);
@@ -386,6 +414,35 @@ void MeleeGame::handle_commands(const render::InputState& in, float aspect) {
                     break;
                 }
             }
+        } else if (pending_build_) {
+            dragging_ = false;
+            bool placed = false;
+            std::uint32_t bw = sim::kNoTarget;
+            for (std::uint32_t id : selection_)
+                if (id < world_.units().size() && world_.unit(id).alive &&
+                    world_.unit(id).is_worker && world_.unit(id).player == cfg_.human_player) {
+                    bw = id;
+                    break;
+                }
+            sim::Fixed wx, wy;
+            if (bw != sim::kNoTarget &&
+                ctrl.ground_point(world_, ScreenPoint{in.mouse_x, in.mouse_y}, wx, wy)) {
+                bool clear = wx.to_double() >= 0.0 && wy.to_double() >= 0.0 &&
+                             wx.to_double() <= double(map_w_) && wy.to_double() <= double(map_h_);
+                if (clear)
+                    for (const Unit& u : world_.units()) {
+                        if (!u.alive) continue;
+                        const sim::Fixed dx = u.x - wx, dy = u.y - wy;
+                        const sim::Fixed rr = build_proto_.radius + u.radius;
+                        if (dx * dx + dy * dy < rr * rr) { clear = false; break; }
+                    }
+                if (clear) {
+                    build_queue_.push_back({bw, wx, wy, build_proto_, build_cost_, build_time_,
+                                            build_proto_.supply_provides.raw() == 0});
+                    placed = true;
+                }
+            }
+            if ((placed && !in.shift) || bw == sim::kNoTarget) pending_build_ = false;
         } else if ((pending_attack_ || pending_patrol_) && !selection_.empty()) {
             dragging_ = false;
             sim::Fixed wx, wy;
@@ -431,7 +488,9 @@ void MeleeGame::handle_commands(const render::InputState& in, float aspect) {
         }
     }
 
-    if (in.right_pressed && !selection_.empty() && !over_bar) {
+    if (in.right_pressed && pending_build_) pending_build_ = false;
+
+    if (in.right_pressed && !pending_build_ && !selection_.empty() && !over_bar) {
         std::uint32_t node = sim::kNoTarget;
         sim::Fixed gx, gy;
         if (ctrl.ground_point(world_, ScreenPoint{in.mouse_x, in.mouse_y}, gx, gy)) {
@@ -444,8 +503,22 @@ void MeleeGame::handle_commands(const render::InputState& in, float aspect) {
                 if (node == sim::kNoTarget || d2 < best_d2) { node = u.id; best_d2 = d2; }
             }
         }
-        if (node != sim::kNoTarget && cfg_.human_player >= 0 &&
-            size_t(cfg_.human_player) < layout_.players.size()) {
+        std::uint32_t resume = sim::kNoTarget;
+        if (node == sim::kNoTarget) {
+            for (const Unit& u : world_.units()) {
+                if (!u.alive || u.player != cfg_.human_player || !world_.is_halted(u.id)) continue;
+                const sim::Fixed r = u.radius + sim::Fixed::from_int(1);
+                const sim::Fixed dx = u.x - gx, dy = u.y - gy;
+                if (dx * dx + dy * dy <= r * r) { resume = u.id; break; }
+            }
+        }
+
+        if (resume != sim::kNoTarget) {
+            for (std::uint32_t id : selection_)
+                if (id < world_.units().size() && world_.unit(id).alive &&
+                    world_.unit(id).is_worker) { world_.assign_builder(id, resume); break; }
+        } else if (node != sim::kNoTarget && cfg_.human_player >= 0 &&
+                   size_t(cfg_.human_player) < layout_.players.size()) {
             const std::uint32_t depot = layout_.players[size_t(cfg_.human_player)].base.depot;
             for (std::uint32_t id : selection_) {
                 if (id >= world_.units().size()) continue;
@@ -602,23 +675,32 @@ bool MeleeGame::step(const render::InputState& in, float dt_ms,
             (human_producer_ >= world_.units().size() || !world_.unit(human_producer_).alive))
             human_producer_ = sim::kNoTarget;
 
-        if (human_producer_ == sim::kNoTarget && human_producer_pending_) {
+        if (human_producer_ == sim::kNoTarget) {
             for (const Unit& u : world_.units())
                 if (u.alive && u.player == cfg_.human_player && u.speed.raw() == 0 &&
-                    u.id != pl.base.depot && u.supply_provides.raw() == 0) {
+                    !u.constructing && u.id != pl.base.depot && u.supply_provides.raw() == 0) {
                     human_producer_ = u.id;
                     human_producer_pending_ = false;
                     break;
                 }
         }
 
+        auto selected_worker = [&]() -> std::uint32_t {
+            for (std::uint32_t id : selection_)
+                if (id < world_.units().size() && world_.unit(id).alive &&
+                    world_.unit(id).is_worker && world_.unit(id).player == cfg_.human_player)
+                    return id;
+            return sim::kNoTarget;
+        };
+
         const bool do_build = (in.key_build && !prev_build_) || ui_build_;
-        if (do_build && !human_producer_pending_ &&
-            human_producer_ == sim::kNoTarget && pl.base.depot < world_.units().size()) {
-            const ai::BuildItem& pu = pl.config.producer_unit;
-            if (world_.player(cfg_.human_player).minerals >= pu.minerals &&
-                world_.queue_train(pl.base.depot, pu.proto, pu.minerals, pu.gas, pu.build_time))
-                human_producer_pending_ = true;
+        if (do_build && !human_producer_pending_ && human_producer_ == sim::kNoTarget &&
+            selected_worker() != sim::kNoTarget) {
+            pending_build_ = true;
+            build_proto_ = human_producer_proto_;
+            build_cost_ = human_producer_cost_;
+            build_time_ = human_producer_build_time_;
+            pending_attack_ = pending_patrol_ = false;
         }
 
         const bool do_train = (in.key_train && !prev_train_) || ui_train_;
@@ -634,11 +716,32 @@ bool MeleeGame::step(const render::InputState& in, float dt_ms,
             world_.queue_train(pl.base.depot, human_worker_proto_, human_worker_cost_, 0,
                                human_worker_build_time_);
 
-        if (ui_buildsupply_ && pl.base.depot < world_.units().size() &&
-            world_.unit(pl.base.depot).alive &&
-            world_.player(cfg_.human_player).minerals >= human_supply_cost_)
-            world_.queue_train(pl.base.depot, human_supply_proto_, human_supply_cost_, 0,
-                               human_supply_build_time_);
+        if (ui_buildsupply_ && selected_worker() != sim::kNoTarget) {
+            pending_build_ = true;
+            build_proto_ = human_supply_proto_;
+            build_cost_ = human_supply_cost_;
+            build_time_ = human_supply_build_time_;
+            pending_attack_ = pending_patrol_ = false;
+        }
+
+        std::vector<std::uint32_t> issued_this_frame;
+        for (std::size_t i = 0; i < build_queue_.size();) {
+            const QueuedBuild& q = build_queue_[i];
+            const bool worker_free =
+                q.worker < world_.units().size() && world_.unit(q.worker).alive &&
+                !world_.worker_committed(q.worker) &&
+                std::find(issued_this_frame.begin(), issued_this_frame.end(), q.worker) ==
+                    issued_this_frame.end();
+            if (!worker_free || world_.player(cfg_.human_player).minerals < q.cost) {
+                ++i;
+                continue;
+            }
+            if (world_.issue_worker_build(q.worker, q.x, q.y, q.proto, q.cost, 0, q.time) &&
+                q.is_producer)
+                human_producer_pending_ = true;
+            issued_this_frame.push_back(q.worker);
+            build_queue_.erase(build_queue_.begin() + i);
+        }
     }
     prev_train_ = in.key_train;
     prev_build_ = in.key_build;
@@ -912,6 +1015,95 @@ void MeleeGame::build_overlay(std::uint32_t view_w, std::uint32_t view_h,
                 }
             }
         }
+    }
+
+    {
+        auto putpx = [&](int x, int y, int r, int g, int b, int a) {
+            if (x < 0 || y < 0 || x >= int(view_w) || y >= int(view_h)) return;
+            std::size_t i = (std::size_t(y) * view_w + x) * 4;
+            out[i] = std::uint8_t(r); out[i + 1] = std::uint8_t(g);
+            out[i + 2] = std::uint8_t(b); out[i + 3] = std::uint8_t(a);
+        };
+        const float aspect2 = view_h > 0 ? float(view_w) / float(view_h) : 1.0f;
+        const render::Mat4 mvp = camctl_.view_proj(aspect2);
+        const auto& m = mvp.m;
+        auto proj0 = [&](float x, float y, int& sx, int& sy) -> bool {
+            const float cx = m[0] * x + m[4] * y + m[12];
+            const float cy = m[1] * x + m[5] * y + m[13];
+            const float cw = m[3] * x + m[7] * y + m[15];
+            if (cw <= 1e-6f) return false;
+            sx = int((cx / cw * 0.5f + 0.5f) * float(view_w));
+            sy = int((cy / cw * 0.5f + 0.5f) * float(view_h));
+            return true;
+        };
+        auto line = [&](int x0, int y0, int x1, int y1, int r, int g, int b, int a) {
+            int dx = std::abs(x1 - x0), dy = -std::abs(y1 - y0);
+            int sx = x0 < x1 ? 1 : -1, sy = y0 < y1 ? 1 : -1, err = dx + dy;
+            for (int guard = 0; guard < 4000; ++guard) {
+                putpx(x0, y0, r, g, b, a);
+                if (x0 == x1 && y0 == y1) break;
+                int e2 = 2 * err;
+                if (e2 >= dy) { err += dy; x0 += sx; }
+                if (e2 <= dx) { err += dx; y0 += sy; }
+            }
+        };
+        auto marker = [&](int cx, int cy, int r, int g, int b) {
+            for (int k = -5; k <= 5; ++k) {
+                putpx(cx + k, cy, r, g, b, 235); putpx(cx, cy + k, r, g, b, 235);
+                putpx(cx + k, cy + (5 - std::abs(k)), r, g, b, 200);
+                putpx(cx + k, cy - (5 - std::abs(k)), r, g, b, 200);
+            }
+        };
+
+        if (pending_build_) {
+            const float wx = float(build_px_.to_double()), wy = float(build_py_.to_double());
+            const float rad = float(build_proto_.radius.to_double());
+            int cx, cy, ex, ey;
+            if (proj0(wx, wy, cx, cy) && proj0(wx + (rad > 0 ? rad : 1.0f), wy, ex, ey)) {
+                int pr = std::abs(ex - cx);
+                pr = pr < 8 ? 8 : (pr > 90 ? 90 : pr);
+                const int r = build_valid_ ? 60 : 225, g = build_valid_ ? 215 : 60;
+                for (int y = cy - pr; y <= cy + pr; ++y)
+                    for (int x = cx - pr; x <= cx + pr; ++x) putpx(x, y, r, g, 60, 70);
+                for (int t = 0; t < 2; ++t) {
+                    for (int x = cx - pr; x <= cx + pr; ++x) { putpx(x, cy - pr + t, r, g, 60, 255); putpx(x, cy + pr - t, r, g, 60, 255); }
+                    for (int y = cy - pr; y <= cy + pr; ++y) { putpx(cx - pr + t, y, r, g, 60, 255); putpx(cx + pr - t, y, r, g, 60, 255); }
+                }
+            }
+        }
+
+        if (cfg_.human_player >= 0)
+            for (std::uint32_t id : selection_) {
+                if (id >= world_.units().size()) continue;
+                const Unit& u = world_.unit(id);
+                if (!u.alive || u.player != cfg_.human_player || u.orders.empty()) continue;
+                const sim::Order& o = u.orders.front();
+                if (o.type != sim::OrderType::Move && o.type != sim::OrderType::AttackMove) continue;
+                int ux, uy, tx, ty;
+                if (proj0(float(u.x.to_double()), float(u.y.to_double()), ux, uy) &&
+                    proj0(float(o.tx.to_double()), float(o.ty.to_double()), tx, ty)) {
+                    const bool atk = o.type == sim::OrderType::AttackMove;
+                    const int r = atk ? 230 : 90, g = atk ? 90 : 210, b = atk ? 70 : 90;
+                    line(ux, uy, tx, ty, r, g, b, 170);
+                    marker(tx, ty, r, g, b);
+                }
+            }
+
+        if (cfg_.human_player >= 0)
+            for (const Unit& u : world_.units()) {
+                if (!u.alive || u.player != cfg_.human_player || !u.constructing) continue;
+                int cx, cy;
+                if (!proj0(float(u.x.to_double()), float(u.y.to_double()), cx, cy)) continue;
+                const int bw = 40, bh = 6, x0 = cx - bw / 2, y0 = cy - 26;
+                const double prog = u.build_progress.to_double();
+                const int fillw = int(double(bw) * (prog < 0 ? 0 : (prog > 1 ? 1 : prog)));
+                for (int y = y0; y < y0 + bh; ++y)
+                    for (int x = x0; x < x0 + bw; ++x) putpx(x, y, 20, 25, 30, 210);
+                for (int y = y0; y < y0 + bh; ++y)
+                    for (int x = x0; x < x0 + fillw; ++x) putpx(x, y, 240, 210, 70, 255);
+                for (int x = x0 - 1; x <= x0 + bw; ++x) { putpx(x, y0 - 1, 0, 0, 0, 255); putpx(x, y0 + bh, 0, 0, 0, 255); }
+                for (int y = y0 - 1; y <= y0 + bh; ++y) { putpx(x0 - 1, y, 0, 0, 0, 255); putpx(x0 + bw, y, 0, 0, 0, 255); }
+            }
     }
 
     if (cfg_.human_player >= 0 && selection_.size() == 1 &&

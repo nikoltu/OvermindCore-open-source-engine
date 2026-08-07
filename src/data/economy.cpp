@@ -6,12 +6,13 @@ using sim::Fixed;
 
 static int cost_resource(const Catalog& cat, const std::string& unit_id,
                          const std::string& which) {
+    int value = 0;
     for (const core::XmlNode& c : cat.resolved("CUnit", unit_id)) {
         if (c.name != "CostResource") continue;
         if (c.attr_or("index", "") == which)
-            return int(Fixed::parse(c.attr_or("value", "0")).round());
+            value = int(Fixed::parse(c.attr_or("value", "0")).round());
     }
-    return 0;
+    return value;
 }
 
 static Fixed food(const Catalog& cat, const std::string& unit_id) {

@@ -13,7 +13,8 @@ struct EmpResult {
 };
 
 inline EmpResult emp_strike(World& world, Fixed x, Fixed y, Fixed radius, Fixed energy_drain,
-                            std::int32_t caster_player, bool enemies_only = true) {
+                            std::int32_t caster_player, bool enemies_only = true,
+                            Fixed shield_burn = Fixed::from_int(100)) {
     EmpResult r;
     if (radius.raw() <= 0) return r;
     const Fixed r2 = radius * radius;
@@ -27,8 +28,10 @@ inline EmpResult emp_strike(World& world, Fixed x, Fixed y, Fixed radius, Fixed 
 
         bool touched = false;
         if (u.shields.raw() > 0) {
-            r.shields_removed = r.shields_removed + u.shields;
-            u.shields = Fixed();
+            const Fixed removed =
+                (shield_burn.raw() > 0 && u.shields > shield_burn) ? shield_burn : u.shields;
+            r.shields_removed = r.shields_removed + removed;
+            u.shields = u.shields - removed;
             touched = true;
         }
         if (energy_drain.raw() > 0 && u.energy.raw() > 0) {

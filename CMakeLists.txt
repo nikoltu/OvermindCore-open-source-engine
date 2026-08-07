@@ -37,6 +37,7 @@ add_library(sc2core STATIC
   src/data/catalog.cpp
   src/data/requirements.cpp
   src/data/production.cpp
+  src/data/environment.cpp
   src/data/economy.cpp
   src/data/veterancy.cpp
   src/data/upgrades.cpp
@@ -52,6 +53,7 @@ add_library(sc2core STATIC
   src/ai/macro.cpp
   src/ai/melee_ai.cpp
   src/app/spawn.cpp
+  src/app/ability.cpp
   src/app/install.cpp
   src/app/boot.cpp
   src/app/melee_commands.cpp
@@ -82,6 +84,12 @@ target_include_directories(sc2core PUBLIC include)
 
 add_executable(sc2casc tools/sc2casc.cpp)
 target_link_libraries(sc2casc PRIVATE sc2core)
+
+add_executable(sc2probe tools/sc2probe.cpp)
+target_link_libraries(sc2probe PRIVATE sc2core)
+
+add_executable(sc2oracle_dump tools/sc2oracle_dump.cpp)
+target_link_libraries(sc2oracle_dump PRIVATE sc2core)
 
 find_package(Vulkan COMPONENTS glslc QUIET)
 if(Vulkan_FOUND AND Vulkan_GLSLC_EXECUTABLE)
@@ -119,6 +127,9 @@ if(Vulkan_FOUND AND Vulkan_GLSLC_EXECUTABLE)
 
   add_executable(sc2scene tools/sc2scene.cpp)
   target_link_libraries(sc2scene PRIVATE sc2render sc2core)
+
+  add_executable(sc2render_frames tools/sc2render_frames.cpp)
+  target_link_libraries(sc2render_frames PRIVATE sc2render sc2core)
 
   add_executable(sc2window tools/sc2window.cpp)
   target_link_libraries(sc2window PRIVATE sc2render sc2core)
