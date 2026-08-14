@@ -44,6 +44,8 @@ public:
 
     uint32_t pick_target(const sim::World& world, const ScreenPoint& p) const;
 
+    uint32_t pick_own(const sim::World& world, const ScreenPoint& p) const;
+
     uint32_t pick_resource(const sim::World& world, const ScreenPoint& p) const;
 
     Command resolve_command(const sim::World& world, const ScreenPoint& p,

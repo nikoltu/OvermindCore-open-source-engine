@@ -1,5 +1,7 @@
 #include "sc2/formats/dds.hpp"
 
+#include <algorithm>
+#include <cmath>
 #include <stdexcept>
 
 #include "sc2/core/byte_reader.hpp"
@@ -63,6 +65,21 @@ static uint32_t rd32(const uint8_t* p) {
     return uint32_t(p[0]) | uint32_t(p[1]) << 8 | uint32_t(p[2]) << 16 |
            uint32_t(p[3]) << 24;
 }
+
+static void decode_bc_chan(const uint8_t* b, int out[16]) {
+    int e0 = b[0], e1 = b[1];
+    int lut[8] = {e0, e1, 0, 0, 0, 0, 0, 0};
+    if (e0 > e1)
+        for (int k = 1; k <= 6; ++k) lut[k + 1] = rdiv((7 - k) * e0 + k * e1, 7);
+    else {
+        for (int k = 1; k <= 4; ++k) lut[k + 1] = rdiv((5 - k) * e0 + k * e1, 5);
+        lut[6] = 0;
+        lut[7] = 255;
+    }
+    uint64_t bits = 0;
+    for (int i = 0; i < 6; ++i) bits |= uint64_t(b[2 + i]) << (8 * i);
+    for (int k = 0; k < 16; ++k) out[k] = lut[(bits >> (3 * k)) & 7];
+}
 }
 
 std::vector<uint8_t> decode_dxt(const std::vector<uint8_t>& data, size_t off,
@@ -80,18 +97,7 @@ std::vector<uint8_t> decode_dxt(const std::vector<uint8_t>& data, size_t off,
             bool have_alpha = false;
             size_t coff = p;
             if (dxt == 5) {
-                int a0 = data[p], a1 = data[p + 1];
-                int at[8] = {a0, a1, 0, 0, 0, 0, 0, 0};
-                if (a0 > a1)
-                    for (int k = 1; k <= 6; ++k) at[k + 1] = rdiv((7 - k) * a0 + k * a1, 7);
-                else {
-                    for (int k = 1; k <= 4; ++k) at[k + 1] = rdiv((5 - k) * a0 + k * a1, 5);
-                    at[6] = 0;
-                    at[7] = 255;
-                }
-                uint64_t bits = 0;
-                for (int i = 0; i < 6; ++i) bits |= uint64_t(data[p + 2 + i]) << (8 * i);
-                for (int k = 0; k < 16; ++k) alpha[k] = at[(bits >> (3 * k)) & 7];
+                decode_bc_chan(&data[p], alpha);
                 have_alpha = true;
                 coff = p + 8;
             } else if (dxt == 3) {
@@ -133,8 +139,57 @@ std::vector<uint8_t> decode_dxt(const std::vector<uint8_t>& data, size_t off,
     return out;
 }
 
+std::vector<uint8_t> decode_bc45(const std::vector<uint8_t>& data, size_t off, uint32_t w,
+                                 uint32_t h, bool two_channel) {
+    const size_t blk = two_channel ? 16 : 8;
+    std::vector<uint8_t> out(size_t(w) * h * 4, 0);
+    uint32_t bxn = (w + 3) / 4, byn = (h + 3) / 4;
+    size_t p = off;
+    for (uint32_t by = 0; by < byn; ++by) {
+        for (uint32_t bx = 0; bx < bxn; ++bx) {
+            if (p + blk > data.size()) return out;
+            int red[16];
+            decode_bc_chan(&data[p], red);
+            int grn[16] = {0};
+            if (two_channel) decode_bc_chan(&data[p + 8], grn);
+            for (int k = 0; k < 16; ++k) {
+                uint32_t lx = bx * 4 + (k & 3), ly = by * 4 + (k >> 2);
+                if (lx >= w || ly >= h) continue;
+                const int R = red[k], G = two_channel ? grn[k] : 0;
+                int B = 0;
+                if (two_channel) {
+                    const double nx = R / 255.0 * 2.0 - 1.0, ny = G / 255.0 * 2.0 - 1.0;
+                    const double nz = std::sqrt(std::max(0.0, 1.0 - nx * nx - ny * ny));
+                    B = int(std::lround((nz * 0.5 + 0.5) * 255.0));
+                }
+                size_t di = (size_t(ly) * w + lx) * 4;
+                out[di] = uint8_t(R);
+                out[di + 1] = uint8_t(G);
+                out[di + 2] = uint8_t(B);
+                out[di + 3] = 255;
+            }
+            p += blk;
+        }
+    }
+    return out;
+}
+
 std::vector<uint8_t> dds_decode_rgba(const std::vector<uint8_t>& data, DdsInfo& out) {
     out = dds_parse(data);
+    const std::string& fc = out.fourcc;
+    const uint32_t dx = out.dxgi_format;
+    const bool is_bc4 = fc == "ATI1" || fc == "BC4U" || fc == "BC4S" ||
+                        (fc == "DX10" && dx >= 79 && dx <= 81);
+    const bool is_bc5 = fc == "ATI2" || fc == "BC5U" || fc == "BC5S" ||
+                        (fc == "DX10" && dx >= 82 && dx <= 84);
+    if (is_bc5) return decode_bc45(data, out.data_offset, out.width, out.height, true);
+    if (is_bc4) return decode_bc45(data, out.data_offset, out.width, out.height, false);
+    if (fc == "DX10") {
+        const char* mapped = (dx >= 70 && dx <= 72) ? "DXT1"
+                             : (dx >= 73 && dx <= 75) ? "DXT3"
+                                                      : "DXT5";
+        return decode_dxt(data, out.data_offset, out.width, out.height, mapped);
+    }
     return decode_dxt(data, out.data_offset, out.width, out.height, out.fourcc);
 }
 

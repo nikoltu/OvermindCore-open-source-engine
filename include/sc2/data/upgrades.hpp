@@ -13,7 +13,7 @@ class Storage;
 namespace sc2::data {
 
 struct UpgradeEffect {
-    enum class Op { Add, Subtract, Set };
+    enum class Op { Add, Subtract, Multiply, Set };
 
     std::string catalog;
     std::string entry;
@@ -26,6 +26,8 @@ struct UpgradeEffect {
     double numeric_value() const;
     bool is_numeric() const;
     double delta() const;
+
+    double apply(double cur) const;
 };
 
 class UpgradeCatalog {

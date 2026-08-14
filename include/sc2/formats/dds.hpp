@@ -20,6 +20,9 @@ DdsInfo dds_parse(const std::vector<uint8_t>& data);
 std::vector<uint8_t> decode_dxt(const std::vector<uint8_t>& data, size_t off,
                                 uint32_t w, uint32_t h, const std::string& fourcc);
 
+std::vector<uint8_t> decode_bc45(const std::vector<uint8_t>& data, size_t off,
+                                 uint32_t w, uint32_t h, bool two_channel);
+
 std::vector<uint8_t> dds_decode_rgba(const std::vector<uint8_t>& data, DdsInfo& out);
 
 }

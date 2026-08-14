@@ -89,7 +89,6 @@ MeleeLayout build_melee(sim::World& w, const MeleeSetup& s) {
             uint32_t id = add(std::move(scv), "SCV");
             w.unit(id).home_depot = out.town_hall;
             w.unit(id).gather_target = node;
-            w.issue(id, Order{OrderType::Gather, Fixed(), Fixed(), sim::kNoTarget});
             out.workers.push_back(id);
         }
 
@@ -114,7 +113,6 @@ MeleeLayout build_melee(sim::World& w, const MeleeSetup& s) {
                 uint32_t id = add(std::move(scv), "SCV");
                 w.unit(id).home_depot = out.town_hall;
                 w.unit(id).gather_target = geyser;
-                w.issue(id, Order{OrderType::Gather, Fixed(), Fixed(), sim::kNoTarget});
                 out.workers.push_back(id);
             }
         }
@@ -131,7 +129,14 @@ MeleeLayout build_melee(sim::World& w, const MeleeSetup& s) {
 
         out.config.army_unit =
             ai::BuildItem{ps.army_unit, ps.army_mineral_cost, ps.army_gas_cost,
-                          ps.army_build_time, true};
+                          ps.army_build_time, true, ps.army_count};
+        if (ps.has_army_unit2) {
+            out.config.army_unit2 =
+                ai::BuildItem{ps.army_unit2, ps.army2_mineral_cost, ps.army2_gas_cost,
+                              ps.army2_build_time, true};
+            out.config.has_army_unit2 = true;
+            out.config.army_unit2_gate = ps.army_unit2_gate;
+        }
         out.config.army_threshold = ps.army_threshold;
         {
             Unit wproto = ps.worker;

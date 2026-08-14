@@ -1,0 +1,4 @@
+# Local, personal build assets only — never committed. Keeps trademarked/cosmetic art out of
+# the clean-room source tree; the icon is compiled into crafter-sc only on this machine.
+app_icon.png
+app_icon.ico

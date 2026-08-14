@@ -104,6 +104,14 @@ inline std::string layer_of(const formats::Model& m, int mat, const char* usage)
     return {};
 }
 
+inline const formats::M3Layer* layer_ptr_of(const formats::Model& m, int mat,
+                                            const char* usage) {
+    if (mat < 0 || mat >= int(m.materials.size())) return nullptr;
+    for (const auto& l : m.materials[mat].layers)
+        if (l.usage == usage) return &l;
+    return nullptr;
+}
+
 inline std::string diffuse_of(const formats::Model& m, int mat) {
     return layer_of(m, mat, "Diffuse");
 }

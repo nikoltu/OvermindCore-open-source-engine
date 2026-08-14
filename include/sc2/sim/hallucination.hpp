@@ -25,6 +25,9 @@ public:
             h.x = proto.x + spread * Fixed::from_int(DX[k]);
             h.y = proto.y + spread * Fixed::from_int(DY[k]);
             h.wpn_damage = Fixed();
+            h.dmg_fraction = Fixed::from_int(2);
+            h.barrier = h.barrier_max = h.barrier_cd = h.barrier_cd_max = Fixed();
+            h.dmg_clamp_max = h.dmg_minimum = h.damage_reduction = Fixed();
             h.time_life = lifetime.raw() > 0 ? lifetime : Fixed::from_raw(1);
             h.orders.clear();
             h.target = kNoTarget;

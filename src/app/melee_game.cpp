@@ -3,16 +3,22 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
+#include <set>
 #include <string>
 #include <unordered_map>
 
+#include "sc2/app/caster_composition.hpp"
 #include "sc2/app/command_bind.hpp"
 #include "sc2/app/control.hpp"
 #include "sc2/app/hud.hpp"
 #include "sc2/app/hud_render.hpp"
 #include "sc2/app/melee_commands.hpp"
+#include "sc2/app/ability.hpp"
+#include "sc2/app/spawn.hpp"
+#include "sc2/data/economy.hpp"
 #include "sc2/formats/m3.hpp"
 #include "sc2/render/mat4.hpp"
+#include "sc2/sim/transport.hpp"
 #include "sc2/render/prim.hpp"
 #include "sc2/ui/font.hpp"
 
@@ -21,6 +27,10 @@ namespace sc2::app {
 using sim::Unit;
 
 namespace {
+
+const char kInfantryWeaponsL1[] = "TerranInfantryWeaponsLevel1";
+
+constexpr std::int32_t kAbilCdSlotInfestedTerran = 0;
 
 void alpha_over(std::vector<uint8_t>& base, const std::vector<uint8_t>& top) {
     size_t n = std::min(base.size(), top.size());
@@ -180,6 +190,28 @@ MeleeGame::MeleeGame(MeleeGameConfig cfg) : cfg_(cfg), world_(1) {
     alerts_.set_player(cfg_.human_player >= 0 ? cfg_.human_player : 0);
 }
 
+std::string MeleeGame::human_gas_structure() const {
+    if (cfg_.human_player < 0 || size_t(cfg_.human_player) >= layout_.players.size())
+        return "Refinery";
+    const std::uint32_t depot = layout_.players[size_t(cfg_.human_player)].base.depot;
+    const int r = depot < world_.units().size() ? race_of(world_.units()[depot].catalog_id) : 0;
+    return r == 2 ? "Extractor" : r == 1 ? "Assimilator" : "Refinery";
+}
+
+std::string MeleeGame::human_town_hall() const {
+    if (cfg_.human_player < 0 || size_t(cfg_.human_player) >= layout_.players.size())
+        return "CommandCenter";
+    const std::uint32_t depot = layout_.players[size_t(cfg_.human_player)].base.depot;
+    const int r = depot < world_.units().size() ? race_of(world_.units()[depot].catalog_id) : 0;
+    return r == 2 ? "Hatchery" : r == 1 ? "Nexus" : "CommandCenter";
+}
+
+bool MeleeGame::human_is_protoss() const {
+    if (cfg_.human_player < 0 || size_t(cfg_.human_player) >= layout_.players.size()) return false;
+    const std::uint32_t depot = layout_.players[size_t(cfg_.human_player)].base.depot;
+    return depot < world_.units().size() && race_of(world_.units()[depot].catalog_id) == 1;
+}
+
 MeleeCommandContext MeleeGame::command_context() {
     MeleeCommandContext ctx;
     if (cfg_.human_player < 0) return ctx;
@@ -199,28 +231,362 @@ MeleeCommandContext MeleeGame::command_context() {
         }
     ctx.producer_built = human_producer_ != sim::kNoTarget;
     const int bank = world_.player(cfg_.human_player).minerals;
-    ctx.can_afford_producer = bank >= human_producer_cost_;
-    ctx.can_afford_army = bank >= human_army_cost_;
-    ctx.can_afford_worker = bank >= human_worker_cost_;
-    ctx.can_afford_supply = bank >= human_supply_cost_;
+    ctx.can_afford_producer = bank >= human_build_.producer_cost;
+    ctx.can_afford_army = bank >= human_build_.army_cost;
+    ctx.can_afford_worker = bank >= human_build_.worker_cost;
+    ctx.can_afford_supply = bank >= human_build_.supply_cost;
+    if (ctx.worker_selected && !ctx.town_hall_selected && cat_ &&
+        size_t(cfg_.human_player) < layout_.players.size()) {
+        ctx.worker_gas_selected = true;
+        ctx.refinery_name = human_gas_structure();
+        ctx.can_afford_refinery = bank >= data::unit_cost(*cat_, ctx.refinery_name).minerals;
+        ctx.worker_expand_selected = true;
+        ctx.town_hall_name = human_town_hall();
+        ctx.can_afford_town_hall = bank >= data::unit_cost(*cat_, ctx.town_hall_name).minerals;
+    }
+    if (ctx.worker_selected && !ctx.town_hall_selected && ctx.producer_built && cat_) {
+        ctx.worker_starport_selected = true;
+        const data::UnitCost sc = data::unit_cost(*cat_, "Starport");
+        ctx.can_afford_starport = bank >= sc.minerals && world_.player(cfg_.human_player).gas >= sc.gas;
+    }
+    if (cat_ && selected_starport() != sim::kNoTarget) {
+        ctx.starport_selected = true;
+        ctx.air_unit_name = "Viking";
+        const data::UnitCost ac = data::unit_cost(*cat_, "VikingFighter");
+        ctx.can_afford_air = bank >= ac.minerals && world_.player(cfg_.human_player).gas >= ac.gas;
+    }
+    if (ctx.worker_selected && !ctx.town_hall_selected && cat_ && human_is_protoss()) {
+        ctx.worker_pylon_selected = true;
+        ctx.can_afford_pylon = bank >= data::unit_cost(*cat_, "Pylon").minerals;
+        ctx.worker_gateway_selected = true;
+        ctx.can_afford_gateway = bank >= data::unit_cost(*cat_, "Gateway").minerals;
+    }
+    if (cat_ && human_is_protoss() && selected_gateway() != sim::kNoTarget) {
+        ctx.gateway_selected = true;
+        ctx.can_afford_zealot = bank >= data::unit_cost(*cat_, "Zealot").minerals;
+    }
+    ctx.addon_producer_selected = selected_addon_producer() != sim::kNoTarget;
+    ctx.can_afford_addon = bank >= 50 && world_.player(cfg_.human_player).gas >= 25;
+    if (cat_) ctx.can_afford_factory = bank >= data::unit_cost(*cat_, "Factory").minerals;
+    if (const std::uint32_t tp = selected_techlab_producer(); tp != sim::kNoTarget && cat_) {
+        const data::Catalog::TechTrain tt = cat_->techlab_train_product(world_.units()[tp].catalog_id);
+        if (!tt.unit.empty()) {
+            ctx.techlab_producer_selected = true;
+            ctx.techlab_unit_name = tt.unit;
+            const data::UnitCost mc = data::unit_cost(*cat_, tt.unit);
+            ctx.can_afford_marauder = bank >= mc.minerals && world_.player(cfg_.human_player).gas >= mc.gas;
+        }
+    }
+    if (cat_ && selected_command_center() != sim::kNoTarget && ctx.producer_built) {
+        ctx.cc_morph_selected = true;
+        const auto delta = morph_cost_delta(*cat_, "CommandCenter", "OrbitalCommand");
+        ctx.can_afford_orbital =
+            bank >= delta.first && world_.player(cfg_.human_player).gas >= delta.second;
+    }
+    if (const std::uint32_t ob = selected_orbital(); ob != sim::kNoTarget) {
+        ctx.orbital_selected = true;
+        ctx.orbital_has_energy = world_.units()[ob].energy >= sim::Fixed::from_int(50);
+    }
+    if (cat_) ctx.can_afford_engbay = bank >= data::unit_cost(*cat_, "EngineeringBay").minerals;
+    if (cat_ && selected_completed_engbay() != sim::kNoTarget) {
+        ctx.engbay_selected = true;
+        const data::Catalog::ResearchInfo info = cat_->research_info(kInfantryWeaponsL1);
+        const sim::Player& hp = world_.player(cfg_.human_player);
+        const bool done = research_ && research_->has(cfg_.human_player, kInfantryWeaponsL1);
+        const bool inflight = research_ && research_->pending(cfg_.human_player, kInfantryWeaponsL1);
+        ctx.can_afford_research =
+            info.found && !done && !inflight && hp.minerals >= info.minerals && hp.gas >= info.gas;
+    }
+    if (cat_) {
+        if (selected_liberator() != sim::kNoTarget) ctx.liberator_selected = true;
+        if (selected_liberator_ag() != sim::kNoTarget) ctx.liberator_ag_selected = true;
+    }
+    if (cat_ && selected_merge_templar().size() >= 2) ctx.templar_merge_selected = true;
+    if (const std::uint32_t qz = cat_ ? selected_queen() : sim::kNoTarget; qz != sim::kNoTarget) {
+        ctx.queen_selected = true;
+        const auto iv = cat_->inject_ability(world_.unit(qz).catalog_id);
+        const sim::Fixed e = app::ability_energy_cost(*cat_, iv.ability);
+        ctx.inject_ready = e.raw() <= 0 || world_.unit(qz).energy >= e;
+    }
+    if (const std::uint32_t iz = cat_ ? selected_infestor() : sim::kNoTarget; iz != sim::kNoTarget) {
+        ctx.infestor_selected = true;
+        const auto it = cat_->infested_terran_ability(world_.unit(iz).catalog_id);
+        const sim::Fixed e = sim::Fixed::from_double(it.energy);
+        ctx.infested_terran_ready =
+            world_.ability_cooldown_left(iz, kAbilCdSlotInfestedTerran).raw() <= 0 &&
+            (e.raw() <= 0 || world_.unit(iz).energy >= e);
+    }
+    if (cat_) {
+        if (!selected_burrowers(false).empty()) ctx.burrow_selected = true;
+        if (!selected_burrowers(true).empty()) ctx.unburrow_selected = true;
+    }
+    if (cat_) {
+        if (selected_liftoff_structure(false) != sim::kNoTarget) ctx.liftoff_selected = true;
+        if (selected_liftoff_structure(true) != sim::kNoTarget) ctx.land_selected = true;
+    }
+    if (cat_) {
+        if (selected_depot(false) != sim::kNoTarget) ctx.depot_lower_selected = true;
+        if (selected_depot(true) != sim::kNoTarget) ctx.depot_raise_selected = true;
+    }
+    if (selected_loaded_transport() != sim::kNoTarget) ctx.transport_unload_selected = true;
     return ctx;
+}
+
+std::uint32_t MeleeGame::selected_command_center() const {
+    if (cfg_.human_player < 0) return sim::kNoTarget;
+    for (std::uint32_t id : selection_) {
+        if (id >= world_.units().size()) continue;
+        const sim::Unit& u = world_.units()[id];
+        if (!u.alive || u.player != cfg_.human_player || u.constructing) continue;
+        if (u.catalog_id == "CommandCenter") return id;
+    }
+    return sim::kNoTarget;
+}
+
+std::uint32_t MeleeGame::selected_orbital() const {
+    if (cfg_.human_player < 0) return sim::kNoTarget;
+    for (std::uint32_t id : selection_) {
+        if (id >= world_.units().size()) continue;
+        const sim::Unit& u = world_.units()[id];
+        if (!u.alive || u.player != cfg_.human_player || u.constructing) continue;
+        if (u.catalog_id == "OrbitalCommand") return id;
+    }
+    return sim::kNoTarget;
+}
+
+std::uint32_t MeleeGame::selected_completed_engbay() const {
+    if (cfg_.human_player < 0) return sim::kNoTarget;
+    for (std::uint32_t id : selection_) {
+        if (id >= world_.units().size()) continue;
+        const sim::Unit& u = world_.units()[id];
+        if (!u.alive || u.player != cfg_.human_player || u.constructing) continue;
+        if (u.catalog_id == "EngineeringBay") return id;
+    }
+    return sim::kNoTarget;
+}
+
+std::uint32_t MeleeGame::selected_starport() const {
+    if (cfg_.human_player < 0) return sim::kNoTarget;
+    for (std::uint32_t id : selection_) {
+        if (id >= world_.units().size()) continue;
+        const sim::Unit& u = world_.units()[id];
+        if (!u.alive || u.player != cfg_.human_player || u.constructing) continue;
+        if (u.catalog_id == "Starport") return id;
+    }
+    return sim::kNoTarget;
+}
+
+std::uint32_t MeleeGame::selected_gateway() const {
+    if (cfg_.human_player < 0) return sim::kNoTarget;
+    for (std::uint32_t id : selection_) {
+        if (id >= world_.units().size()) continue;
+        const sim::Unit& u = world_.units()[id];
+        if (!u.alive || u.player != cfg_.human_player || u.constructing) continue;
+        if (u.catalog_id == "Gateway") return id;
+    }
+    return sim::kNoTarget;
+}
+
+std::uint32_t MeleeGame::selected_liberator() const {
+    if (cfg_.human_player < 0) return sim::kNoTarget;
+    for (std::uint32_t id : selection_) {
+        if (id >= world_.units().size()) continue;
+        const sim::Unit& u = world_.units()[id];
+        if (!u.alive || u.player != cfg_.human_player || u.constructing) continue;
+        if (u.catalog_id == "Liberator") return id;
+    }
+    return sim::kNoTarget;
+}
+
+std::uint32_t MeleeGame::selected_liberator_ag() const {
+    if (cfg_.human_player < 0) return sim::kNoTarget;
+    for (std::uint32_t id : selection_) {
+        if (id >= world_.units().size()) continue;
+        const sim::Unit& u = world_.units()[id];
+        if (!u.alive || u.player != cfg_.human_player || u.constructing) continue;
+        if (u.catalog_id == "LiberatorAG") return id;
+    }
+    return sim::kNoTarget;
+}
+
+std::vector<std::uint32_t> MeleeGame::selected_merge_templar() const {
+    std::vector<std::uint32_t> out;
+    if (cfg_.human_player < 0 || !cat_) return out;
+    for (std::uint32_t id : selection_) {
+        if (id >= world_.units().size()) continue;
+        const sim::Unit& u = world_.units()[id];
+        if (!u.alive || u.player != cfg_.human_player || u.constructing) continue;
+        if (!cat_->merge_ability(u.catalog_id).empty()) out.push_back(id);
+    }
+    std::sort(out.begin(), out.end());
+    return out;
+}
+
+std::uint32_t MeleeGame::selected_queen() const {
+    if (cfg_.human_player < 0 || !cat_) return sim::kNoTarget;
+    for (std::uint32_t id : selection_) {
+        if (id >= world_.units().size()) continue;
+        const sim::Unit& u = world_.units()[id];
+        if (!u.alive || u.player != cfg_.human_player || u.constructing) continue;
+        if (cat_->inject_ability(u.catalog_id).found) return id;
+    }
+    return sim::kNoTarget;
+}
+
+std::uint32_t MeleeGame::selected_infestor() const {
+    if (cfg_.human_player < 0 || !cat_) return sim::kNoTarget;
+    for (std::uint32_t id : selection_) {
+        if (id >= world_.units().size()) continue;
+        const sim::Unit& u = world_.units()[id];
+        if (!u.alive || u.player != cfg_.human_player || u.constructing) continue;
+        if (cat_->infested_terran_ability(u.catalog_id).found) return id;
+    }
+    return sim::kNoTarget;
+}
+
+std::uint32_t MeleeGame::selected_liftoff_structure(bool flying) const {
+    if (cfg_.human_player < 0 || !cat_) return sim::kNoTarget;
+    for (std::uint32_t id : selection_) {
+        if (id >= world_.units().size()) continue;
+        const sim::Unit& u = world_.units()[id];
+        if (!u.alive || u.player != cfg_.human_player || u.constructing) continue;
+        if (u.flying != flying) continue;
+        if (!cat_->liftoff_ability(u.catalog_id).empty()) return id;
+    }
+    return sim::kNoTarget;
+}
+
+std::uint32_t MeleeGame::selected_depot(bool lowered) const {
+    if (cfg_.human_player < 0 || !cat_) return sim::kNoTarget;
+    for (std::uint32_t id : selection_) {
+        if (id >= world_.units().size()) continue;
+        const sim::Unit& u = world_.units()[id];
+        if (!u.alive || u.player != cfg_.human_player || u.constructing) continue;
+        if (u.lowered != lowered) continue;
+        if (!cat_->depot_lower_ability(u.catalog_id).empty()) return id;
+    }
+    return sim::kNoTarget;
+}
+
+std::uint32_t MeleeGame::selected_loaded_transport() const {
+    if (cfg_.human_player < 0) return sim::kNoTarget;
+    for (std::uint32_t id : selection_) {
+        if (id >= world_.units().size()) continue;
+        const sim::Unit& u = world_.units()[id];
+        if (!u.alive || u.player != cfg_.human_player || u.constructing) continue;
+        if (u.cargo_space > 0 && world_.cargo_used(id) > 0) return id;
+    }
+    return sim::kNoTarget;
+}
+
+std::vector<std::uint32_t> MeleeGame::selected_burrowers(bool burrowed) const {
+    std::vector<std::uint32_t> out;
+    if (cfg_.human_player < 0 || !cat_) return out;
+    for (std::uint32_t id : selection_) {
+        if (id >= world_.units().size()) continue;
+        const sim::Unit& u = world_.units()[id];
+        if (!u.alive || u.player != cfg_.human_player || u.constructing) continue;
+        if (u.burrowed != burrowed) continue;
+        if (!cat_->burrow_ability(u.catalog_id).empty()) out.push_back(id);
+    }
+    return out;
+}
+
+std::uint32_t MeleeGame::selected_techlab_producer() const {
+    if (cfg_.human_player < 0) return sim::kNoTarget;
+    for (std::uint32_t id : selection_) {
+        if (id >= world_.units().size()) continue;
+        const sim::Unit& u = world_.units()[id];
+        if (!u.alive || u.player != cfg_.human_player || u.constructing) continue;
+        if (u.addon == sim::World::kAddonTechLab && u.addon_building == 0) return id;
+    }
+    return sim::kNoTarget;
+}
+
+std::uint32_t MeleeGame::selected_addon_producer() const {
+    if (!cat_ || cfg_.human_player < 0) return sim::kNoTarget;
+    for (std::uint32_t id : selection_) {
+        if (id >= world_.units().size()) continue;
+        const sim::Unit& u = world_.units()[id];
+        if (!u.alive || u.player != cfg_.human_player) continue;
+        if (u.speed.raw() != 0 || u.constructing) continue;
+        if (u.addon != sim::World::kAddonNone || u.addon_building != 0) continue;
+        if (cat_->unit_can_build_addon(u.catalog_id)) return id;
+    }
+    return sim::kNoTarget;
 }
 
 void MeleeGame::setup(const MeleeSetup& setup, const MeleeModels* models,
                       const formats::Model* ground, float map_w, float map_h,
                       const sim::NavGrid* nav) {
-    layout_ = build_melee(world_, setup);
     ground_ = ground;
     map_w_ = map_w;
     map_h_ = map_h;
+    if (map_w > 0.0f && map_h > 0.0f)
+        world_.creep().configure(int(map_w) + 1, int(map_h) + 1, sim::Fixed::from_int(1),
+                                 sim::Fixed(), sim::Fixed());
+    layout_ = build_melee(world_, setup);
+    for (const sim::Unit& u : world_.units())
+        if (u.alive && u.catalog_id == "XelNagaTower")
+            world_.register_watchtower(u.id, sim::Fixed::from_double(2.5));
     if (nav) world_.nav() = *nav;
+    if (world_.nav().configured())
+        for (const sim::Unit& u : world_.units()) {
+            if (!u.alive || u.catalog_id.find("Destructible") == std::string::npos) continue;
+            const sim::Fixed r = u.radius;
+            int cx0, cy0, cx1, cy1;
+            world_.nav().to_cell(u.x - r, u.y - r, cx0, cy0);
+            world_.nav().to_cell(u.x + r, u.y + r, cx1, cy1);
+            world_.register_destructible(u.id, cx0, cy0, cx1, cy1);
+        }
+    {
+        std::vector<std::uint32_t> towers;
+        for (const sim::Unit& u : world_.units()) {
+            const std::string& c = u.catalog_id;
+            if (u.alive && c.rfind("Collapsible", 0) == 0 && c.find("Tower") != std::string::npos &&
+                c.find("Debris") == std::string::npos && c.find("PushUnit") == std::string::npos)
+                towers.push_back(u.id);
+        }
+        const int n = int(towers.size());
+        std::vector<int> parent(n);
+        for (int i = 0; i < n; ++i) parent[i] = i;
+        auto find = [&](int i) {
+            while (parent[i] != i) { parent[i] = parent[parent[i]]; i = parent[i]; }
+            return i;
+        };
+        const sim::Fixed r2 = sim::Fixed::from_int(15) * sim::Fixed::from_int(15);
+        for (int i = 0; i < n; ++i)
+            for (int j = i + 1; j < n; ++j) {
+                const sim::Unit& a = world_.unit(towers[i]);
+                const sim::Unit& b = world_.unit(towers[j]);
+                const sim::Fixed dx = a.x - b.x, dy = a.y - b.y;
+                if (dx * dx + dy * dy <= r2) parent[find(i)] = find(j);
+            }
+        for (int root = 0; root < n; ++root) {
+            if (find(root) != root) continue;
+            std::vector<std::uint32_t> members;
+            for (int i = 0; i < n; ++i)
+                if (find(i) == root) members.push_back(towers[i]);
+            world_.register_conjoined_group(std::move(members));
+        }
+    }
     world_.set_separation(true);
-    world_.set_game_speed(sim::Fixed::from_ratio(7, 5));
+    world_.set_acceleration(true);
+    world_.set_turn_limit(true);
+    world_.enable_building_burndown();
+    world_.enable_flee_response();
+    world_.enable_multi_hit_armor();
+    world_.set_projectile_travel(true);
+    world_.set_attack_windup(true);
+    world_.set_backswing(true);
+    world_.set_fire_while_moving(true);
+    world_.enable_point_defense();
 
     if (cfg_.human_player >= 0 && size_t(cfg_.human_player) < layout_.players.size())
         for (std::uint32_t id : layout_.players[size_t(cfg_.human_player)].workers)
             world_.stop(id);
 
+    models_ = models;
     driver_.default_model = models ? models->model_for("Marine") : nullptr;
     for (uint32_t id = 0; id < layout_.unit_type.size(); ++id) {
         const formats::Model* m = models ? models->model_for(layout_.unit_type[id]) : nullptr;
@@ -229,6 +595,9 @@ void MeleeGame::setup(const MeleeSetup& setup, const MeleeModels* models,
     producer_model_ = models ? models->model_for("Barracks") : nullptr;
     carry_model_ = models ? models->model_for("MineralField") : nullptr;
     bound_count_ = layout_.unit_type.size();
+    spawn_worker_model_.assign(layout_.players.size(), models ? models->model_for("SCV") : nullptr);
+    spawn_army_model_.assign(layout_.players.size(), driver_.default_model);
+    spawn_producer_model_.assign(layout_.players.size(), producer_model_);
 
     ais_.clear();
     for (size_t p = 0; p < layout_.players.size(); ++p) {
@@ -245,17 +614,17 @@ void MeleeGame::setup(const MeleeSetup& setup, const MeleeModels* models,
 
     if (cfg_.human_player >= 0 && size_t(cfg_.human_player) < setup.players.size()) {
         const MeleePlayerSetup& hp = setup.players[size_t(cfg_.human_player)];
-        human_producer_cost_ = hp.producer_mineral_cost;
-        human_army_cost_ = hp.army_mineral_cost;
-        human_worker_proto_ = hp.worker;
-        human_worker_cost_ = hp.worker_mineral_cost;
-        human_worker_build_time_ = hp.worker_build_time;
-        human_supply_proto_ = hp.supply_unit;
-        human_supply_cost_ = hp.supply_mineral_cost;
-        human_supply_build_time_ = hp.supply_build_time;
-        human_producer_proto_ = hp.producer;
-        human_producer_proto_.speed = sim::Fixed();
-        human_producer_build_time_ = hp.producer_build_time;
+        human_build_.producer_cost = hp.producer_mineral_cost;
+        human_build_.army_cost = hp.army_mineral_cost;
+        human_build_.worker_proto = hp.worker;
+        human_build_.worker_cost = hp.worker_mineral_cost;
+        human_build_.worker_build_time = hp.worker_build_time;
+        human_build_.supply_proto = hp.supply_unit;
+        human_build_.supply_cost = hp.supply_mineral_cost;
+        human_build_.supply_build_time = hp.supply_build_time;
+        human_build_.producer_proto = hp.producer;
+        human_build_.producer_proto.speed = sim::Fixed();
+        human_build_.producer_build_time = hp.producer_build_time;
     }
 
     if (cfg_.human_player >= 0 && size_t(cfg_.human_player) < setup.players.size()) {
@@ -276,6 +645,206 @@ void MeleeGame::setup(const MeleeSetup& setup, const MeleeModels* models,
             camctl_.distance = 40.0f;
         }
     }
+}
+
+void MeleeGame::enable_research(const data::Catalog& cat, const data::UpgradeCatalog& up,
+                                std::vector<MeleeResearchDriver::ProtoNames> proto_names) {
+    research_ = std::make_unique<MeleeResearchDriver>(cat, up);
+    research_->set_world(&world_);
+    cat_ = &cat;
+    for (std::size_t p = 0; p < ais_.size(); ++p) {
+        MeleeResearchDriver::ProtoNames names =
+            p < proto_names.size() ? proto_names[p] : MeleeResearchDriver::ProtoNames{};
+        research_->bind(*ais_[p], std::move(names));
+    }
+}
+
+void MeleeGame::register_creep_masks(const data::Catalog& cat) {
+    for (const std::string& id : cat.ids("CUnit")) {
+        auto mask = cat.creep_source_footprint_offsets(id);
+        if (!mask.empty()) world_.register_creep_mask(id, std::move(mask));
+    }
+}
+
+void MeleeGame::enable_larva(const data::Catalog& cat) {
+    std::unordered_map<std::string, int32_t> proto_idx;
+    for (const MeleePlayerLayout& pl : layout_.players) {
+        const std::uint32_t hall = pl.town_hall;
+        if (hall >= world_.units().size() || !world_.unit(hall).alive) continue;
+        const std::string hid = world_.unit(hall).catalog_id;
+        if (hid.empty()) continue;
+        const auto sb = cat.unit_spawn_behavior(hid);
+        if (!sb) continue;
+        auto it = proto_idx.find(sb->unit);
+        int32_t idx;
+        if (it == proto_idx.end()) {
+            idx = world_.add_spawn_proto(make_unit(cat, sb->unit, 0));
+            proto_idx.emplace(sb->unit, idx);
+        } else {
+            idx = it->second;
+        }
+        world_.begin_spawner(hall, idx, sb->max_count, sim::Fixed::from_double(sb->period),
+                             sb->hard_cap);
+    }
+}
+
+void MeleeGame::begin_research(int player, const std::string& id, sim::Fixed delay) {
+    if (research_) research_->begin(player, id, delay);
+}
+
+void MeleeGame::maybe_ai_research(int player) {
+    if (!research_ || !cat_ || player < 0 || std::size_t(player) >= ai_research_.size()) return;
+    const AiResearchPlan& plan = ai_research_[player];
+    if (plan.tech_id.empty() || plan.upgrades.empty()) return;
+    std::string next;
+    for (const std::string& tier : plan.upgrades) {
+        if (research_->has(player, tier)) continue;
+        if (research_->pending(player, tier)) return;
+        next = tier;
+        break;
+    }
+    if (next.empty()) return;
+    bool tech_stands = false;
+    for (const sim::Unit& u : world_.units())
+        if (u.alive && u.player == player && !u.constructing && u.catalog_id == plan.tech_id) {
+            tech_stands = true;
+            break;
+        }
+    if (!tech_stands) return;
+    const data::Catalog::ResearchInfo info = cat_->research_info(next);
+    if (!info.found || info.time <= 0) return;
+    sim::Player& pp = world_.player(player);
+    if (pp.minerals < info.minerals || pp.gas < info.gas) return;
+    pp.minerals -= info.minerals;
+    pp.gas -= info.gas;
+    research_->begin(player, next, sim::Fixed::from_double(info.time));
+}
+
+const std::vector<std::string>& MeleeGame::researched(int player) const {
+    static const std::vector<std::string> kNone{};
+    return research_ ? research_->researched(player) : kNone;
+}
+
+int MeleeGame::research_in_progress() const {
+    return research_ ? research_->in_progress() : 0;
+}
+
+void MeleeGame::enable_collapsible_debris(const data::Catalog& cat) {
+    if (world_.conjoined_count() == 0) return;
+    sim::Unit debris = make_unit(cat, "CollapsibleRockTowerDebris", 0);
+    debris.player = -1;
+    debris.alive = true;
+    world_.set_conjoined_debris_proto(world_.add_spawn_proto(std::move(debris)));
+}
+
+void MeleeGame::enable_ai_casting(const data::Catalog& cat,
+                                  const std::vector<std::pair<std::string, std::string>>& regs) {
+    cast_policy_ = std::make_unique<CastPolicy>(cat);
+    cat_ = &cat;
+    for (const auto& [unit_id, abil_id] : regs)
+        cast_policy_->register_offensive(world_, unit_id, abil_id);
+}
+
+int MeleeGame::enable_ai_casting_from_roster(const data::Catalog& cat) {
+    cast_policy_ = std::make_unique<CastPolicy>(cat);
+    cat_ = &cat;
+    int registered = 0;
+    for (std::size_t i = 0; i < kNumCasterCompositions; ++i) {
+        const CasterComposition& c = kCasterCompositions[i];
+        const int before = registered;
+        std::set<std::string> seen;
+        for (const auto& [abil_id, cmd_index] : cat.unit_ability_commands(c.caster)) {
+            (void)cmd_index;
+            if (abil_id.empty() || !seen.insert(abil_id).second) continue;
+            const auto* ce = cat.find("CAbil", abil_id);
+            if (!ce || ce->tag != "CAbilEffectTarget") continue;
+            if (cast_policy_->register_offensive(world_, c.caster, abil_id)) ++registered;
+        }
+        if (registered == before && cast_policy_->register_offensive(world_, c.caster, c.ability))
+            ++registered;
+    }
+    struct SelfBuff {
+        const char* unit;
+        const char* abil;
+    };
+    static const SelfBuff kSelfBuffs[] = {{"Marine", "Stimpack"}, {"Marauder", "StimpackMarauder"}};
+    for (const SelfBuff& sb : kSelfBuffs)
+        if (cast_policy_->register_selfcast(world_, sb.unit, sb.abil, sim::Fixed::from_int(7)))
+            ++registered;
+    if (cast_policy_->register_support(world_, "Medivac", "MedivacHeal", sim::Fixed::from_int(6)))
+        ++registered;
+    if (cast_policy_->register_support(world_, "Queen", "Transfusion", sim::Fixed::from_int(7)))
+        ++registered;
+    return registered;
+}
+
+std::uint32_t MeleeGame::human_lead_caster() const {
+    for (std::uint32_t id : selection_) {
+        if (id >= world_.units().size()) continue;
+        const sim::Unit& u = world_.units()[id];
+        if (u.alive && u.player == cfg_.human_player) return id;
+    }
+    return sim::kNoTarget;
+}
+
+bool MeleeGame::human_cast(const std::string& abil_id, std::uint32_t target_id) {
+    if (!cast_policy_) return false;
+    const std::uint32_t caster = human_lead_caster();
+    if (caster == sim::kNoTarget) return false;
+    return cast_policy_->cast_now(world_, caster, abil_id, target_id);
+}
+
+bool MeleeGame::human_cast_point(const std::string& abil_id, sim::Fixed px, sim::Fixed py) {
+    if (!cast_policy_) return false;
+    const std::uint32_t caster = human_lead_caster();
+    if (caster == sim::kNoTarget) return false;
+    return cast_policy_->cast_now_point(world_, caster, abil_id, px, py);
+}
+
+std::vector<AbilityCardEntry> MeleeGame::selection_ability_entries() const {
+    if (!cat_) return {};
+    const std::uint32_t lead = human_lead_caster();
+    if (lead == sim::kNoTarget) return {};
+    const std::string& type = world_.units()[lead].catalog_id;
+    if (type.empty()) return {};
+    static const std::vector<std::string> kNoResearch;
+    const std::vector<std::string>& researched =
+        research_ ? research_->researched(cfg_.human_player) : kNoResearch;
+    return build_ability_card_entries(*cat_, type, researched);
+}
+
+std::vector<AbilityCardEntry> MeleeGame::merge_selection_abilities(CommandCard& card) const {
+    std::vector<AbilityCardEntry> out;
+    if (!cat_) return out;
+    std::vector<AbilityCardEntry> entries = selection_ability_entries();
+    if (entries.empty()) return out;
+    auto occupied = [&](int s) {
+        return s < 0 || s >= CommandCard::kSlots || s == CommandCard::kCancelSlot ||
+               card.slots[s].state != ButtonState::Empty;
+    };
+    for (AbilityCardEntry& e : entries) {
+        int slot = e.slot;
+        if (occupied(slot)) {
+            slot = -1;
+            for (int s = 0; s < CommandCard::kCancelSlot; ++s)
+                if (!occupied(s)) { slot = s; break; }
+        }
+        if (slot < 0) continue;
+        e.slot = slot;
+        CommandButton btn;
+        btn.icon = e.icon;
+        btn.name = e.name;
+        btn.ability = 0;
+        btn.state = resolve_button_state(e.requirement_met, 0.0f);
+        card.slots[slot] = btn;
+        out.push_back(e);
+    }
+    return out;
+}
+
+std::vector<AbilityCardEntry> MeleeGame::selection_card_abilities() {
+    CommandCard card = build_melee_command_card(command_context());
+    return merge_selection_abilities(card);
 }
 
 void MeleeGame::update_camera(const render::InputState& in, float dt_s) {
@@ -320,12 +889,12 @@ void MeleeGame::handle_commands(const render::InputState& in, float aspect) {
     };
 
     if (!selection_.empty()) {
-        if (in.key_hold && !prev_hold_)
+        if (in.key_hold && !prev_keys_.hold)
             for (std::uint32_t id : selection_)
                 world_.issue(id, sim::Order{sim::OrderType::HoldPosition});
-        if (in.key_stop && !prev_stop_)
+        if (in.key_stop && !prev_keys_.stop)
             for (std::uint32_t id : selection_) world_.stop(id);
-        if (in.key_patrol && !prev_patrol_ && !over_bar) {
+        if (in.key_patrol && !prev_keys_.patrol && !over_bar) {
             sim::Fixed wx, wy;
             if (ctrl.ground_point(world_, ScreenPoint{in.mouse_x, in.mouse_y}, wx, wy))
                 for (std::uint32_t id : selection_) {
@@ -338,9 +907,9 @@ void MeleeGame::handle_commands(const render::InputState& in, float aspect) {
                 }
         }
     }
-    prev_hold_ = in.key_hold;
-    prev_stop_ = in.key_stop;
-    prev_patrol_ = in.key_patrol;
+    prev_keys_.hold = in.key_hold;
+    prev_keys_.stop = in.key_stop;
+    prev_keys_.patrol = in.key_patrol;
 
     if (pending_build_) {
         sim::Fixed wx, wy;
@@ -356,6 +925,10 @@ void MeleeGame::handle_commands(const render::InputState& in, float aspect) {
                     const sim::Fixed rr = build_proto_.radius + u.radius;
                     if (dx * dx + dy * dy < rr * rr) { clear = false; break; }
                 }
+            if (clear && build_proto_.requires_creep && !world_.creep().is_creep(wx, wy)) clear = false;
+            if (clear && build_proto_.needs_power &&
+                !world_.powered_at(wx, wy, cfg_.human_player))
+                clear = false;
             build_valid_ = clear && world_.player(cfg_.human_player).minerals >= build_cost_;
         } else {
             build_valid_ = false;
@@ -382,32 +955,114 @@ void MeleeGame::handle_commands(const render::InputState& in, float aspect) {
     if (in.left_pressed) {
         if (over_bar) {
             dragging_ = false;
-            const CommandCard card = build_melee_command_card(command_context());
+            CommandCard card = build_melee_command_card(command_context());
+            const std::vector<AbilityCardEntry> card_abils = merge_selection_abilities(card);
             for (int i = 0; i < kCommandCols * kCommandRows && i < CommandCard::kSlots; ++i) {
                 const HudRect c = hud_command_cell(in.view_w, in.view_h, i);
                 if (in.mouse_x >= float(c.x0) && in.mouse_x < float(c.x1) &&
                     in.mouse_y >= float(c.y0) && in.mouse_y < float(c.y1)) {
+                    bool routed = false;
+                    for (const AbilityCardEntry& ab : card_abils)
+                        if (ab.slot == i) {
+                            if (ab.requirement_met && cat_) {
+                                pending_attack_ = pending_patrol_ = false;
+                                cancel_ability_cast();
+                                const AbilTargetMode m = ability_target_mode(*cat_, ab.ability);
+                                if (m == AbilTargetMode::Instant)
+                                    human_cast(ab.ability, human_lead_caster());
+                                else {
+                                    begin_ability_cast(ab.ability, ab.command);
+                                    pending_cast_mode_ = m;
+                                }
+                            }
+                            routed = true;
+                            break;
+                        }
+                    if (routed) break;
+                    cancel_ability_cast();
                     switch (card.slots[i].ability) {
                         case kMeleeAbilTrainWorker: ui_trainworker_ = true; break;
                         case kMeleeAbilBuildProducer: ui_build_ = true; break;
                         case kMeleeAbilBuildSupply: ui_buildsupply_ = true; break;
+                        case kMeleeAbilBuildTechLab: ui_buildtechlab_ = true; break;
+                        case kMeleeAbilBuildReactor: ui_buildreactor_ = true; break;
+                        case kMeleeAbilTrainTechUnit: ui_traintech_ = true; break;
+                        case kMeleeAbilBuildFactory: ui_buildfactory_ = true; break;
+                        case kMeleeAbilBuildStarport: ui_buildstarport_ = true; break;
+                        case kMeleeAbilTrainAir: ui_trainair_ = true; break;
+                        case kMeleeAbilBuildPylon: ui_buildpylon_ = true; break;
+                        case kMeleeAbilBuildGateway: ui_buildgateway_ = true; break;
+                        case kMeleeAbilTrainZealot: ui_trainzealot_ = true; break;
+                        case kMeleeAbilBuildTownHall: pending_town_hall_ = true; break;
+                        case kMeleeAbilMorphOrbital: ui_morphorbital_ = true; break;
+                        case kMeleeAbilBuildEngBay: ui_buildengbay_ = true; break;
+                        case kMeleeAbilBuildRefinery:
+                            pending_refinery_ = true;
+                            pending_build_ = false;
+                            pending_attack_ = pending_patrol_ = false;
+                            break;
+                        case kMeleeAbilResearchInfWeapons: ui_research_ = true; break;
                         case kMeleeAbilTrainArmy: ui_train_ = true; break;
+                        case kMeleeAbilCalldownMule:
+                            pending_orbital_ = selected_orbital();
+                            if (pending_orbital_ != sim::kNoTarget) pending_mule_ = true;
+                            pending_attack_ = pending_patrol_ = false;
+                            break;
+                        case kMeleeAbilLiberatorDefender:
+                            pending_liberator_ = selected_liberator();
+                            if (pending_liberator_ != sim::kNoTarget) pending_defender_ = true;
+                            pending_mule_ = false;
+                            pending_attack_ = pending_patrol_ = false;
+                            break;
+                        case kMeleeAbilLiberatorFighter: ui_fightermode_ = true; break;
+                        case kMeleeAbilSpawnLarva:
+                            pending_queen_ = selected_queen();
+                            if (pending_queen_ != sim::kNoTarget) pending_inject_ = true;
+                            pending_mule_ = pending_defender_ = false;
+                            pending_attack_ = pending_patrol_ = false;                            pending_infested_ = false;
+                            break;
+                        case kMeleeAbilSpawnInfestedTerran:
+                            pending_mule_ = pending_defender_ = false;
+                            pending_inject_ = false;
+                            pending_attack_ = pending_patrol_ = false;
+                            pending_infestor_ = selected_infestor();
+                            pending_infested_ = (pending_infestor_ != sim::kNoTarget);
+                            break;
+                        case kMeleeAbilMergeArchon: ui_mergearchon_ = true; break;
+                        case kMeleeAbilBurrow: ui_burrow_ = true; break;
+                        case kMeleeAbilUnburrow: ui_unburrow_ = true; break;
+                        case kMeleeAbilLiftOff: ui_liftoff_ = true; break;
+                        case kMeleeAbilLowerDepot: ui_lowerdepot_ = true; break;
+                        case kMeleeAbilRaiseDepot: ui_raisedepot_ = true; break;
+                        case kMeleeAbilLand:
+                            pending_land_unit_ = selected_liftoff_structure(true);
+                            if (pending_land_unit_ != sim::kNoTarget) pending_land_ = true;
+                            pending_mule_ = pending_defender_ = false;
+                            pending_inject_ = pending_attack_ = pending_patrol_ = false;                            pending_infested_ = false;
+                            break;
+                        case kMeleeAbilUnloadAll:
+                            pending_unload_unit_ = selected_loaded_transport();
+                            if (pending_unload_unit_ != sim::kNoTarget) pending_unload_ = true;
+                            pending_mule_ = pending_defender_ = false;
+                            pending_land_ = pending_inject_ = false;
+                            pending_attack_ = pending_patrol_ = false;
+                            break;
                         case kMeleeAbilStop:
                             for (std::uint32_t id : selection_) world_.stop(id);
-                            pending_attack_ = pending_patrol_ = false;
+                            pending_attack_ = pending_patrol_ = pending_unload_ = false;
                             break;
                         case kMeleeAbilHold:
                             for (std::uint32_t id : selection_)
                                 world_.issue(id, sim::Order{sim::OrderType::HoldPosition});
-                            pending_attack_ = pending_patrol_ = false;
+                            pending_attack_ = pending_patrol_ = pending_unload_ = false;
                             break;
                         case kMeleeAbilAttack:
                             pending_attack_ = true;
-                            pending_patrol_ = false;
+                            pending_patrol_ = pending_unload_ = false;
                             break;
                         case kMeleeAbilPatrol:
                             pending_patrol_ = true;
-                            pending_attack_ = false;
+                            pending_attack_ = pending_unload_ = false;
                             break;
                         default: break;
                     }
@@ -436,6 +1091,10 @@ void MeleeGame::handle_commands(const render::InputState& in, float aspect) {
                         const sim::Fixed rr = build_proto_.radius + u.radius;
                         if (dx * dx + dy * dy < rr * rr) { clear = false; break; }
                     }
+                if (clear && build_proto_.requires_creep && !world_.creep().is_creep(wx, wy))
+                    clear = false;
+                if (clear && build_proto_.needs_power && !world_.powered_at(wx, wy, cfg_.human_player))
+                    clear = false;
                 if (clear) {
                     build_queue_.push_back({bw, wx, wy, build_proto_, build_cost_, build_time_,
                                             build_proto_.supply_provides.raw() == 0});
@@ -443,6 +1102,138 @@ void MeleeGame::handle_commands(const render::InputState& in, float aspect) {
                 }
             }
             if ((placed && !in.shift) || bw == sim::kNoTarget) pending_build_ = false;
+        } else if (pending_refinery_) {
+            dragging_ = false;
+            std::uint32_t bw = sim::kNoTarget;
+            for (std::uint32_t id : selection_)
+                if (id < world_.units().size() && world_.unit(id).alive &&
+                    world_.unit(id).is_worker && world_.unit(id).player == cfg_.human_player) {
+                    bw = id;
+                    break;
+                }
+            sim::Fixed wx, wy;
+            if (bw != sim::kNoTarget && cat_ &&
+                ctrl.ground_point(world_, ScreenPoint{in.mouse_x, in.mouse_y}, wx, wy)) {
+                std::uint32_t geyser = sim::kNoTarget;
+                sim::Fixed best_d2;
+                for (const Unit& u : world_.units()) {
+                    if (!u.alive || u.player >= 0 || !u.is_gas) continue;
+                    const sim::Fixed r = u.radius + sim::Fixed::from_int(2);
+                    const sim::Fixed dx = u.x - wx, dy = u.y - wy, d2 = dx * dx + dy * dy;
+                    if (d2 > r * r) continue;
+                    if (geyser == sim::kNoTarget || d2 < best_d2) { geyser = u.id; best_d2 = d2; }
+                }
+                if (geyser != sim::kNoTarget) {
+                    const std::string gas = human_gas_structure();
+                    const int cost = data::unit_cost(*cat_, gas).minerals;
+                    if (world_.player(cfg_.human_player).minerals >= cost) {
+                        Unit& gy = world_.unit(geyser);
+                        sim::Unit proto = make_unit(*cat_, gas, cfg_.human_player);
+                        proto.speed = sim::Fixed();
+                        proto.is_gas = true;
+                        proto.resource_left = gy.resource_left;
+                        const sim::Fixed gpx = gy.x, gpy = gy.y;
+                        gy.alive = false;
+                        world_.issue_worker_build(bw, gpx, gpy, proto, cost, 0, sim::Fixed::from_int(30),
+                                                  sim::Fixed::from_int(2), human_build_verb_);
+                    }
+                }
+            }
+            pending_refinery_ = false;
+        } else if (pending_mule_) {
+            dragging_ = false;
+            sim::Fixed wx, wy;
+            if (pending_orbital_ < world_.units().size() && world_.unit(pending_orbital_).alive &&
+                ctrl.ground_point(world_, ScreenPoint{in.mouse_x, in.mouse_y}, wx, wy)) {
+                calldown_mule(world_, mule_system_, pending_orbital_, wx, wy);
+            }
+            pending_mule_ = false;
+            pending_orbital_ = sim::kNoTarget;
+        } else if (pending_defender_) {
+            dragging_ = false;
+            sim::Fixed wx, wy;
+            if (cat_ && pending_liberator_ < world_.units().size() &&
+                world_.unit(pending_liberator_).alive &&
+                world_.unit(pending_liberator_).catalog_id == "Liberator" &&
+                ctrl.ground_point(world_, ScreenPoint{in.mouse_x, in.mouse_y}, wx, wy)) {
+                if (liberator_ag_proto_ < 0)
+                    liberator_ag_proto_ =
+                        world_.add_spawn_proto(make_unit(*cat_, "LiberatorAG", cfg_.human_player));
+                const auto ms = cat_->morph_spec("LiberatorMorphtoAG");
+                const sim::Fixed t =
+                    ms ? sim::Fixed::from_double(ms->morph_time) : sim::Fixed::from_double(4.0417);
+                world_.begin_morph(pending_liberator_, liberator_ag_proto_, t);
+                world_.set_zone(pending_liberator_, wx, wy, sim::Fixed::from_int(5));
+            }
+            pending_defender_ = false;
+            pending_liberator_ = sim::kNoTarget;
+        } else if (pending_inject_) {
+            dragging_ = false;
+            const std::uint32_t hall = ctrl.pick_own(world_, ScreenPoint{in.mouse_x, in.mouse_y});
+            if (cat_ && pending_queen_ < world_.units().size() && world_.unit(pending_queen_).alive &&
+                hall != sim::kNoTarget && hall < world_.units().size() && world_.unit(hall).alive &&
+                world_.unit(hall).spawner_proto >= 0) {
+                const auto iv = cat_->inject_ability(world_.unit(pending_queen_).catalog_id);
+                const sim::Fixed iv_energy = ability_energy_cost(*cat_, iv.ability);
+                if (iv.found && iv.count > 0 && iv.delay > 0) {
+                    world_.cast_inject(pending_queen_, hall, iv_energy,
+                                       world_.unit(hall).spawner_proto, iv.count,
+                                       sim::Fixed::from_double(iv.delay),
+                                       sim::Fixed::from_double(iv.stun));
+                }
+            }
+            pending_inject_ = false;
+            pending_queen_ = sim::kNoTarget;
+        } else if (pending_infested_) {
+            dragging_ = false;
+            sim::Fixed wx, wy;
+            if (cat_ && pending_infestor_ < world_.units().size() && world_.unit(pending_infestor_).alive &&
+                ctrl.ground_point(world_, ScreenPoint{in.mouse_x, in.mouse_y}, wx, wy)) {
+                const auto it = cat_->infested_terran_ability(world_.unit(pending_infestor_).catalog_id);
+                const sim::Fixed cost = sim::Fixed::from_double(it.energy);
+                const sim::Fixed cd = ability_cooldown_sec(*cat_, it.ability);
+                const bool ready =
+                    world_.ability_cooldown_left(pending_infestor_, kAbilCdSlotInfestedTerran).raw() <= 0;
+                const bool afford = cost.raw() <= 0 || world_.unit(pending_infestor_).energy >= cost;
+                if (it.found && !it.unit.empty() && ready && afford) {
+                    const int n = it.count < 1 ? 1 : it.count;
+                    for (int k = 0; k < n; ++k) {
+                        sim::Unit u = make_unit(*cat_, it.unit, cfg_.human_player);
+                        u.x = wx + sim::Fixed::from_double(n == 1 ? 0.0 : 0.75 * std::cos(2.0 * 3.14159265 * k / n));
+                        u.y = wy + sim::Fixed::from_double(n == 1 ? 0.0 : 0.75 * std::sin(2.0 * 3.14159265 * k / n));
+                        u.time_life = sim::Fixed::from_double(it.life);
+                        world_.add_unit(u);
+                    }
+                    if (cost.raw() > 0) world_.spend_energy(pending_infestor_, cost);
+                    world_.arm_ability_cooldown(pending_infestor_, kAbilCdSlotInfestedTerran, cd);
+                }
+            }
+            pending_infested_ = false;
+            pending_infestor_ = sim::kNoTarget;
+        } else if (pending_land_) {
+            dragging_ = false;
+            sim::Fixed wx, wy;
+            if (pending_land_unit_ < world_.units().size() && world_.unit(pending_land_unit_).alive &&
+                world_.unit(pending_land_unit_).flying &&
+                ctrl.ground_point(world_, ScreenPoint{in.mouse_x, in.mouse_y}, wx, wy)) {
+                const bool in_bounds = wx.to_double() >= 0.0 && wy.to_double() >= 0.0 &&
+                                       wx.to_double() <= double(map_w_) && wy.to_double() <= double(map_h_);
+                if (in_bounds && world_.land(pending_land_unit_, wx, wy)) {
+                    pending_land_ = false;
+                    pending_land_unit_ = sim::kNoTarget;
+                }
+            } else {
+                pending_land_ = false;
+                pending_land_unit_ = sim::kNoTarget;
+            }
+        } else if (pending_unload_) {
+            dragging_ = false;
+            sim::Fixed wx, wy;
+            if (pending_unload_unit_ < world_.units().size() && world_.unit(pending_unload_unit_).alive &&
+                ctrl.ground_point(world_, ScreenPoint{in.mouse_x, in.mouse_y}, wx, wy))
+                world_.unload_all_at(pending_unload_unit_, wx, wy);
+            pending_unload_ = false;
+            pending_unload_unit_ = sim::kNoTarget;
         } else if ((pending_attack_ || pending_patrol_) && !selection_.empty()) {
             dragging_ = false;
             sim::Fixed wx, wy;
@@ -461,6 +1252,18 @@ void MeleeGame::handle_commands(const render::InputState& in, float aspect) {
                     world_.issue(id, o);
                 }
             pending_attack_ = pending_patrol_ = false;
+        } else if (has_pending_ability_cast()) {
+            dragging_ = false;
+            if (pending_cast_mode_ == AbilTargetMode::Point) {
+                sim::Fixed wx, wy;
+                if (ctrl.ground_point(world_, ScreenPoint{in.mouse_x, in.mouse_y}, wx, wy))
+                    cast_pending_at_point(wx, wy);
+            } else {
+                std::uint32_t tgt = ctrl.pick_target(world_, ScreenPoint{in.mouse_x, in.mouse_y});
+                if (tgt == sim::kNoTarget)
+                    tgt = ctrl.pick_own(world_, ScreenPoint{in.mouse_x, in.mouse_y});
+                if (tgt != sim::kNoTarget) cast_pending_at_target(tgt);
+            }
         } else {
             dragging_ = true;
             drag_x0_ = in.mouse_x;
@@ -489,14 +1292,17 @@ void MeleeGame::handle_commands(const render::InputState& in, float aspect) {
     }
 
     if (in.right_pressed && pending_build_) pending_build_ = false;
+    if (in.right_pressed && pending_refinery_) pending_refinery_ = false;
 
-    if (in.right_pressed && !pending_build_ && !selection_.empty() && !over_bar) {
+    if (in.right_pressed && !pending_build_ && !pending_refinery_ && !selection_.empty() && !over_bar) {
         std::uint32_t node = sim::kNoTarget;
         sim::Fixed gx, gy;
         if (ctrl.ground_point(world_, ScreenPoint{in.mouse_x, in.mouse_y}, gx, gy)) {
             sim::Fixed best_d2;
             for (const Unit& u : world_.units()) {
-                if (!u.alive || u.player >= 0) continue;
+                const bool neutral_resource = u.alive && u.player < 0;
+                const bool own_gas = u.alive && u.is_gas && u.player == cfg_.human_player;
+                if (!neutral_resource && !own_gas) continue;
                 sim::Fixed r = u.radius + sim::Fixed::from_int(2);
                 sim::Fixed dx = u.x - gx, dy = u.y - gy, d2 = dx * dx + dy * dy;
                 if (d2 > r * r) continue;
@@ -513,19 +1319,42 @@ void MeleeGame::handle_commands(const render::InputState& in, float aspect) {
             }
         }
 
+        std::uint32_t transport = sim::kNoTarget;
+        if (node == sim::kNoTarget && resume == sim::kNoTarget && cfg_.human_player >= 0) {
+            for (const Unit& u : world_.units()) {
+                if (!u.alive || u.cargo_space <= 0) continue;
+                if (!world_.are_allied(u.player, cfg_.human_player)) continue;
+                const sim::Fixed r = u.radius + sim::Fixed::from_int(1);
+                const sim::Fixed dx = u.x - gx, dy = u.y - gy;
+                if (dx * dx + dy * dy <= r * r) { transport = u.id; break; }
+            }
+        }
+
         if (resume != sim::kNoTarget) {
             for (std::uint32_t id : selection_)
                 if (id < world_.units().size() && world_.unit(id).alive &&
                     world_.unit(id).is_worker) { world_.assign_builder(id, resume); break; }
+        } else if (transport != sim::kNoTarget) {
+            for (std::uint32_t id : selection_) {
+                if (id >= world_.units().size() || id == transport) continue;
+                const Unit& p = world_.unit(id);
+                if (!p.alive || p.player != cfg_.human_player || p.cargo_size <= 0 || p.cargo_space > 0)
+                    continue;
+                world_.issue(id, sim::Order{sim::OrderType::Load, sim::Fixed(), sim::Fixed(), transport},
+                             in.shift);
+            }
         } else if (node != sim::kNoTarget && cfg_.human_player >= 0 &&
                    size_t(cfg_.human_player) < layout_.players.size()) {
             const std::uint32_t depot = layout_.players[size_t(cfg_.human_player)].base.depot;
+            const bool gas_node = node < world_.units().size() && world_.unit(node).is_gas;
             for (std::uint32_t id : selection_) {
                 if (id >= world_.units().size()) continue;
-                if (id < layout_.unit_type.size() && layout_.unit_type[id] == "SCV") {
+                const bool is_scv = id < layout_.unit_type.size() && layout_.unit_type[id] == "SCV";
+                if (is_scv || world_.unit(id).is_worker) {
                     Unit& w = world_.unit(id);
                     w.home_depot = depot;
                     w.gather_target = node;
+                    w.gathers_gas = gas_node;
                     world_.issue(id, sim::Order{sim::OrderType::Gather, sim::Fixed(),
                                                 sim::Fixed(), sim::kNoTarget});
                 }
@@ -565,7 +1394,8 @@ void MeleeGame::emit_scene(std::vector<render::SceneInstance>& scene) {
         g.seq = -1;
         scene.push_back(g);
     }
-    const float tick_ms = 1000.0f / float(sim::World::kTicksPerSecond);
+    const float tick_ms =
+        (1000.0f / float(sim::World::kTicksPerSecond)) / float(clock_.multiplier(clock_.speed()));
     const float alpha = tick_ms > 0.0f ? std::min(1.0f, accum_ms_ / tick_ms) : 0.0f;
     for (const Unit& u : world_.units()) {
         if (!u.alive) continue;
@@ -644,6 +1474,18 @@ void MeleeGame::emit_scene(std::vector<render::SceneInstance>& scene) {
     }
 }
 
+void MeleeGame::set_spawn_models(int player, const formats::Model* worker,
+                                 const formats::Model* army, const formats::Model* producer) {
+    if (player < 0) return;
+    const size_t p = size_t(player);
+    if (spawn_worker_model_.size() <= p) spawn_worker_model_.resize(p + 1, nullptr);
+    if (spawn_army_model_.size() <= p) spawn_army_model_.resize(p + 1, nullptr);
+    if (spawn_producer_model_.size() <= p) spawn_producer_model_.resize(p + 1, nullptr);
+    if (worker) spawn_worker_model_[p] = worker;
+    if (army) spawn_army_model_[p] = army;
+    if (producer) spawn_producer_model_[p] = producer;
+}
+
 bool MeleeGame::step(const render::InputState& in, float dt_ms,
                      std::vector<render::SceneInstance>& scene, render::Camera& cam) {
     const float dt_s = dt_ms / 1000.0f;
@@ -693,17 +1535,17 @@ bool MeleeGame::step(const render::InputState& in, float dt_ms,
             return sim::kNoTarget;
         };
 
-        const bool do_build = (in.key_build && !prev_build_) || ui_build_;
+        const bool do_build = (in.key_build && !prev_keys_.build) || ui_build_;
         if (do_build && !human_producer_pending_ && human_producer_ == sim::kNoTarget &&
             selected_worker() != sim::kNoTarget) {
             pending_build_ = true;
-            build_proto_ = human_producer_proto_;
-            build_cost_ = human_producer_cost_;
-            build_time_ = human_producer_build_time_;
+            build_proto_ = human_build_.producer_proto;
+            build_cost_ = human_build_.producer_cost;
+            build_time_ = human_build_.producer_build_time;
             pending_attack_ = pending_patrol_ = false;
         }
 
-        const bool do_train = (in.key_train && !prev_train_) || ui_train_;
+        const bool do_train = (in.key_train && !prev_keys_.train) || ui_train_;
         if (do_train && human_producer_ != sim::kNoTarget) {
             const ai::BuildItem& au = pl.config.army_unit;
             MeleeCommands::train(world_, human_producer_, au.proto, au.minerals, au.gas,
@@ -712,17 +1554,198 @@ bool MeleeGame::step(const render::InputState& in, float dt_ms,
 
         if (ui_trainworker_ && pl.base.depot < world_.units().size() &&
             world_.unit(pl.base.depot).alive &&
-            world_.player(cfg_.human_player).minerals >= human_worker_cost_)
-            world_.queue_train(pl.base.depot, human_worker_proto_, human_worker_cost_, 0,
-                               human_worker_build_time_);
+            world_.player(cfg_.human_player).minerals >= human_build_.worker_cost)
+            world_.queue_train(pl.base.depot, human_build_.worker_proto, human_build_.worker_cost, 0,
+                               human_build_.worker_build_time);
+
+        if (ui_buildtechlab_ || ui_buildreactor_) {
+            const std::uint32_t prod = selected_addon_producer();
+            auto& hp = world_.player(cfg_.human_player);
+            if (prod != sim::kNoTarget && hp.minerals >= 50 && hp.gas >= 25) {
+                const int32_t kind =
+                    ui_buildreactor_ ? sim::World::kAddonReactor : sim::World::kAddonTechLab;
+                const sim::Fixed btime = sim::Fixed::from_int(ui_buildreactor_ ? 50 : 25);
+                if (world_.build_addon(prod, kind, btime)) {
+                    hp.minerals -= 50;
+                    hp.gas -= 25;
+                }
+            }
+        }
+
+        if (ui_traintech_ && cat_) {
+            const std::uint32_t prod = selected_techlab_producer();
+            if (prod != sim::kNoTarget) {
+                const data::Catalog::TechTrain tt = cat_->techlab_train_product(world_.unit(prod).catalog_id);
+                auto& hp = world_.player(cfg_.human_player);
+                if (!tt.unit.empty()) {
+                    const data::UnitCost mc = data::unit_cost(*cat_, tt.unit);
+                    if (hp.minerals >= mc.minerals && hp.gas >= mc.gas) {
+                        sim::Unit mp = make_unit(*cat_, tt.unit, cfg_.human_player);
+                        world_.queue_train(prod, mp, mc.minerals, mc.gas,
+                                           sim::Fixed::from_double(tt.time > 0 ? tt.time : 21.0));
+                    }
+                }
+            }
+        }
+
+        if (ui_trainair_ && cat_) {
+            const std::uint32_t sp = selected_starport();
+            if (sp != sim::kNoTarget) {
+                const data::UnitCost ac = data::unit_cost(*cat_, "VikingFighter");
+                auto& hp = world_.player(cfg_.human_player);
+                if (hp.minerals >= ac.minerals && hp.gas >= ac.gas) {
+                    sim::Unit vp = make_unit(*cat_, "VikingFighter", cfg_.human_player);
+                    world_.queue_train(sp, vp, ac.minerals, ac.gas, sim::Fixed::from_int(42));
+                }
+            }
+        }
+
+        if (ui_trainzealot_ && cat_) {
+            const std::uint32_t gw = selected_gateway();
+            if (gw != sim::kNoTarget) {
+                const data::UnitCost zc = data::unit_cost(*cat_, "Zealot");
+                auto& hp = world_.player(cfg_.human_player);
+                if (hp.minerals >= zc.minerals && hp.gas >= zc.gas) {
+                    sim::Unit zp = make_unit(*cat_, "Zealot", cfg_.human_player);
+                    world_.queue_train(gw, zp, zc.minerals, zc.gas, sim::Fixed::from_int(33));
+                }
+            }
+        }
 
         if (ui_buildsupply_ && selected_worker() != sim::kNoTarget) {
             pending_build_ = true;
-            build_proto_ = human_supply_proto_;
-            build_cost_ = human_supply_cost_;
-            build_time_ = human_supply_build_time_;
+            build_proto_ = human_build_.supply_proto;
+            build_cost_ = human_build_.supply_cost;
+            build_time_ = human_build_.supply_build_time;
             pending_attack_ = pending_patrol_ = false;
         }
+
+        if (ui_buildfactory_ && cat_ && selected_worker() != sim::kNoTarget) {
+            pending_build_ = true;
+            build_proto_ = make_unit(*cat_, "Factory", cfg_.human_player);
+            build_cost_ = data::unit_cost(*cat_, "Factory").minerals;
+            build_time_ = sim::Fixed::from_int(60);
+            pending_attack_ = pending_patrol_ = false;
+        }
+
+        if (ui_buildstarport_ && cat_ && selected_worker() != sim::kNoTarget) {
+            pending_build_ = true;
+            build_proto_ = make_unit(*cat_, "Starport", cfg_.human_player);
+            build_cost_ = data::unit_cost(*cat_, "Starport").minerals;
+            build_time_ = sim::Fixed::from_int(50);
+            pending_attack_ = pending_patrol_ = false;
+        }
+
+        if (ui_buildpylon_ && cat_ && selected_worker() != sim::kNoTarget) {
+            pending_build_ = true;
+            build_proto_ = make_unit(*cat_, "Pylon", cfg_.human_player);
+            build_cost_ = data::unit_cost(*cat_, "Pylon").minerals;
+            build_time_ = sim::Fixed::from_int(25);
+            pending_attack_ = pending_patrol_ = false;
+        }
+
+        if (ui_buildgateway_ && cat_ && selected_worker() != sim::kNoTarget) {
+            pending_build_ = true;
+            build_proto_ = make_unit(*cat_, "Gateway", cfg_.human_player);
+            build_cost_ = data::unit_cost(*cat_, "Gateway").minerals;
+            build_time_ = sim::Fixed::from_int(65);
+            pending_attack_ = pending_patrol_ = false;
+        }
+
+        if (pending_town_hall_ && cat_ && selected_worker() != sim::kNoTarget) {
+            const std::string th = human_town_hall();
+            pending_build_ = true;
+            build_proto_ = make_unit(*cat_, th, cfg_.human_player);
+            build_cost_ = data::unit_cost(*cat_, th).minerals;
+            build_time_ = sim::Fixed::from_int(71);
+            pending_attack_ = pending_patrol_ = false;
+        }
+
+        if (ui_buildengbay_ && cat_ && selected_worker() != sim::kNoTarget) {
+            pending_build_ = true;
+            build_proto_ = make_unit(*cat_, "EngineeringBay", cfg_.human_player);
+            build_cost_ = data::unit_cost(*cat_, "EngineeringBay").minerals;
+            build_time_ = sim::Fixed::from_int(35);
+            pending_attack_ = pending_patrol_ = false;
+        }
+
+        if (ui_research_ && cat_ && research_ && cfg_.human_player >= 0) {
+            const std::uint32_t eb = selected_completed_engbay();
+            const bool done = research_->has(cfg_.human_player, kInfantryWeaponsL1);
+            const bool inflight = research_->pending(cfg_.human_player, kInfantryWeaponsL1);
+            if (eb != sim::kNoTarget && !done && !inflight) {
+                const data::Catalog::ResearchInfo info = cat_->research_info(kInfantryWeaponsL1);
+                sim::Player& hp = world_.player(cfg_.human_player);
+                if (info.found && info.time > 0 && hp.minerals >= info.minerals &&
+                    hp.gas >= info.gas) {
+                    hp.minerals -= info.minerals;
+                    hp.gas -= info.gas;
+                    begin_research(cfg_.human_player, kInfantryWeaponsL1,
+                                   sim::Fixed::from_double(info.time));
+                }
+            }
+        }
+
+        if (ui_morphorbital_ && cat_) {
+            const std::uint32_t cc = selected_command_center();
+            auto& hp = world_.player(cfg_.human_player);
+            const auto delta = morph_cost_delta(*cat_, "CommandCenter", "OrbitalCommand");
+            const bool barracks = human_producer_ != sim::kNoTarget;
+            if (cc != sim::kNoTarget && barracks && hp.minerals >= delta.first && hp.gas >= delta.second) {
+                if (orbital_proto_ < 0)
+                    orbital_proto_ =
+                        world_.add_spawn_proto(make_unit(*cat_, "OrbitalCommand", cfg_.human_player));
+                world_.begin_morph(cc, orbital_proto_, sim::Fixed::from_int(35));
+                hp.minerals -= delta.first;
+                hp.gas -= delta.second;
+            }
+        }
+
+        if (ui_fightermode_ && cat_) {
+            const std::uint32_t ag = selected_liberator_ag();
+            if (ag != sim::kNoTarget) {
+                if (liberator_proto_ < 0)
+                    liberator_proto_ =
+                        world_.add_spawn_proto(make_unit(*cat_, "Liberator", cfg_.human_player));
+                world_.clear_zone(ag);
+                const auto ms = cat_->morph_spec("LiberatorMorphtoAA");
+                const sim::Fixed t =
+                    ms ? sim::Fixed::from_double(ms->morph_time) : sim::Fixed::from_double(1.5417);
+                world_.begin_morph(ag, liberator_proto_, t);
+            }
+        }
+
+        if (ui_mergearchon_ && cat_) {
+            const std::vector<std::uint32_t> tem = selected_merge_templar();
+            if (tem.size() >= 2) {
+                const std::uint32_t hi = tem[tem.size() - 1];
+                const std::uint32_t lo = tem[tem.size() - 2];
+                const std::uint32_t keep = lo;
+                const std::uint32_t absorb = hi;
+                const std::string abil = cat_->merge_ability(world_.unit(keep).catalog_id);
+                const auto ms = cat_->merge_spec(abil);
+                if (ms && !ms->target.empty()) {
+                    if (archon_proto_ < 0)
+                        archon_proto_ =
+                            world_.add_spawn_proto(make_unit(*cat_, ms->target, cfg_.human_player));
+                    const sim::Fixed t = sim::Fixed::from_double(ms->time);
+                    world_.merge_units(keep, absorb, archon_proto_, t);
+                }
+            }
+        }
+
+        if (ui_burrow_ && cat_)
+            for (std::uint32_t id : selected_burrowers(false)) sim::set_burrowed(world_, id, true);
+        if (ui_unburrow_ && cat_)
+            for (std::uint32_t id : selected_burrowers(true)) sim::set_burrowed(world_, id, false);
+
+        if (ui_liftoff_ && cat_)
+            if (const std::uint32_t id = selected_liftoff_structure(false); id != sim::kNoTarget)
+                world_.lift_off(id);
+        if (ui_lowerdepot_ && cat_)
+            if (const std::uint32_t id = selected_depot(false); id != sim::kNoTarget) world_.lower(id);
+        if (ui_raisedepot_ && cat_)
+            if (const std::uint32_t id = selected_depot(true); id != sim::kNoTarget) world_.raise(id);
 
         std::vector<std::uint32_t> issued_this_frame;
         for (std::size_t i = 0; i < build_queue_.size();) {
@@ -736,16 +1759,25 @@ bool MeleeGame::step(const render::InputState& in, float dt_ms,
                 ++i;
                 continue;
             }
-            if (world_.issue_worker_build(q.worker, q.x, q.y, q.proto, q.cost, 0, q.time) &&
+            if (world_.issue_worker_build(q.worker, q.x, q.y, q.proto, q.cost, 0, q.time,
+                                          sim::Fixed::from_int(2), human_build_verb_) &&
                 q.is_producer)
                 human_producer_pending_ = true;
             issued_this_frame.push_back(q.worker);
             build_queue_.erase(build_queue_.begin() + i);
         }
     }
-    prev_train_ = in.key_train;
-    prev_build_ = in.key_build;
+    prev_keys_.train = in.key_train;
+    prev_keys_.build = in.key_build;
     ui_build_ = ui_train_ = ui_trainworker_ = ui_buildsupply_ = false;
+    ui_buildtechlab_ = ui_buildreactor_ = ui_traintech_ = ui_buildfactory_ = false;
+    ui_buildstarport_ = ui_trainair_ = false;
+    ui_buildpylon_ = ui_buildgateway_ = ui_trainzealot_ = false;
+    pending_town_hall_ = false;
+    ui_morphorbital_ = ui_buildengbay_ = ui_research_ = ui_fightermode_ = false;
+    ui_mergearchon_ = false;
+    ui_burrow_ = ui_unburrow_ = false;
+    ui_liftoff_ = ui_lowerdepot_ = ui_raisedepot_ = false;
 
     if (cfg_.human_player >= 0) {
         groups_.prune(world_);
@@ -762,14 +1794,18 @@ bool MeleeGame::step(const render::InputState& in, float dt_ms,
         }
     }
 
-    const float tick_ms = 1000.0f / float(sim::World::kTicksPerSecond);
-    accum_ms_ += dt_ms;
+    const float tick_ms =
+        (1000.0f / float(sim::World::kTicksPerSecond)) / float(clock_.multiplier(clock_.speed()));
+    accum_ms_ += clock_.paused() ? 0.0f : dt_ms;
     if (accum_ms_ > tick_ms * 8.0f) accum_ms_ = tick_ms * 8.0f;
     if (curr_pos_.empty()) snapshot_positions(curr_pos_);
     bool ticked = false;
     while (accum_ms_ >= tick_ms) {
         prev_pos_ = curr_pos_;
         world_.step();
+        if (research_)
+            research_->advance(sim::Fixed::from_ratio(1, sim::World::kTicksPerSecond));
+        mule_system_.advance(world_, sim::World::dt());
         snapshot_positions(curr_pos_);
         if (prev_pos_.size() < curr_pos_.size()) {
             std::size_t old = prev_pos_.size();
@@ -781,14 +1817,30 @@ bool MeleeGame::step(const render::InputState& in, float dt_ms,
         if (++tick_counter_ >= cfg_.ai_period_ticks) {
             tick_counter_ = 0;
             for (size_t p = 0; p < ais_.size(); ++p)
-                if (cfg_.human_player < 0 || int(p) != cfg_.human_player) ais_[p]->update(world_);
+                if (cfg_.human_player < 0 || int(p) != cfg_.human_player) {
+                    ais_[p]->update(world_);
+                    maybe_ai_research(int(p));
+                    if (cast_policy_) cast_policy_->run(world_, int(p));
+                }
         }
     }
 
     for (std::size_t id = bound_count_; id < world_.units().size(); ++id) {
         const Unit& u = world_.unit(std::uint32_t(id));
-        if (u.player >= 0 && u.speed.raw() == 0)
-            driver_.set_model(std::uint32_t(id), producer_model_);
+        if (u.player < 0) continue;
+        if (u.spawn_parent != sim::kNoTarget) {
+            driver_.set_model(std::uint32_t(id), models_ ? models_->model_for(u.catalog_id) : nullptr);
+            continue;
+        }
+        const std::vector<const formats::Model*>* tbl;
+        const formats::Model* fallback;
+        if (u.speed.raw() == 0) { tbl = &spawn_producer_model_; fallback = producer_model_; }
+        else if (u.is_worker)   { tbl = &spawn_worker_model_;   fallback = nullptr; }
+        else                    { tbl = &spawn_army_model_;     fallback = driver_.default_model; }
+        const formats::Model* m =
+            (size_t(u.player) < tbl->size() && (*tbl)[size_t(u.player)]) ? (*tbl)[size_t(u.player)]
+                                                                         : fallback;
+        driver_.set_model(std::uint32_t(id), m);
     }
     bound_count_ = world_.units().size();
 
@@ -1197,7 +2249,8 @@ void MeleeGame::build_overlay(std::uint32_t view_w, std::uint32_t view_h,
                 }
         };
         const MeleeCommandContext ctx = command_context();
-        const CommandCard card = build_melee_command_card(ctx);
+        CommandCard card = build_melee_command_card(ctx);
+        merge_selection_abilities(card);
 
         for (int i = 0; i < CommandCard::kSlots; ++i) {
             const HudRect c = hud_command_cell(view_w, view_h, i);

@@ -103,19 +103,35 @@ std::vector<Mat4> pose_world(const formats::Model& m, uint32_t seq, float time_m
     float t = time_ms;
     if (seq < m.sequences.size()) t += float(m.sequences[seq].start_ms);
 
+    std::vector<Mat4> local(n);
     for (size_t b = 0; b < n; ++b) {
         const formats::M3Bone& bone = m.bones[b];
         float T[3], R[4] = {0, 0, 0, 1}, S[3] = {1, 1, 1};
         field(m, seq, bone.location, t, 3, T);
         field(m, seq, bone.rotation, t, 4, R);
         field(m, seq, bone.scale, t, 3, S);
-        Mat4 local = translation(T[0], T[1], T[2]) * from_quat(R[0], R[1], R[2], R[3]) *
-                     scaling(S[0], S[1], S[2]);
-        if (bone.parent >= 0 && size_t(bone.parent) < b)
-            world[b] = world[bone.parent] * local;
-        else
-            world[b] = local;
+        local[b] = translation(T[0], T[1], T[2]) * from_quat(R[0], R[1], R[2], R[3]) *
+                   scaling(S[0], S[1], S[2]);
     }
+    std::vector<char> done(n, 0);
+    for (bool progress = true; progress;) {
+        progress = false;
+        for (size_t b = 0; b < n; ++b) {
+            if (done[b]) continue;
+            const int par = m.bones[b].parent;
+            if (par < 0 || size_t(par) >= n) {
+                world[b] = local[b];
+                done[b] = 1;
+                progress = true;
+            } else if (done[size_t(par)]) {
+                world[b] = world[size_t(par)] * local[b];
+                done[b] = 1;
+                progress = true;
+            }
+        }
+    }
+    for (size_t b = 0; b < n; ++b)
+        if (!done[b]) world[b] = local[b];
     return world;
 }
 

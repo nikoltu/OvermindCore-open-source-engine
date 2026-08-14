@@ -15,22 +15,36 @@ struct Defender {
     Fixed dmg_clamp_max = Fixed();
     Fixed dmg_minimum = Fixed();
     Fixed shield_armor = Fixed();
+    uint32_t attributes = 0;
+    Fixed barrier = Fixed();
 };
 
 struct Weapon {
     Fixed damage;
     Fixed period;
+    uint32_t bonus_attr = 0;
+    Fixed bonus_amount = Fixed();
 };
 
 inline Fixed min_damage() { return Fixed::from_ratio(1, 2); }
 
 inline void apply_hit(const Weapon& w, Defender& d) {
     const Fixed armor = d.shields.raw() > 0 ? d.shield_armor : d.armor;
-    Fixed eff = w.damage - armor - d.damage_reduction;
+    Fixed base = w.damage;
+    if (w.bonus_attr != 0 && (d.attributes & w.bonus_attr) != 0) base = base + w.bonus_amount;
+    Fixed eff = base - armor - d.damage_reduction;
     eff = eff * d.dmg_fraction;
     if (d.dmg_clamp_max.raw() > 0 && eff > d.dmg_clamp_max) eff = d.dmg_clamp_max;
     if (eff < d.dmg_minimum) eff = d.dmg_minimum;
     if (eff < min_damage()) eff = min_damage();
+    if (d.barrier.raw() > 0) {
+        if (eff <= d.barrier) {
+            d.barrier = d.barrier - eff;
+            return;
+        }
+        eff = eff - d.barrier;
+        d.barrier = Fixed();
+    }
     if (d.shields.raw() > 0) {
         if (eff <= d.shields) {
             d.shields = d.shields - eff;
@@ -56,6 +70,39 @@ inline CombatResult time_to_kill(const Weapon& w, Defender d) {
     }
     if (r.hits > 0) r.duration = w.period * Fixed::from_int(r.hits - 1);
     return r;
+}
+
+inline bool in_line_splash(Fixed ax, Fixed ay, Fixed tx, Fixed ty, Fixed first, Fixed step, int count,
+                           Fixed radius, Fixed px, Fixed py) {
+    if (count <= 0 || radius.raw() <= 0) return false;
+    const Fixed r2 = radius * radius;
+    Fixed dirx = Fixed(), diry = Fixed();
+    const Fixed bvx = tx - ax, bvy = ty - ay;
+    const Fixed blen = isqrt(bvx * bvx + bvy * bvy);
+    if (blen.raw() > 0) {
+        dirx = bvx / blen;
+        diry = bvy / blen;
+    }
+    for (int k = 0; k < count; ++k) {
+        const Fixed off = first + step * Fixed::from_int(k);
+        const Fixed cx = tx + dirx * off, cy = ty + diry * off;
+        const Fixed ex = px - cx, ey = py - cy;
+        if (ex * ex + ey * ey <= r2) return true;
+    }
+    return false;
+}
+
+inline bool in_arc(Fixed ax, Fixed ay, Fixed tx, Fixed ty, Fixed radius, Fixed cos_half, Fixed px, Fixed py) {
+    if (radius.raw() <= 0) return false;
+    const Fixed ex = px - tx, ey = py - ty;
+    const Fixed d2 = ex * ex + ey * ey;
+    if (d2 > radius * radius) return false;
+    const Fixed bvx = tx - ax, bvy = ty - ay;
+    const Fixed blen = isqrt(bvx * bvx + bvy * bvy);
+    const Fixed elen = isqrt(d2);
+    if (blen.raw() <= 0 || elen.raw() <= 0) return true;
+    const Fixed dot = (bvx * ex + bvy * ey) / (blen * elen);
+    return dot >= cos_half;
 }
 
 }

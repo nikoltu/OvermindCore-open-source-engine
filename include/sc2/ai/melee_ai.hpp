@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstdint>
+#include <string>
 #include <utility>
 #include <vector>
 
@@ -15,11 +16,15 @@ struct BuildItem {
     int gas = 0;
     sim::Fixed build_time = sim::Fixed::from_int(1);
     bool army = false;
+    int count = 1;
 };
 
 struct MeleeConfig {
     std::vector<BuildItem> build_order;
     BuildItem army_unit;
+    BuildItem army_unit2;
+    bool has_army_unit2 = false;
+    std::string army_unit2_gate;
     BuildItem supply_unit;
     BuildItem worker_unit;
     int worker_target = 0;
@@ -57,6 +62,8 @@ public:
 
     void set_base(MeleeBase base);
     int player() const { return player_; }
+    MeleeConfig& config() { return cfg_; }
+    const MeleeConfig& config() const { return cfg_; }
     bool attacking() const { return attacking_; }
     int army_size(const sim::World& w) const;
 
@@ -71,6 +78,7 @@ private:
     bool supply_ok(const sim::World& w, const BuildItem& it) const;
     void run_workers(sim::World& w);
     void run_production(sim::World& w);
+    bool army_unit2_gate_ok(const sim::World& w) const;
     void run_expansion(sim::World& w);
     void run_army(sim::World& w);
     int patches_near(const sim::World& w, sim::Fixed x, sim::Fixed y, sim::Fixed radius) const;
@@ -84,6 +92,7 @@ private:
     size_t build_idx_ = 0;
     bool attacking_ = false;
     bool producer_pending_ = false;
+    bool army_alt_ = false;
     bool expansion_pending_ = false;
     sim::Fixed expand_x_, expand_y_;
 };

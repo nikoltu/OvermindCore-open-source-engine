@@ -2,6 +2,7 @@
 
 #include <cstdlib>
 #include <stdexcept>
+#include <unordered_map>
 #include <unordered_set>
 #include <utility>
 
@@ -246,7 +247,48 @@ float attr_f(const XmlNode& n, const char* key, float dflt) {
     return dflt;
 }
 
-Rect solve_one(const Frame& f, const Rect& parent) {
+std::string sibling_ref_name(const std::string& rel) {
+    if (rel.empty() || rel == "$parent" || rel == "$this") return "";
+    std::size_t slash = rel.find('/');
+    if (slash == std::string::npos) return rel;
+    if (rel.compare(0, slash, "$parent") == 0 && rel.find('/', slash + 1) == std::string::npos)
+        return rel.substr(slash + 1);
+    return "";
+}
+
+int ancestor_depth(const std::string& rel) {
+    if (rel.empty()) return 0;
+    int depth = 0;
+    std::size_t i = 0;
+    while (true) {
+        std::size_t slash = rel.find('/', i);
+        std::size_t end = (slash == std::string::npos) ? rel.size() : slash;
+        if (rel.compare(i, end - i, "$parent") != 0) return 0;
+        ++depth;
+        if (slash == std::string::npos) break;
+        i = slash + 1;
+    }
+    return depth;
+}
+
+const Rect& anchor_target(const std::string& rel, const Rect& parent,
+                          const std::unordered_map<std::string, Rect>& siblings,
+                          const std::vector<const Rect*>& ancestors) {
+    if (int d = ancestor_depth(rel)) {
+        if (ancestors.empty()) return parent;
+        const std::size_t k = static_cast<std::size_t>(d);
+        const std::size_t idx = ancestors.size() >= k ? ancestors.size() - k : 0;
+        return *ancestors[idx];
+    }
+    const std::string name = sibling_ref_name(rel);
+    if (name.empty()) return parent;
+    auto it = siblings.find(name);
+    return it != siblings.end() ? it->second : parent;
+}
+
+Rect solve_one(const Frame& f, const Rect& parent,
+               const std::unordered_map<std::string, Rect>& siblings,
+               const std::vector<const Rect*>& ancestors) {
     bool haveL = false, haveR = false, haveT = false, haveB = false;
     bool haveW = false, haveH = false;
     float L = parent.x, R = parent.x + parent.w;
@@ -260,8 +302,9 @@ Rect solve_one(const Frame& f, const Rect& parent) {
             if (side.empty()) continue;
             std::string pos = p.attr_or("pos", "Min");
             float off = attr_f(p, "offset", 0);
+            const Rect& base = anchor_target(p.attr_or("relative", ""), parent, siblings, ancestors);
             bool horiz = (side == "Left" || side == "Right");
-            float c = anchor_base(parent, horiz, pos) + off;
+            float c = anchor_base(base, horiz, pos) + off;
             if (side == "Left") { L = c; haveL = true; }
             else if (side == "Right") { R = c; haveR = true; }
             else if (side == "Top") { T = c; haveT = true; }
@@ -304,17 +347,70 @@ std::string texture_ref(const Frame& f) {
     return "";
 }
 
-void solve_rec(const Frame& f, const Rect& parent, int depth,
-               std::vector<SolvedFrame>& out) {
-    Rect r = solve_one(f, parent);
-    out.push_back({r, f.type, f.name, display_text(f), depth, texture_ref(f)});
-    for (const Frame& c : f.children) solve_rec(c, r, depth + 1, out);
+std::vector<std::size_t> sibling_solve_order(const std::vector<Frame>& children) {
+    const std::size_t n = children.size();
+    std::unordered_map<std::string, std::size_t> name_to_index;
+    for (std::size_t i = 0; i < n; ++i)
+        if (!children[i].name.empty()) name_to_index[children[i].name] = i;
+    std::vector<int> indeg(n, 0);
+    std::vector<std::vector<std::size_t>> dependents(n);
+    for (std::size_t i = 0; i < n; ++i)
+        for (const XmlNode& p : children[i].props) {
+            if (p.name != "Anchor") continue;
+            const std::string rel = p.attr_or("relative", "");
+            if (ancestor_depth(rel)) continue;
+            const std::string nm = sibling_ref_name(rel);
+            if (nm.empty()) continue;
+            auto it = name_to_index.find(nm);
+            if (it == name_to_index.end() || it->second == i) continue;
+            dependents[it->second].push_back(i);
+            ++indeg[i];
+        }
+    std::vector<std::size_t> order;
+    order.reserve(n);
+    std::vector<bool> placed(n, false);
+    for (std::size_t step = 0; step < n; ++step) {
+        std::size_t pick = n;
+        for (std::size_t k = 0; k < n; ++k)
+            if (!placed[k] && indeg[k] == 0) { pick = k; break; }
+        if (pick == n) break;
+        placed[pick] = true;
+        order.push_back(pick);
+        for (std::size_t d : dependents[pick])
+            if (indeg[d] > 0) --indeg[d];
+    }
+    for (std::size_t k = 0; k < n; ++k)
+        if (!placed[k]) order.push_back(k);
+    return order;
+}
+
+void emit_tree(const Frame& f, const Rect& rect, int depth, std::vector<SolvedFrame>& out,
+               std::vector<const Rect*>& chain) {
+    out.push_back({rect, f.type, f.name, display_text(f), depth, texture_ref(f)});
+    const std::size_t n = f.children.size();
+    if (n == 0) return;
+    chain.push_back(&rect);
+    std::unordered_map<std::string, Rect> child_siblings;
+    std::vector<Rect> solved(n);
+    for (std::size_t idx : sibling_solve_order(f.children)) {
+        const Frame& c = f.children[idx];
+        Rect cr = solve_one(c, rect, child_siblings, chain);
+        solved[idx] = cr;
+        if (!c.name.empty()) child_siblings[c.name] = cr;
+    }
+    for (std::size_t i = 0; i < n; ++i)
+        emit_tree(f.children[i], solved[i], depth + 1, out, chain);
+    chain.pop_back();
 }
 }
 
 std::vector<SolvedFrame> solve_layout(const Frame& root, const Rect& canvas) {
     std::vector<SolvedFrame> out;
-    solve_rec(root, canvas, 0, out);
+    const std::unordered_map<std::string, Rect> no_siblings;
+    const std::vector<const Rect*> no_ancestors;
+    const Rect root_rect = solve_one(root, canvas, no_siblings, no_ancestors);
+    std::vector<const Rect*> chain;
+    emit_tree(root, root_rect, 0, out, chain);
     return out;
 }
 

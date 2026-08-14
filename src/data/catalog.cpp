@@ -1,3 +1,4 @@
+#include <algorithm>
 #include "sc2/data/catalog.hpp"
 
 #include <cstdlib>
@@ -60,7 +61,11 @@ void Catalog::ingest(const std::vector<uint8_t>& xml) {
                 if (kv.first == k) { kv.second = v; found = true; break; }
             if (!found) entry.attrs.emplace_back(k, v);
         }
-        for (const XmlNode& field : e.children) entry.own.push_back(field);
+        const std::uint16_t decl = entry.decl_seen++;
+        for (const XmlNode& field : e.children) {
+            entry.own.push_back(field);
+            entry.own_decl.push_back(decl);
+        }
     }
     resolved_cache_.clear();
 }
@@ -136,6 +141,16 @@ std::optional<double> Catalog::scalar_num(const std::string& family,
 std::vector<std::string> Catalog::array_links(const std::string& family,
                                               const std::string& id,
                                               const std::string& field) const {
+    std::vector<TwoSlot> slots = resolve_array_slots(family, id, field);
+    std::vector<std::string> out;
+    for (const TwoSlot& s : slots)
+        if (s.present && !s.dead && !s.link.empty()) out.push_back(s.link);
+    return out;
+}
+
+std::vector<std::string> Catalog::array_links_legacy(const std::string& family,
+                                                     const std::string& id,
+                                                     const std::string& field) const {
     const auto& children = resolved(family, id);
     std::vector<std::string> slots;
     std::unordered_map<std::string, size_t> byidx;
@@ -173,6 +188,78 @@ std::vector<std::string> Catalog::array_links(const std::string& family,
     return out;
 }
 
+std::vector<Catalog::TwoSlot> Catalog::resolve_array_slots(const std::string& family,
+                                                           const std::string& id,
+                                                           const std::string& field) const {
+    const Entry* e = find(family, id);
+    if (!e) return {};
+
+    std::vector<TwoSlot> base;
+    if (!e->parent.empty() && e->parent != id) base = resolve_array_slots(family, e->parent, field);
+
+    struct Own { long key; bool is_pos; std::string link; bool present; bool dead; };
+    std::vector<Own> own;
+    std::unordered_map<long, size_t> own_at;
+    long counter = 0;
+    long cur_decl = -1;
+    for (size_t k = 0; k < e->own.size(); ++k) {
+        if (e->own[k].name != field) {
+            if (k < e->own_decl.size() && long(e->own_decl[k]) != cur_decl) {
+                cur_decl = long(e->own_decl[k]); counter = 0;
+            }
+            continue;
+        }
+        if (k < e->own_decl.size() && long(e->own_decl[k]) != cur_decl) {
+            cur_decl = long(e->own_decl[k]); counter = 0;
+        }
+        const XmlNode& c = e->own[k];
+        const std::string* lv = c.attr("Link");
+        if (!lv) lv = c.attr("value");
+        const bool has_link = lv != nullptr;
+        std::string link = has_link ? expand_id(*lv, id) : std::string{};
+        int rm_state = -1;
+        if (const std::string* rm = c.attr("removed"))
+            rm_state = (*rm != "0" && !rm->empty()) ? 1 : 0;
+        bool has_index = false; long index = 0;
+        if (const std::string* ix = c.attr("index")) {
+            char* end = nullptr; long n = std::strtol(ix->c_str(), &end, 10);
+            if (end != ix->c_str() && *end == '\0') { has_index = true; index = n; }
+        }
+        long key;
+        bool is_pos;
+        if (has_index) { key = index; is_pos = false; counter = index + 1; }
+        else { key = counter; is_pos = true; ++counter; }
+        auto it = own_at.find(key);
+        if (it == own_at.end()) {
+            own_at[key] = own.size();
+            own.push_back(Own{key, is_pos, link, has_link, rm_state == 1});
+        } else {
+            Own& o = own[it->second];
+            if (has_link) { o.link = link; o.present = true; }
+            if (rm_state == 1) o.dead = true;
+            else if (rm_state == 0) o.dead = false;
+        }
+    }
+
+    for (const Own& o : own) {
+        if (o.is_pos) {
+            base.push_back(TwoSlot{o.link, o.present, o.dead});
+        } else {
+            size_t idx = size_t(o.key < 0 ? 0 : o.key);
+            if (idx >= base.size()) base.resize(idx + 1);
+            if (o.present) { base[idx].link = o.link; base[idx].present = true; }
+            if (o.dead) base[idx].dead = true;
+        }
+    }
+    return base;
+}
+
+std::vector<std::string> Catalog::array_links_twomode(const std::string& family,
+                                                      const std::string& id,
+                                                      const std::string& field) const {
+    return array_links(family, id, field);
+}
+
 std::vector<std::string> Catalog::switch_effects(const std::string& effect_id) const {
     std::vector<std::string> out;
     for (const core::XmlNode& n : resolved("CEffect", effect_id))
@@ -183,113 +270,72 @@ std::vector<std::string> Catalog::switch_effects(const std::string& effect_id) c
     return out;
 }
 
-std::optional<int> Catalog::effect_damage(const std::string& effect_id,
-                                          int depth) const {
-    if (depth > 32) return std::nullopt;
-    const Entry* e = find("CEffect", effect_id);
-    if (!e) return std::nullopt;
-    const std::string& tag = e->tag;
-
-    if (tag == "CEffectDamage") {
-        if (auto a = scalar_num("CEffect", effect_id, "Amount")) return int(*a);
-        return std::nullopt;
-    }
-    auto follow = [&](const std::string& field) -> std::optional<int> {
-        if (auto link = scalar("CEffect", effect_id, field); link && !link->empty())
-            return effect_damage(*link, depth + 1);
-        return std::nullopt;
-    };
-    auto follow_array = [&](const std::string& field) -> std::optional<int> {
-        for (const std::string& link : array_links("CEffect", effect_id, field))
-            if (!link.empty())
-                if (auto d = effect_damage(link, depth + 1)) return d;
-        return std::nullopt;
-    };
-
-    if (tag == "CEffectLaunchMissile") {
-        if (auto d = follow("ImpactEffect")) return d;
-    } else if (tag == "CEffectCreatePersistent") {
-        const int pc = int(scalar_num("CEffect", effect_id, "PeriodCount").value_or(1));
-        if (auto d = follow_array("PeriodicEffectArray")) return *d * (pc > 0 ? pc : 1);
-        if (auto d = follow("InitialEffect")) return d;
-    } else if (tag == "CEffectSet") {
-        if (auto d = follow_array("EffectArray")) return d;
-    } else if (tag == "CEffectSwitch") {
-        for (const std::string& ce : switch_effects(effect_id))
-            if (auto d = effect_damage(ce, depth + 1)) return d;
-    }
-    for (const char* f : {"ImpactEffect", "InitialEffect", "FinalEffect", "ExpireEffect"})
-        if (auto d = follow(f)) return d;
-    for (const char* f : {"EffectArray", "PeriodicEffectArray", "CaseArray"})
-        if (auto d = follow_array(f)) return d;
-    return std::nullopt;
+std::optional<int> Catalog::effect_damage(const std::string& effect_id, int depth,
+                                          const std::string& prefer) const {
+    return walk_damage_tree<int>(
+        effect_id, depth,
+        [this](const std::string& id) -> std::optional<int> {
+            if (auto a = scalar_num("CEffect", id, "Amount")) return int(*a);
+            return std::nullopt;
+        },
+        [this](int sub, const std::string& id) -> int {
+            const int pc = int(scalar_num("CEffect", id, "PeriodCount").value_or(1));
+            return sub * (pc > 0 ? pc : 1);
+        },
+        prefer);
 }
 
 std::optional<double> Catalog::effect_life_change(const std::string& effect_id, int depth) const {
-    if (depth > 32) return std::nullopt;
-    const Entry* e = find("CEffect", effect_id);
-    if (!e) return std::nullopt;
-    const std::string& tag = e->tag;
-
-    if (tag == "CEffectModifyUnit") {
-        std::optional<double> change;
-        for (const core::XmlNode& n : resolved("CEffect", effect_id)) {
-            if (n.name != "VitalArray" || n.attr_or("index", "") != "Life") continue;
-            for (const core::XmlNode& c : n.children)
-                if (c.name == "Change")
-                    if (const std::string* v = c.attr("value"); v && !v->empty())
-                        change = std::strtod(v->c_str(), nullptr);
-        }
-        return change;
-    }
-    auto follow = [&](const std::string& field) -> std::optional<double> {
-        if (auto link = scalar("CEffect", effect_id, field); link && !link->empty())
-            return effect_life_change(*link, depth + 1);
-        return std::nullopt;
-    };
-    auto follow_array = [&](const std::string& field) -> std::optional<double> {
-        for (const std::string& link : array_links("CEffect", effect_id, field))
-            if (!link.empty())
-                if (auto d = effect_life_change(link, depth + 1)) return d;
-        return std::nullopt;
-    };
-    for (const char* f : {"ImpactEffect", "InitialEffect", "FinalEffect", "ExpireEffect"})
-        if (auto d = follow(f)) return d;
-    for (const char* f : {"EffectArray", "PeriodicEffectArray", "CaseArray"})
-        if (auto d = follow_array(f)) return d;
-    return std::nullopt;
+    return walk_effect_first<double>(
+        effect_id, depth,
+        [this](const std::string& id, const std::string& tag, int, bool& terminal) -> std::optional<double> {
+            if (tag != "CEffectModifyUnit") return std::nullopt;
+            terminal = true;
+            std::optional<double> change;
+            for (const core::XmlNode& n : resolved("CEffect", id)) {
+                if (n.name != "VitalArray" || n.attr_or("index", "") != "Life") continue;
+                for (const core::XmlNode& c : n.children)
+                    if (c.name == "Change")
+                        if (const std::string* v = c.attr("value"); v && !v->empty())
+                            change = std::strtod(v->c_str(), nullptr);
+            }
+            return change;
+        });
 }
 
 std::optional<double> Catalog::effect_energy_fraction(const std::string& effect_id, int depth) const {
-    if (depth > 32) return std::nullopt;
-    const Entry* e = find("CEffect", effect_id);
-    if (!e) return std::nullopt;
-    const std::string& tag = e->tag;
+    return walk_effect_first<double>(
+        effect_id, depth,
+        [this](const std::string& id, const std::string& tag, int, bool& terminal) -> std::optional<double> {
+            if (tag != "CEffectDamage") return std::nullopt;
+            terminal = true;
+            std::optional<double> frac;
+            for (const core::XmlNode& n : resolved("CEffect", id))
+                if (n.name == "VitalFractionCurrent" && n.attr_or("index", "") == "Energy")
+                    if (const std::string* v = n.attr("value"); v && !v->empty())
+                        frac = std::strtod(v->c_str(), nullptr);
+            return frac;
+        });
+}
 
-    if (tag == "CEffectDamage") {
-        std::optional<double> frac;
-        for (const core::XmlNode& n : resolved("CEffect", effect_id))
-            if (n.name == "VitalFractionCurrent" && n.attr_or("index", "") == "Energy")
-                if (const std::string* v = n.attr("value"); v && !v->empty())
-                    frac = std::strtod(v->c_str(), nullptr);
-        return frac;
-    }
-    auto follow = [&](const std::string& field) -> std::optional<double> {
-        if (auto link = scalar("CEffect", effect_id, field); link && !link->empty())
-            return effect_energy_fraction(*link, depth + 1);
-        return std::nullopt;
-    };
-    auto follow_array = [&](const std::string& field) -> std::optional<double> {
-        for (const std::string& link : array_links("CEffect", effect_id, field))
-            if (!link.empty())
-                if (auto d = effect_energy_fraction(link, depth + 1)) return d;
-        return std::nullopt;
-    };
-    for (const char* f : {"ImpactEffect", "InitialEffect", "FinalEffect", "ExpireEffect"})
-        if (auto d = follow(f)) return d;
-    for (const char* f : {"EffectArray", "PeriodicEffectArray", "CaseArray"})
-        if (auto d = follow_array(f)) return d;
-    return std::nullopt;
+std::optional<double> Catalog::effect_flat_energy_change(const std::string& effect_id) const {
+    return walk_effect_first<double>(
+        effect_id, 0,
+        [this](const std::string& id, const std::string& tag, int, bool& terminal) -> std::optional<double> {
+            if (tag != "CEffectModifyUnit") return std::nullopt;
+            terminal = true;
+            std::optional<double> change;
+            for (const core::XmlNode& n : resolved("CEffect", id)) {
+                if (n.name != "VitalArray" || n.attr_or("index", "") != "Energy") continue;
+                if (const std::string* v = n.attr("Change"); v && !v->empty())
+                    change = std::strtod(v->c_str(), nullptr);
+                for (const core::XmlNode& c : n.children)
+                    if (c.name == "Change")
+                        if (const std::string* v = c.attr("value"); v && !v->empty())
+                            change = std::strtod(v->c_str(), nullptr);
+            }
+            return change;
+        });
 }
 
 std::optional<Catalog::BehaviorBuff> Catalog::behavior_buff(const std::string& behavior_id) const {
@@ -316,106 +362,163 @@ std::optional<Catalog::BehaviorBuff> Catalog::behavior_buff(const std::string& b
             }
     }
     if (bb.move_speed_mult == 0.0) bb.root = true;
+    for (const core::XmlNode& n : resolved("CBehavior", behavior_id)) {
+        if (n.name != "Player") continue;
+        const std::string* v = n.attr("Value");
+        if (!v) v = n.attr("value");
+        if (v && *v == "Caster") { bb.control_transfer = true; any = true; }
+    }
     return any ? std::optional<BehaviorBuff>(bb) : std::nullopt;
+}
+
+std::optional<std::string> Catalog::effect_control_transfer_behavior(const std::string& effect_id) const {
+    return walk_effect_first<std::string>(
+        effect_id, 0,
+        [this](const std::string& id, const std::string& tag, int,
+               bool& terminal) -> std::optional<std::string> {
+            if (tag != "CEffectApplyBehavior") return std::nullopt;
+            if (auto beh = effect_apply_behavior(id))
+                if (auto bb = behavior_buff(*beh); bb && bb->control_transfer && bb->duration > 0.0) {
+                    terminal = true;
+                    return *beh;
+                }
+            return std::nullopt;
+        });
+}
+
+Catalog::DamageResponse Catalog::behavior_damage_response(const std::string& behavior_id) const {
+    DamageResponse r;
+    const Entry* e = find("CBehavior", behavior_id);
+    if (!e) return r;
+    auto field = [](const core::XmlNode& dr, const char* name) -> std::optional<double> {
+        if (const std::string* v = dr.attr(name); v && !v->empty())
+            return std::strtod(v->c_str(), nullptr);
+        for (const core::XmlNode& c : dr.children)
+            if (c.name == name)
+                if (const std::string* v = c.attr("value"); v && !v->empty())
+                    return std::strtod(v->c_str(), nullptr);
+        return std::nullopt;
+    };
+    for (const core::XmlNode& n : resolved("CBehavior", behavior_id)) {
+        if (n.name != "DamageResponse") continue;
+        r.present = true;
+        if (auto v = field(n, "ModifyFraction")) r.fraction = *v;
+        if (auto v = field(n, "ModifyLimit")) r.modify_limit = *v;
+        if (auto v = field(n, "ClampMaximum")) r.clamp_max = *v;
+        if (auto v = field(n, "ClampMinimum")) r.clamp_min = *v;
+        if (auto v = field(n, "Minimum")) r.minimum = *v;
+        if (auto v = field(n, "ModifyMinimumDamage")) r.minimum = *v;
+        if (auto v = field(n, "ModifyAmount")) r.modify_amount = *v;
+        for (const core::XmlNode& cost : n.children) {
+            if (cost.name != "Cost") continue;
+            for (const core::XmlNode& cd : cost.children) {
+                if (cd.name != "Cooldown") continue;
+                if (auto v = field(cd, "TimeUse")) r.cooldown = *v;
+            }
+        }
+        for (const core::XmlNode& k : n.children)
+            if (k.name == "Kind" && k.attr_or("index", "") == "Spell" && k.attr_or("value", "") == "0")
+                r.excludes_spell = true;
+    }
+    return r;
 }
 
 std::optional<std::string> Catalog::effect_apply_behavior(const std::string& effect_id,
                                                           int depth) const {
-    if (depth > 32) return std::nullopt;
-    const Entry* e = find("CEffect", effect_id);
-    if (!e) return std::nullopt;
-    if (e->tag == "CEffectApplyBehavior") {
-        for (const core::XmlNode& n : resolved("CEffect", effect_id))
-            if (n.name == "Behavior")
-                if (const std::string* v = n.attr("value"); v && !v->empty()) return *v;
-        if (auto b = scalar("CEffect", effect_id, "Behavior"); b && !b->empty()) return *b;
-        return std::nullopt;
-    }
-    auto follow = [&](const std::string& field) -> std::optional<std::string> {
-        if (auto link = scalar("CEffect", effect_id, field); link && !link->empty())
-            return effect_apply_behavior(*link, depth + 1);
-        return std::nullopt;
-    };
-    auto follow_array = [&](const std::string& field) -> std::optional<std::string> {
-        for (const std::string& link : array_links("CEffect", effect_id, field))
-            if (!link.empty())
-                if (auto d = effect_apply_behavior(link, depth + 1)) return d;
-        return std::nullopt;
-    };
-    for (const char* f : {"ImpactEffect", "InitialEffect", "FinalEffect", "ExpireEffect"})
-        if (auto d = follow(f)) return d;
-    for (const char* f : {"EffectArray", "PeriodicEffectArray", "CaseArray"})
-        if (auto d = follow_array(f)) return d;
-    for (const core::XmlNode& n : resolved("CEffect", effect_id))
-        if (n.name == "AreaArray")
-            if (const std::string* ef = n.attr("Effect"); ef && !ef->empty())
-                if (auto d = effect_apply_behavior(*ef, depth + 1)) return d;
-    return std::nullopt;
+    return walk_effect_first<std::string>(
+        effect_id, depth,
+        [this](const std::string& id, const std::string& tag, int,
+               bool& terminal) -> std::optional<std::string> {
+            if (tag != "CEffectApplyBehavior") return std::nullopt;
+            terminal = true;
+            for (const core::XmlNode& n : resolved("CEffect", id))
+                if (n.name == "Behavior")
+                    if (const std::string* v = n.attr("value"); v && !v->empty()) return *v;
+            if (auto b = scalar("CEffect", id, "Behavior"); b && !b->empty()) return *b;
+            if (find("CBehavior", id)) return id;
+            return std::nullopt;
+        },
+        [this](const std::string& id, int node_depth) -> std::optional<std::string> {
+            for (const core::XmlNode& n : resolved("CEffect", id))
+                if (n.name == "AreaArray")
+                    if (const std::string* ef = n.attr("Effect"); ef && !ef->empty())
+                        if (auto d = effect_apply_behavior(*ef, node_depth + 1)) return d;
+            return std::nullopt;
+        });
+}
+
+std::optional<std::string> Catalog::effect_movement_slow_behavior(const std::string& effect_id) const {
+    return walk_effect_first<std::string>(
+        effect_id, 0,
+        [this](const std::string& id, const std::string& tag, int,
+               bool& terminal) -> std::optional<std::string> {
+            if (tag != "CEffectSet") return std::nullopt;
+            std::vector<std::string> behs;
+            bool any = false;
+            for (const std::string& c : effect_set_children(id)) {
+                if (c.empty()) continue;
+                any = true;
+                if (effect_subclass(c) != "ApplyBehavior") return std::nullopt;
+                if (auto b = effect_apply_behavior(c)) behs.push_back(*b);
+            }
+            if (!any) return std::nullopt;
+            terminal = true;
+            for (const std::string& b : behs)
+                if (auto bb = behavior_buff(b); bb && bb->move_speed_mult < 1.0 && bb->move_speed_mult >= 0.0)
+                    return b;
+            return std::nullopt;
+        },
+        [this](const std::string& id, int) -> std::optional<std::string> {
+            for (const core::XmlNode& n : resolved("CEffect", id))
+                if (n.name == "AreaArray")
+                    if (const std::string* ef = n.attr("Effect"); ef && !ef->empty())
+                        if (auto d = effect_movement_slow_behavior(*ef)) return d;
+            return std::nullopt;
+        });
 }
 
 std::optional<Catalog::CreateUnitSpec> Catalog::effect_create_unit(const std::string& effect_id,
                                                                   int depth) const {
-    if (depth > 32) return std::nullopt;
-    const Entry* e = find("CEffect", effect_id);
-    if (!e) return std::nullopt;
-    if (e->tag == "CEffectCreateUnit") {
-        CreateUnitSpec s;
-        if (auto u = scalar("CEffect", effect_id, "SpawnUnit"); u && !u->empty()) s.unit = *u;
-        if (auto c = scalar("CEffect", effect_id, "SpawnCount"); c && !c->empty())
-            s.count = std::atoi(c->c_str());
-        if (auto f = scalar("CEffect", effect_id, "SpawnEffect"); f && !f->empty())
-            s.spawn_effect = *f;
-        if (s.unit.empty()) return std::nullopt;
-        return s;
-    }
-    auto follow = [&](const std::string& field) -> std::optional<CreateUnitSpec> {
-        if (auto link = scalar("CEffect", effect_id, field); link && !link->empty())
-            return effect_create_unit(*link, depth + 1);
-        return std::nullopt;
-    };
-    auto follow_array = [&](const std::string& field) -> std::optional<CreateUnitSpec> {
-        for (const std::string& link : array_links("CEffect", effect_id, field))
-            if (!link.empty())
-                if (auto d = effect_create_unit(link, depth + 1)) return d;
-        return std::nullopt;
-    };
-    for (const char* f : {"ImpactEffect", "InitialEffect", "FinalEffect", "ExpireEffect"})
-        if (auto d = follow(f)) return d;
-    for (const char* f : {"EffectArray", "PeriodicEffectArray", "CaseArray"})
-        if (auto d = follow_array(f)) return d;
-    return std::nullopt;
+    return walk_effect_first<CreateUnitSpec>(
+        effect_id, depth,
+        [this](const std::string& id, const std::string& tag, int,
+               bool& terminal) -> std::optional<CreateUnitSpec> {
+            if (tag != "CEffectCreateUnit") return std::nullopt;
+            terminal = true;
+            CreateUnitSpec s;
+            if (auto u = scalar("CEffect", id, "SpawnUnit"); u && !u->empty()) s.unit = *u;
+            if (auto c = scalar("CEffect", id, "SpawnCount"); c && !c->empty())
+                s.count = std::atoi(c->c_str());
+            if (auto f = scalar("CEffect", id, "SpawnEffect"); f && !f->empty()) s.spawn_effect = *f;
+            if (s.unit.empty()) return std::nullopt;
+            return s;
+        });
 }
 
 std::optional<std::pair<double, double>> Catalog::area_damage_radius(const std::string& effect_id,
                                                                      int depth) const {
-    if (depth > 32) return std::nullopt;
-    const Entry* e = find("CEffect", effect_id);
-    if (!e) return std::nullopt;
-    if (e->tag == "CEffectEnumArea") {
-        double radius = 0;
-        std::string dmg_eff;
-        for (const core::XmlNode& n : resolved("CEffect", effect_id))
-            if (n.name == "AreaArray") {
-                if (const std::string* r = n.attr("Radius")) radius = std::strtod(r->c_str(), nullptr);
-                if (const std::string* ef = n.attr("Effect"); ef && !ef->empty()) dmg_eff = *ef;
-            }
-        if (dmg_eff.empty()) return std::nullopt;
-        std::optional<double> amt = effect_damage_f(dmg_eff);
-        if (!amt)
-            if (auto beh = effect_apply_behavior(dmg_eff, depth + 1))
-                if (auto pe = scalar("CBehavior", *beh, "PeriodicEffect"); pe && !pe->empty())
-                    amt = effect_damage_f(*pe);
-        if (amt) return std::make_pair(*amt, radius);
-        return std::nullopt;
-    }
-    for (const char* f : {"ImpactEffect", "InitialEffect", "FinalEffect", "ExpireEffect"})
-        if (auto link = scalar("CEffect", effect_id, f); link && !link->empty())
-            if (auto d = area_damage_radius(*link, depth + 1)) return d;
-    for (const char* f : {"EffectArray", "PeriodicEffectArray", "CaseArray"})
-        for (const std::string& link : array_links("CEffect", effect_id, f))
-            if (!link.empty())
-                if (auto d = area_damage_radius(link, depth + 1)) return d;
-    return std::nullopt;
+    return walk_effect_first<std::pair<double, double>>(
+        effect_id, depth,
+        [this](const std::string& id, const std::string& tag, int node_depth,
+               bool& terminal) -> std::optional<std::pair<double, double>> {
+            if (tag != "CEffectEnumArea") return std::nullopt;
+            terminal = true;
+            double radius = 0;
+            std::string dmg_eff;
+            for (const core::XmlNode& n : resolved("CEffect", id))
+                if (n.name == "AreaArray") {
+                    if (const std::string* r = n.attr("Radius")) radius = std::strtod(r->c_str(), nullptr);
+                    if (const std::string* ef = n.attr("Effect"); ef && !ef->empty()) dmg_eff = *ef;
+                }
+            if (dmg_eff.empty()) return std::nullopt;
+            std::optional<double> amt = effect_damage_f(dmg_eff);
+            if (!amt)
+                if (auto beh = effect_apply_behavior(dmg_eff, node_depth + 1))
+                    if (auto pe = scalar("CBehavior", *beh, "PeriodicEffect"); pe && !pe->empty())
+                        amt = effect_damage_f(*pe);
+            if (amt) return std::make_pair(*amt, radius);
+            return std::nullopt;
+        });
 }
 
 std::optional<Catalog::PersistentSpec> Catalog::effect_persistent(const std::string& effect_id,
@@ -438,6 +541,21 @@ std::optional<Catalog::PersistentSpec> Catalog::effect_persistent(const std::str
                     s.radius = ar->second;
                     break;
                 }
+        std::vector<double> offs;
+        for (const std::string& off : array_links("CEffect", effect_id, "PeriodicOffsetArray")) {
+            if (off.empty()) continue;
+            char* end = nullptr;
+            const double x = std::strtod(off.c_str(), &end);
+            double y = 0.0;
+            if (end && *end == ',') y = std::strtod(end + 1, nullptr);
+            offs.push_back(x != 0.0 ? x : y);
+        }
+        if (offs.size() >= 2) {
+            s.line_count = static_cast<int>(offs.size());
+            s.line_first = *std::min_element(offs.begin(), offs.end());
+            s.line_last = *std::max_element(offs.begin(), offs.end());
+            s.line_step = (s.line_last - s.line_first) / (s.line_count - 1);
+        }
         if (s.amount == 0 && s.radius == 0) return std::nullopt;
         return s;
     }
@@ -451,49 +569,81 @@ std::optional<Catalog::PersistentSpec> Catalog::effect_persistent(const std::str
     return std::nullopt;
 }
 
-std::optional<std::string> Catalog::damage_effect_id(const std::string& effect_id,
-                                                     int depth) const {
-    if (depth > 32) return std::nullopt;
-    const Entry* e = find("CEffect", effect_id);
-    if (!e) return std::nullopt;
-    const std::string& tag = e->tag;
-    if (tag == "CEffectDamage") return effect_id;
+std::optional<std::string> Catalog::damage_effect_id(const std::string& effect_id, int depth) const {
+    return walk_damage_tree<std::string>(
+        effect_id, depth,
+        [](const std::string& id) -> std::optional<std::string> { return id; },
+        [](std::string sub, const std::string&) -> std::string { return sub; });
+}
 
-    auto follow = [&](const std::string& field) -> std::optional<std::string> {
-        if (auto link = scalar("CEffect", effect_id, field); link && !link->empty())
-            return damage_effect_id(*link, depth + 1);
-        return std::nullopt;
-    };
-    auto follow_array = [&](const std::string& field) -> std::optional<std::string> {
-        for (const std::string& link : array_links("CEffect", effect_id, field))
-            if (!link.empty())
-                if (auto d = damage_effect_id(link, depth + 1)) return d;
-        return std::nullopt;
-    };
-    if (tag == "CEffectLaunchMissile") {
-        if (auto d = follow("ImpactEffect")) return d;
-    } else if (tag == "CEffectCreatePersistent") {
-        if (auto d = follow_array("PeriodicEffectArray")) return d;
-        if (auto d = follow("InitialEffect")) return d;
-    } else if (tag == "CEffectSet") {
-        if (auto d = follow_array("EffectArray")) return d;
-    } else if (tag == "CEffectSwitch") {
-        for (const std::string& ce : switch_effects(effect_id))
-            if (auto d = damage_effect_id(ce, depth + 1)) return d;
+std::optional<double> Catalog::weapon_radius_split_no_splash(const std::string& weapon_id) const {
+    const std::string eff = weapon_effect_id(weapon_id);
+    const Entry* e = find("CEffect", eff);
+    if (!e || e->tag != "CEffectSwitch") return std::nullopt;
+    std::string large_eff, small_eff;
+    double threshold = 0.0;
+    for (const XmlNode& n : resolved("CEffect", eff)) {
+        if (n.name != "CaseArray") continue;
+        const std::string val = n.attr_or("Validator", "");
+        const std::string ce = n.attr_or("Effect", "");
+        if (val.empty() || ce.empty()) continue;
+        const Entry* ve = find("CValidator", val);
+        if (!ve || ve->tag != "CValidatorUnitCompareField") continue;
+        const auto field = scalar("CValidator", val, "Field");
+        const auto cmp = scalar("CValidator", val, "Compare");
+        const auto value = scalar_num("CValidator", val, "Value");
+        if (!field || *field != "Radius" || !cmp) continue;
+        if (*cmp == "GE" && value) { large_eff = ce; threshold = *value; }
+        else if (*cmp == "LT") { small_eff = ce; }
     }
-    for (const char* f : {"ImpactEffect", "InitialEffect", "FinalEffect"})
-        if (auto d = follow(f)) return d;
-    for (const char* f : {"EffectArray", "PeriodicEffectArray", "CaseArray"})
-        if (auto d = follow_array(f)) return d;
-    return std::nullopt;
+    if (large_eff.empty() || threshold <= 0.0) return std::nullopt;
+    auto rings = [&](const std::string& id) {
+        int r = 0;
+        for (const XmlNode& n : resolved("CEffect", id))
+            if (n.name == "AreaArray") ++r;
+        return r;
+    };
+    const int large_r = rings(large_eff);
+    const int small_r = small_eff.empty() ? 1 : rings(small_eff);
+    return large_r < small_r ? std::optional<double>(threshold) : std::nullopt;
 }
 
 std::optional<int> Catalog::weapon_damage(const std::string& weapon_id) const {
     const Entry* w = find("CWeapon", weapon_id);
     if (!w) return std::nullopt;
-    std::string effect = scalar("CWeapon", weapon_id, "Effect").value_or("");
-    if (effect.empty()) effect = weapon_id;
-    return effect_damage(effect, 0);
+    const std::string eff = weapon_effect_id(weapon_id);
+    const std::string disp = scalar("CWeapon", weapon_id, "DisplayEffect").value_or("");
+    if (!disp.empty())
+        if (auto d = effect_damage(eff, 0, disp)) return d;
+    if (auto d = effect_damage(eff, 0)) return d;
+    if (!disp.empty())
+        return effect_damage(disp, 0);
+    return std::nullopt;
+}
+
+std::optional<int> Catalog::effect_hit_count(const std::string& effect_id, int depth,
+                                             const std::string& prefer) const {
+    return walk_damage_tree<int>(
+        effect_id, depth,
+        [](const std::string&) -> std::optional<int> { return 1; },
+        [this](int sub, const std::string& id) -> int {
+            const int pc = int(scalar_num("CEffect", id, "PeriodCount").value_or(1));
+            return sub * (pc > 0 ? pc : 1);
+        },
+        prefer);
+}
+
+std::optional<int> Catalog::weapon_hit_count(const std::string& weapon_id) const {
+    const Entry* w = find("CWeapon", weapon_id);
+    if (!w) return std::nullopt;
+    const std::string eff = weapon_effect_id(weapon_id);
+    const std::string disp = scalar("CWeapon", weapon_id, "DisplayEffect").value_or("");
+    if (!disp.empty())
+        if (auto c = effect_hit_count(eff, 0, disp)) return c;
+    if (auto c = effect_hit_count(eff, 0)) return c;
+    if (!disp.empty())
+        return effect_hit_count(disp, 0);
+    return std::nullopt;
 }
 
 std::vector<std::pair<double, double>>
@@ -501,9 +651,7 @@ Catalog::weapon_splash(const std::string& weapon_id) const {
     std::vector<std::pair<double, double>> rings;
     const Entry* w = find("CWeapon", weapon_id);
     if (!w) return rings;
-    std::string effect = scalar("CWeapon", weapon_id, "Effect").value_or("");
-    if (effect.empty()) effect = weapon_id;
-    auto did = damage_effect_id(effect, 0);
+    auto did = damage_effect_id(weapon_effect_id(weapon_id), 0);
     if (!did) return rings;
     for (const core::XmlNode& n : resolved("CEffect", *did)) {
         if (n.name != "AreaArray") continue;
@@ -516,6 +664,158 @@ Catalog::weapon_splash(const std::string& weapon_id) const {
         rings.emplace_back(radius, frac);
     }
     return rings;
+}
+
+std::vector<Catalog::ArcSplash>
+Catalog::weapon_arc_splash(const std::string& weapon_id) const {
+    std::vector<ArcSplash> arcs;
+    const Entry* w = find("CWeapon", weapon_id);
+    if (!w) return arcs;
+    auto did = damage_effect_id(weapon_effect_id(weapon_id), 0);
+    if (!did) return arcs;
+    for (const core::XmlNode& n : resolved("CEffect", *did)) {
+        if (n.name != "AreaArray") continue;
+        const std::string* a = n.attr("Arc");
+        const std::string* r = n.attr("Radius");
+        if (!a || !r) continue;
+        ArcSplash e;
+        e.frac = 1.0;
+        try { e.arc_deg = std::stod(*a); e.radius = std::stod(*r); } catch (...) { continue; }
+        if (const std::string* f = n.attr("Fraction")) { try { e.frac = std::stod(*f); } catch (...) {} }
+        arcs.push_back(e);
+    }
+    return arcs;
+}
+
+std::optional<double> Catalog::missile_speed(const std::string& weapon_id) const {
+    const std::string eff = weapon_effect_id(weapon_id);
+    if (eff.empty()) return std::nullopt;
+    const Entry* ee = find("CEffect", eff);
+    if (!ee || ee->tag != "CEffectLaunchMissile") return std::nullopt;
+    std::string mover;
+    if (auto mv = scalar("CEffect", eff, "Movers"); mv && !mv->empty())
+        mover = *mv;
+    else if (auto au = scalar("CEffect", eff, "AmmoUnit"); au && !au->empty()) {
+        if (auto m = scalar("CUnit", *au, "Mover"); m && !m->empty()) mover = *m;
+    }
+    if (mover.empty()) return std::nullopt;
+    for (const core::XmlNode& n : resolved("CMover", mover)) {
+        if (n.name != "MotionPhases") continue;
+        for (const char* fld : {"MaxSpeed", "Speed"})
+            for (const core::XmlNode& c : n.children)
+                if (c.name == fld)
+                    if (const std::string* v = c.attr("value"); v && !v->empty()) {
+                        try { return std::stod(*v); } catch (...) { return std::nullopt; }
+                    }
+    }
+    return std::nullopt;
+}
+
+std::string Catalog::ability_command_requirement(const std::string& abil_id,
+                                                 const std::string& cmd_index) const {
+    std::string req;
+    for (const core::XmlNode& n : resolved("CAbil", abil_id)) {
+        if (n.name != "CmdButtonArray") continue;
+        if (n.attr_or("index", "") != cmd_index) continue;
+        const std::string r = n.attr_or("Requirements", "");
+        if (!r.empty()) req = r;
+    }
+    return req;
+}
+
+std::vector<std::pair<std::string, std::string>>
+Catalog::unit_ability_commands(const std::string& unit_id) const {
+    std::vector<std::pair<std::string, std::string>> out;
+    for (const core::XmlNode& n : resolved("CUnit", unit_id)) {
+        if (n.name != "CardLayouts") continue;
+        for (const core::XmlNode& b : n.children) {
+            if (b.name != "LayoutButtons") continue;
+            if (b.attr_or("Type", "") != "AbilCmd") continue;
+            const std::string ac = b.attr_or("AbilCmd", "");
+            if (ac.empty()) continue;
+            const std::size_t comma = ac.find(',');
+            std::string abil = comma == std::string::npos ? ac : ac.substr(0, comma);
+            std::string cmd = comma == std::string::npos ? std::string() : ac.substr(comma + 1);
+            if (abil.empty()) continue;
+            bool dup = false;
+            for (const auto& p : out)
+                if (p.first == abil && p.second == cmd) { dup = true; break; }
+            if (!dup) out.emplace_back(std::move(abil), std::move(cmd));
+        }
+    }
+    return out;
+}
+
+std::optional<std::string> Catalog::button_icon(const std::string& button_id) const {
+    std::optional<std::string> icon;
+    for (const core::XmlNode& n : resolved("CButton", button_id))
+        if (n.name == "Icon") {
+            const std::string v = n.attr_or("value", "");
+            if (!v.empty()) icon = v;
+        }
+    return icon;
+}
+
+std::vector<Catalog::AbilityCardButton>
+Catalog::unit_ability_card_buttons(const std::string& unit_id) const {
+    auto parse_int = [](const std::string& s) -> int {
+        if (s.empty()) return -1;
+        char* end = nullptr;
+        long v = std::strtol(s.c_str(), &end, 10);
+        return (end != s.c_str() && *end == '\0') ? static_cast<int>(v) : -1;
+    };
+    std::vector<AbilityCardButton> out;
+    for (const core::XmlNode& n : resolved("CUnit", unit_id)) {
+        if (n.name != "CardLayouts") continue;
+        for (const core::XmlNode& b : n.children) {
+            if (b.name != "LayoutButtons") continue;
+            if (b.attr_or("Type", "") != "AbilCmd") continue;
+            const std::string ac = b.attr_or("AbilCmd", "");
+            if (ac.empty()) continue;
+            const std::size_t comma = ac.find(',');
+            std::string abil = comma == std::string::npos ? ac : ac.substr(0, comma);
+            std::string cmd = comma == std::string::npos ? std::string() : ac.substr(comma + 1);
+            if (abil.empty()) continue;
+            const std::string face = b.attr_or("Face", "");
+            const int row = parse_int(b.attr_or("Row", ""));
+            const int col = parse_int(b.attr_or("Column", ""));
+            AbilityCardButton* found = nullptr;
+            for (AbilityCardButton& e : out)
+                if (e.ability == abil && e.command == cmd) { found = &e; break; }
+            if (found) {
+                if (!face.empty()) found->face = face;
+                if (row >= 0) found->row = row;
+                if (col >= 0) found->col = col;
+            } else {
+                AbilityCardButton e;
+                e.ability = std::move(abil);
+                e.command = std::move(cmd);
+                e.face = face;
+                e.row = row;
+                e.col = col;
+                out.push_back(std::move(e));
+            }
+        }
+    }
+    return out;
+}
+
+std::map<std::string, int>
+Catalog::weapon_attribute_bonus(const std::string& weapon_id) const {
+    std::map<std::string, int> out;
+    auto did = weapon_damage_effect_id(weapon_id);
+    if (!did) return out;
+    for (const core::XmlNode& n : resolved("CEffect", *did)) {
+        if (n.name != "AttributeBonus") continue;
+        const std::string* idx = n.attr("index");
+        const std::string* val = n.attr("value");
+        if (!idx || !val) continue;
+        try {
+            out[*idx] = std::stoi(*val);
+        } catch (...) {
+        }
+    }
+    return out;
 }
 
 Catalog::UnitStats Catalog::unit_stats(const std::string& unit_id) const {
@@ -559,7 +859,8 @@ void Catalog::load_files(const casc::Storage& store,
 void Catalog::load_melee(const casc::Storage& store) {
     load_files(store, {"UnitData.xml", "WeaponData.xml", "EffectData.xml", "AbilData.xml",
                        "BehaviorData.xml", "UpgradeData.xml", "ValidatorData.xml", "MoverData.xml",
-                       "FootprintData.xml", "ButtonData.xml", "RequirementData.xml", "ActorData.xml",
+                       "FootprintData.xml", "ButtonData.xml", "RequirementData.xml",
+                       "RequirementNodeData.xml", "ActorData.xml",
                        "ModelData.xml", "SoundData.xml"});
 }
 
@@ -617,6 +918,67 @@ std::optional<Catalog::MorphSpec> Catalog::morph_spec(const std::string& abil_id
     spec.target = spec.chain.back();
     spec.finish_effect = finish_effect;
     return spec;
+}
+
+std::optional<Catalog::MergeSpec> Catalog::merge_spec(const std::string& abil_id) const {
+    const Entry* e = find("CAbil", abil_id);
+    if (!e || e->tag != "CAbilMerge") return std::nullopt;
+    MergeSpec spec;
+    for (const XmlNode& info : resolved("CAbil", abil_id)) {
+        if (info.name != "Info") continue;
+        if (const std::string* u = info.attr("Unit"); u && !u->empty()) spec.target = *u;
+        if (const std::string* t = info.attr("Time")) spec.time = std::atof(t->c_str());
+        for (const XmlNode& c : info.children) {
+            if (c.name == "Unit") {
+                if (const std::string* v = c.attr("value"); v && !v->empty()) spec.target = *v;
+                else if (!c.text.empty()) spec.target = c.text;
+            } else if (c.name == "Time") {
+                if (const std::string* v = c.attr("value")) spec.time = std::atof(v->c_str());
+                else if (!c.text.empty()) spec.time = std::atof(c.text.c_str());
+            }
+        }
+    }
+    if (spec.target.empty()) return std::nullopt;
+    return spec;
+}
+
+std::optional<Catalog::BuildSpec> Catalog::build_spec(const std::string& abil_id) const {
+    const Entry* e = find("CAbil", abil_id);
+    if (!e || e->tag != "CAbilBuild") return std::nullopt;
+    for (const XmlNode& info : resolved("CAbil", abil_id)) {
+        if (info.name != "InfoArray") continue;
+        const std::string built = info.attr_or("Unit", "");
+        if (built.empty()) continue;
+        double energy = 0;
+        for (const XmlNode& g : info.children)
+            if (g.name == "Vital" && g.attr_or("index", "") == "Energy") {
+                const std::string v = g.attr_or("value", "");
+                if (!v.empty()) energy = std::atof(v.c_str());
+            }
+        if (energy <= 0) continue;
+        BuildSpec spec;
+        spec.unit = built;
+        spec.energy = energy;
+        return spec;
+    }
+    return std::nullopt;
+}
+
+int Catalog::footprint_place_cells(const std::string& footprint_id) const {
+    int count = 0;
+    auto count_row = [&](const std::string& s) {
+        for (char c : s)
+            if (c != '.' && c != ' ' && c != '\t' && c != '\r' && c != '\n') ++count;
+    };
+    for (const XmlNode& layer : resolved("CFootprint", footprint_id)) {
+        if (layer.name != "Layers" || layer.attr_or("index", "") != "Place") continue;
+        for (const XmlNode& row : layer.children) {
+            if (row.name != "Rows") continue;
+            if (const std::string* v = row.attr("value")) count_row(*v);
+            else count_row(row.text);
+        }
+    }
+    return count;
 }
 
 std::optional<Catalog::SpawnBehavior> Catalog::spawn_behavior(const std::string& behavior_id) const {

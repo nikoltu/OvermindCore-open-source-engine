@@ -65,6 +65,15 @@ private:
 inline bool set_burrowed(World& world, std::uint32_t id, bool burrow) {
     if (id >= world.units().size()) return false;
     Unit& u = world.unit(id);
+    if (burrow && u.has_burrowed_wpn && !u.burrowed_wpn_on) {
+        u.swap_burrow_weapon();
+        u.can_burrow_attack = true;
+        u.burrowed_wpn_on = true;
+    } else if (!burrow && u.burrowed_wpn_on) {
+        u.swap_burrow_weapon();
+        u.can_burrow_attack = false;
+        u.burrowed_wpn_on = false;
+    }
     u.burrowed = burrow;
     u.cloaked = burrow;
     if (burrow) u.orders.clear();

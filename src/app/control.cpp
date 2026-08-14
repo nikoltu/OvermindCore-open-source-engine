@@ -153,6 +153,26 @@ uint32_t Control::pick_target(const sim::World& world, const ScreenPoint& p) con
     return best;
 }
 
+uint32_t Control::pick_own(const sim::World& world, const ScreenPoint& p) const {
+    Fixed gx, gy;
+    if (!ground_point(world, p, gx, gy)) return kNoTarget;
+
+    uint32_t best = kNoTarget;
+    Fixed best_d2;
+    for (const sim::Unit& u : world.units()) {
+        if (!u.alive || u.player != player_ || u.resource_left > 0) continue;
+        Fixed r = std::max(u.radius, pick_radius_);
+        Fixed dx = u.x - gx, dy = u.y - gy;
+        Fixed d2 = dx * dx + dy * dy;
+        if (d2 > r * r) continue;
+        if (best == kNoTarget || d2 < best_d2) {
+            best = u.id;
+            best_d2 = d2;
+        }
+    }
+    return best;
+}
+
 uint32_t Control::pick_resource(const sim::World& world, const ScreenPoint& p) const {
     Fixed gx, gy;
     if (!ground_point(world, p, gx, gy)) return kNoTarget;

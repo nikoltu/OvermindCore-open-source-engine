@@ -37,18 +37,23 @@ void VisionGrid::compute(const World& world, int32_t player, Fixed sight_radius,
     if (sight_radius.raw() <= 0) return;
 
     const Fixed half = Fixed::from_raw(cell_.raw() / 2);
-    const int64_t r_raw = sight_radius.raw();
-    const int64_t r2 = r_raw * r_raw;
 
     for (const Unit& u : world.units()) {
         if (!u.alive || u.player != player) continue;
 
-        const std::uint8_t viewer_level = terrain ? terrain->level_at(u.x, u.y) : 0;
+        const Fixed sr = u.sight.raw() > 0 ? u.sight : sight_radius;
+        const int64_t r2 = int64_t(sr.raw()) * int64_t(sr.raw());
 
-        int ix0 = ((u.x - sight_radius - bounds_.min_x) / cell_).floor();
-        int ix1 = ((u.x + sight_radius - bounds_.min_x) / cell_).floor();
-        int iy0 = ((u.y - sight_radius - bounds_.min_y) / cell_).floor();
-        int iy1 = ((u.y + sight_radius - bounds_.min_y) / cell_).floor();
+        constexpr Fixed kOverCliffVisionHeight = Fixed::from_int(15);
+        const bool sees_over_cliffs =
+            u.flying || u.vision_height.raw() >= kOverCliffVisionHeight.raw();
+        const std::uint8_t viewer_level =
+            sees_over_cliffs ? std::uint8_t(0xFF) : (terrain ? terrain->level_at(u.x, u.y) : 0);
+
+        int ix0 = ((u.x - sr - bounds_.min_x) / cell_).floor();
+        int ix1 = ((u.x + sr - bounds_.min_x) / cell_).floor();
+        int iy0 = ((u.y - sr - bounds_.min_y) / cell_).floor();
+        int iy1 = ((u.y + sr - bounds_.min_y) / cell_).floor();
         if (ix0 < 0) ix0 = 0;
         if (iy0 < 0) iy0 = 0;
         if (ix1 >= w_) ix1 = w_ - 1;

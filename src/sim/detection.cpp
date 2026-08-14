@@ -33,16 +33,17 @@ void DetectionGrid::compute(const World& world, int32_t player, Fixed detect_rad
     if (detect_radius.raw() <= 0) return;
 
     const Fixed half = Fixed::from_raw(cell_.raw() / 2);
-    const int64_t r_raw = detect_radius.raw();
-    const int64_t r2 = r_raw * r_raw;
 
     for (const Unit& u : world.units()) {
         if (!u.alive || u.player != player || !u.detector) continue;
 
-        int ix0 = ((u.x - detect_radius - bounds_.min_x) / cell_).floor();
-        int ix1 = ((u.x + detect_radius - bounds_.min_x) / cell_).floor();
-        int iy0 = ((u.y - detect_radius - bounds_.min_y) / cell_).floor();
-        int iy1 = ((u.y + detect_radius - bounds_.min_y) / cell_).floor();
+        const Fixed dr = u.detect_range.raw() > 0 ? u.detect_range : detect_radius;
+        const int64_t r2 = int64_t(dr.raw()) * int64_t(dr.raw());
+
+        int ix0 = ((u.x - dr - bounds_.min_x) / cell_).floor();
+        int ix1 = ((u.x + dr - bounds_.min_x) / cell_).floor();
+        int iy0 = ((u.y - dr - bounds_.min_y) / cell_).floor();
+        int iy1 = ((u.y + dr - bounds_.min_y) / cell_).floor();
         if (ix0 < 0) ix0 = 0;
         if (iy0 < 0) iy0 = 0;
         if (ix1 >= w_) ix1 = w_ - 1;

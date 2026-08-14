@@ -29,6 +29,11 @@ struct LoadedMap {
     TerrainQuantize quantize;
     std::string tileset;
     std::vector<std::string> tileset_textures;
+    TextureInfo texture_info;
+    TextureMask texture_mask;
+    bool has_splat = false;
+    CliffMap cliff;
+    bool has_cliff_levels = false;
 };
 
 inline LoadedMap load_map_terrain(std::vector<std::uint8_t> sc2map_bytes) {
@@ -56,8 +61,40 @@ inline LoadedMap load_map_terrain(std::vector<std::uint8_t> sc2map_bytes) {
     out.height = out.terrain.height;
     out.blocked_cells = terrain_grid_to_nav(out.terrain, out.nav);
 
+    if (arc.contains("t3SyncCliffLevel")) {
+        try {
+            out.cliff = CliffMap::parse(arc.read_file("t3SyncCliffLevel"));
+            if (!out.cliff.empty()) {
+                const int nw = out.nav.width(), nh = out.nav.height();
+                const int cw = int(out.cliff.width), ch = int(out.cliff.height);
+                const int mw = cw < nw ? cw : nw, mh = ch < nh ? ch : nh;
+                for (int y = 0; y < mh; ++y)
+                    for (int x = 0; x < mw; ++x)
+                        out.nav.set_level(x, y, out.cliff.levels[std::size_t(y) * cw + x]);
+                out.nav.mark_ramps_from_levels();
+                out.has_cliff_levels = out.nav.has_levels();
+            }
+        } catch (const std::exception&) {
+            out.cliff = CliffMap{};
+            out.has_cliff_levels = false;
+        }
+    }
+
     if (arc.contains("Objects")) out.objects = parse_placed_objects(arc.read_file("Objects"));
     if (arc.contains("MapInfo")) out.info = parse_map_info(arc.read_file("MapInfo"));
+
+    if (arc.contains("t3SyncTextureInfo") && arc.contains("t3TextureMasks")) {
+        try {
+            out.texture_info = TextureInfo::parse(arc.read_file("t3SyncTextureInfo"));
+            out.texture_mask = TextureMask::parse(arc.read_file("t3TextureMasks"));
+            out.has_splat = out.texture_mask.mask_w == out.texture_info.width * 8 &&
+                            out.texture_mask.mask_h == out.texture_info.height * 8;
+        } catch (const std::exception&) {
+            out.texture_info = TextureInfo{};
+            out.texture_mask = TextureMask{};
+            out.has_splat = false;
+        }
+    }
     return out;
 }
 

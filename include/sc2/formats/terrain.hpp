@@ -37,4 +37,30 @@ Model build_terrain_mesh(const HeightMap& hm, const std::vector<uint8_t>& data,
                          float cell = 1.0f, float quantize_scale = 1.0f / 512.0f,
                          float quantize_bias = 0.0f, uint32_t max_dim = 128);
 
+struct TextureInfo {
+    uint32_t version = 0;
+    uint32_t width = 0, height = 0;
+    uint32_t field3 = 0;
+    std::vector<std::string> layer_names;
+    std::vector<uint8_t> slots;
+    bool empty() const { return width == 0 || height == 0; }
+    static TextureInfo parse(const std::vector<uint8_t>& data);
+};
+
+struct CliffMap {
+    uint32_t version = 0;
+    uint32_t width = 0, height = 0;
+    std::vector<uint8_t> levels;
+    bool empty() const { return width == 0 || height == 0 || levels.empty(); }
+    static CliffMap parse(const std::vector<uint8_t>& data);
+};
+
+struct TextureMask {
+    uint32_t version = 0;
+    uint32_t mask_w = 0, mask_h = 0;
+    std::vector<uint8_t> texels;
+    bool empty() const { return mask_w == 0 || mask_h == 0; }
+    static TextureMask parse(const std::vector<uint8_t>& data);
+};
+
 }

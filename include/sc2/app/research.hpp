@@ -3,6 +3,7 @@
 #include <cstdint>
 #include <string>
 #include <unordered_map>
+#include <utility>
 #include <vector>
 
 #include "sc2/sim/fixed.hpp"
@@ -24,16 +25,21 @@ public:
         if (!has(player, id)) done_[player].push_back(id);
     }
 
-    void advance(Fixed dt) {
+    std::vector<std::pair<int, std::string>> advance(Fixed dt) {
+        std::vector<std::pair<int, std::string>> completed;
         for (std::size_t i = 0; i < pending_.size();) {
             pending_[i].timer = pending_[i].timer - dt;
             if (pending_[i].timer.raw() <= 0) {
-                grant(pending_[i].player, pending_[i].id);
+                if (!has(pending_[i].player, pending_[i].id)) {
+                    completed.emplace_back(pending_[i].player, pending_[i].id);
+                    grant(pending_[i].player, pending_[i].id);
+                }
                 pending_.erase(pending_.begin() + i);
             } else {
                 ++i;
             }
         }
+        return completed;
     }
 
     const std::vector<std::string>& researched(int player) const {
@@ -50,6 +56,12 @@ public:
     }
 
     int in_progress() const { return int(pending_.size()); }
+
+    bool pending(int player, const std::string& id) const {
+        for (const Pending& p : pending_)
+            if (p.player == player && p.id == id) return true;
+        return false;
+    }
 
 private:
     struct Pending {

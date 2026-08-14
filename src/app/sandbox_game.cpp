@@ -89,6 +89,12 @@ Unit make_structure(data::Catalog& cat, const char* token) {
 
 }
 
+RaceOpening race_opening(Race r) {
+    const RaceDef& d = race_def(r);
+    const char* rn = (r == Race::Protoss) ? "Protoss" : (r == Race::Zerg) ? "Zerg" : "Terran";
+    return RaceOpening{d.town_hall, d.worker, d.army, rn};
+}
+
 SandboxGame::SandboxGame(data::Catalog& cat, MeleeModels& models, casc::Storage& store,
                          const TestMap& map)
     : cat_(cat), models_(models), store_(store), map_(map) {

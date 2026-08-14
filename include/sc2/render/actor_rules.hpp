@@ -12,7 +12,7 @@ struct CActorUnit;
 namespace sc2::render {
 
 struct ActorRules {
-    std::vector<std::string> by_state[6];
+    std::vector<std::string> by_state[7];
     bool valid = false;
 
     const std::vector<std::string>& tokens(AnimState s) const { return by_state[int(s)]; }

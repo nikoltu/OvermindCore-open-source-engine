@@ -34,16 +34,31 @@ double UpgradeEffect::delta() const {
             return numeric_value();
         case Op::Subtract:
             return -numeric_value();
+        case Op::Multiply:
+            return 0.0;
         case Op::Set:
             return 0.0;
     }
     return 0.0;
 }
 
+double UpgradeEffect::apply(double cur) const {
+    if (op == Op::Set)  return is_numeric() ? numeric_value() : cur;
+    if (!is_numeric())  return cur;
+    switch (op) {
+        case Op::Add:      return cur + numeric_value();
+        case Op::Subtract: return cur - numeric_value();
+        case Op::Multiply: return cur * numeric_value();
+        case Op::Set:      return numeric_value();
+    }
+    return cur;
+}
+
 static UpgradeEffect::Op parse_op(const std::string* s) {
     if (!s) return UpgradeEffect::Op::Add;
     if (*s == "Set") return UpgradeEffect::Op::Set;
     if (*s == "Subtract") return UpgradeEffect::Op::Subtract;
+    if (*s == "Multiply") return UpgradeEffect::Op::Multiply;
     return UpgradeEffect::Op::Add;
 }
 

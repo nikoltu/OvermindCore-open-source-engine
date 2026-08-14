@@ -38,7 +38,7 @@ public:
             case Speed::Slow: return 0.75;
             case Speed::Normal: return 1.0;
             case Speed::Fast: return 1.21;
-            case Speed::Faster: return 1.38;
+            case Speed::Faster: return 1.4;
         }
         return 1.0;
     }

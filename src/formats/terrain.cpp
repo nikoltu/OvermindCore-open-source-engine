@@ -150,4 +150,88 @@ Model build_terrain_mesh(const HeightMap& hm, const std::vector<uint8_t>& data,
     return m;
 }
 
+TextureInfo TextureInfo::parse(const std::vector<uint8_t>& d) {
+    if (d.size() < 20 || d[0] != 'R' || d[1] != 'T' || d[2] != 'X' || d[3] != 'T')
+        throw std::runtime_error("terrain: not an RTXT t3SyncTextureInfo");
+
+    ByteReader r(d);
+    r.seek(4);
+    TextureInfo ti;
+    ti.version = r.u32le();
+    ti.width = r.u32le();
+    ti.height = r.u32le();
+    ti.field3 = r.u32le();
+
+    if (ti.width == 0 || ti.height == 0 || ti.width > 65536 || ti.height > 65536)
+        throw std::runtime_error("terrain: RTXT dims out of range");
+
+    const size_t blob = size_t(ti.width) * ti.height * 8;
+    if (d.size() < 20 + blob)
+        throw std::runtime_error("terrain: RTXT slot blob does not fit");
+    const size_t blob_start = d.size() - blob;
+
+    size_t off = 20;
+    while (off < blob_start) {
+        if (d[off] == 0) {
+            ++off;
+            continue;
+        }
+        size_t end = off;
+        while (end < d.size() && d[end] != 0) ++end;
+        if (end >= d.size() || end > blob_start) break;
+        ti.layer_names.emplace_back(reinterpret_cast<const char*>(&d[off]), end - off);
+        off = end + 1;
+    }
+    ti.slots.assign(d.begin() + blob_start, d.begin() + blob_start + blob);
+    return ti;
+}
+
+TextureMask TextureMask::parse(const std::vector<uint8_t>& d) {
+    if (d.size() < 20 || d[0] != 'M' || d[1] != 'A' || d[2] != 'S' || d[3] != 'K')
+        throw std::runtime_error("terrain: not a MASK t3TextureMasks");
+
+    ByteReader r(d);
+    r.seek(4);
+    TextureMask tm;
+    tm.version = r.u32le();
+    r.u32le();
+    tm.mask_w = r.u32le();
+    tm.mask_h = r.u32le();
+
+    if (tm.mask_w == 0 || tm.mask_h == 0 || tm.mask_w > 524288 || tm.mask_h > 524288)
+        throw std::runtime_error("terrain: MASK dims out of range");
+
+    const size_t field = size_t(tm.mask_w) * tm.mask_h * 4;
+    if (d.size() < field)
+        throw std::runtime_error("terrain: MASK texel field does not fit");
+    const size_t header = d.size() - field;
+    if (header < 20)
+        throw std::runtime_error("terrain: MASK field overruns its header");
+    tm.texels.assign(d.begin() + header, d.end());
+    return tm;
+}
+
+CliffMap CliffMap::parse(const std::vector<uint8_t>& d) {
+    if (d.size() < 32 || d[0] != 'C' || d[1] != 'L' || d[2] != 'I' || d[3] != 'F')
+        throw std::runtime_error("terrain: not a CLIF t3SyncCliffLevel");
+    ByteReader r(d);
+    r.seek(4);
+    CliffMap cm;
+    cm.version = r.u32le();
+    cm.width = r.u32le();
+    cm.height = r.u32le();
+    if (cm.width == 0 || cm.height == 0 || cm.width > 65536 || cm.height > 65536)
+        throw std::runtime_error("terrain: CLIF dims out of range");
+    const size_t cells = size_t(cm.width) * cm.height;
+    if (d.size() < 32 + cells * 2)
+        throw std::runtime_error("terrain: CLIF cell region too short");
+    r.seek(32);
+    cm.levels.resize(cells);
+    for (size_t i = 0; i < cells; ++i) {
+        const uint32_t lvl = uint32_t(r.u16le()) >> 6;
+        cm.levels[i] = uint8_t(lvl > 255 ? 255 : lvl);
+    }
+    return cm;
+}
+
 }

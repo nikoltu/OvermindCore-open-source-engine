@@ -53,6 +53,21 @@ public:
         }
     }
 
+    void stamp_mask_upto(int cx, int cy, const std::vector<std::pair<int, int>>& mask, int r, int delta) {
+        const long r2 = long(r) * r;
+        for (const auto& off : mask) {
+            const long dx = off.first, dy = off.second;
+            if (dx * dx + dy * dy > r2) continue;
+            const int x = cx + off.first, y = cy + off.second;
+            if (!in_bounds(x, y)) continue;
+            uint8_t& c = cover_[size_t(y) * w_ + x];
+            if (delta > 0)
+                c = uint8_t(c + 1);
+            else if (c > 0)
+                c = uint8_t(c - 1);
+        }
+    }
+
     uint64_t checksum() const {
         uint64_t h = 1469598103934665603ull;
         for (uint8_t c : cover_) {
@@ -76,6 +91,7 @@ struct CreepSource {
     int period_ticks = 13;
     int timer = 0;
     bool alive = true;
+    std::vector<std::pair<int, int>> mask;
 };
 
 class CreepSystem {
@@ -85,14 +101,19 @@ public:
     }
 
     int add_source(Fixed wx, Fixed wy, int max_radius, int period_ticks) {
+        return add_source(wx, wy, max_radius, period_ticks, {});
+    }
+    int add_source(Fixed wx, Fixed wy, int max_radius, int period_ticks,
+                   std::vector<std::pair<int, int>> mask) {
         CreepSource s;
         grid_.to_cell(wx, wy, s.cx, s.cy);
         s.max_radius = max_radius;
         s.period_ticks = period_ticks;
         s.timer = period_ticks;
         s.radius = 1;
-        grid_.stamp_disc(s.cx, s.cy, s.radius, +1);
-        sources_.push_back(s);
+        s.mask = std::move(mask);
+        stamp(s, s.radius, +1);
+        sources_.push_back(std::move(s));
         return int(sources_.size()) - 1;
     }
 
@@ -100,17 +121,17 @@ public:
         for (CreepSource& s : sources_) {
             if (!s.alive) {
                 if (s.radius > 0) {
-                    grid_.stamp_disc(s.cx, s.cy, s.radius, -1);
-                    grid_.stamp_disc(s.cx, s.cy, --s.radius, +1);
-                    if (s.radius == 0) grid_.stamp_disc(s.cx, s.cy, 0, -1);
+                    stamp(s, s.radius, -1);
+                    stamp(s, --s.radius, +1);
+                    if (s.radius == 0) stamp(s, 0, -1);
                 }
                 continue;
             }
             if (s.radius >= s.max_radius) continue;
             if (--s.timer > 0) continue;
             s.timer = s.period_ticks;
-            grid_.stamp_disc(s.cx, s.cy, s.radius, -1);
-            grid_.stamp_disc(s.cx, s.cy, ++s.radius, +1);
+            stamp(s, s.radius, -1);
+            stamp(s, ++s.radius, +1);
         }
     }
 
@@ -123,6 +144,13 @@ public:
     uint64_t checksum() const { return grid_.checksum(); }
 
 private:
+    void stamp(const CreepSource& s, int r, int delta) {
+        if (s.mask.empty())
+            grid_.stamp_disc(s.cx, s.cy, r, delta);
+        else
+            grid_.stamp_mask_upto(s.cx, s.cy, s.mask, r, delta);
+    }
+
     CreepGrid grid_;
     std::vector<CreepSource> sources_;
 };

@@ -44,7 +44,7 @@ public:
             if (e.caster >= n) continue;
             const Unit& c = world.units()[e.caster];
             if (!c.alive) continue;
-            if (!abil.ready(e.caster, e.ability)) continue;
+            if (!abil.ready(world, e.caster, e.ability)) continue;
 
             const std::uint32_t target = pick_target(world, c, e);
             if (target == kNoTarget) continue;

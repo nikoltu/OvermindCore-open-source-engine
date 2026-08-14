@@ -38,6 +38,13 @@ struct MeleePlayerSetup {
     int army_mineral_cost = 50;
     int army_gas_cost = 0;
     sim::Fixed army_build_time = sim::Fixed::from_int(1);
+    int army_count = 1;
+    bool has_army_unit2 = false;
+    sim::Unit army_unit2;
+    int army2_mineral_cost = 50;
+    int army2_gas_cost = 0;
+    sim::Fixed army2_build_time = sim::Fixed::from_int(1);
+    std::string army_unit2_gate;
     int start_minerals = 50;
     int army_threshold = 3;
 };

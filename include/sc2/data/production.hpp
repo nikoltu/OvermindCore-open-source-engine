@@ -15,7 +15,9 @@ struct ProductInfo {
     std::string product;
     std::string requirement;
     double time = 0;
+    int count = 1;
     double warp_charge = 0;
+    bool from_morph = false;
 };
 
 class Production {
@@ -27,7 +29,19 @@ public:
 
     double time_of(const std::string& product) const {
         auto it = by_product_.find(product);
-        return (it == by_product_.end() || it->second.empty()) ? 0.0 : it->second.front().time;
+        if (it == by_product_.end() || it->second.empty()) return 0.0;
+        for (const ProductInfo& pi : it->second)
+            if (!pi.from_morph) return pi.time;
+        return it->second.front().time;
+    }
+
+    int train_count(const std::string& product) const {
+        auto it = by_product_.find(product);
+        if (it == by_product_.end()) return 1;
+        int c = 1;
+        for (const ProductInfo& pi : it->second)
+            if (!pi.from_morph && pi.count > c) c = pi.count;
+        return c;
     }
 
     double warp_charge_time(const std::string& product) const {

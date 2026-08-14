@@ -14,7 +14,7 @@ struct ActorRules;
 
 struct AudioSink;
 
-enum class AnimState { Birth, Stand, Walk, Attack, Death, Gather };
+enum class AnimState { Birth, Stand, Walk, Attack, Death, Gather, Cast };
 
 struct ActorInstance {
     const formats::Model* model = nullptr;
@@ -25,7 +25,7 @@ struct ActorInstance {
     bool has_oneshot = true;
     bool dead = false;
     float clock = 0;
-    int cached_seq[6] = {-2, -2, -2, -2, -2, -2};
+    int cached_seq[7] = {-2, -2, -2, -2, -2, -2, -2};
 
     std::vector<formats::M3Event> last_events;
 
@@ -45,6 +45,7 @@ struct ActorDriver {
         bool known = false;
         bool alive = true;
         sim::Fixed x, y, cooldown;
+        std::uint32_t cast_count = 0;
     };
     std::vector<Shadow> shadows;
     std::vector<ActorInstance> actors;

@@ -50,7 +50,6 @@ add_library(sc2core STATIC
   src/sim/vision.cpp
   src/sim/detection.cpp
   src/sim/trigger.cpp
-  src/ai/macro.cpp
   src/ai/melee_ai.cpp
   src/app/spawn.cpp
   src/app/ability.cpp
@@ -139,6 +138,16 @@ if(Vulkan_FOUND AND Vulkan_GLSLC_EXECUTABLE)
 
   add_executable(sc2melee tools/sc2melee.cpp)
   target_link_libraries(sc2melee PRIVATE sc2render sc2core)
+
+  set(CRAFTER_SC_SOURCES tools/crafter_sc.cpp src/app/platform_win32.cpp)
+  if(EXISTS "${CMAKE_SOURCE_DIR}/assets/app_icon.ico")
+    enable_language(RC)
+    list(APPEND CRAFTER_SC_SOURCES assets/crafter_sc.rc)
+    message(STATUS "crafter-sc: embedding app icon from assets/app_icon.ico")
+  endif()
+  add_executable(crafter-sc ${CRAFTER_SC_SOURCES})
+  target_link_libraries(crafter-sc PRIVATE sc2render sc2core ole32 shell32)
+  target_link_options(crafter-sc PRIVATE -mwindows)
   set(SC2_HAVE_VULKAN ON)
 endif()
 

@@ -1,5 +1,6 @@
 #include "sc2/render/terrain_tex.hpp"
 
+#include <cmath>
 #include <exception>
 
 #include "sc2/casc/storage.hpp"
@@ -59,6 +60,25 @@ bool diffuse_decodes(const casc::Storage& store, const std::string& rel) {
             formats::DdsInfo info;
             std::vector<uint8_t> rgba = formats::dds_decode_rgba(bytes, info);
             if (!rgba.empty() && info.width && info.height) return true;
+        } catch (const std::exception&) {
+        }
+    }
+    return false;
+}
+
+bool decode_asset(const casc::Storage& store, const std::string& rel, uint32_t& w, uint32_t& h,
+                  std::vector<uint8_t>& out) {
+    for (const char* root : kTexRoots) {
+        try {
+            std::vector<uint8_t> bytes = store.read_by_name(std::string(root) + rel);
+            formats::DdsInfo info;
+            std::vector<uint8_t> rgba = formats::dds_decode_rgba(bytes, info);
+            if (!rgba.empty() && info.width && info.height) {
+                w = info.width;
+                h = info.height;
+                out = std::move(rgba);
+                return true;
+            }
         } catch (const std::exception&) {
         }
     }
@@ -138,6 +158,43 @@ std::string resolve_map_tileset_diffuse(const casc::Storage& store,
     return {};
 }
 
+std::vector<ResolvedLayer> resolve_map_layers(const casc::Storage& store,
+                                              const std::vector<std::string>& layer_names) {
+    std::vector<ResolvedLayer> out;
+    out.reserve(layer_names.size());
+    if (layer_names.empty()) return out;
+
+    std::vector<core::XmlNode> tex_cats = load_catalogs(store, "TerrainTexData.xml");
+
+    for (const std::string& name : layer_names) {
+        ResolvedLayer layer;
+        layer.terrain_tex = name;
+        for (const core::XmlNode& cat : tex_cats) {
+            const core::XmlNode* tex = find_by_id(cat, "CTerrainTex", name);
+            if (!tex) continue;
+            std::string diffuse, normal;
+            for (const core::XmlNode& c : tex->children) {
+                if (diffuse.empty() && c.name == "Texture") {
+                    if (const std::string* v = c.attr("value"); v && !v->empty()) {
+                        std::string rel = normalise_asset_path(*v);
+                        if (diffuse_decodes(store, rel)) diffuse = rel;
+                    }
+                } else if (normal.empty() && c.name == "Normalmap") {
+                    if (const std::string* v = c.attr("value"); v && !v->empty())
+                        normal = normalise_asset_path(*v);
+                }
+            }
+            if (!diffuse.empty()) {
+                layer.diffuse = std::move(diffuse);
+                layer.normal = std::move(normal);
+                break;
+            }
+        }
+        out.push_back(std::move(layer));
+    }
+    return out;
+}
+
 void set_terrain_diffuse(formats::Model& m, const std::string& diffuse_path) {
     m.materials.clear();
     m.material_refs.clear();
@@ -152,6 +209,105 @@ void set_terrain_diffuse(formats::Model& m, const std::string& diffuse_path) {
     mat.name = "terrain";
     mat.layers.push_back(layer);
     m.materials.push_back(mat);
+    formats::M3MaterialRef ref;
+    ref.type = 1;
+    ref.index = 0;
+    m.material_refs.push_back(ref);
+    m.region_material.assign(m.regions.size(), 0);
+}
+
+GroundImage composite_map_ground(const casc::Storage& store, const formats::TextureInfo& info,
+                                 const formats::TextureMask& mask,
+                                 const std::vector<ResolvedLayer>& layers, uint32_t uv_tiles) {
+    GroundImage out;
+    if (info.empty() || mask.empty() || layers.empty() || uv_tiles == 0) return out;
+    if (mask.mask_w != info.width * 8 || mask.mask_h != info.height * 8) return out;
+    if (info.slots.size() < size_t(info.width) * info.height * 8) return out;
+    if (mask.texels.size() < size_t(mask.mask_w) * mask.mask_h * 4) return out;
+
+    struct Img {
+        uint32_t w = 0, h = 0;
+        std::vector<uint8_t> px;
+        bool ok = false;
+    };
+    std::vector<Img> imgs(layers.size());
+    for (size_t i = 0; i < layers.size(); ++i)
+        if (!layers[i].diffuse.empty())
+            imgs[i].ok = decode_asset(store, layers[i].diffuse, imgs[i].w, imgs[i].h, imgs[i].px);
+
+    int base = -1;
+    for (size_t i = 0; i < imgs.size(); ++i)
+        if (imgs[i].ok) {
+            base = int(i);
+            break;
+        }
+    if (base < 0) return out;
+
+    const uint32_t W = mask.mask_w, H = mask.mask_h;
+    out.w = W;
+    out.h = H;
+    out.rgba.assign(size_t(W) * H * 4, 255);
+
+    auto sample = [](const Img& im, double u, double v, uint8_t* rgb) {
+        uint32_t sx = uint32_t(u * im.w);
+        uint32_t sy = uint32_t(v * im.h);
+        if (sx >= im.w) sx = im.w - 1;
+        if (sy >= im.h) sy = im.h - 1;
+        const uint8_t* p = &im.px[(size_t(sy) * im.w + sx) * 4];
+        rgb[0] = p[0];
+        rgb[1] = p[1];
+        rgb[2] = p[2];
+    };
+
+    for (uint32_t my = 0; my < H; ++my) {
+        for (uint32_t mx = 0; mx < W; ++mx) {
+            const uint32_t cx = mx / 8, cy = my / 8;
+            const size_t cell = size_t(cy) * info.width + cx;
+            double tu = (double(mx) / W) * uv_tiles;
+            double tv = (double(my) / H) * uv_tiles;
+            tu -= std::floor(tu);
+            tv -= std::floor(tv);
+            uint8_t diff[3];
+            sample(imgs[base], tu, tv, diff);
+            const double w01 = double(mask.texels[(size_t(my) * W + mx) * 4]) / 255.0;
+            for (int k = 0; k < 8; ++k) {
+                const uint8_t s = info.slots[cell * 8 + k];
+                if (s == 0) continue;
+                const size_t li = size_t(s) - 1;
+                if (li >= imgs.size() || !imgs[li].ok) continue;
+                uint8_t ld[3];
+                sample(imgs[li], tu, tv, ld);
+                for (int c = 0; c < 3; ++c)
+                    diff[c] = uint8_t(int(diff[c]) + (int(ld[c]) - int(diff[c])) * w01 + 0.5);
+            }
+            uint8_t* o = &out.rgba[(size_t(my) * W + mx) * 4];
+            o[0] = diff[0];
+            o[1] = diff[1];
+            o[2] = diff[2];
+            o[3] = 255;
+        }
+    }
+    return out;
+}
+
+void set_terrain_diffuse_rgba(formats::Model& m, uint32_t w, uint32_t h,
+                              std::vector<uint8_t> rgba) {
+    m.materials.clear();
+    m.material_refs.clear();
+    if (rgba.empty() || w == 0 || h == 0 || w > 16384 || h > 16384 ||
+        rgba.size() < size_t(w) * h * 4) {
+        m.region_material.assign(m.regions.size(), -1);
+        return;
+    }
+    formats::M3Layer layer;
+    layer.usage = "Diffuse";
+    layer.inline_w = w;
+    layer.inline_h = h;
+    layer.inline_rgba = std::move(rgba);
+    formats::M3Material mat;
+    mat.name = "terrain_splat";
+    mat.layers.push_back(std::move(layer));
+    m.materials.push_back(std::move(mat));
     formats::M3MaterialRef ref;
     ref.type = 1;
     ref.index = 0;

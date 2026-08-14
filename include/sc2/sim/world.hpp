@@ -1,16 +1,24 @@
 #pragma once
 
 #include <cstdint>
+#include <string>
+#include <unordered_map>
+#include <unordered_set>
+#include <utility>
 #include <vector>
 
 #include "sc2/sim/creep.hpp"
+#include "sc2/sim/death_reveal.hpp"
 #include "sc2/sim/fixed.hpp"
 #include "sc2/sim/nav.hpp"
 #include "sc2/sim/rng.hpp"
+#include "sc2/sim/scan_sweep.hpp"
 
 namespace sc2::sim {
 
 constexpr uint32_t kNoTarget = 0xFFFFFFFF;
+
+inline constexpr double kInstantTurn = 720.0;
 constexpr uint32_t kNoAbility = 0xFFFFFFFF;
 
 enum class OrderType {
@@ -22,21 +30,43 @@ enum class OrderType {
     Gather,
     Cast,
     Patrol,
+    Unload,
+    Load,
 };
+
+enum class BuildVerb : uint8_t { Committed, Warp, Morph };
 
 enum class EffectKind {
     Damage,
     Heal,
     Buff,
     ModifyEnergy,
+    DrainEnergy,
     ApplyBehavior,
     Teleport,
     CreatePersistent,
     CreateUnit,
     Morph,
+    RemoveBehavior,
+    Set,
+    EnumArea,
+    Switch,
+    IssueOrder,
+    CreateHealer,
+    WeaponDamage,
+    Reveal,
+    Force,
+    PhaseShift,
 };
 
 inline constexpr std::uint16_t kCastBehaviorKind = 0xCA5;
+inline constexpr std::uint16_t kCastBehaviorKindControl = 0xCA7;
+
+using EffectRef = int32_t;
+inline constexpr EffectRef kNoEffect = -1;
+inline constexpr std::int16_t kIssueOrderStop = 100;
+inline constexpr std::uint8_t kTargetSortDefault = 0;
+inline constexpr std::uint8_t kTargetSortLifeFractionLow = 1;
 
 struct AbilityDef {
     EffectKind kind = EffectKind::Damage;
@@ -48,6 +78,8 @@ struct AbilityDef {
     Fixed attack_speed_mult = Fixed::from_int(1);
     bool beh_root = false;
     bool beh_stun = false;
+    bool beh_lift = false;
+    bool beh_control_transfer = false;
     Fixed beh_dmg_per_tick;
     Fixed beh_dmg_period;
     Fixed radius;
@@ -57,6 +89,65 @@ struct AbilityDef {
     int32_t spawn_count = 0;
     int32_t mineral_cost = 0, gas_cost = 0;
     Fixed morph_heal_life_frac, morph_heal_shield_frac;
+    EffectRef root = kNoEffect;
+};
+
+enum : std::uint8_t {
+    kAffilSelf = 1,
+    kAffilPlayer = 2,
+    kAffilAlly = 4,
+    kAffilEnemy = 8,
+    kAffilNeutral = 16,
+};
+inline constexpr std::uint8_t kAffilNotOwn = kAffilAlly | kAffilEnemy | kAffilNeutral;
+inline constexpr std::uint8_t kAffilAll = kAffilSelf | kAffilPlayer | kAffilNotOwn;
+
+struct VitalGate {
+    enum Which { Life, Energy, Shields } vital = Life;
+    enum Cmp { LT, LE, GT, GE, EQ, NE } cmp = LT;
+    Fixed value;
+    bool fraction = false;
+};
+
+struct EffectNode {
+    EffectKind kind = EffectKind::Damage;
+    Fixed amount, duration, energy_fraction, radius, period;
+    Fixed heal_drain_factor;
+    Fixed shield_bonus;
+    Fixed move_speed_mult{Fixed::from_int(1)}, attack_speed_mult{Fixed::from_int(1)};
+    bool beh_root = false, beh_stun = false;
+    bool beh_lift = false;
+    bool beh_control_transfer = false;
+    Fixed beh_dmg_per_tick, beh_dmg_period;
+    int32_t period_count = 0, spawn_proto = -1, spawn_count = 0;
+    int32_t mineral_cost = 0, gas_cost = 0;
+    Fixed morph_heal_life_frac, morph_heal_shield_frac;
+    std::uint32_t wpn_bonus_attr = 0;
+    Fixed wpn_bonus_amount;
+    std::uint32_t behavior_tag = 0;
+    bool beh_on_caster = false;
+    std::vector<EffectRef> children;
+    EffectRef initial = kNoEffect, periodic = kNoEffect, expire = kNoEffect, impact = kNoEffect;
+    std::uint8_t search_affiliation = kAffilNotOwn;
+    bool search_exclude_structure = false;
+    std::vector<VitalGate> gates;
+    std::vector<VitalGate> switch_case_gates;
+    std::int16_t issue_order = -1;
+    bool teleport_to_source = false;
+};
+
+struct EffectContext {
+    uint32_t source = kNoTarget;
+    uint32_t target = kNoTarget;
+    Fixed sx, sy;
+    Fixed tx, ty;
+    int32_t origin = -1;
+    Fixed range;
+    bool has_weapon = false;
+    Fixed wpn_amount;
+    std::uint32_t wpn_bonus_attr = 0;
+    Fixed wpn_bonus_amount;
+    int32_t recall_index = -1;
 };
 
 struct Order {
@@ -69,13 +160,19 @@ struct Order {
 
 struct BehaviorInstance {
     uint16_t kind = 0;
+    uint32_t src = 0;
     Fixed timer;
     Fixed speed_mult = Fixed::from_int(1);
     bool root = false;
     bool stun = false;
+    bool lift = false;
     Fixed dmg_per_tick;
     Fixed dmg_period;
     Fixed dmg_timer;
+    std::uint32_t wpn_bonus_attr = 0;
+    Fixed wpn_bonus_amount;
+    int32_t ctrl_orig_owner = -2;
+    std::uint32_t ctrl_caster = kNoTarget;
 };
 
 struct PersistentInstance {
@@ -87,6 +184,18 @@ struct PersistentInstance {
     int32_t count = 0;
     int32_t owner = -1;
     BehaviorInstance on_hit;
+    EffectRef periodic = kNoEffect;
+    std::vector<std::pair<Fixed, Fixed>> offsets;
+    Fixed face_x = Fixed::from_int(1), face_y;
+    int32_t applied = 0;
+};
+
+struct HealerInstance {
+    std::uint32_t caster = kNoTarget;
+    std::uint32_t target = kNoTarget;
+    Fixed heal_rate;
+    Fixed drain_factor;
+    Fixed range;
 };
 
 enum class StatKind { Armor, WeaponDamage, WeaponRange, LifeMax };
@@ -114,6 +223,7 @@ struct Unit {
     uint32_t id = 0;
     int32_t player = 0;
     int32_t type_id = 0;
+    std::string catalog_id;
     Fixed x, y;
     Fixed hp, hp_max, shields, armor;
     Fixed shields_max;
@@ -121,14 +231,39 @@ struct Unit {
     Fixed shield_since_hit, shield_last_total;
     Fixed shield_armor;
     Fixed wpn_damage, wpn_period, wpn_range;
+    Fixed wpn_min_range;
     Fixed wpn_damage_point;
+    Fixed wpn_projectile_speed;
+    Fixed wpn_backswing;
+    int32_t wpn_hits = 1;
+    Fixed backswing_timer{};
+    uint32_t wpn_bonus_attr = 0;
+    Fixed wpn_bonus_amount;
+    EffectRef wpn_effect = kNoEffect;
     Fixed speed, radius;
+    Fixed sep_radius;
     Fixed sight;
+    Fixed death_reveal_radius{Fixed::from_int(2)};
+    Fixed vision_height;
+    int32_t vision_player = -1;
     Fixed speed_mult_creep = Fixed::from_int(1);
+    bool can_jump = false;
+    bool walks_cliffs = false;
+    bool crushes_ff = false;
+    int32_t creep_radius = 0;
+    int32_t creep_grow_period = 0;
+    bool requires_creep = false;
     Fixed atk_speed_mult = Fixed::from_int(1);
     Fixed damage_reduction;
     Fixed aura_dmg_reduction, aura_radius;
     Fixed aura_reduction;
+    Fixed dmg_fraction = Fixed::from_int(1);
+    Fixed dmg_clamp_max;
+    Fixed dmg_minimum;
+    Fixed barrier;
+    Fixed barrier_max;
+    Fixed barrier_cd;
+    Fixed barrier_cd_max;
     Fixed cooldown;
     uint32_t target = kNoTarget;
     bool alive = true;
@@ -139,8 +274,13 @@ struct Unit {
     int32_t resource_left = 0;
     int32_t miners_max = 0;
     int32_t yield_amount = 0;
+    Fixed harvest_time;
     int32_t carrying = 0;
+    uint32_t carry_source = kNoTarget;
     int32_t carry_amount = 5;
+    bool carry_override = false;
+    bool saturation_exempt = false;
+    Fixed mine_time_mult;
     bool is_gas = false;
     bool gathers_gas = false;
     bool is_worker = false;
@@ -152,16 +292,37 @@ struct Unit {
     uint32_t home_depot = kNoTarget;
 
     int32_t train_slots = 0;
+    int32_t addon = 0;
+    int32_t addon_building = 0;
+    Fixed addon_build_left;
 
     bool has_rally = false;
     Fixed rally_x, rally_y;
 
     bool hold_fire = false;
+    bool fire_while_moving = false;
 
     Fixed chrono_timer;
 
     Fixed life_regen;
     Fixed time_life;
+    Fixed burrow_regen;
+    bool burns_down = false;
+    Fixed burn_timer;
+    bool flees_when_attacked = false;
+    uint32_t flee_from = kNoTarget;
+    Fixed phase_timer;
+    uint32_t phase_shade = kNoTarget;
+
+    Fixed windup_timer;
+    uint32_t windup_target = kNoTarget;
+    Fixed windup_dmg;
+    uint32_t windup_battr = 0;
+    Fixed windup_bamt;
+    Fixed windup_ps;
+
+    Fixed crush_damage;
+    Fixed crush_radius;
 
     Fixed buff_timer;
     Fixed buff_damage;
@@ -193,7 +354,11 @@ struct Unit {
     Fixed power_radius;
     bool needs_power = false;
     bool powered = false;
+    bool power_managed = false;
     Fixed morph_heal_life_frac, morph_heal_shield_frac;
+    bool morph_pair = false;
+
+    Fixed zone_x, zone_y, zone_radius;
 
     bool constructing = false;
     Fixed build_time;
@@ -217,15 +382,83 @@ struct Unit {
 
     bool loaded = false;
     bool burrowed = false;
+    bool can_burrow_move = false;
+    bool can_burrow_attack = false;
+    struct BurrowWeapon {
+        Fixed damage, period, range, min_range, damage_point, projectile_speed, backswing, bonus_amount, acquire;
+        int32_t hits = 1;
+        uint32_t target_filter = 3, bonus_attr = 0;
+    };
+    bool has_burrowed_wpn = false;
+    bool burrowed_wpn_on = false;
+    BurrowWeapon burrowed_wpn;
+    void swap_burrow_weapon() {
+        std::swap(wpn_damage, burrowed_wpn.damage);
+        std::swap(wpn_period, burrowed_wpn.period);
+        std::swap(wpn_range, burrowed_wpn.range);
+        std::swap(wpn_min_range, burrowed_wpn.min_range);
+        std::swap(wpn_damage_point, burrowed_wpn.damage_point);
+        std::swap(wpn_projectile_speed, burrowed_wpn.projectile_speed);
+        std::swap(wpn_backswing, burrowed_wpn.backswing);
+        std::swap(wpn_bonus_amount, burrowed_wpn.bonus_amount);
+        std::swap(acquire_range, burrowed_wpn.acquire);
+        std::swap(wpn_hits, burrowed_wpn.hits);
+        std::swap(wpn_target_filter, burrowed_wpn.target_filter);
+        std::swap(wpn_bonus_attr, burrowed_wpn.bonus_attr);
+    }
+    int32_t attack_spawn_proto = -1;
+    int32_t attack_spawn_count = 0;
 
     bool flying = false;
+    bool lowered = false;
     uint32_t attributes = 0;
     uint32_t wpn_target_filter = 3;
+    uint8_t target_sort = 0;
+    int32_t target_priority = 20;
 
     Fixed wpn2_damage, wpn2_period, wpn2_range;
+    Fixed wpn2_min_range;
     uint32_t wpn2_target_filter = 3;
+    uint32_t wpn2_bonus_attr = 0;
+    Fixed wpn2_bonus_amount;
+    Fixed wpn2_damage_point;
+    Fixed wpn2_backswing;
+    int32_t wpn2_hits = 1;
+    Fixed wpn2_projectile_speed;
 
     Fixed splash_inner, splash_mid, splash_outer;
+    Fixed no_splash_radius;
+    Fixed splash_inner_frac = Fixed::from_int(1);
+    Fixed splash_mid_frac = Fixed::from_ratio(1, 2);
+    Fixed splash_outer_frac = Fixed::from_ratio(1, 4);
+
+    int splash_line_count = 0;
+    Fixed splash_line_first, splash_line_step, splash_line_radius;
+
+    Fixed arc_radius[2];
+    Fixed arc_cos[2];
+    Fixed arc_frac[2];
+
+    static constexpr int kMaxBounce = 4;
+    int bounce_count = 0;
+    Fixed bounce_range;
+    Fixed bounce_amount[kMaxBounce] = {};
+
+    Fixed point_defense_radius;
+    int point_defense_max = 0;
+
+    Fixed acquire_range;
+
+    Fixed turn_rate;
+    Fixed stationary_turn_rate;
+    Fixed accel, decel;
+    Fixed lateral_accel;
+    Fixed cur_speed;
+    bool moving_now = false;
+    std::uint32_t cast_count = 0;
+    Fixed facing;
+    Fixed guard_x{}, guard_y{};
+    bool guarding = false;
 
     int32_t vet_index = -1;
     int64_t xp = 0;
@@ -234,10 +467,50 @@ struct Unit {
     bool heroic = false;
     bool hero_ui = false;
 
+    std::vector<std::pair<int32_t, Fixed>> ability_cd;
+
     std::vector<Waypoint> path;
     size_t path_next = 0;
     int32_t path_gx = INT32_MIN;
     int32_t path_gy = INT32_MIN;
+};
+
+inline bool vital_gate_passes(const VitalGate& g, const Unit& t) {
+    Fixed cur, max;
+    switch (g.vital) {
+        case VitalGate::Life: cur = t.hp; max = t.hp_max; break;
+        case VitalGate::Energy: cur = t.energy; max = t.energy_max; break;
+        case VitalGate::Shields: cur = t.shields; max = t.shields_max; break;
+    }
+    const Fixed lhs = g.fraction ? (max.raw() > 0 ? cur / max : Fixed()) : cur;
+    switch (g.cmp) {
+        case VitalGate::LT: return lhs < g.value;
+        case VitalGate::LE: return lhs <= g.value;
+        case VitalGate::GT: return lhs > g.value;
+        case VitalGate::GE: return lhs >= g.value;
+        case VitalGate::EQ: return lhs == g.value;
+        case VitalGate::NE: return !(lhs == g.value);
+    }
+    return true;
+}
+
+struct UpgradeMod {
+    enum class Field {
+        WeaponDamage,
+        WeaponRange,
+        LifeArmor,
+        ShieldArmor,
+        ShieldMax,
+        LifeMax,
+        Sight,
+        MoveSpeed,
+    };
+    enum class Op { Add, Multiply, Set };
+    Field field = Field::WeaponDamage;
+    Op op = Op::Add;
+    Fixed value{};
+    std::vector<std::string> catalog_ids;
+    uint32_t attr_mask = 0;
 };
 
 struct Player {
@@ -246,6 +519,7 @@ struct Player {
     int32_t team = -1;
     std::vector<int32_t> upgrades;
     int32_t weapon_upgrade = 0;
+    std::vector<UpgradeMod> stat_mods;
 };
 
 struct VeterancyDef {
@@ -261,14 +535,26 @@ public:
     static constexpr int kTicksPerSecond = 16;
     static Fixed dt() { return Fixed::from_ratio(1, kTicksPerSecond); }
 
-    void set_game_speed(Fixed mult) { game_speed_ = mult; }
-    Fixed game_speed() const { return game_speed_; }
-
     explicit World(uint64_t seed = 1) : rng_(seed) {}
 
     uint32_t add_unit(Unit u) {
         u.id = uint32_t(units_.size());
+        if (weapon_executor_ && u.wpn_effect == kNoEffect &&
+            (u.wpn_damage.raw() > 0 || u.wpn2_damage.raw() > 0))
+            u.wpn_effect = ensure_weapon_effect();
         units_.push_back(u);
+        if (u.player >= 0 && u.player < int32_t(players_.size()) && !players_[u.player].stat_mods.empty()) {
+            Unit& added = units_.back();
+            for (const UpgradeMod& m : players_[u.player].stat_mods) apply_mod_to_unit(added, m);
+        }
+        if (u.creep_radius > 0) {
+            const int period = u.creep_grow_period > 0 ? u.creep_grow_period : 1;
+            auto mit = creep_masks_.find(u.catalog_id);
+            if (mit != creep_masks_.end() && !mit->second.empty())
+                creep_.add_source(u.x, u.y, u.creep_radius, period, mit->second);
+            else
+                creep_.add_source(u.x, u.y, u.creep_radius, period);
+        }
         return u.id;
     }
 
@@ -310,6 +596,23 @@ public:
         issue(actor, smart_order(actor, target, tx, ty), queued);
     }
 
+    bool teleport_unit(uint32_t id, Fixed tx, Fixed ty);
+
+    void apply_spell_damage(uint32_t target, Fixed dmg, uint32_t caster);
+
+    void apply_weapon_hit(std::uint32_t target, Fixed base, std::uint32_t bonus_attr,
+                          Fixed bonus_amount, std::uint32_t attacker);
+
+    void apply_weapon_fire(std::uint32_t attacker, std::uint32_t target, Fixed w_dmg,
+                           std::uint32_t w_battr, Fixed w_bamt, int hits = 1);
+    void step_windup(Fixed dt);
+    void step_projectiles(Fixed dt);
+    void step_point_defense(Fixed dt);
+    void queue_projectile(std::uint32_t attacker, Fixed px, Fixed py, std::uint32_t target, Fixed speed,
+                          Fixed dmg, std::uint32_t battr, Fixed bamt);
+
+    Fixed heal_unit(uint32_t id, Fixed amount);
+
     Unit& unit(uint32_t id) { return units_[id]; }
 
     void step();
@@ -322,12 +625,47 @@ public:
 
     int32_t add_ability(AbilityDef def);
     size_t ability_count() const { return abilities_.size(); }
+    EffectRef add_effect(EffectNode n) {
+        effects_.push_back(std::move(n));
+        return EffectRef(effects_.size()) - 1;
+    }
+    void set_weapon_executor(bool on) {
+        weapon_executor_ = on;
+        if (!on) return;
+        for (Unit& u : units_)
+            if (u.wpn_effect == kNoEffect &&
+                (u.wpn_damage.raw() > 0 || u.wpn2_damage.raw() > 0))
+                u.wpn_effect = ensure_weapon_effect();
+    }
+    bool weapon_executor() const { return weapon_executor_; }
+    int32_t add_ability_with_root(AbilityDef def, EffectRef root) {
+        def.root = root;
+        abilities_.push_back(def);
+        return int32_t(abilities_.size()) - 1;
+    }
 
     void cast(uint32_t caster, int32_t ability, uint32_t target) {
         Order o;
         o.type = OrderType::Cast;
         o.ability = uint32_t(ability);
         o.target = target;
+        if (target < units_.size() && units_[target].alive) {
+            o.tx = units_[target].x;
+            o.ty = units_[target].y;
+        } else if (caster < units_.size()) {
+            o.tx = units_[caster].x;
+            o.ty = units_[caster].y;
+        }
+        issue(caster, o, false);
+    }
+
+    void cast(uint32_t caster, int32_t ability, Fixed tx, Fixed ty) {
+        Order o;
+        o.type = OrderType::Cast;
+        o.ability = uint32_t(ability);
+        o.target = kNoTarget;
+        o.tx = tx;
+        o.ty = ty;
         issue(caster, o, false);
     }
 
@@ -342,15 +680,47 @@ public:
     int32_t upgrade_level(int32_t player, int32_t upgrade_id) const;
     void set_upgrade_level(int32_t player, int32_t upgrade_id, int32_t level);
 
+    void apply_upgrade_mod(int32_t player, const UpgradeMod& mod);
+
     bool queue_train(uint32_t producer, const Unit& proto, int32_t mineral_cost,
-                     int32_t gas_cost, Fixed build_time);
+                     int32_t gas_cost, Fixed build_time, int32_t count = 1);
     bool queue_train_at(uint32_t producer, const Unit& proto, int32_t mineral_cost,
-                        int32_t gas_cost, Fixed build_time, Fixed x, Fixed y);
+                        int32_t gas_cost, Fixed build_time, Fixed x, Fixed y, int32_t count = 1);
     size_t pending_count() const { return pending_.size(); }
+    bool cancel_train(uint32_t producer);
+
+    bool cancel_construction(uint32_t building, int32_t mineral_cost, int32_t gas_cost);
+    bool cancel_worker_build(uint32_t builder, int32_t mineral_cost, int32_t gas_cost);
+
+    void set_tech_requirement(std::string unit_id, std::vector<std::string> prereqs);
+    bool tech_requirements_met(int32_t player, const std::string& unit_id) const;
+
+    static constexpr int32_t kAddonNone = 0, kAddonTechLab = 1, kAddonReactor = 2;
+    void attach_addon(uint32_t building, int32_t kind) {
+        if (building >= units_.size()) return;
+        units_[building].addon = kind;
+        units_[building].train_slots = (kind == kAddonReactor) ? 2 : 1;
+    }
+    int32_t addon_of(uint32_t building) const {
+        return building < units_.size() ? units_[building].addon : kAddonNone;
+    }
+    bool build_addon(uint32_t building, int32_t kind, Fixed build_time) {
+        if (building >= units_.size()) return false;
+        Unit& b = units_[building];
+        if (!b.alive || b.constructing) return false;
+        if (b.addon != kAddonNone || b.addon_building != 0) return false;
+        if (kind != kAddonTechLab && kind != kAddonReactor) return false;
+        if (build_time.raw() <= 0) { attach_addon(building, kind); return true; }
+        b.addon_building = kind;
+        b.addon_build_left = build_time;
+        return true;
+    }
+    void require_attached_techlab(std::string unit_id) { techlab_gated_.insert(std::move(unit_id)); }
 
     bool issue_worker_build(uint32_t builder, Fixed x, Fixed y, const Unit& proto,
                             int32_t mineral_cost, int32_t gas_cost, Fixed build_time,
-                            Fixed arrive = Fixed::from_int(2));
+                            Fixed arrive = Fixed::from_int(2),
+                            BuildVerb verb = BuildVerb::Committed);
     size_t worker_build_count() const { return worker_builds_.size(); }
 
     bool worker_committed(uint32_t id) const {
@@ -394,6 +764,66 @@ public:
         u.build_progress = Fixed();
         u.build_hp0 = start_hp;
         u.hp = start_hp;
+        if (nav_.configured() && u.radius.raw() > 0) {
+            int cx0, cy0, cx1, cy1;
+            nav_.to_cell(u.x - u.radius, u.y - u.radius, cx0, cy0);
+            nav_.to_cell(u.x + u.radius, u.y + u.radius, cx1, cy1);
+            register_destructible(id, cx0, cy0, cx1, cy1);
+        }
+    }
+    bool lift_off(uint32_t id) {
+        if (id >= units_.size()) return false;
+        Unit& u = units_[id];
+        if (!u.alive || u.flying) return false;
+        u.flying = true;
+        return true;
+    }
+    bool land(uint32_t id, Fixed x, Fixed y) {
+        if (id >= units_.size()) return false;
+        Unit& u = units_[id];
+        if (!u.alive || !u.flying) return false;
+        for (const Unit& o : units_) {
+            if (!o.alive || o.id == id || o.flying) continue;
+            const Fixed dx = o.x - x, dy = o.y - y;
+            const Fixed rr = u.radius + o.radius;
+            if (dx * dx + dy * dy < rr * rr) return false;
+        }
+        u.x = x;
+        u.y = y;
+        u.flying = false;
+        if (nav_.configured() && u.radius.raw() > 0) {
+            int cx0, cy0, cx1, cy1;
+            nav_.to_cell(u.x - u.radius, u.y - u.radius, cx0, cy0);
+            nav_.to_cell(u.x + u.radius, u.y + u.radius, cx1, cy1);
+            register_destructible(id, cx0, cy0, cx1, cy1);
+        }
+        return true;
+    }
+    bool lower(uint32_t id) {
+        if (id >= units_.size()) return false;
+        Unit& u = units_[id];
+        if (!u.alive || u.lowered) return false;
+        u.lowered = true;
+        return true;
+    }
+    bool raise(uint32_t id) {
+        if (id >= units_.size()) return false;
+        Unit& u = units_[id];
+        if (!u.alive || !u.lowered) return false;
+        for (const Unit& o : units_) {
+            if (!o.alive || o.id == id || o.flying) continue;
+            const Fixed dx = o.x - u.x, dy = o.y - u.y;
+            const Fixed rr = u.radius + o.radius;
+            if (dx * dx + dy * dy < rr * rr) return false;
+        }
+        u.lowered = false;
+        if (nav_.configured() && u.radius.raw() > 0) {
+            int cx0, cy0, cx1, cy1;
+            nav_.to_cell(u.x - u.radius, u.y - u.radius, cx0, cy0);
+            nav_.to_cell(u.x + u.radius, u.y + u.radius, cx1, cy1);
+            register_destructible(id, cx0, cy0, cx1, cy1);
+        }
+        return true;
     }
     bool is_constructing(uint32_t id) const {
         return id < units_.size() && units_[id].constructing;
@@ -411,8 +841,31 @@ public:
         u.energy = u.energy - amount;
         return true;
     }
+    bool spend_life(uint32_t id, Fixed amount) {
+        if (id >= units_.size()) return false;
+        Unit& u = units_[id];
+        if (u.hp <= amount) return false;
+        u.hp = u.hp - amount;
+        return true;
+    }
     Fixed energy(uint32_t id) const {
         return id < units_.size() ? units_[id].energy : Fixed();
+    }
+
+    Fixed ability_cooldown_left(uint32_t caster, int32_t slot) const {
+        if (caster >= units_.size()) return Fixed();
+        for (const auto& e : units_[caster].ability_cd)
+            if (e.first == slot) return e.second;
+        return Fixed();
+    }
+    void arm_ability_cooldown(uint32_t caster, int32_t slot, Fixed dur) {
+        if (caster >= units_.size() || dur.raw() <= 0) return;
+        auto& cds = units_[caster].ability_cd;
+        for (auto& e : cds)
+            if (e.first == slot) { e.second = dur; return; }
+        auto pos = cds.begin();
+        while (pos != cds.end() && pos->first < slot) ++pos;
+        cds.insert(pos, {slot, dur});
     }
 
     bool set_cloak(uint32_t id, bool engage) {
@@ -425,6 +878,10 @@ public:
 
     int32_t add_persistent(PersistentInstance p);
     size_t persistent_count() const { return persistents_.size(); }
+
+    bool start_heal(std::uint32_t caster, std::uint32_t target, Fixed heal_rate, Fixed drain_factor,
+                    Fixed range);
+    size_t healer_count() const { return healers_.size(); }
 
     int32_t add_force_field(Fixed x, Fixed y, Fixed radius, Fixed duration) {
         ForceFieldInstance ff;
@@ -445,6 +902,7 @@ public:
                     if (dx * dx + dy * dy <= r2 && nav_.in_bounds(cx, cy) &&
                         !nav_.is_blocked_cell(cx, cy)) {
                         nav_.block_cell(cx, cy);
+                        nav_.mark_ff(cx, cy, true);
                         ff.cells.emplace_back(cx, cy);
                     }
                 }
@@ -500,6 +958,42 @@ public:
         return id < units_.size() && units_[id].morph_proto >= 0;
     }
 
+    void set_zone(uint32_t id, Fixed cx, Fixed cy, Fixed radius) {
+        if (id >= units_.size()) return;
+        units_[id].zone_x = cx;
+        units_[id].zone_y = cy;
+        units_[id].zone_radius = radius;
+    }
+    void clear_zone(uint32_t id) {
+        if (id < units_.size()) units_[id].zone_radius = Fixed();
+    }
+    bool has_zone(uint32_t id) const {
+        return id < units_.size() && units_[id].zone_radius.raw() > 0;
+    }
+
+    bool merge_units(uint32_t keep, uint32_t absorb, int32_t proto, Fixed time) {
+        if (keep >= units_.size() || absorb >= units_.size() || keep == absorb) return false;
+        if (proto < 0 || proto >= int32_t(spawn_protos_.size())) return false;
+        Unit& a = units_[keep];
+        Unit& b = units_[absorb];
+        if (!a.alive || !b.alive || a.player != b.player) return false;
+        b.alive = false;
+        a.morph_proto = proto;
+        a.morph_timer = time;
+        return true;
+    }
+
+    bool phase_cancel(uint32_t adept) {
+        if (adept >= units_.size()) return false;
+        Unit& a = units_[adept];
+        if (a.phase_timer.raw() <= 0) return false;
+        if (a.phase_shade < units_.size()) units_[a.phase_shade].alive = false;
+        a.phase_timer = Fixed();
+        a.phase_shade = kNoTarget;
+        return true;
+    }
+    bool is_phasing(uint32_t id) const { return id < units_.size() && units_[id].phase_timer.raw() > 0; }
+
     void begin_spawner(uint32_t id, int32_t proto, int32_t cap, Fixed period, int32_t hard_cap = 0) {
         if (id >= units_.size() || proto < 0 || proto >= int32_t(spawn_protos_.size())) return;
         units_[id].spawner_proto = proto;
@@ -507,6 +1001,9 @@ public:
         units_[id].spawner_hard_cap = hard_cap;
         units_[id].spawner_period = period;
         units_[id].spawner_timer = period;
+        for (int32_t i = 0; i < cap; ++i)
+            pending_spawns_.push_back(
+                {proto, 1, units_[id].x, units_[id].y, units_[id].player, id, false});
     }
     int spawner_brood(uint32_t id) const {
         int n = 0;
@@ -585,7 +1082,9 @@ public:
 
     bool powered_at(Fixed x, Fixed y, int32_t player) const {
         for (const Unit& s : units_) {
-            if (!s.alive || s.power_radius.raw() <= 0 || !are_allied(s.player, player)) continue;
+            if (!s.alive || s.constructing || s.power_radius.raw() <= 0 ||
+                !are_allied(s.player, player))
+                continue;
             const Fixed dx = x - s.x, dy = y - s.y;
             if (dx * dx + dy * dy <= s.power_radius * s.power_radius) return true;
         }
@@ -608,9 +1107,8 @@ public:
         u.transport_id = transport;
         return true;
     }
-    int unload_all(uint32_t transport) {
+    int unload_all_at(uint32_t transport, Fixed atx, Fixed aty) {
         if (transport >= units_.size()) return 0;
-        const Fixed tx = units_[transport].x, ty = units_[transport].y;
         static const int DX[8] = {1, 1, 0, -1, -1, -1, 0, 1};
         static const int DY[8] = {0, 1, 1, 1, 0, -1, -1, -1};
         int n = 0;
@@ -618,11 +1116,21 @@ public:
             if (!u.alive || !u.loaded || u.transport_id != transport) continue;
             u.loaded = false;
             u.transport_id = kNoTarget;
-            u.x = tx + Fixed::from_int(DX[n & 7]);
-            u.y = ty + Fixed::from_int(DY[n & 7]);
+            u.x = atx + Fixed::from_int(DX[n & 7]);
+            u.y = aty + Fixed::from_int(DY[n & 7]);
             ++n;
         }
         return n;
+    }
+    int unload_all(uint32_t transport) {
+        if (transport >= units_.size()) return 0;
+        return unload_all_at(transport, units_[transport].x, units_[transport].y);
+    }
+    int nydus_unload(uint32_t entrance, uint32_t exit_worm) {
+        if (entrance >= units_.size() || exit_worm >= units_.size()) return 0;
+        const Unit& ex = units_[exit_worm];
+        if (!ex.alive || !are_allied(units_[entrance].player, ex.player)) return 0;
+        return unload_all_at(entrance, ex.x, ex.y);
     }
 
     uint64_t state_hash() const;
@@ -633,6 +1141,31 @@ public:
 
     CreepSystem& creep() { return creep_; }
     const CreepSystem& creep() const { return creep_; }
+    void register_creep_mask(std::string catalog_id, std::vector<std::pair<int32_t, int32_t>> mask) {
+        creep_masks_[std::move(catalog_id)] = std::move(mask);
+    }
+
+    void set_death_reveal(bool on) { death_reveal_enabled_ = on; }
+    bool death_reveal_enabled() const { return death_reveal_enabled_; }
+
+    void enable_building_burndown(bool on = true) { building_burndown_enabled_ = on; }
+    bool building_burndown_enabled() const { return building_burndown_enabled_; }
+
+    void enable_multi_hit_armor(bool on = true) { multi_hit_armor_ = on; }
+    bool multi_hit_armor() const { return multi_hit_armor_; }
+
+    void enable_target_priority(bool on = true) { target_priority_ = on; }
+    bool target_priority() const { return target_priority_; }
+
+    void enable_flee_response(bool on = true) { flee_response_enabled_ = on; }
+    bool flee_response_enabled() const { return flee_response_enabled_; }
+    const DeathReveal& death_reveal() const { return death_reveal_; }
+    bool death_revealed(int32_t player, Fixed x, Fixed y) const { return death_reveal_.covers(player, x, y); }
+
+    const ScanSweep& scan_sweep() const { return scan_sweep_; }
+    int drop_scan(Fixed x, Fixed y, Fixed radius, Fixed duration) {
+        return scan_sweep_.drop(x, y, radius, duration);
+    }
 
     NavGrid& nav() { return nav_; }
     const NavGrid& nav() const { return nav_; }
@@ -642,17 +1175,100 @@ public:
 
     void set_fog_acquire(bool on) { fog_acquire_ = on; }
     bool fog_acquire() const { return fog_acquire_; }
+    void set_target_sort(bool on) { target_sort_ = on; }
+    bool target_sort() const { return target_sort_; }
+
+    void set_attack_windup(bool on) { attack_windup_ = on; }
+    bool attack_windup() const { return attack_windup_; }
+    void set_projectile_travel(bool on) { projectile_travel_ = on; }
+    bool projectile_travel() const { return projectile_travel_; }
+    void enable_point_defense(bool on = true) { point_defense_enabled_ = on; }
+    bool point_defense_enabled() const { return point_defense_enabled_; }
+    void set_reserve_supply(bool on) { reserve_supply_ = on; }
+    bool reserve_supply() const { return reserve_supply_; }
+    void set_turn_limit(bool on) { turn_limit_ = on; }
+    bool turn_limit() const { return turn_limit_; }
+    void set_acceleration(bool on) { acceleration_ = on; }
+    bool acceleration() const { return acceleration_; }
+    void set_arc_movement(bool on) { arc_movement_ = on; }
+    bool arc_movement() const { return arc_movement_; }
+
+    void set_leash(bool on) { leash_ = on; }
+    bool leash() const { return leash_; }
+    void set_backswing(bool on) { backswing_ = on; }
+    bool backswing() const { return backswing_; }
+    void set_fire_while_moving(bool on) { fwm_ = on; }
+    bool fire_while_moving_enabled() const { return fwm_; }
     bool visible_to(int32_t player, const Unit& target) const;
+
+    void register_watchtower(uint32_t tower_id, Fixed capture_radius) {
+        watchtowers_.push_back(Watchtower{tower_id, capture_radius * capture_radius, -1});
+    }
+    void update_watchtowers();
+
+    void register_destructible(uint32_t unit_id, int cx0, int cy0, int cx1, int cy1) {
+        Destructible d;
+        d.id = unit_id;
+        for (int y = cy0; y <= cy1; ++y)
+            for (int x = cx0; x <= cx1; ++x)
+                if (nav_.in_bounds(x, y) && !nav_.is_blocked_cell(x, y)) {
+                    nav_.set_blocked(x, y, true);
+                    d.cells.emplace_back(x, y);
+                }
+        destructibles_.push_back(std::move(d));
+    }
+    void update_destructibles();
+
+    void register_conjoined_group(std::vector<uint32_t> members, int32_t debris_proto = -1) {
+        if (members.size() >= 2) conjoined_.push_back(Conjoined{std::move(members), false, debris_proto});
+    }
+    void update_conjoined();
+
+    std::size_t set_conjoined_debris_proto(int32_t proto) {
+        for (Conjoined& g : conjoined_) g.debris_proto = proto;
+        return conjoined_.size();
+    }
+    std::size_t conjoined_count() const { return conjoined_.size(); }
+
+    void return_dead_carry();
 
     int winner() const;
 
 private:
+    static bool mod_matches(const Unit& u, const UpgradeMod& m);
+    void apply_mod_to_unit(Unit& u, const UpgradeMod& m);
+    void emit_death_reveal(const Unit& victim, uint32_t killer);
+
+    struct Watchtower {
+        uint32_t tower_id;
+        Fixed capture_r2;
+        int32_t owner = -1;
+    };
+    std::vector<Watchtower> watchtowers_;
+
+    struct Destructible {
+        uint32_t id;
+        std::vector<std::pair<int, int>> cells;
+        bool cleared = false;
+    };
+    std::vector<Destructible> destructibles_;
+
+    struct Conjoined {
+        std::vector<uint32_t> members;
+        bool collapsed = false;
+        int32_t debris_proto = -1;
+    };
+    std::vector<Conjoined> conjoined_;
+
     struct Pending {
         uint32_t producer;
         Unit proto;
         Fixed timer;
         bool has_pos = false;
         Fixed px, py;
+        int32_t count = 1;
+        int32_t mineral_cost = 0, gas_cost = 0;
+        uint32_t consumed_larva = kNoTarget;
     };
 
     struct WorkerBuild {
@@ -661,6 +1277,7 @@ private:
         Unit proto;
         Fixed build_time;
         Fixed arrive;
+        BuildVerb verb = BuildVerb::Committed;
     };
 
     std::vector<Unit> units_;
@@ -668,6 +1285,7 @@ private:
     std::vector<Pending> pending_;
     std::vector<WorkerBuild> worker_builds_;
     std::vector<PersistentInstance> persistents_;
+    std::vector<HealerInstance> healers_;
     std::vector<StatModInstance> stat_mods_;
     std::vector<KnockImpulse> knockbacks_;
     std::vector<ForceFieldInstance> force_fields_;
@@ -693,21 +1311,66 @@ private:
                 break;
         }
     }
+    static Fixed chrono_dt(const Unit& u, Fixed dt) {
+        return u.chrono_timer.raw() > 0 ? dt + dt / Fixed::from_int(2) : dt;
+    }
     std::vector<Unit> spawn_protos_;
     struct PendingSpawn { int32_t proto; int32_t count; Fixed x, y; int32_t owner;
-                          uint32_t parent = kNoTarget; bool injected = false; };
+                          uint32_t parent = kNoTarget; bool injected = false;
+                          uint32_t phase_link = kNoTarget; Fixed move_x, move_y; };
     std::vector<PendingSpawn> pending_spawns_;
+    struct PendingHit {
+        std::uint32_t attacker, target;
+        Fixed px, py;
+        Fixed speed;
+        Fixed dmg;
+        std::uint32_t battr;
+        Fixed bamt;
+        Fixed life;
+    };
+    std::vector<PendingHit> pending_hits_;
     std::vector<VeterancyDef> vet_defs_;
     std::vector<AbilityDef> abilities_;
+    std::vector<EffectNode> effects_;
+    bool weapon_executor_ = false;
+    EffectRef weapon_effect_ = kNoEffect;
+    EffectRef ensure_weapon_effect() {
+        if (weapon_effect_ == kNoEffect) {
+            EffectNode n;
+            n.kind = EffectKind::WeaponDamage;
+            weapon_effect_ = add_effect(std::move(n));
+        }
+        return weapon_effect_;
+    }
     CreepSystem creep_;
+    std::unordered_map<std::string, std::vector<std::pair<int32_t, int32_t>>> creep_masks_;
+    DeathReveal death_reveal_;
+    bool death_reveal_enabled_ = false;
+    ScanSweep scan_sweep_;
+    bool building_burndown_enabled_ = false;
+    bool flee_response_enabled_ = false;
+    bool multi_hit_armor_ = false;
+    bool target_priority_ = false;
     NavGrid nav_;
     Rng rng_;
-    Fixed game_speed_ = Fixed::from_int(1);
     int tick_ = 0;
     bool separation_ = false;
     bool fog_acquire_ = false;
+    bool target_sort_ = false;
+    bool attack_windup_ = false;
+    bool projectile_travel_ = false;
+    bool point_defense_enabled_ = false;
+    bool reserve_supply_ = false;
+    std::unordered_map<std::string, std::vector<std::string>> tech_reqs_;
+    std::unordered_set<std::string> techlab_gated_;
+    bool turn_limit_ = false;
+    bool acceleration_ = false;
+    bool leash_ = false;
+    bool arc_movement_ = false;
+    bool backswing_ = false;
+    bool fwm_ = false;
 
-    uint32_t acquire_target(const Unit& u) const;
+    uint32_t acquire_target(const Unit& u, Fixed max_range = Fixed()) const;
     bool detected_by(int32_t player, const Unit& target) const {
         for (const Unit& d : units_) {
             if (!d.alive || d.detect_range.raw() <= 0 || !are_allied(d.player, player)) continue;
@@ -716,20 +1379,41 @@ private:
         }
         return false;
     }
-    Fixed move_step(const Unit& u, Fixed dt) const;
+    Fixed move_step(Unit& u, Fixed dt);
     bool move_unit_toward(Unit& u, Fixed gx, Fixed gy, Fixed step);
+    bool advance_turn(Unit& u, Fixed tx, Fixed ty);
     void apply_separation();
     void step_gather(Unit& u, Fixed dt);
     void step_cast(Unit& u, Fixed dt);
+    void execute_effect(EffectRef ref, const EffectContext& ctx, int depth = 0);
+    static constexpr int kMaxEffectDepth = 32;
+    static bool is_point_self(EffectKind k) {
+        return k == EffectKind::Teleport || k == EffectKind::CreatePersistent ||
+               k == EffectKind::CreateUnit || k == EffectKind::Morph ||
+               k == EffectKind::Reveal ||
+               k == EffectKind::EnumArea ||
+               k == EffectKind::PhaseShift ||
+               k == EffectKind::IssueOrder;
+    }
+    bool root_is_point_cast(EffectRef root, int depth = 0) const {
+        if (depth > kMaxEffectDepth || root < 0 || root >= EffectRef(effects_.size())) return false;
+        const EffectNode& n = effects_[root];
+        if (is_point_self(n.kind)) return true;
+        if (n.kind == EffectKind::Set && !n.children.empty())
+            return root_is_point_cast(n.children[0], depth + 1);
+        return false;
+    }
     void step_production(Fixed dt);
     void step_worker_builds();
     void step_construction(Unit& u, Fixed dt);
     void step_persistents(Fixed dt);
+    void step_healers(Fixed dt);
     void step_bunker_fire(Fixed dt);
     void step_auras();
     void step_power();
     void step_cloak_field();
     static Fixed behavior_speed_mult(const Unit& u);
+    static Fixed behavior_weapon_bonus(const Unit& u, std::uint32_t target_attrs);
     static bool behavior_stunned(const Unit& u);
     static bool behavior_rooted(const Unit& u);
     void award_kill_xp(Unit& killer, int64_t victim_xp);

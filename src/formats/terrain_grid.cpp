@@ -65,6 +65,7 @@ size_t terrain_grid_to_nav(const TerrainGrid& tg, sim::NavGrid& out,
         for (uint32_t x = 0; x < tg.width; ++x)
             if (tg.blocked[tg.idx(x, y)]) {
                 out.block_cell(int(x), int(y));
+                out.mark_cliff(int(x), int(y), true);
                 ++blocked;
             }
     return blocked;

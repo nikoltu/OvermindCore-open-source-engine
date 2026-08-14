@@ -22,18 +22,27 @@ void Production::build(const Catalog& cat) {
         if (!e) continue;
         const std::string& tag = e->tag;
         if (tag != "CAbilBuild" && tag != "CAbilTrain" && tag != "CAbilWarpTrain" &&
-            tag != "CAbilMorph")
+            tag != "CAbilMorph" && tag != "CAbilMerge")
             continue;
 
         std::unordered_map<std::string, ProductInfo> by_index;
         std::vector<std::string> order;
         for (const XmlNode& c : cat.resolved("CAbil", id)) {
-            if (c.name != "InfoArray") continue;
+            const bool merge_info = (tag == "CAbilMerge" && c.name == "Info");
+            if (c.name != "InfoArray" && !merge_info) continue;
             std::string index = c.attr_or("index", "");
             std::string product = c.attr_or("Unit", "");
+            int unit_count = 1;
             if (product.empty()) {
-                if (const XmlNode* u = find_child(c, "Unit"))
-                    product = u->attr_or("value", "");
+                int n = 0;
+                for (const XmlNode& ch : c.children)
+                    if (ch.name == "Unit") {
+                        std::string v = ch.attr_or("value", "");
+                        if (v.empty()) continue;
+                        if (product.empty()) product = v;
+                        ++n;
+                    }
+                if (n > 1) unit_count = n;
             }
             std::string req;
             if (const XmlNode* b = find_child(c, "Button"))
@@ -60,7 +69,8 @@ void Production::build(const Catalog& cat) {
                 if (it != by_index.end()) warp_charge = it->second.warp_charge;
             }
             if (by_index.find(index) == by_index.end()) order.push_back(index);
-            by_index[index] = ProductInfo{id, index, product, req, time, warp_charge};
+            by_index[index] =
+                ProductInfo{id, index, product, req, time, unit_count, warp_charge, tag == "CAbilMorph"};
         }
         for (const std::string& idx : order) {
             const ProductInfo& pi = by_index[idx];

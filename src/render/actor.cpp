@@ -9,13 +9,15 @@ namespace {
 const std::vector<std::string>& tokens_for(AnimState s) {
     static const std::vector<std::string> birth{"Birth"}, stand{"Stand"}, walk{"Walk"},
         attack{"Attack"}, death{"Death"},
-        gather{"Work", "Stand Gather", "Gather"};
+        gather{"Work", "Stand Gather", "Gather"},
+        cast{"Spell", "Spell Channel", "Channel"};
     switch (s) {
         case AnimState::Birth: return birth;
         case AnimState::Walk: return walk;
         case AnimState::Attack: return attack;
         case AnimState::Death: return death;
         case AnimState::Gather: return gather;
+        case AnimState::Cast: return cast;
         case AnimState::Stand: default: return stand;
     }
 }
@@ -122,7 +124,7 @@ void ActorDriver::observe(const sim::World& world, float dt_ms, bool sim_ticked)
                 a.has_oneshot = false;
             s.known = true;
             s.alive = u.alive;
-            s.x = u.x; s.y = u.y; s.cooldown = u.cooldown;
+            s.x = u.x; s.y = u.y; s.cooldown = u.cooldown; s.cast_count = u.cast_count;
         }
 
         if (sim_ticked) {
@@ -131,11 +133,13 @@ void ActorDriver::observe(const sim::World& world, float dt_ms, bool sim_ticked)
             if (u.cooldown > s.cooldown && s.cooldown == sim::Fixed::from_int(0) && u.alive)
                 a.trigger(AnimState::Attack);
 
+            if (u.cast_count != s.cast_count && u.alive) a.trigger(AnimState::Cast);
+
             bool moving = (u.x != s.x || u.y != s.y);
             a.set_activity(moving, u.mine_cd.raw() > 0);
 
             s.alive = u.alive;
-            s.x = u.x; s.y = u.y; s.cooldown = u.cooldown;
+            s.x = u.x; s.y = u.y; s.cooldown = u.cooldown; s.cast_count = u.cast_count;
         }
 
         a.advance(dt_ms);

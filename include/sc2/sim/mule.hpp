@@ -33,6 +33,8 @@ public:
         m.speed = st.speed;
         m.radius = st.radius;
         m.carry_amount = st.carry_amount;
+        m.carry_override = true;
+        m.saturation_exempt = true;
         m.mine_time = st.mine_time;
         m.gather_target = node;
         m.home_depot = depot;

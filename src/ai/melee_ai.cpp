@@ -45,11 +45,14 @@ int MeleeAI::army_size(const sim::World& w) const {
 
 bool MeleeAI::afford(const sim::World& w, const BuildItem& it) const {
     const sim::Player& p = w.player(player_);
-    return p.minerals >= it.minerals && p.gas >= it.gas;
+    const int n = it.count > 1 ? it.count : 1;
+    return p.minerals >= it.minerals * n && p.gas >= it.gas * n;
 }
 
 bool MeleeAI::supply_ok(const sim::World& w, const BuildItem& it) const {
-    return (w.supply_used(player_) + it.proto.supply_uses) <= w.supply_max(player_);
+    const int n = it.count > 1 ? it.count : 1;
+    const sim::Fixed need = it.proto.supply_uses * sim::Fixed::from_int(n);
+    return (w.supply_used(player_) + need) <= w.supply_max(player_);
 }
 
 int MeleeAI::worker_count(const sim::World& w) const {
@@ -133,12 +136,23 @@ void MeleeAI::run_production(sim::World& w) {
     }
 
     const bool in_order = build_idx_ < cfg_.build_order.size();
-    const BuildItem& item = in_order ? cfg_.build_order[build_idx_] : cfg_.army_unit;
+    const bool want2 = cfg_.has_army_unit2 && army_alt_ && army_unit2_gate_ok(w);
+    const BuildItem& item =
+        in_order ? cfg_.build_order[build_idx_]
+                 : (want2 ? cfg_.army_unit2 : cfg_.army_unit);
     if (afford(w, item) && supply_ok(w, item)) {
         w.queue_train(base_.producer, item.proto, item.minerals, item.gas,
-                      item.build_time);
+                      item.build_time, item.count);
         if (in_order) ++build_idx_;
+        else if (cfg_.has_army_unit2) army_alt_ = !army_alt_;
     }
+}
+
+bool MeleeAI::army_unit2_gate_ok(const sim::World& w) const {
+    if (cfg_.army_unit2_gate.empty()) return true;
+    for (const Unit& u : w.units())
+        if (u.alive && u.player == player_ && u.catalog_id == cfg_.army_unit2_gate) return true;
+    return false;
 }
 
 bool MeleeAI::enemy_target(const sim::World& w, Fixed& tx, Fixed& ty) const {

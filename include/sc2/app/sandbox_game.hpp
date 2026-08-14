@@ -25,6 +25,14 @@ namespace sc2::app {
 
 enum class Race { Terran, Protoss, Zerg };
 
+struct RaceOpening {
+    const char* town_hall;
+    const char* worker;
+    const char* army;
+    const char* race_name;
+};
+RaceOpening race_opening(Race r);
+
 class SandboxGame {
 public:
     SandboxGame(data::Catalog& cat, MeleeModels& models, casc::Storage& store,
