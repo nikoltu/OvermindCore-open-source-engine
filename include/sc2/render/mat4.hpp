@@ -38,6 +38,14 @@ inline Mat4 scaling(float x, float y, float z) {
     return r;
 }
 
+inline Mat4 rotation_z(float rad) {
+    Mat4 r = Mat4::identity();
+    float c = std::cos(rad), s = std::sin(rad);
+    r.m[0] = c;  r.m[1] = s;
+    r.m[4] = -s; r.m[5] = c;
+    return r;
+}
+
 inline Mat4 from_quat(float x, float y, float z, float w) {
     float n = std::sqrt(x * x + y * y + z * z + w * w);
     if (n < 1e-8f) return Mat4::identity();
@@ -82,6 +90,18 @@ inline Mat4 look_at(const Vec3& eye, const Vec3& center, const Vec3& up) {
     r.m[13] = -dot(u, eye);
     r.m[14] = dot(f, eye);
     return r;
+}
+
+inline Mat4 ortho(float l, float r, float b, float t, float znear, float zfar) {
+    Mat4 m;
+    m.m[0] = 2.0f / (r - l);
+    m.m[5] = 2.0f / (t - b);
+    m.m[10] = -1.0f / (zfar - znear);
+    m.m[12] = -(r + l) / (r - l);
+    m.m[13] = -(t + b) / (t - b);
+    m.m[14] = -znear / (zfar - znear);
+    m.m[15] = 1.0f;
+    return m;
 }
 
 inline Mat4 perspective(float fovy, float aspect, float znear, float zfar) {

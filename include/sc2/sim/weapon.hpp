@@ -17,6 +17,24 @@ enum UnitAttribute : std::uint32_t {
     kAttrStructure = 1u << 6,
 };
 
+enum CollideFlag : std::uint32_t {
+    kCollideGround = 1u << 0,
+    kCollideSmall = 1u << 1,
+    kCollideFlying = 1u << 2,
+    kCollideFlyingEscorts = 1u << 3,
+    kCollideStructure = 1u << 4,
+    kCollideForceField = 1u << 5,
+    kCollideLocust = 1u << 6,
+    kCollideLarva = 1u << 7,
+    kCollideColossus = 1u << 8,
+    kCollideBurrow = 1u << 9,
+    kCollideRoachBurrow = 1u << 10,
+    kCollidePhased = 1u << 11,
+    kCollideCreepTumor = 1u << 12,
+    kCollideDisruptorPhased = 1u << 13,
+    kCollideLocustForceField = 1u << 14,
+};
+
 enum WeaponTarget : std::uint32_t {
     kTargetGround = 1u << 0,
     kTargetAir = 1u << 1,

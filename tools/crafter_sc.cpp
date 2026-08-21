@@ -3,6 +3,7 @@
 #include <string>
 #include <vector>
 
+#include "sc2/app/casc_maps.hpp"
 #include "sc2/app/front_end.hpp"
 #include "sc2/app/install.hpp"
 #include "sc2/app/melee_models.hpp"
@@ -53,7 +54,8 @@ int main() {
 
         splash.progress(0.35f, "Loading unit catalog...");
         cat.load_melee(store);
-        cat.load_files(store, {"AbilData.xml", "RequirementData.xml", "RequirementNodeData.xml"});
+        cat.load_files(store, {"AbilData.xml", "RequirementData.xml", "RequirementNodeData.xml",
+                               "LightData.xml", "TerrainData.xml"});
 
         splash.progress(0.70f, "Loading models...");
         models.load(store);
@@ -67,16 +69,35 @@ int main() {
     app::TestMap map = app::TestMap::generate(72.0f, 72.0f);
     app::FrontEnd fe(cat, models, store, map);
 
-    auto scan_maps = [&](const std::string& dir) { return platform::list_maps(dir); };
+    std::vector<platform::MapEntry> casc_entries;
+    for (const app::CascMap& cm : app::discover_casc_maps(store)) {
+        try {
+            std::vector<std::uint8_t> mb = store.read_by_name(cm.path);
+            std::string title = app::read_casc_map_name(mb);
+            formats::LoadedMap lm = formats::load_map_terrain(std::move(mb));
+            platform::MapEntry e;
+            e.path = cm.path;
+            e.casc = true;
+            const std::string sz = std::to_string(lm.width) + "x" + std::to_string(lm.height);
+            e.name = !title.empty() ? title + " (" + sz + ")"
+                     : (lm.tileset.empty() ? cm.name.substr(0, 8) : lm.tileset) + " " + sz;
+            casc_entries.push_back(std::move(e));
+        } catch (const std::exception&) {
+        }
+    }
+
+    auto with_casc = [&](std::vector<platform::MapEntry> folder) {
+        folder.insert(folder.end(), casc_entries.begin(), casc_entries.end());
+        return folder;
+    };
     std::string maps_dir = platform::get_config("maps_dir");
-    std::vector<platform::MapEntry> maps =
-        !maps_dir.empty() ? scan_maps(maps_dir) : scan_maps(info.install_root);
-    fe.set_maps(maps);
+    fe.set_maps(with_casc(!maps_dir.empty() ? platform::list_maps(maps_dir)
+                                            : platform::list_maps(info.install_root)));
     fe.set_maps_folder_callback([&] {
         std::string d = platform::pick_folder("Select a folder that contains .SC2Map files");
         if (d.empty()) return;
         platform::set_config("maps_dir", d);
-        fe.set_maps(platform::list_maps(d));
+        fe.set_maps(with_casc(platform::list_maps(d)));
     });
     fe.set_texture_callback([&](formats::Model& ground, const formats::LoadedMap& lm) {
         if (lm.has_splat) {
@@ -84,6 +105,15 @@ int main() {
                 render::resolve_map_layers(store, lm.texture_info.layer_names);
             render::GroundImage g = render::composite_map_ground(
                 store, lm.texture_info, lm.texture_mask, layers, std::max(1u, lm.width / 8u));
+            if (!g.empty()) {
+                render::apply_grid_uvs(ground, 1.0f);
+                render::set_terrain_diffuse_rgba(ground, g.w, g.h, std::move(g.rgba));
+                return;
+            }
+        }
+        if (lm.has_retail_splat) {
+            render::GroundImage g = render::composite_retail_ground(
+                store, lm.tileset_textures, lm.texture_mask, std::max(1u, lm.width / 4u));
             if (!g.empty()) {
                 render::apply_grid_uvs(ground, 1.0f);
                 render::set_terrain_diffuse_rgba(ground, g.w, g.h, std::move(g.rgba));
@@ -107,7 +137,8 @@ int main() {
     };
 
     try {
-        render::WindowResult r = render::run_game_window(frame, &store, 1280, 720, "", 0);
+        render::WindowResult r = render::run_game_window(
+            frame, &store, 1280, 720, "", 0, [&] { return fe.current_environment(); });
         if (!r.created) {
             platform::alert("CrafterSC", "Could not open a display window (Vulkan/WSI unavailable).");
             return 1;

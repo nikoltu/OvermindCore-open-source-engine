@@ -2,6 +2,7 @@
 #include "sc2/app/spawn.hpp"
 
 #include <algorithm>
+#include <map>
 #include <vector>
 
 #include "sc2/data/economy.hpp"
@@ -99,6 +100,40 @@ static bool read_flying(const data::Catalog& cat, const std::string& unit_id) {
     return air && !ground;
 }
 
+static uint32_t collide_bit(const std::string& name) {
+    using namespace sim;
+    if (name == "Ground") return kCollideGround;
+    if (name == "Small") return kCollideSmall;
+    if (name == "Flying") return kCollideFlying;
+    if (name == "FlyingEscorts") return kCollideFlyingEscorts;
+    if (name == "Structure") return kCollideStructure;
+    if (name == "ForceField") return kCollideForceField;
+    if (name == "Locust") return kCollideLocust;
+    if (name == "Larva") return kCollideLarva;
+    if (name == "Colossus") return kCollideColossus;
+    if (name == "Burrow") return kCollideBurrow;
+    if (name == "RoachBurrow") return kCollideRoachBurrow;
+    if (name == "Phased") return kCollidePhased;
+    if (name == "CreepTumor") return kCollideCreepTumor;
+    if (name == "DisruptorPhased") return kCollideDisruptorPhased;
+    if (name == "LocustForceField") return kCollideLocustForceField;
+    return 0;
+}
+
+static uint32_t read_collide(const data::Catalog& cat, const std::string& unit_id) {
+    std::map<std::string, bool> final_val;
+    for (const core::XmlNode& n : cat.resolved("CUnit", unit_id)) {
+        if (n.name != "Collide") continue;
+        const std::string* idx = n.attr("index");
+        if (!idx) continue;
+        final_val[*idx] = truthy(n.attr_or("value", "1"));
+    }
+    uint32_t flags = 0;
+    for (const auto& [name, set] : final_val)
+        if (set) flags |= collide_bit(name);
+    return flags;
+}
+
 sim::Unit make_unit(const data::Catalog& cat, const std::string& unit_id,
                     int player, Fixed x, Fixed y) {
     sim::Unit u;
@@ -137,7 +172,7 @@ sim::Unit make_unit(const data::Catalog& cat, const std::string& unit_id,
 
     u.sight = field(cat, "CUnit", unit_id, "Sight");
     u.death_reveal_radius = field(cat, "CUnit", unit_id, "DeathRevealRadius", Fixed::from_int(2));
-    u.target_priority = int(field(cat, "CUnit", unit_id, "AttackTargetPriority", Fixed::from_int(20)).round());
+    u.target_priority = int(field(cat, "CUnit", unit_id, "AttackTargetPriority", Fixed()).round());
     u.life_regen = field(cat, "CUnit", unit_id, "LifeRegenRate");
     for (const std::string& ab : cat.array_links("CUnit", unit_id, "AbilArray")) {
         if (ab.empty()) continue;
@@ -162,7 +197,7 @@ sim::Unit make_unit(const data::Catalog& cat, const std::string& unit_id,
         auto dmg = cat.weapon_damage(w);
         if (!dmg) continue;
         const Fixed damage = Fixed::from_int(*dmg);
-        const Fixed period = field(cat, "CWeapon", w, "Period", Fixed::from_int(1));
+        const Fixed period = field(cat, "CWeapon", w, "Period", Fixed::from_double(0.8332));
         const Fixed range = field(cat, "CWeapon", w, "Range", Fixed::from_int(5));
         const Fixed min_range = field(cat, "CWeapon", w, "MinimumRange");
         uint32_t filter = 3;
@@ -175,8 +210,9 @@ sim::Unit make_unit(const data::Catalog& cat, const std::string& unit_id,
             u.wpn_min_range = min_range;
             u.wpn_target_filter = filter;
             weapon_attribute_bonus(cat, w, u.wpn_bonus_attr, u.wpn_bonus_amount);
-            u.wpn_damage_point = field(cat, "CWeapon", w, "DamagePoint");
-            u.wpn_backswing = field(cat, "CWeapon", w, "Backswing");
+            u.wpn_damage_point = field(cat, "CWeapon", w, "DamagePoint", Fixed::from_double(0.1670));
+            u.wpn_backswing = field(cat, "CWeapon", w, "Backswing", Fixed::from_double(0.5));
+            u.wpn_armor_reduction = Fixed::from_double(cat.weapon_armor_reduction(w));
             u.wpn_hits = cat.weapon_hit_count(w).value_or(1);
             if (auto ps = cat.missile_speed(w)) u.wpn_projectile_speed = Fixed::from_double(*ps);
             if (auto am = cat.scalar("CWeapon", w, "AllowedMovement"); am && *am == "Moving")
@@ -187,9 +223,16 @@ sim::Unit make_unit(const data::Catalog& cat, const std::string& unit_id,
             auto arcs = cat.weapon_arc_splash(w);
             if (lsplash && lsplash->line_count >= 2 && lsplash->radius > 0) {
                 u.splash_line_count = lsplash->line_count;
-                u.splash_line_first = Fixed::from_double(lsplash->line_first);
-                u.splash_line_step = Fixed::from_double(lsplash->line_step);
                 u.splash_line_radius = Fixed::from_double(lsplash->radius);
+                u.splash_line_from_source = lsplash->line_from_source;
+                if (lsplash->line_from_source) {
+                    const double a = std::fabs(lsplash->line_first), b = std::fabs(lsplash->line_last);
+                    u.splash_line_first = Fixed::from_double(std::min(a, b));
+                    u.splash_line_step = Fixed::from_double(std::fabs(lsplash->line_step));
+                } else {
+                    u.splash_line_first = Fixed::from_double(lsplash->line_first);
+                    u.splash_line_step = Fixed::from_double(lsplash->line_step);
+                }
             } else if (!arcs.empty()) {
                 constexpr double kPi = 3.14159265358979323846;
                 data::Catalog::ArcSplash src[2] = {};
@@ -235,8 +278,9 @@ sim::Unit make_unit(const data::Catalog& cat, const std::string& unit_id,
             u.wpn2_min_range = min_range;
             u.wpn2_target_filter = filter;
             weapon_attribute_bonus(cat, w, u.wpn2_bonus_attr, u.wpn2_bonus_amount);
-            u.wpn2_damage_point = field(cat, "CWeapon", w, "DamagePoint");
-            u.wpn2_backswing = field(cat, "CWeapon", w, "Backswing");
+            u.wpn2_damage_point = field(cat, "CWeapon", w, "DamagePoint", Fixed::from_double(0.1670));
+            u.wpn2_backswing = field(cat, "CWeapon", w, "Backswing", Fixed::from_double(0.5));
+            u.wpn2_armor_reduction = Fixed::from_double(cat.weapon_armor_reduction(w));
             u.wpn2_hits = cat.weapon_hit_count(w).value_or(1);
             if (auto ps = cat.missile_speed(w)) u.wpn2_projectile_speed = Fixed::from_double(*ps);
             const Fixed scan2 = field(cat, "CWeapon", w, "MinScanRange");
@@ -244,6 +288,11 @@ sim::Unit make_unit(const data::Catalog& cat, const std::string& unit_id,
             if (acq2 > u.acquire_range) u.acquire_range = acq2;
         }
         if (++filled == 2) break;
+    }
+
+    if (auto pd = cat.point_defense_of(unit_id)) {
+        u.point_defense_radius = Fixed::from_double(pd->radius);
+        u.point_defense_max = pd->max;
     }
 
     if (u.wpn_damage.raw() == 0 && u.wpn2_damage.raw() == 0) {
@@ -264,6 +313,11 @@ sim::Unit make_unit(const data::Catalog& cat, const std::string& unit_id,
                 u.burrowed_wpn.hits = bu.wpn_hits;
                 u.burrowed_wpn.target_filter = bu.wpn_target_filter;
                 u.burrowed_wpn.bonus_attr = bu.wpn_bonus_attr;
+                u.burrowed_wpn.splash_line_count = bu.splash_line_count;
+                u.burrowed_wpn.splash_line_first = bu.splash_line_first;
+                u.burrowed_wpn.splash_line_step = bu.splash_line_step;
+                u.burrowed_wpn.splash_line_radius = bu.splash_line_radius;
+                u.burrowed_wpn.splash_line_from_source = bu.splash_line_from_source;
             }
         }
     }
@@ -281,13 +335,24 @@ sim::Unit make_unit(const data::Catalog& cat, const std::string& unit_id,
         u.creep_grow_period =
             period_s > 0 ? int(period_s * sim::World::kTicksPerSecond + 0.5) : 1;
     }
+    if (auto offs = cat.unit_pathing_footprint_offsets(unit_id); !offs.empty()) {
+        u.footprint_offsets.reserve(offs.size());
+        for (const auto& [dx, dy] : offs)
+            u.footprint_offsets.emplace_back(int16_t(dx), int16_t(dy));
+    }
     u.requires_creep = cat.requires_creep(unit_id);
+    u.requires_vespene = cat.structure_requires_vespene(unit_id);
     if (const double pr = cat.power_source_radius(unit_id); pr > 0)
         u.power_radius = Fixed::from_double(pr);
     u.needs_power = cat.requires_power(unit_id);
     u.turn_rate = field(cat, "CUnit", unit_id, "TurningRate");
-    u.stationary_turn_rate = field(cat, "CUnit", unit_id, "StationaryTurningRate", u.turn_rate);
+    u.stationary_turn_rate = field(cat, "CUnit", unit_id, "StationaryTurningRate", Fixed());
     u.sep_radius = field(cat, "CUnit", unit_id, "SeparationRadius");
+    u.inner_radius = field(cat, "CUnit", unit_id, "InnerRadius", u.radius);
+    u.push_priority = int32_t(field(cat, "CUnit", unit_id, "PushPriority", Fixed::from_int(10)).round());
+    u.allied_push_priority =
+        int32_t(field(cat, "CUnit", unit_id, "AlliedPushPriority", Fixed()).round());
+    u.collide_flags = read_collide(cat, unit_id);
     u.catalog_id = unit_id;
     u.yield_amount = cat.resource_harvest_amount(unit_id);
     if (const int content = cat.resource_content(unit_id); content > 0) u.resource_left = content;

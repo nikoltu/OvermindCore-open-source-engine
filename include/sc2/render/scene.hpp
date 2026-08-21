@@ -32,8 +32,13 @@ struct Camera {
     float zfar = 1000.0f;
     bool mirror_x = false;
 
+    bool orthographic = false;
+    float ortho_half_h = 1.0f;
+
     Mat4 view_proj(float aspect) const {
-        Mat4 p = perspective(fovy, aspect, znear, zfar);
+        Mat4 p = orthographic ? ortho(-ortho_half_h * aspect, ortho_half_h * aspect, -ortho_half_h,
+                                      ortho_half_h, znear, zfar)
+                              : perspective(fovy, aspect, znear, zfar);
         if (mirror_x) p.m[0] = -p.m[0];
         return p * look_at(eye, center, up);
     }

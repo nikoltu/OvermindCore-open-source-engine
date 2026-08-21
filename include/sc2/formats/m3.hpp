@@ -181,6 +181,19 @@ struct Model {
     std::vector<M3Particle> particles;
 
     std::vector<M3Event> events_for_sequence(size_t seq) const;
+
+    struct SplatLayerImage {
+        uint32_t w = 0, h = 0;
+        std::vector<uint8_t> rgba;
+    };
+    std::vector<SplatLayerImage> splat_layers;
+    uint32_t splat_w = 0, splat_h = 0;
+    std::vector<uint8_t> splat_weights;
+    float splat_extent_x = 0, splat_extent_y = 0;
+    bool has_splat_payload() const {
+        return splat_w && splat_h && !splat_layers.empty() &&
+               splat_weights.size() >= size_t(splat_w) * splat_h * 8;
+    }
 };
 
 std::string m3_tag(uint32_t tag);

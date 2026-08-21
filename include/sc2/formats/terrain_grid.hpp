@@ -48,6 +48,6 @@ TerrainGrid build_terrain_grid(const HeightMap& hm, const std::vector<uint8_t>& 
 size_t terrain_grid_to_nav(const TerrainGrid& tg, sim::NavGrid& out,
                            sim::Fixed cell_size = sim::Fixed::from_int(1),
                            sim::Fixed origin_x = sim::Fixed(),
-                           sim::Fixed origin_y = sim::Fixed());
+                           sim::Fixed origin_y = sim::Fixed(), bool apply_slope = true);
 
 }

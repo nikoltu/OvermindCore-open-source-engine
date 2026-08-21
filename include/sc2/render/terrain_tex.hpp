@@ -39,9 +39,27 @@ struct GroundImage {
     bool empty() const { return w == 0 || h == 0 || rgba.empty(); }
 };
 
+struct LayerImage {
+    uint32_t w = 0, h = 0;
+    std::vector<uint8_t> rgba;
+    bool ok() const { return w != 0 && h != 0 && rgba.size() >= size_t(w) * h * 4; }
+};
+
+GroundImage composite_ground_images(const formats::TextureInfo& info,
+                                    const formats::TextureMask& mask,
+                                    const std::vector<LayerImage>& images, uint32_t uv_tiles = 9);
+
+GroundImage composite_retail_ground(const casc::Storage& store,
+                                    const std::vector<std::string>& layer_names,
+                                    const formats::TextureMask& mask, uint32_t uv_tiles);
+
 GroundImage composite_map_ground(const casc::Storage& store, const formats::TextureInfo& info,
                                  const formats::TextureMask& mask,
                                  const std::vector<ResolvedLayer>& layers, uint32_t uv_tiles = 9);
+
+bool set_terrain_splat_gpu(formats::Model& m, const casc::Storage& store,
+                           const std::vector<std::string>& layer_names,
+                           const formats::TextureMask& mask, float extent_x, float extent_y);
 
 void set_terrain_diffuse_rgba(formats::Model& m, uint32_t w, uint32_t h,
                               std::vector<uint8_t> rgba);

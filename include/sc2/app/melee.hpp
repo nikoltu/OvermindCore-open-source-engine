@@ -34,6 +34,11 @@ struct MeleePlayerSetup {
     int producer_mineral_cost = 150;
     int producer_gas_cost = 0;
     sim::Fixed producer_build_time = sim::Fixed::from_int(46);
+    sim::Unit tech_unit;
+    int tech_mineral_cost = 0;
+    int tech_gas_cost = 0;
+    sim::Fixed tech_build_time = sim::Fixed::from_int(25);
+    bool has_tech = false;
     sim::Unit army_unit;
     int army_mineral_cost = 50;
     int army_gas_cost = 0;
@@ -45,12 +50,14 @@ struct MeleePlayerSetup {
     int army2_gas_cost = 0;
     sim::Fixed army2_build_time = sim::Fixed::from_int(1);
     std::string army_unit2_gate;
+    std::vector<ai::BuildItem> tech_chain;
     int start_minerals = 50;
     int army_threshold = 3;
 };
 
 struct MeleeSetup {
     std::vector<MeleePlayerSetup> players;
+    std::vector<sim::Unit> neutrals;
 };
 
 struct MeleePlayerLayout {

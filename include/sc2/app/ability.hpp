@@ -23,6 +23,12 @@ double weapon_upgrade_bonus(const data::Catalog& cat, const data::UpgradeCatalog
 std::vector<std::string> army_weapon_upgrade_ids(const data::Catalog& cat, const data::UpgradeCatalog& up,
                                                  const std::string& army_unit);
 
+std::vector<std::string> army_armor_upgrade_ids(const data::UpgradeCatalog& up,
+                                                const std::string& army_unit);
+
+std::vector<std::string> army_shield_upgrade_ids(const data::UpgradeCatalog& up,
+                                                 const std::string& army_unit);
+
 double armor_upgrade_bonus(const data::UpgradeCatalog& up, const std::string& unit_name,
                            const std::vector<std::string>& researched);
 
@@ -58,6 +64,7 @@ struct AbilityBuild {
     std::uint32_t exc_attr_mask = 0;
     bool require_energy = false;
     bool requires_ground = false;
+    bool requires_spawner_target = false;
     std::vector<sim::VitalGate> vital_gates;
     std::string spawn_unit;
     sim::Fixed spawn_life;
@@ -80,9 +87,6 @@ AbilTargetMode ability_target_mode(const data::Catalog& cat, const std::string& 
 
 std::pair<int, int> morph_cost_delta(const data::Catalog& cat, const std::string& source_unit,
                                      const std::string& target_unit);
-
-std::uint32_t calldown_mule(sim::World& world, sim::MuleSystem& mules, std::uint32_t caster,
-                            sim::Fixed tx, sim::Fixed ty);
 
 bool order_repair(const data::Catalog& cat, sim::World& world, sim::RepairSystem& repairs,
                   std::uint32_t repairer, std::uint32_t target, const std::string& target_unit_id);

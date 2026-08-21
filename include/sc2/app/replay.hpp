@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstdint>
+#include <string>
 #include <vector>
 
 #include "sc2/sim/world.hpp"
@@ -12,10 +13,13 @@ struct TimedOrder {
     uint32_t unit_id = 0;
     sim::Order order;
     bool queued = false;
+    bool is_stop = false;
 };
 
 struct OrderLog {
     uint64_t seed = 1;
+    std::string map_id;
+    std::vector<int32_t> player_races;
     std::vector<sim::Unit> initial_units;
     std::vector<TimedOrder> orders;
     int total_ticks = 0;
@@ -71,5 +75,31 @@ private:
 };
 
 ReplayTrace replay(const OrderLog& log);
+
+class LogRecorder : public sim::OrderSink {
+public:
+    explicit LogRecorder(OrderLog& log) : log_(log) {}
+    void on_order(int tick, uint32_t id, const sim::Order& o, bool queued) override {
+        log_.orders.push_back(TimedOrder{tick, id, o, queued, false});
+    }
+    void on_stop(int tick, uint32_t id) override {
+        TimedOrder t;
+        t.tick = tick;
+        t.unit_id = id;
+        t.is_stop = true;
+        log_.orders.push_back(t);
+    }
+
+private:
+    OrderLog& log_;
+};
+
+inline constexpr char kOrderLogMagic[8] = {'S', 'C', '2', 'R', 'L', 'O', 'G', '\0'};
+inline constexpr uint32_t kOrderLogVersion = 2;
+
+void write_order_log(const OrderLog& log, std::vector<uint8_t>& out);
+bool read_order_log(const uint8_t* data, size_t len, OrderLog& out);
+bool write_order_log_file(const OrderLog& log, const std::string& path);
+bool read_order_log_file(const std::string& path, OrderLog& out);
 
 }

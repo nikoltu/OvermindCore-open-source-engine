@@ -1,5 +1,8 @@
 #include "sc2/app/melee_models.hpp"
 
+#include <cctype>
+#include <cstdio>
+
 #include <cstdint>
 #include <exception>
 #include <utility>
@@ -117,6 +120,57 @@ void MeleeModels::load(casc::Storage& store) {
 const formats::Model* MeleeModels::ensure(casc::Storage& store, const std::string& token) {
     resolve_one(store, token);
     return model_for(token);
+}
+
+static std::string with_variation(const std::string& path, int variation) {
+    if (variation <= 0) return path;
+    const std::size_t dot = path.rfind(".m3");
+    if (dot == std::string::npos || dot < 3) return path;
+    std::size_t i = dot;
+    while (i > 0 && std::isdigit(static_cast<unsigned char>(path[i - 1]))) --i;
+    if (i == dot || i == 0 || path[i - 1] != '_') return path;
+    char buf[8];
+    std::snprintf(buf, sizeof(buf), "%02d", variation);
+    return path.substr(0, i) + buf + path.substr(dot);
+}
+
+const formats::Model* MeleeModels::doodad_model(casc::Storage& store, const std::string& type,
+                                                int variation) {
+    const std::string key = variation > 0 ? type + '#' + std::to_string(variation) : type;
+    if (auto it = doodads_.find(key); it != doodads_.end())
+        return it->second.vertex_count > 0 ? &it->second : nullptr;
+    formats::Model model;
+    data::Catalog& cat = catalog(store);
+    if (std::optional<std::string> model_id = cat.scalar("CActorDoodad", type, "Model")) {
+        if (std::optional<std::string> path = cat.scalar("CModel", *model_id, "Model")) {
+            std::string rel = *path;
+            for (char& c : rel)
+                if (c == '\\') c = '/';
+            const std::string vrel = with_variation(rel, variation);
+            for (const char* root : kAssetRoots)
+                if (try_decode(store, std::string(root) + vrel, model)) break;
+            if (model.vertex_count == 0 && vrel != rel)
+                for (const char* root : kAssetRoots)
+                    if (try_decode(store, std::string(root) + rel, model)) break;
+        }
+    }
+    if (model.vertex_count == 0) {
+        char vsuf[16];
+        std::snprintf(vsuf, sizeof(vsuf), "_%02d.m3", variation);
+        for (const char* root : kAssetRoots) {
+            bool got = false;
+            for (const char* suf :
+                 {static_cast<const char*>(vsuf), "_00.m3", ".m3", "_01.m3"}) {
+                const std::string name =
+                    std::string(root) + "Assets/Doodads/" + type + "/" + type + suf;
+                if (try_decode(store, name, model)) { got = true; break; }
+            }
+            if (got) break;
+        }
+    }
+    if (model.vertex_count == 0) doodad_misses_.insert(type);
+    auto [it, _] = doodads_.emplace(key, std::move(model));
+    return it->second.vertex_count > 0 ? &it->second : nullptr;
 }
 
 const formats::Model* MeleeModels::model_for(const std::string& type_token) const {

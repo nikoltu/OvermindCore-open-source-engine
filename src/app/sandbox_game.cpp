@@ -5,6 +5,7 @@
 #include <exception>
 
 #include "sc2/app/overlay_draw.hpp"
+#include "sc2/app/shipping_wiring.hpp"
 #include "sc2/app/spawn.hpp"
 #include "sc2/casc/storage.hpp"
 #include "sc2/data/catalog.hpp"
@@ -158,6 +159,7 @@ void SandboxGame::reset(Race race) {
     game_ = std::make_unique<MeleeGame>(cfg);
     game_->setup(setup, &models_, &map_.ground, map_.width, map_.height, &map_.nav);
     game_->set_ui_storage(&store_);
+    apply_shipping_wiring(*game_, cat_, nullptr, nullptr, nullptr);
 
     float sx = base.town.x, sy = base.town.y;
     float dx = map_.width * 0.5f - sx, dy = map_.height * 0.5f - sy;

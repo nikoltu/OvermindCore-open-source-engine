@@ -50,6 +50,12 @@ add_library(sc2core STATIC
   src/sim/vision.cpp
   src/sim/detection.cpp
   src/sim/trigger.cpp
+  src/campaign/flow.cpp
+  src/campaign/bank.cpp
+  src/campaign/mission_load.cpp
+  src/campaign/triggers.cpp
+  src/campaign/trigger_vm.cpp
+  src/campaign/mission_runtime.cpp
   src/ai/melee_ai.cpp
   src/app/spawn.cpp
   src/app/ability.cpp
@@ -64,22 +70,32 @@ add_library(sc2core STATIC
   src/app/melee_game.cpp
   src/app/sandbox_game.cpp
   src/app/front_end.cpp
+  src/app/shipping_wiring.cpp
   src/app/hud.cpp
   src/app/hud_render.cpp
+  src/app/console_panel.cpp
   src/app/menu.cpp
   src/app/control_groups.cpp
   src/render/anim.cpp
   src/render/actor.cpp
   src/render/actor_rules.cpp
+  src/render/font_ttf.cpp
+  src/render/font_cff.cpp
   src/formats/png.cpp
   src/asset/manager.cpp
   src/app/melee_models.cpp
   src/ui/layout.cpp
   src/ui/interact.cpp
   src/audio/mixer.cpp
+  src/audio/ogg.cpp
+  src/audio/vorbis.cpp
+  src/audio/wasapi.cpp
   src/platform/file_desktop.cpp
 )
 target_include_directories(sc2core PUBLIC include)
+if(WIN32)
+  target_link_libraries(sc2core PUBLIC ole32)
+endif()
 
 add_executable(sc2casc tools/sc2casc.cpp)
 target_link_libraries(sc2casc PRIVATE sc2core)
@@ -90,11 +106,14 @@ target_link_libraries(sc2probe PRIVATE sc2core)
 add_executable(sc2oracle_dump tools/sc2oracle_dump.cpp)
 target_link_libraries(sc2oracle_dump PRIVATE sc2core)
 
+add_executable(sc2sound tools/sc2sound.cpp)
+target_link_libraries(sc2sound PRIVATE sc2core)
+
 find_package(Vulkan COMPONENTS glslc QUIET)
 if(Vulkan_FOUND AND Vulkan_GLSLC_EXECUTABLE)
   set(SHADER_OUT ${CMAKE_BINARY_DIR}/shaders)
   file(MAKE_DIRECTORY ${SHADER_OUT})
-  foreach(shader mesh.vert mesh.frag particle.vert particle.frag overlay.vert overlay.frag)
+  foreach(shader mesh.vert mesh.frag scene.vert scene.frag shadow.vert particle.vert particle.frag overlay.vert overlay.frag tonemap.frag)
     add_custom_command(
       OUTPUT ${SHADER_OUT}/${shader}.spv.h
       COMMAND ${Vulkan_GLSLC_EXECUTABLE} ${CMAKE_SOURCE_DIR}/shaders/${shader}
@@ -105,6 +124,7 @@ if(Vulkan_FOUND AND Vulkan_GLSLC_EXECUTABLE)
   endforeach()
   add_library(sc2render STATIC
     src/render/vulkan_scene.cpp
+    src/render/scene_renderer.cpp
     src/render/vulkan_offscreen.cpp
     src/render/window.cpp
     src/render/game_window.cpp
@@ -113,11 +133,15 @@ if(Vulkan_FOUND AND Vulkan_GLSLC_EXECUTABLE)
     src/render/terrain_tex.cpp
     ${SHADER_OUT}/mesh.vert.spv.h
     ${SHADER_OUT}/mesh.frag.spv.h
+    ${SHADER_OUT}/scene.vert.spv.h
+    ${SHADER_OUT}/scene.frag.spv.h
+    ${SHADER_OUT}/shadow.vert.spv.h
     ${SHADER_OUT}/particle.vert.spv.h
     ${SHADER_OUT}/particle.frag.spv.h
     ${SHADER_OUT}/overlay.vert.spv.h
-    ${SHADER_OUT}/overlay.frag.spv.h)
-  target_include_directories(sc2render PUBLIC include PRIVATE ${SHADER_OUT})
+    ${SHADER_OUT}/overlay.frag.spv.h
+    ${SHADER_OUT}/tonemap.frag.spv.h)
+  target_include_directories(sc2render PUBLIC include PRIVATE ${SHADER_OUT} src/render)
   target_link_libraries(sc2render PUBLIC sc2core Vulkan::Vulkan)
   target_compile_options(sc2render PRIVATE -Wno-missing-field-initializers)
 
@@ -126,6 +150,18 @@ if(Vulkan_FOUND AND Vulkan_GLSLC_EXECUTABLE)
 
   add_executable(sc2scene tools/sc2scene.cpp)
   target_link_libraries(sc2scene PRIVATE sc2render sc2core)
+
+  add_executable(sc2mapframe tools/sc2mapframe.cpp)
+  target_link_libraries(sc2mapframe PRIVATE sc2render sc2core)
+
+  add_executable(sc2console tools/sc2console.cpp)
+  target_link_libraries(sc2console PRIVATE sc2render sc2core)
+
+  add_executable(sc2cliffframe tools/sc2cliffframe.cpp)
+  target_link_libraries(sc2cliffframe PRIVATE sc2render sc2core)
+
+  add_executable(sc2campaign tools/sc2campaign.cpp)
+  target_link_libraries(sc2campaign PRIVATE sc2render sc2core)
 
   add_executable(sc2render_frames tools/sc2render_frames.cpp)
   target_link_libraries(sc2render_frames PRIVATE sc2render sc2core)

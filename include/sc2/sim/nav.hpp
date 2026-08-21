@@ -107,6 +107,20 @@ public:
         return (!levels_.empty() && in_bounds(cx, cy)) ? levels_[idx(cx, cy)] : uint8_t(0);
     }
 
+    bool can_traverse(int fx, int fy, int tx, int ty, bool can_jump = false,
+                      bool can_walk_cliffs = false) const {
+        if (!has_levels()) return true;
+        if (level_cell(fx, fy) == level_cell(tx, ty)) return true;
+        if (is_ramp_cell(fx, fy) || is_ramp_cell(tx, ty)) return true;
+        return can_jump || can_walk_cliffs;
+    }
+
+    bool is_leap_edge(int fx, int fy, int tx, int ty, bool can_walk_cliffs = false) const {
+        if (!has_levels() || can_walk_cliffs) return false;
+        if (level_cell(fx, fy) == level_cell(tx, ty)) return false;
+        return !(is_ramp_cell(fx, fy) || is_ramp_cell(tx, ty));
+    }
+
     bool has_cliffs() const { return cliff_count_ > 0; }
     void mark_cliff(int cx, int cy, bool c) {
         if (!in_bounds(cx, cy)) return;
@@ -288,13 +302,9 @@ inline void find_path(const NavGrid& g, int sx, int sy, int gx, int gy,
             const int ni = index(nx, ny);
             if (closed[size_t(ni)]) continue;
             int32_t step_cost = (diag ? 14 : 10) + (via_ff ? kNavFFCost : 0);
-            if (g.has_levels() && g.level_cell(cx, cy) != g.level_cell(nx, ny)) {
-                const bool ramp = g.is_ramp_cell(cx, cy) || g.is_ramp_cell(nx, ny);
-                if (!ramp && !can_walk_cliffs) {
-                    if (!can_jump) continue;
-                    step_cost += kNavJumpCost;
-                }
-            }
+            if (!g.can_traverse(cx, cy, nx, ny, can_jump, can_walk_cliffs)) continue;
+            if (g.is_leap_edge(cx, cy, nx, ny, can_walk_cliffs))
+                step_cost += kNavJumpCost;
             const int32_t tentative = gscore[size_t(cur.idx)] + step_cost;
             if (tentative < gscore[size_t(ni)]) {
                 gscore[size_t(ni)] = tentative;

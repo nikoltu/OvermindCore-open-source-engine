@@ -1,12 +1,14 @@
 #include "sc2/app/front_end.hpp"
 
 #include <cmath>
+#include <cstdlib>
 #include <fstream>
 #include <iterator>
 
 #include "sc2/app/ability.hpp"
 #include "sc2/app/overlay_draw.hpp"
 #include "sc2/app/race_melee_setup.hpp"
+#include "sc2/app/shipping_wiring.hpp"
 #include "sc2/app/spawn.hpp"
 #include "sc2/casc/storage.hpp"
 #include "sc2/data/catalog.hpp"
@@ -40,6 +42,11 @@ Race race_cycle(Race r) {
 
 constexpr int kActStart = 1, kActBack = 2, kActMapsFolder = 3, kActP0Race = 10, kActP1Race = 11,
               kMapRow0 = 100;
+
+constexpr int kMenuLobby = 1, kMenuSandbox = 2, kMenuQuit = 3;
+
+constexpr const char* kMainMenuLayoutPath =
+    "mods/core.sc2mod/base.sc2data/UI/Layout/Glue/ScreenNavigationSC2.SC2Layout";
 }
 
 FrontEnd::FrontEnd(data::Catalog& cat, MeleeModels& models, casc::Storage& store,
@@ -59,14 +66,58 @@ void FrontEnd::set_maps(std::vector<platform::MapEntry> maps) {
     sel_map_ = 0;
 }
 
-std::vector<FrontEnd::Button> FrontEnd::menu_buttons(std::uint32_t view_w,
-                                                     std::uint32_t view_h) const {
+const MainMenu* FrontEnd::real_menu(std::uint32_t view_w, std::uint32_t view_h) {
+    if (real_menu_disabled_ || !view_w || !view_h) return nullptr;
+    if (real_menu_forced_) return real_menu_ ? &*real_menu_ : nullptr;
+    if (real_menu_tried_ && real_menu_w_ == view_w && real_menu_h_ == view_h)
+        return real_menu_ ? &*real_menu_ : nullptr;
+    real_menu_tried_ = true;
+    real_menu_w_ = view_w;
+    real_menu_h_ = view_h;
+    real_menu_.reset();
+
+    std::string dir = menu_data_dir_;
+    if (dir.empty())
+        if (const char* env = std::getenv("SC2_DATA_DIR")) dir = env;
+    if (dir.empty()) return nullptr;
+
+    const ui::Rect canvas{0, 0, float(view_w), float(view_h)};
+    std::optional<MainMenu> m = MainMenu::from_install(dir, kMainMenuLayoutPath, canvas);
+    if (!m) return nullptr;
+
+    const float canvas_area = float(view_w) * float(view_h);
+    bool usable = false;
+    for (const ui::SolvedFrame& sf : m->buttons()) {
+        if (MainMenu::classify(sf.name) == MenuAction::None) continue;
+        if (sf.rect.w <= 1.0f || sf.rect.h <= 1.0f) continue;
+        if (sf.rect.w * sf.rect.h < 0.9f * canvas_area) { usable = true; break; }
+    }
+    if (!usable) return nullptr;
+    real_menu_ = std::move(m);
+    return &*real_menu_;
+}
+
+std::vector<FrontEnd::Button> FrontEnd::menu_buttons(std::uint32_t view_w, std::uint32_t view_h) {
+    if (const MainMenu* m = real_menu(view_w, view_h)) {
+        std::vector<Button> out;
+        out.reserve(m->buttons().size());
+        for (const ui::SolvedFrame& sf : m->buttons()) {
+            const MenuAction a = MainMenu::classify(sf.name);
+            const int action = a == MenuAction::StartSkirmish ? kMenuLobby
+                               : a == MenuAction::Quit        ? kMenuQuit
+                                                              : 0;
+            const ui::Rect& r = sf.rect;
+            out.push_back({int(r.x), int(r.y), int(r.x + r.w), int(r.y + r.h), sf.name, action});
+        }
+        if (!out.empty()) return out;
+    }
+
     const int bw = 380, bh = 54, gap = 18;
     int x0 = (int(view_w) - bw) / 2;
     int y0 = int(view_h) / 2 - bh;
     std::vector<Button> out;
-    out.push_back({x0, y0, x0 + bw, y0 + bh, "1v1 Melee  vs AI", 1});
-    out.push_back({x0, y0 + bh + gap, x0 + bw, y0 + 2 * bh + gap, "Sandbox  Test Map", 2});
+    out.push_back({x0, y0, x0 + bw, y0 + bh, "1v1 Melee  vs AI", kMenuLobby});
+    out.push_back({x0, y0 + bh + gap, x0 + bw, y0 + 2 * bh + gap, "Sandbox  Test Map", kMenuSandbox});
     return out;
 }
 
@@ -145,13 +196,21 @@ void FrontEnd::start_lobby_match() {
         map_h = map_.height;
         nav = &map_.nav;
     } else {
-        std::ifstream in(maps_[sel_map_].path, std::ios::binary);
-        std::vector<std::uint8_t> bytes((std::istreambuf_iterator<char>(in)),
-                                        std::istreambuf_iterator<char>());
+        std::vector<std::uint8_t> bytes;
+        if (maps_[sel_map_].casc) {
+            bytes = store_.read_by_name(maps_[sel_map_].path);
+        } else {
+            std::ifstream in(maps_[sel_map_].path, std::ios::binary);
+            bytes.assign(std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>());
+        }
         real_map_ = std::make_unique<formats::LoadedMap>(
             formats::load_map_terrain(std::move(bytes)));
-        real_ground_ = formats::build_map_mesh(*real_map_);
+        current_env_ = data::resolve_environment_light(cat_, real_map_->tileset);
+        real_cliffs_ = app::place_cliffs(store_, *real_map_);
+        const bool have_cliffs = !real_cliffs_.instances.empty();
+        real_ground_ = formats::build_map_mesh_stepped(*real_map_, 1.0f, 128, !have_cliffs);
         if (texture_cb_) texture_cb_(real_ground_, *real_map_);
+        formats::append_map_water(real_ground_, *real_map_);
         setup = melee_setup_for_map(*real_map_, cat_, p0_race_, p1_race_);
         ground = &real_ground_;
         map_w = float(real_map_->width);
@@ -165,6 +224,8 @@ void FrontEnd::start_lobby_match() {
         for (const char* tok : {u.hall, u.worker, u.producer, u.supply, u.army})
             models_.ensure(store_, tok);
     }
+    for (const sim::Unit& n : setup.neutrals)
+        if (!n.catalog_id.empty()) models_.ensure(store_, n.catalog_id);
 
     MeleeGameConfig cfg;
     cfg.human_player = 0;
@@ -175,20 +236,20 @@ void FrontEnd::start_lobby_match() {
                                                         : sim::BuildVerb::Committed);
     skirmish_->register_creep_masks(cat_);
     skirmish_->setup(setup, &models_, ground, map_w, map_h, nav);
-    {
-        data::Production tech_prod;
-        tech_prod.build(cat_);
-        for (const std::string& uid : cat_.ids("CUnit"))
-            for (const data::ProductInfo& pi : tech_prod.producers_of(uid))
-                if (pi.requirement.find("Attached") != std::string::npos &&
-                    pi.requirement.find("TechLab") != std::string::npos) {
-                    skirmish_->world().require_attached_techlab(uid);
-                    break;
-                }
+    if (real_map_) {
+        real_doodads_ = real_map_->objects.doodads;
+        const auto& cm = real_map_->cliff;
+        for (formats::PlacedDoodad& d : real_doodads_) {
+            const int cx = int(d.x), cy = int(d.y);
+            if (!cm.empty() && cx >= 0 && cy >= 0 && std::uint32_t(cx) < cm.width &&
+                std::uint32_t(cy) < cm.height)
+                d.z = float(cm.levels[std::size_t(cy) * cm.width + cx]) * 2.0f;
+            else
+                d.z = 0.0f;
+        }
+        skirmish_->set_doodads(&real_doodads_);
+        skirmish_->set_cliffs(&real_cliffs_.instances);
     }
-    skirmish_->enable_larva(cat_);
-    skirmish_->enable_collapsible_debris(cat_);
-    skirmish_->enable_ai_casting_from_roster(cat_);
     if (!research_up_) {
         research_up_ = std::make_unique<data::UpgradeCatalog>();
         try {
@@ -196,34 +257,8 @@ void FrontEnd::start_lobby_match() {
         } catch (const std::exception&) {
         }
     }
-    {
-        const Race rs_res[2] = {p0_race_, p1_race_};
-        auto race_tech_building = [](Race r) -> std::string {
-            switch (r) {
-                case Race::Protoss: return "Forge";
-                case Race::Zerg:    return "EvolutionChamber";
-                case Race::Terran:
-                default:            return "EngineeringBay";
-            }
-        };
-        std::vector<MeleeResearchDriver::ProtoNames> names(setup.players.size());
-        std::vector<MeleeGame::AiResearchPlan> plans(setup.players.size());
-        for (std::size_t p = 0; p < setup.players.size(); ++p) {
-            const MeleePlayerSetup& ps = setup.players[p];
-            names[p] = MeleeResearchDriver::ProtoNames{ps.army_unit.catalog_id, ps.worker.catalog_id,
-                                                       ps.producer.catalog_id, ps.supply_unit.catalog_id};
-            plans[p].upgrades =
-                army_weapon_upgrade_ids(cat_, *research_up_, ps.army_unit.catalog_id);
-            plans[p].tech_id = race_tech_building(p < 2 ? rs_res[p] : Race::Terran);
-        }
-        skirmish_->enable_research(cat_, *research_up_, std::move(names));
-        skirmish_->enable_ai_research(std::move(plans));
-    }
-    skirmish_->world().set_weapon_executor(true);
-    skirmish_->world().set_reserve_supply(true);
-    skirmish_->world().set_attack_windup(true);
-    skirmish_->world().set_projectile_travel(true);
-    skirmish_->world().set_death_reveal(true);
+    const std::vector<Race> races = {p0_race_, p1_race_};
+    apply_shipping_wiring(*skirmish_, cat_, research_up_.get(), &setup, &races);
     for (int p = 0; p < 2; ++p) {
         const RaceUnits u = race_units(rs2[p]);
         skirmish_->set_spawn_models(p, models_.model_for(u.worker), models_.model_for(u.army),
@@ -235,14 +270,17 @@ void FrontEnd::start_lobby_match() {
 bool FrontEnd::step(const render::InputState& in, float dt_ms,
                     std::vector<render::SceneInstance>& scene, render::Camera& cam) {
     if (state_ == State::Skirmish && skirmish_) {
-        if (in.quit) { skirmish_.reset(); real_map_.reset(); state_ = State::Lobby;
-                       prev_left_ = false; scene.clear(); cam = menu_ctl_.camera(); return true; }
-        return skirmish_->step(in, dt_ms, scene, cam);
+        if (!skirmish_->step(in, dt_ms, scene, cam)) {
+            skirmish_.reset(); real_map_.reset(); state_ = State::Lobby;
+            prev_left_ = false; scene.clear(); cam = menu_ctl_.camera();
+        }
+        return true;
     }
     if (state_ == State::Sandbox && sandbox_) {
-        if (in.quit) { sandbox_.reset(); state_ = State::Menu; scene.clear();
-                       cam = menu_ctl_.camera(); return true; }
-        return sandbox_->step(in, dt_ms, scene, cam);
+        if (!sandbox_->step(in, dt_ms, scene, cam)) {
+            sandbox_.reset(); state_ = State::Menu; scene.clear(); cam = menu_ctl_.camera();
+        }
+        return true;
     }
 
     const bool click = in.left_pressed && !prev_left_ && in.view_w && in.view_h;
@@ -250,8 +288,9 @@ bool FrontEnd::step(const render::InputState& in, float dt_ms,
         if (click)
             for (const Button& b : menu_buttons(in.view_w, in.view_h))
                 if (b.hit(in.mouse_x, in.mouse_y)) {
-                    if (b.action == 1) state_ = State::Lobby;
-                    else if (b.action == 2) start_sandbox();
+                    if (b.action == kMenuLobby) state_ = State::Lobby;
+                    else if (b.action == kMenuSandbox) start_sandbox();
+                    else if (b.action == kMenuQuit) { prev_left_ = in.left_pressed; return false; }
                     break;
                 }
         if (in.quit) { prev_left_ = in.left_pressed; return false; }
@@ -276,8 +315,30 @@ bool FrontEnd::step(const render::InputState& in, float dt_ms,
     return true;
 }
 
+void FrontEnd::ensure_overlay_font() {
+    if (overlay_font_tried_) {
+        if (overlay_font_.valid()) draw::set_active_font(&overlay_font_);
+        return;
+    }
+    overlay_font_tried_ = true;
+    static const char* kCandidates[] = {
+        "mods/core.sc2mod/base.sc2data/UI/Fonts/Eurostile-Reg.otf",
+        "mods/core.sc2mod/base.sc2data/UI/Fonts/Eurostile-Bol.otf",
+        "mods/core.sc2mod/base.sc2data/UI/Fonts/BLQ55.ttf",
+        "mods/core.sc2mod/base.sc2data/UI/Fonts/BLQ85.ttf",
+        "mods/core.sc2mod/base.sc2data/UI/Fonts/bl.ttf",
+    };
+    for (const char* path : kCandidates) {
+        try {
+            auto bytes = store_.read_by_name(path);
+            if (overlay_font_.load(bytes)) { draw::set_active_font(&overlay_font_); return; }
+        } catch (const std::exception&) {   }
+    }
+}
+
 void FrontEnd::build_overlay(std::uint32_t view_w, std::uint32_t view_h,
                              std::vector<std::uint8_t>& out) {
+    ensure_overlay_font();
     if (state_ == State::Skirmish && skirmish_) { skirmish_->build_overlay(view_w, view_h, out); return; }
     if (state_ == State::Sandbox && sandbox_) { sandbox_->build_overlay(view_w, view_h, out); return; }
 

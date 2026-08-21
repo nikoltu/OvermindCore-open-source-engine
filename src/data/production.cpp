@@ -44,9 +44,13 @@ void Production::build(const Catalog& cat) {
                     }
                 if (n > 1) unit_count = n;
             }
+            bool req_present = false;
             std::string req;
             if (const XmlNode* b = find_child(c, "Button"))
-                req = b->attr_or("Requirements", "");
+                if (const std::string* r = b->attr("Requirements")) {
+                    req = *r;
+                    req_present = true;
+                }
             double warp_charge = 0;
             if (tag == "CAbilWarpTrain") {
                 if (const XmlNode* ch = find_child(c, "Charge")) {
@@ -60,7 +64,10 @@ void Production::build(const Catalog& cat) {
             if (product.find("##") != std::string::npos) continue;
             if (product.empty()) {
                 auto it = by_index.find(index);
-                if (it != by_index.end() && warp_charge > 0) it->second.warp_charge = warp_charge;
+                if (it != by_index.end()) {
+                    if (warp_charge > 0) it->second.warp_charge = warp_charge;
+                    if (req_present) it->second.requirement = req;
+                }
                 continue;
             }
             double time = std::strtod(c.attr_or("Time", "0").c_str(), nullptr);
@@ -68,6 +75,8 @@ void Production::build(const Catalog& cat) {
                 auto it = by_index.find(index);
                 if (it != by_index.end()) warp_charge = it->second.warp_charge;
             }
+            if (!req_present)
+                if (auto it = by_index.find(index); it != by_index.end()) req = it->second.requirement;
             if (by_index.find(index) == by_index.end()) order.push_back(index);
             by_index[index] =
                 ProductInfo{id, index, product, req, time, unit_count, warp_charge, tag == "CAbilMorph"};

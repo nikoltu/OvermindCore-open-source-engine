@@ -32,6 +32,7 @@
 #include "sc2/render/anim.hpp"
 #include "sc2/render/vk_helpers.hpp"
 #include "sc2/render/vk_raii.hpp"
+#include "sc2/render/wsi_device.hpp"
 #include "mesh_build.hpp"
 
 static const uint32_t kMeshVertSpv[] =
@@ -69,30 +70,6 @@ struct Mesh {
     std::vector<std::array<int, kNumSlots>> draw_tex;
     std::vector<VkDescriptorSet> draw_set;
 };
-
-bool has_layer(const std::vector<VkLayerProperties>& layers, const char* name) {
-    for (const auto& l : layers)
-        if (std::strcmp(l.layerName, name) == 0) return true;
-    return false;
-}
-
-bool has_ext(const std::vector<VkExtensionProperties>& exts, const char* name) {
-    for (const auto& e : exts)
-        if (std::strcmp(e.extensionName, name) == 0) return true;
-    return false;
-}
-
-VKAPI_ATTR VkBool32 VKAPI_CALL debug_cb(
-    VkDebugUtilsMessageSeverityFlagBitsEXT severity,
-    VkDebugUtilsMessageTypeFlagsEXT,
-    const VkDebugUtilsMessengerCallbackDataEXT* data, void* user) {
-    if (severity & VK_DEBUG_UTILS_MESSAGE_SEVERITY_ERROR_BIT_EXT) {
-        if (user) ++*static_cast<uint32_t*>(user);
-        std::fprintf(stderr, "[vk-validation] %s\n",
-                     data && data->pMessage ? data->pMessage : "(no message)");
-    }
-    return VK_FALSE;
-}
 
 const wchar_t* window_class(HINSTANCE hinst) {
     static const wchar_t* kName = L"sc2_render_window";
@@ -138,100 +115,13 @@ WindowResult render_window(const std::vector<SceneInstance>& instances,
     Unique<HWND> window(rawWin, [](HWND h) { DestroyWindow(h); });
     ShowWindow(rawWin, SW_SHOWNA);
 
-    uint32_t nlayers = 0;
-    vkEnumerateInstanceLayerProperties(&nlayers, nullptr);
-    std::vector<VkLayerProperties> layers(nlayers);
-    if (nlayers) vkEnumerateInstanceLayerProperties(&nlayers, layers.data());
-    uint32_t niexts = 0;
-    vkEnumerateInstanceExtensionProperties(nullptr, &niexts, nullptr);
-    std::vector<VkExtensionProperties> iexts(niexts);
-    if (niexts) vkEnumerateInstanceExtensionProperties(nullptr, &niexts, iexts.data());
-
-    if (!has_ext(iexts, VK_KHR_SURFACE_EXTENSION_NAME) ||
-        !has_ext(iexts, VK_KHR_WIN32_SURFACE_EXTENSION_NAME))
-        unavailable("win32 surface instance extensions unavailable");
-
-    std::vector<const char*> want_ext = {VK_KHR_SURFACE_EXTENSION_NAME,
-                                         VK_KHR_WIN32_SURFACE_EXTENSION_NAME};
-    std::vector<const char*> want_layer;
-    const bool validation =
-        has_layer(layers, "VK_LAYER_KHRONOS_validation") &&
-        has_ext(iexts, VK_EXT_DEBUG_UTILS_EXTENSION_NAME);
-    if (validation) {
-        want_layer.push_back("VK_LAYER_KHRONOS_validation");
-        want_ext.push_back(VK_EXT_DEBUG_UTILS_EXTENSION_NAME);
-    }
-
-    VkApplicationInfo app{VK_STRUCTURE_TYPE_APPLICATION_INFO};
-    app.apiVersion = VK_API_VERSION_1_1;
-    VkInstanceCreateInfo ici{VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO};
-    ici.pApplicationInfo = &app;
-    ici.enabledExtensionCount = uint32_t(want_ext.size());
-    ici.ppEnabledExtensionNames = want_ext.data();
-    ici.enabledLayerCount = uint32_t(want_layer.size());
-    ici.ppEnabledLayerNames = want_layer.empty() ? nullptr : want_layer.data();
-    VkInstance rawInst = VK_NULL_HANDLE;
-    if (vkCreateInstance(&ici, nullptr, &rawInst) != VK_SUCCESS)
-        unavailable("vkCreateInstance (WSI) failed");
-    Unique<VkInstance> instance(rawInst, [](VkInstance i) { vkDestroyInstance(i, nullptr); });
-
     uint32_t val_errors = 0;
-    Unique<VkDebugUtilsMessengerEXT> messenger;
-    if (validation) {
-        auto create = reinterpret_cast<PFN_vkCreateDebugUtilsMessengerEXT>(
-            vkGetInstanceProcAddr(rawInst, "vkCreateDebugUtilsMessengerEXT"));
-        auto destroy = reinterpret_cast<PFN_vkDestroyDebugUtilsMessengerEXT>(
-            vkGetInstanceProcAddr(rawInst, "vkDestroyDebugUtilsMessengerEXT"));
-        if (create && destroy) {
-            VkDebugUtilsMessengerCreateInfoEXT mi{
-                VK_STRUCTURE_TYPE_DEBUG_UTILS_MESSENGER_CREATE_INFO_EXT};
-            mi.messageSeverity = VK_DEBUG_UTILS_MESSAGE_SEVERITY_WARNING_BIT_EXT |
-                                 VK_DEBUG_UTILS_MESSAGE_SEVERITY_ERROR_BIT_EXT;
-            mi.messageType = VK_DEBUG_UTILS_MESSAGE_TYPE_GENERAL_BIT_EXT |
-                             VK_DEBUG_UTILS_MESSAGE_TYPE_VALIDATION_BIT_EXT |
-                             VK_DEBUG_UTILS_MESSAGE_TYPE_PERFORMANCE_BIT_EXT;
-            mi.pfnUserCallback = debug_cb;
-            mi.pUserData = &val_errors;
-            VkDebugUtilsMessengerEXT raw = VK_NULL_HANDLE;
-            if (create(rawInst, &mi, nullptr, &raw) == VK_SUCCESS)
-                messenger = Unique<VkDebugUtilsMessengerEXT>(
-                    raw, [rawInst, destroy](VkDebugUtilsMessengerEXT m) {
-                        destroy(rawInst, m, nullptr);
-                    });
-        }
-    }
-
-    VkWin32SurfaceCreateInfoKHR wsci{VK_STRUCTURE_TYPE_WIN32_SURFACE_CREATE_INFO_KHR};
-    wsci.hinstance = hinst;
-    wsci.hwnd = rawWin;
-    VkSurfaceKHR rawSurf = VK_NULL_HANDLE;
-    if (vkCreateWin32SurfaceKHR(rawInst, &wsci, nullptr, &rawSurf) != VK_SUCCESS)
-        unavailable("vkCreateWin32SurfaceKHR failed");
-    Unique<VkSurfaceKHR> surface(rawSurf, [rawInst](VkSurfaceKHR s) {
-        vkDestroySurfaceKHR(rawInst, s, nullptr);
-    });
-
-    VkPhysicalDevice pd = VK_NULL_HANDLE;
-    uint32_t gfx = UINT32_MAX;
-    if (!pick_present_device(rawInst, rawSurf, pd, gfx)) unavailable("no graphics+present queue family");
-
-    float prio = 1.0f;
-    VkDeviceQueueCreateInfo qci{VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO};
-    qci.queueFamilyIndex = gfx;
-    qci.queueCount = 1;
-    qci.pQueuePriorities = &prio;
-    const char* devext[] = {VK_KHR_SWAPCHAIN_EXTENSION_NAME};
-    VkDeviceCreateInfo dci{VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO};
-    dci.queueCreateInfoCount = 1;
-    dci.pQueueCreateInfos = &qci;
-    dci.enabledExtensionCount = 1;
-    dci.ppEnabledExtensionNames = devext;
-    VkDevice dev = VK_NULL_HANDLE;
-    if (vkCreateDevice(pd, &dci, nullptr, &dev) != VK_SUCCESS)
-        unavailable("vkCreateDevice (swapchain) failed");
-    Unique<VkDevice> device(dev, [](VkDevice d) { vkDestroyDevice(d, nullptr); });
-    VkQueue queue;
-    vkGetDeviceQueue(dev, gfx, 0, &queue);
+    WsiDevice wsi = create_wsi_device(hinst, rawWin, "render_window: ", &val_errors);
+    VkSurfaceKHR rawSurf = wsi.surface.get();
+    VkPhysicalDevice pd = wsi.pd;
+    uint32_t gfx = wsi.gfx_family;
+    VkDevice dev = wsi.device.get();
+    VkQueue queue = wsi.queue;
 
     VkSurfaceCapabilitiesKHR caps{};
     check(vkGetPhysicalDeviceSurfaceCapabilitiesKHR(pd, rawSurf, &caps),
@@ -760,7 +650,7 @@ WindowResult render_window(const std::vector<SceneInstance>& instances,
     result.created = true;
     result.width = width;
     result.height = height;
-    result.validation_active = bool(messenger);
+    result.validation_active = bool(wsi.messenger);
 
     for (uint32_t f = 0; f < frames; ++f) {
         if (!pump()) break;

@@ -73,7 +73,13 @@ struct SolvedFrame {
     std::string texture;
 };
 
+int measure_text(const std::string& text, int scale = 1);
+
+using TextResolver = std::function<std::string(const std::string& ref)>;
+
 std::vector<SolvedFrame> solve_layout(const Frame& root, const Rect& canvas);
+std::vector<SolvedFrame> solve_layout(const Frame& root, const Rect& canvas,
+                                      const TextResolver& resolve_text);
 
 std::vector<uint8_t> rasterize_layout(const std::vector<SolvedFrame>& frames,
                                       uint32_t w, uint32_t h);

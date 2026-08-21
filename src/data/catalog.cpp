@@ -2,6 +2,7 @@
 #include "sc2/data/catalog.hpp"
 
 #include <cstdlib>
+#include <functional>
 
 #include "sc2/casc/storage.hpp"
 
@@ -47,6 +48,11 @@ void Catalog::ingest(const std::vector<uint8_t>& xml) {
         if (!id) {
             auto& sing = singletons_[family];
             for (const XmlNode& field : e.children) sing.push_back(field);
+            if (const std::string* d = e.attr("default"); d && *d == "1") {
+                auto& defs = tag_defaults_[e.name];
+                for (const XmlNode& field : e.children)
+                    if (!field.attr("index")) defs.push_back(field);
+            }
             continue;
         }
         Entry& entry = families_[family][*id];
@@ -74,6 +80,18 @@ const std::vector<core::XmlNode>& Catalog::singleton_fields(const std::string& f
     static const std::vector<core::XmlNode> kEmpty;
     auto it = singletons_.find(family);
     return it == singletons_.end() ? kEmpty : it->second;
+}
+
+std::optional<std::string> Catalog::tag_default_scalar(const std::string& tag,
+                                                       const std::string& field) const {
+    auto it = tag_defaults_.find(tag);
+    if (it == tag_defaults_.end()) return std::nullopt;
+    for (auto f = it->second.rbegin(); f != it->second.rend(); ++f) {
+        if (f->name != field) continue;
+        if (const std::string* v = f->attr("value")) return *v;
+        return std::string{};
+    }
+    return std::nullopt;
 }
 
 const std::string* Catalog::const_value(const std::string& id) const {
@@ -279,7 +297,7 @@ std::optional<int> Catalog::effect_damage(const std::string& effect_id, int dept
             return std::nullopt;
         },
         [this](int sub, const std::string& id) -> int {
-            const int pc = int(scalar_num("CEffect", id, "PeriodCount").value_or(1));
+            const int pc = int(scalar_num("CEffect", id, "PeriodCount").value_or(0));
             return sub * (pc > 0 ? pc : 1);
         },
         prefer);
@@ -338,6 +356,55 @@ std::optional<double> Catalog::effect_flat_energy_change(const std::string& effe
         });
 }
 
+std::optional<Catalog::PointDefense> Catalog::point_defense_of(const std::string& unit_id) const {
+    std::function<std::optional<double>(const std::string&, int)> energy_drain =
+        [&](const std::string& effect_id, int depth) -> std::optional<double> {
+        return walk_effect_first<double>(
+            effect_id, depth,
+            [this](const std::string& id, const std::string& tag, int,
+                   bool& terminal) -> std::optional<double> {
+                if (tag != "CEffectModifyUnit") return std::nullopt;
+                std::optional<double> change;
+                for (const core::XmlNode& n : resolved("CEffect", id)) {
+                    if (n.name != "VitalArray" || n.attr_or("index", "") != "Energy") continue;
+                    if (const std::string* v = n.attr("Change"); v && !v->empty())
+                        change = std::strtod(v->c_str(), nullptr);
+                    for (const core::XmlNode& c : n.children)
+                        if (c.name == "Change")
+                            if (const std::string* v = c.attr("value"); v && !v->empty())
+                                change = std::strtod(v->c_str(), nullptr);
+                }
+                if (change && *change != 0.0) terminal = true;
+                return change;
+            },
+            std::function<std::optional<double>(const std::string&, int)>(
+                [&](const std::string& id, int nd) -> std::optional<double> {
+                    for (const core::XmlNode& n : resolved("CEffect", id))
+                        if (n.name == "AreaArray")
+                            if (const std::string* ef = n.attr("Effect"); ef && !ef->empty())
+                                if (auto d = energy_drain(*ef, nd + 1)) return d;
+                    return std::nullopt;
+                }));
+    };
+    for (const std::string& w : array_links("CUnit", unit_id, "WeaponArray")) {
+        if (w.empty()) continue;
+        auto tf = scalar("CWeapon", w, "TargetFilters");
+        if (!tf) continue;
+        std::string req = *tf;
+        if (auto sc = req.find(';'); sc != std::string::npos) req.resize(sc);
+        if (req.find("Missile") == std::string::npos) continue;
+        PointDefense pd;
+        pd.radius = scalar_num("CWeapon", w, "Range").value_or(0.0);
+        if (auto c = energy_drain(weapon_effect_id(w), 0)) {
+            const double cost = std::fabs(*c);
+            const double energy = scalar_num("CUnit", unit_id, "EnergyStart").value_or(0.0);
+            if (cost > 0.0 && energy > 0.0) pd.max = int(energy / cost);
+        }
+        if (pd.radius > 0.0 && pd.max > 0) return pd;
+    }
+    return std::nullopt;
+}
+
 std::optional<Catalog::BehaviorBuff> Catalog::behavior_buff(const std::string& behavior_id) const {
     const Entry* e = find("CBehavior", behavior_id);
     if (!e || e->tag.rfind("CBehaviorBuff", 0) != 0) return std::nullopt;
@@ -384,6 +451,27 @@ std::optional<std::string> Catalog::effect_control_transfer_behavior(const std::
                 }
             return std::nullopt;
         });
+}
+
+Catalog::AbilityAutocast Catalog::ability_autocast(const std::string& abil_id) const {
+    AbilityAutocast a;
+    for (const core::XmlNode& n : resolved("CAbil", abil_id)) {
+        if (n.name != "Flags") continue;
+        const std::string* idx = n.attr("index");
+        if (!idx) continue;
+        const std::string& v = n.attr_or("value", "1");
+        const bool on = !v.empty() && v != "0" && v != "false";
+        if (*idx == "AutoCast") a.offered = on;
+        else if (*idx == "AutoCastOn") a.on_by_default = on;
+    }
+    if (auto r = scalar_num("CAbil", abil_id, "AutoCastRange")) a.range = *r;
+    else if (auto c = scalar_num("CAbil", abil_id, "Range")) a.range = *c;
+    if (auto f = scalar("CAbil", abil_id, "AutoCastFilters"); f && !f->empty()) {
+        const std::size_t semi = f->find(';');
+        if (semi != std::string::npos && f->find("Enemy", semi) != std::string::npos)
+            a.targets_allies = true;
+    }
+    return a;
 }
 
 Catalog::DamageResponse Catalog::behavior_damage_response(const std::string& behavior_id) const {
@@ -495,6 +583,161 @@ std::optional<Catalog::CreateUnitSpec> Catalog::effect_create_unit(const std::st
         });
 }
 
+std::optional<double> Catalog::apply_behavior_duration(const std::string& effect_id, int depth) const {
+    return walk_effect_first<double>(
+        effect_id, depth,
+        [this](const std::string& id, const std::string& tag, int,
+               bool& terminal) -> std::optional<double> {
+            if (tag != "CEffectApplyBehavior") return std::nullopt;
+            if (auto d = scalar_num("CEffect", id, "Duration"); d && *d > 0) {
+                terminal = true;
+                return *d;
+            }
+            return std::nullopt;
+        });
+}
+
+std::optional<Catalog::AttackSpawnSpec> Catalog::attack_spawn_of(const std::string& unit_id) const {
+    std::string mag;
+    for (const std::string& a : array_links("CUnit", unit_id, "AbilArray")) {
+        const Entry* ae = a.empty() ? nullptr : find("CAbil", a);
+        if (ae && ae->tag == "CAbilArmMagazine") { mag = a; break; }
+    }
+    if (mag.empty()) return std::nullopt;
+    std::string escort;
+    int count = 0;
+    for (const XmlNode& info : resolved("CAbil", mag)) {
+        if (info.name != "InfoArray") continue;
+        if (const std::string* u = info.attr("Unit"); u && !u->empty()) escort = *u;
+        if (const std::string* c = info.attr("CountStart"); c && !c->empty()) count = std::atoi(c->c_str());
+        if (!escort.empty()) break;
+    }
+    if (escort.empty() || count <= 0) return std::nullopt;
+    const auto wl = array_links("CUnit", escort, "WeaponArray");
+    if (wl.empty() || wl[0].empty()) return std::nullopt;
+    std::string spawn_unit, spawn_effect;
+    std::function<bool(const std::string&, int)> find_cu = [&](const std::string& eid, int d) -> bool {
+        if (d > 32 || eid.empty()) return false;
+        const Entry* e = find("CEffect", eid);
+        if (!e) return false;
+        if (e->tag == "CEffectCreateUnit") {
+            if (auto u = scalar("CEffect", eid, "SpawnUnit"); u && !u->empty()) {
+                spawn_unit = *u;
+                if (auto f = scalar("CEffect", eid, "SpawnEffect"); f && !f->empty()) spawn_effect = *f;
+                return true;
+            }
+        }
+        for (const char* f :
+             {"ImpactEffect", "FinishEffect", "InitialEffect", "FinalEffect", "ExpireEffect", "SpawnEffect"})
+            if (auto l = scalar("CEffect", eid, f); l && !l->empty())
+                if (find_cu(*l, d + 1)) return true;
+        for (const XmlNode& n : resolved("CEffect", eid)) {
+            if (n.name != "EffectArray" && n.name != "CaseArray" && n.name != "CaseDefault") continue;
+            const std::string* v = n.attr("Effect");
+            if (!v) v = n.attr("Link");
+            if (!v) v = n.attr("value");
+            if (v && !v->empty() && find_cu(*v, d + 1)) return true;
+        }
+        return false;
+    };
+    if (!find_cu(weapon_effect_id(wl[0]), 0) || spawn_unit.empty()) return std::nullopt;
+    AttackSpawnSpec s;
+    s.unit = spawn_unit;
+    s.count = count;
+    if (!spawn_effect.empty())
+        if (auto dur = apply_behavior_duration(spawn_effect, 0)) s.life = *dur;
+    return s;
+}
+
+std::optional<Catalog::InterceptorMagSpec> Catalog::interceptor_magazine_of(
+    const std::string& unit_id) const {
+    std::string mag;
+    for (const std::string& a : array_links("CUnit", unit_id, "AbilArray")) {
+        const Entry* ae = a.empty() ? nullptr : find("CAbil", a);
+        if (ae && ae->tag == "CAbilArmMagazine") { mag = a; break; }
+    }
+    if (mag.empty()) return std::nullopt;
+    std::string escort;
+    int count = 0;
+    double build_time = 0;
+    for (const XmlNode& info : resolved("CAbil", mag)) {
+        if (info.name != "InfoArray") continue;
+        const std::string* u = info.attr("Unit");
+        if (!u || u->empty()) continue;
+        escort = *u;
+        if (const std::string* c = info.attr("CountStart"); c && !c->empty()) count = std::atoi(c->c_str());
+        if (const std::string* t = info.attr("Time"); t && !t->empty())
+            build_time = std::strtod(t->c_str(), nullptr);
+        break;
+    }
+    if (escort.empty()) return std::nullopt;
+    InterceptorMagSpec s;
+    s.unit = escort;
+    s.count = count;
+    s.count_max = int(scalar_num("CAbil", mag, "MaxCount").value_or(count));
+    if (auto l = scalar_num("CAbil", mag, "Leash")) s.leash = *l;
+    s.build_time = build_time;
+    return s;
+}
+
+std::optional<Catalog::NovaLaunchSpec> Catalog::nova_launch_of(const std::string& unit_id) const {
+    for (const std::string& ab : array_links("CUnit", unit_id, "AbilArray")) {
+        const Entry* ae = ab.empty() ? nullptr : find("CAbil", ab);
+        if (!ae || ae->tag != "CAbilEffectTarget") continue;
+        std::string eff;
+        for (const XmlNode& n : resolved("CAbil", ab))
+            if (n.name == "Effect")
+                if (const std::string* v = n.attr("value"); v && !v->empty()) eff = *v;
+        if (eff.empty()) continue;
+        const auto cu = effect_create_unit(eff);
+        if (!cu || cu->unit.empty() || cu->spawn_effect.empty()) continue;
+        const double base_speed = scalar_num("CUnit", cu->unit, "Speed").value_or(0.0);
+        if (base_speed <= 0) continue;
+        const auto beh = effect_apply_behavior(cu->spawn_effect);
+        if (!beh) continue;
+        const double dur = scalar_num("CBehavior", *beh, "Duration").value_or(0.0);
+        if (dur <= 0) continue;
+        const auto expire = scalar("CBehavior", *beh, "ExpireEffect");
+        if (!expire || expire->empty()) continue;
+        const auto ar = area_damage_radius(*expire, 0);
+        if (!ar) continue;
+        double speed_bonus = 0.0;
+        for (const XmlNode& n : resolved("CBehavior", *beh))
+            if (n.name == "Modification")
+                if (const std::string* v = n.attr("MoveSpeedBonus"); v && !v->empty())
+                    speed_bonus = std::strtod(v->c_str(), nullptr);
+        double shield_bonus = 0.0;
+        std::function<std::string(const std::string&, int)> area_dmg = [&](const std::string& eid,
+                                                                           int d) -> std::string {
+            if (d > 32 || eid.empty()) return "";
+            for (const XmlNode& n : resolved("CEffect", eid))
+                if (n.name == "AreaArray")
+                    if (const std::string* ef = n.attr("Effect"); ef && !ef->empty()) return *ef;
+            for (const XmlNode& n : resolved("CEffect", eid)) {
+                if (n.name != "EffectArray") continue;
+                const std::string* v = n.attr("Effect");
+                if (!v) v = n.attr("value");
+                if (v && !v->empty())
+                    if (std::string r = area_dmg(*v, d + 1); !r.empty()) return r;
+            }
+            return "";
+        };
+        if (std::string dmg_root = area_dmg(*expire, 0); !dmg_root.empty())
+            if (const auto did = damage_effect_id(dmg_root, 0))
+                shield_bonus = scalar_num("CEffect", *did, "ShieldBonus").value_or(0.0);
+        NovaLaunchSpec s;
+        s.ability = ab;
+        s.unit = cu->unit;
+        s.speed = base_speed + speed_bonus;
+        s.damage = ar->first;
+        s.radius = ar->second;
+        s.shield_bonus = shield_bonus;
+        s.duration = dur;
+        return s;
+    }
+    return std::nullopt;
+}
+
 std::optional<std::pair<double, double>> Catalog::area_damage_radius(const std::string& effect_id,
                                                                      int depth) const {
     return walk_effect_first<std::pair<double, double>>(
@@ -541,6 +784,18 @@ std::optional<Catalog::PersistentSpec> Catalog::effect_persistent(const std::str
                     s.radius = ar->second;
                     break;
                 }
+        if (s.amount == 0 && s.radius == 0)
+            for (const XmlNode& n : resolved("CEffect", effect_id)) {
+                if (n.name != "PeriodicEffectArray") continue;
+                const std::string* pe = n.attr("value");
+                if (!pe) pe = n.attr("Link");
+                if (!pe || pe->empty()) continue;
+                if (auto ar = area_damage_radius(*pe, depth + 1)) {
+                    s.amount = ar->first;
+                    s.radius = ar->second;
+                    break;
+                }
+            }
         std::vector<double> offs;
         for (const std::string& off : array_links("CEffect", effect_id, "PeriodicOffsetArray")) {
             if (off.empty()) continue;
@@ -555,6 +810,10 @@ std::optional<Catalog::PersistentSpec> Catalog::effect_persistent(const std::str
             s.line_first = *std::min_element(offs.begin(), offs.end());
             s.line_last = *std::max_element(offs.begin(), offs.end());
             s.line_step = (s.line_last - s.line_first) / (s.line_count - 1);
+            for (const XmlNode& n : resolved("CEffect", effect_id))
+                if (n.name == "WhichLocation")
+                    if (const std::string* v = n.attr("Value"); v && *v == "SourcePoint")
+                        s.line_from_source = true;
         }
         if (s.amount == 0 && s.radius == 0) return std::nullopt;
         return s;
@@ -627,7 +886,7 @@ std::optional<int> Catalog::effect_hit_count(const std::string& effect_id, int d
         effect_id, depth,
         [](const std::string&) -> std::optional<int> { return 1; },
         [this](int sub, const std::string& id) -> int {
-            const int pc = int(scalar_num("CEffect", id, "PeriodCount").value_or(1));
+            const int pc = int(scalar_num("CEffect", id, "PeriodCount").value_or(0));
             return sub * (pc > 0 ? pc : 1);
         },
         prefer);
@@ -825,6 +1084,7 @@ Catalog::UnitStats Catalog::unit_stats(const std::string& unit_id) const {
     s.shields_max = scalar_num("CUnit", unit_id, "ShieldsMax").value_or(0);
     s.speed = scalar_num("CUnit", unit_id, "Speed").value_or(0);
     s.radius = scalar_num("CUnit", unit_id, "Radius");
+    if (!s.radius && find("CUnit", unit_id)) s.radius = 0.5;
     bool primary_weapon = true;
     for (const std::string& wl : array_links("CUnit", unit_id, "WeaponArray"))
         if (!wl.empty()) {
@@ -862,6 +1122,80 @@ void Catalog::load_melee(const casc::Storage& store) {
                        "FootprintData.xml", "ButtonData.xml", "RequirementData.xml",
                        "RequirementNodeData.xml", "ActorData.xml",
                        "ModelData.xml", "SoundData.xml"});
+    load_strings(store);
+}
+
+static const char* const kCampaignFiles[] = {
+    "UnitData.xml",     "WeaponData.xml",   "EffectData.xml",  "AbilData.xml",
+    "BehaviorData.xml", "UpgradeData.xml",  "ValidatorData.xml", "MoverData.xml",
+    "FootprintData.xml", "ButtonData.xml",  "RequirementData.xml", "RequirementNodeData.xml",
+    "ActorData.xml",    "ModelData.xml",    "SoundData.xml"};
+
+void Catalog::load_root_files(const casc::Storage& store,
+                              const std::vector<std::string>& roots,
+                              const std::vector<std::string>& basenames) {
+    for (const std::string& root : roots) {
+        for (const std::string& file : basenames) {
+            std::string name = root + "/GameData/" + file;
+            try {
+                ingest(store.read_by_name(name));
+            } catch (const std::exception&) {
+            }
+        }
+    }
+}
+
+void Catalog::load_campaign(const casc::Storage& store,
+                            const std::vector<std::string>& campaign_roots,
+                            const std::string& mission_local_root) {
+    load_melee(store);
+
+    std::vector<std::string> basenames(std::begin(kCampaignFiles), std::end(kCampaignFiles));
+    std::vector<std::string> roots = campaign_roots;
+    if (!mission_local_root.empty()) roots.push_back(mission_local_root);
+    load_root_files(store, roots, basenames);
+
+    for (const std::string& root : roots) {
+        std::string mod_base = root;
+        const std::string kData = ".sc2data";
+        std::size_t slash = mod_base.rfind('/');
+        if (slash != std::string::npos && mod_base.find(kData, slash) != std::string::npos)
+            mod_base = mod_base.substr(0, slash);
+        std::string name = mod_base + "/enus.sc2data/LocalizedData/GameStrings.txt";
+        try {
+            strings_.load(store.read_by_name(name));
+        } catch (const std::exception&) {
+        }
+    }
+}
+
+void Catalog::load_strings(const casc::Storage& store) {
+    for (const char* mod : kMeleeMods) {
+        std::string name = std::string("mods/") + mod +
+                           ".sc2mod/enus.sc2data/LocalizedData/GameStrings.txt";
+        try {
+            strings_.load(store.read_by_name(name));
+        } catch (const std::exception&) {
+        }
+    }
+}
+
+std::optional<std::string> Catalog::button_display_name(const std::string& button_id) const {
+    if (button_id.empty()) return std::nullopt;
+    if (const std::string* v = strings_.find("Button/Name/" + button_id)) return *v;
+    return std::nullopt;
+}
+
+std::optional<std::string> Catalog::unit_display_name(const std::string& unit_id) const {
+    if (unit_id.empty()) return std::nullopt;
+    if (const std::string* v = strings_.find("Unit/Name/" + unit_id)) return *v;
+    return std::nullopt;
+}
+
+std::optional<std::string> Catalog::ability_display_name(const std::string& ability_id) const {
+    if (ability_id.empty()) return std::nullopt;
+    if (const std::string* v = strings_.find("Abil/Name/" + ability_id)) return *v;
+    return std::nullopt;
 }
 
 std::optional<Catalog::MorphSpec> Catalog::morph_spec(const std::string& abil_id) const {

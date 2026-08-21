@@ -10,16 +10,23 @@ namespace sc2::sim {
 enum class BuildStyle { TerranStructure, ProtossWarp, ZergMorph };
 
 inline bool can_place_structure(const World& world, const TerrainMap& terrain, int cx0,
-                                int cy0, int fw, int fh, std::uint32_t builder = kNoTarget) {
+                                int cy0, int fw, int fh, std::uint32_t builder = kNoTarget,
+                                bool requires_vespene = false) {
     if (!terrain.can_place(cx0, cy0, fw, fh)) return false;
+    bool found_gas = false;
     for (const Unit& u : world.units()) {
         if (!u.alive) continue;
         if (u.id == builder) continue;
         int ucx, ucy;
         terrain.to_cell(u.x, u.y, ucx, ucy);
-        if (ucx >= cx0 && ucx < cx0 + fw && ucy >= cy0 && ucy < cy0 + fh) return false;
+        if (!(ucx >= cx0 && ucx < cx0 + fw && ucy >= cy0 && ucy < cy0 + fh)) continue;
+        if (requires_vespene && u.is_gas && u.resource_left > 0) {
+            found_gas = true;
+            continue;
+        }
+        return false;
     }
-    return true;
+    return !requires_vespene || found_gas;
 }
 
 struct BuildResult {
@@ -31,7 +38,8 @@ inline BuildResult begin_structure(World& world, const TerrainMap& terrain, Unit
                                    BuildStyle style, int cx0, int cy0, int fw, int fh,
                                    std::uint32_t builder = kNoTarget, bool powered = true) {
     BuildResult r;
-    if (!can_place_structure(world, terrain, cx0, cy0, fw, fh, builder)) return r;
+    if (!can_place_structure(world, terrain, cx0, cy0, fw, fh, builder, proto.requires_vespene))
+        return r;
     if (style == BuildStyle::ProtossWarp && !powered) return r;
 
     Fixed lx, ly, hx, hy;

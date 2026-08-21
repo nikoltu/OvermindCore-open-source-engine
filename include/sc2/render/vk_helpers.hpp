@@ -102,6 +102,42 @@ inline Image make_image(VkPhysicalDevice pd, VkDevice dev, VkFormat fmt, VkImage
     return out;
 }
 
+inline Image make_image_array(VkPhysicalDevice pd, VkDevice dev, VkFormat fmt,
+                              VkImageUsageFlags usage, uint32_t w, uint32_t h, uint32_t layers) {
+    VkImageCreateInfo ii{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
+    ii.imageType = VK_IMAGE_TYPE_2D;
+    ii.format = fmt;
+    ii.extent = {w, h, 1};
+    ii.mipLevels = 1;
+    ii.arrayLayers = layers;
+    ii.samples = VK_SAMPLE_COUNT_1_BIT;
+    ii.tiling = VK_IMAGE_TILING_OPTIMAL;
+    ii.usage = usage;
+    ii.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+    VkImage raw = VK_NULL_HANDLE;
+    check(vkCreateImage(dev, &ii, nullptr, &raw), "vkCreateImage(array)");
+    Image out;
+    out.img = Unique<VkImage>(raw, [dev](VkImage i) { vkDestroyImage(dev, i, nullptr); });
+    VkMemoryRequirements req;
+    vkGetImageMemoryRequirements(dev, raw, &req);
+    VkMemoryAllocateInfo ai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
+    ai.allocationSize = req.size;
+    ai.memoryTypeIndex = find_memory(pd, req.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+    VkDeviceMemory rawmem = VK_NULL_HANDLE;
+    check(vkAllocateMemory(dev, &ai, nullptr, &rawmem), "vkAllocateMemory(image array)");
+    out.mem = Unique<VkDeviceMemory>(rawmem, [dev](VkDeviceMemory m) { vkFreeMemory(dev, m, nullptr); });
+    check(vkBindImageMemory(dev, raw, rawmem, 0), "vkBindImageMemory(array)");
+    VkImageViewCreateInfo vi{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
+    vi.image = raw;
+    vi.viewType = VK_IMAGE_VIEW_TYPE_2D_ARRAY;
+    vi.format = fmt;
+    vi.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, layers};
+    VkImageView rawview = VK_NULL_HANDLE;
+    check(vkCreateImageView(dev, &vi, nullptr, &rawview), "vkCreateImageView(array)");
+    out.view = Unique<VkImageView>(rawview, [dev](VkImageView v) { vkDestroyImageView(dev, v, nullptr); });
+    return out;
+}
+
 inline bool pick_present_device(VkInstance inst, VkSurfaceKHR surface, VkPhysicalDevice& out_pd,
                                 uint32_t& out_gfx) {
     uint32_t ndev = 0;

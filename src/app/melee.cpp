@@ -125,6 +125,14 @@ MeleeLayout build_melee(sim::World& w, const MeleeSetup& s) {
                           ps.producer_build_time, false};
         out.config.has_producer = true;
 
+        if (ps.has_tech) {
+            Unit tech_proto = ps.tech_unit;
+            tech_proto.speed = Fixed();
+            out.config.build_order.push_back(
+                ai::BuildItem{tech_proto, ps.tech_mineral_cost, ps.tech_gas_cost,
+                              ps.tech_build_time, false});
+        }
+
         w.player(int32_t(p)).minerals = ps.start_minerals;
 
         out.config.army_unit =
@@ -136,6 +144,7 @@ MeleeLayout build_melee(sim::World& w, const MeleeSetup& s) {
                               ps.army2_build_time, true};
             out.config.has_army_unit2 = true;
             out.config.army_unit2_gate = ps.army_unit2_gate;
+            out.config.tech_chain = ps.tech_chain;
         }
         out.config.army_threshold = ps.army_threshold;
         {
@@ -158,6 +167,8 @@ MeleeLayout build_melee(sim::World& w, const MeleeSetup& s) {
 
         layout.players.push_back(std::move(out));
     }
+
+    for (const Unit& n : s.neutrals) add(n, n.catalog_id.c_str());
 
     if (layout.unit_type.size() < w.units().size())
         layout.unit_type.resize(w.units().size());

@@ -57,6 +57,7 @@ enum class EffectKind {
     Reveal,
     Force,
     PhaseShift,
+    Inject,
 };
 
 inline constexpr std::uint16_t kCastBehaviorKind = 0xCA5;
@@ -87,6 +88,7 @@ struct AbilityDef {
     int32_t period_count = 0;
     int32_t spawn_proto = -1;
     int32_t spawn_count = 0;
+    bool spawn_snap_resource = false;
     int32_t mineral_cost = 0, gas_cost = 0;
     Fixed morph_heal_life_frac, morph_heal_shield_frac;
     EffectRef root = kNoEffect;
@@ -114,12 +116,14 @@ struct EffectNode {
     Fixed amount, duration, energy_fraction, radius, period;
     Fixed heal_drain_factor;
     Fixed shield_bonus;
+    Fixed armor_reduction{Fixed::from_int(1)};
     Fixed move_speed_mult{Fixed::from_int(1)}, attack_speed_mult{Fixed::from_int(1)};
     bool beh_root = false, beh_stun = false;
     bool beh_lift = false;
     bool beh_control_transfer = false;
     Fixed beh_dmg_per_tick, beh_dmg_period;
     int32_t period_count = 0, spawn_proto = -1, spawn_count = 0;
+    bool spawn_snap_resource = false;
     int32_t mineral_cost = 0, gas_cost = 0;
     Fixed morph_heal_life_frac, morph_heal_shield_frac;
     std::uint32_t wpn_bonus_attr = 0;
@@ -233,6 +237,7 @@ struct Unit {
     Fixed wpn_damage, wpn_period, wpn_range;
     Fixed wpn_min_range;
     Fixed wpn_damage_point;
+    Fixed wpn_armor_reduction{Fixed::from_int(1)};
     Fixed wpn_projectile_speed;
     Fixed wpn_backswing;
     int32_t wpn_hits = 1;
@@ -242,6 +247,10 @@ struct Unit {
     EffectRef wpn_effect = kNoEffect;
     Fixed speed, radius;
     Fixed sep_radius;
+    Fixed inner_radius;
+    uint32_t collide_flags = 0;
+    int32_t push_priority = 10;
+    int32_t allied_push_priority = 0;
     Fixed sight;
     Fixed death_reveal_radius{Fixed::from_int(2)};
     Fixed vision_height;
@@ -252,7 +261,9 @@ struct Unit {
     bool crushes_ff = false;
     int32_t creep_radius = 0;
     int32_t creep_grow_period = 0;
+    std::vector<std::pair<int16_t, int16_t>> footprint_offsets;
     bool requires_creep = false;
+    bool requires_vespene = false;
     Fixed atk_speed_mult = Fixed::from_int(1);
     Fixed damage_reduction;
     Fixed aura_dmg_reduction, aura_radius;
@@ -320,6 +331,7 @@ struct Unit {
     uint32_t windup_battr = 0;
     Fixed windup_bamt;
     Fixed windup_ps;
+    Fixed windup_ar{Fixed::from_int(1)};
 
     Fixed crush_damage;
     Fixed crush_radius;
@@ -388,6 +400,9 @@ struct Unit {
         Fixed damage, period, range, min_range, damage_point, projectile_speed, backswing, bonus_amount, acquire;
         int32_t hits = 1;
         uint32_t target_filter = 3, bonus_attr = 0;
+        int splash_line_count = 0;
+        Fixed splash_line_first, splash_line_step, splash_line_radius;
+        bool splash_line_from_source = false;
     };
     bool has_burrowed_wpn = false;
     bool burrowed_wpn_on = false;
@@ -405,6 +420,11 @@ struct Unit {
         std::swap(wpn_hits, burrowed_wpn.hits);
         std::swap(wpn_target_filter, burrowed_wpn.target_filter);
         std::swap(wpn_bonus_attr, burrowed_wpn.bonus_attr);
+        std::swap(splash_line_count, burrowed_wpn.splash_line_count);
+        std::swap(splash_line_first, burrowed_wpn.splash_line_first);
+        std::swap(splash_line_step, burrowed_wpn.splash_line_step);
+        std::swap(splash_line_radius, burrowed_wpn.splash_line_radius);
+        std::swap(splash_line_from_source, burrowed_wpn.splash_line_from_source);
     }
     int32_t attack_spawn_proto = -1;
     int32_t attack_spawn_count = 0;
@@ -414,7 +434,7 @@ struct Unit {
     uint32_t attributes = 0;
     uint32_t wpn_target_filter = 3;
     uint8_t target_sort = 0;
-    int32_t target_priority = 20;
+    int32_t target_priority = 0;
 
     Fixed wpn2_damage, wpn2_period, wpn2_range;
     Fixed wpn2_min_range;
@@ -424,6 +444,7 @@ struct Unit {
     Fixed wpn2_damage_point;
     Fixed wpn2_backswing;
     int32_t wpn2_hits = 1;
+    Fixed wpn2_armor_reduction{Fixed::from_int(1)};
     Fixed wpn2_projectile_speed;
 
     Fixed splash_inner, splash_mid, splash_outer;
@@ -434,6 +455,7 @@ struct Unit {
 
     int splash_line_count = 0;
     Fixed splash_line_first, splash_line_step, splash_line_radius;
+    bool splash_line_from_source = false;
 
     Fixed arc_radius[2];
     Fixed arc_cos[2];
@@ -455,6 +477,7 @@ struct Unit {
     Fixed lateral_accel;
     Fixed cur_speed;
     bool moving_now = false;
+    bool moved_this_tick = false;
     std::uint32_t cast_count = 0;
     Fixed facing;
     Fixed guard_x{}, guard_y{};
@@ -494,32 +517,11 @@ inline bool vital_gate_passes(const VitalGate& g, const Unit& t) {
     return true;
 }
 
-struct UpgradeMod {
-    enum class Field {
-        WeaponDamage,
-        WeaponRange,
-        LifeArmor,
-        ShieldArmor,
-        ShieldMax,
-        LifeMax,
-        Sight,
-        MoveSpeed,
-    };
-    enum class Op { Add, Multiply, Set };
-    Field field = Field::WeaponDamage;
-    Op op = Op::Add;
-    Fixed value{};
-    std::vector<std::string> catalog_ids;
-    uint32_t attr_mask = 0;
-};
-
 struct Player {
     int32_t minerals = 50;
     int32_t gas = 0;
     int32_t team = -1;
     std::vector<int32_t> upgrades;
-    int32_t weapon_upgrade = 0;
-    std::vector<UpgradeMod> stat_mods;
 };
 
 struct VeterancyDef {
@@ -528,6 +530,12 @@ struct VeterancyDef {
     std::vector<Fixed> cum_damage;
     Fixed xp_fraction = Fixed::from_int(1);
     int max_level() const { return int(xp_threshold.size()) - 1; }
+};
+
+struct OrderSink {
+    virtual ~OrderSink() = default;
+    virtual void on_order(int tick, uint32_t id, const Order& o, bool queued) = 0;
+    virtual void on_stop(int tick, uint32_t id) = 0;
 };
 
 class World {
@@ -542,11 +550,29 @@ public:
         if (weapon_executor_ && u.wpn_effect == kNoEffect &&
             (u.wpn_damage.raw() > 0 || u.wpn2_damage.raw() > 0))
             u.wpn_effect = ensure_weapon_effect();
-        units_.push_back(u);
-        if (u.player >= 0 && u.player < int32_t(players_.size()) && !players_[u.player].stat_mods.empty()) {
-            Unit& added = units_.back();
-            for (const UpgradeMod& m : players_[u.player].stat_mods) apply_mod_to_unit(added, m);
+        if (!attack_spawn_reg_.empty() && u.attack_spawn_proto < 0) {
+            auto it = attack_spawn_reg_.find(u.catalog_id);
+            if (it != attack_spawn_reg_.end()) {
+                u.attack_spawn_proto = it->second.first;
+                u.attack_spawn_count = it->second.second;
+            }
         }
+        if (!interceptor_arm_reg_.empty()) {
+            auto it = interceptor_arm_reg_.find(u.catalog_id);
+            if (it != interceptor_arm_reg_.end()) {
+                const InterceptorArm& a = it->second;
+                Carrier c;
+                c.carrier = u.id;
+                c.count = a.count;
+                c.count_max = a.count_max;
+                c.leash = a.leash;
+                c.build_time = a.build_time;
+                c.build_timer = a.build_time;
+                c.proto_idx = a.proto_idx;
+                carriers_.push_back(std::move(c));
+            }
+        }
+        units_.push_back(u);
         if (u.creep_radius > 0) {
             const int period = u.creep_grow_period > 0 ? u.creep_grow_period : 1;
             auto mit = creep_masks_.find(u.catalog_id);
@@ -558,8 +584,12 @@ public:
         return u.id;
     }
 
+    void set_order_sink(OrderSink* s) { order_sink_ = s; }
+    OrderSink* order_sink() const { return order_sink_; }
+
     void issue(uint32_t id, const Order& o, bool queued = false) {
         if (id >= units_.size()) return;
+        if (order_sink_ && !in_step_) order_sink_->on_order(tick_, id, o, queued);
         detach_builder(id);
         Unit& u = units_[id];
         if (!queued) u.orders.clear();
@@ -567,6 +597,7 @@ public:
     }
     void stop(uint32_t id) {
         if (id >= units_.size()) return;
+        if (order_sink_ && !in_step_) order_sink_->on_stop(tick_, id);
         detach_builder(id);
         units_[id].orders.clear();
     }
@@ -598,18 +629,23 @@ public:
 
     bool teleport_unit(uint32_t id, Fixed tx, Fixed ty);
 
-    void apply_spell_damage(uint32_t target, Fixed dmg, uint32_t caster);
+    void apply_spell_damage(uint32_t target, Fixed dmg, uint32_t caster,
+                            Fixed armor_reduction = Fixed::from_int(1));
 
     void apply_weapon_hit(std::uint32_t target, Fixed base, std::uint32_t bonus_attr,
-                          Fixed bonus_amount, std::uint32_t attacker);
+                          Fixed bonus_amount, std::uint32_t attacker,
+                          Fixed armor_reduction = Fixed::from_int(1));
+
+    void record_flee_trigger(Unit& target, std::uint32_t attacker, Fixed vitals_before);
 
     void apply_weapon_fire(std::uint32_t attacker, std::uint32_t target, Fixed w_dmg,
-                           std::uint32_t w_battr, Fixed w_bamt, int hits = 1);
+                           std::uint32_t w_battr, Fixed w_bamt, int hits = 1,
+                           Fixed w_ar = Fixed::from_int(1));
     void step_windup(Fixed dt);
     void step_projectiles(Fixed dt);
     void step_point_defense(Fixed dt);
     void queue_projectile(std::uint32_t attacker, Fixed px, Fixed py, std::uint32_t target, Fixed speed,
-                          Fixed dmg, std::uint32_t battr, Fixed bamt);
+                          Fixed dmg, std::uint32_t battr, Fixed bamt, Fixed ar = Fixed::from_int(1));
 
     Fixed heal_unit(uint32_t id, Fixed amount);
 
@@ -679,8 +715,6 @@ public:
 
     int32_t upgrade_level(int32_t player, int32_t upgrade_id) const;
     void set_upgrade_level(int32_t player, int32_t upgrade_id, int32_t level);
-
-    void apply_upgrade_mod(int32_t player, const UpgradeMod& mod);
 
     bool queue_train(uint32_t producer, const Unit& proto, int32_t mineral_cost,
                      int32_t gas_cost, Fixed build_time, int32_t count = 1);
@@ -764,12 +798,7 @@ public:
         u.build_progress = Fixed();
         u.build_hp0 = start_hp;
         u.hp = start_hp;
-        if (nav_.configured() && u.radius.raw() > 0) {
-            int cx0, cy0, cx1, cy1;
-            nav_.to_cell(u.x - u.radius, u.y - u.radius, cx0, cy0);
-            nav_.to_cell(u.x + u.radius, u.y + u.radius, cx1, cy1);
-            register_destructible(id, cx0, cy0, cx1, cy1);
-        }
+        register_footprint_block(id);
     }
     bool lift_off(uint32_t id) {
         if (id >= units_.size()) return false;
@@ -791,12 +820,7 @@ public:
         u.x = x;
         u.y = y;
         u.flying = false;
-        if (nav_.configured() && u.radius.raw() > 0) {
-            int cx0, cy0, cx1, cy1;
-            nav_.to_cell(u.x - u.radius, u.y - u.radius, cx0, cy0);
-            nav_.to_cell(u.x + u.radius, u.y + u.radius, cx1, cy1);
-            register_destructible(id, cx0, cy0, cx1, cy1);
-        }
+        register_footprint_block(id);
         return true;
     }
     bool lower(uint32_t id) {
@@ -817,12 +841,7 @@ public:
             if (dx * dx + dy * dy < rr * rr) return false;
         }
         u.lowered = false;
-        if (nav_.configured() && u.radius.raw() > 0) {
-            int cx0, cy0, cx1, cy1;
-            nav_.to_cell(u.x - u.radius, u.y - u.radius, cx0, cy0);
-            nav_.to_cell(u.x + u.radius, u.y + u.radius, cx1, cy1);
-            register_destructible(id, cx0, cy0, cx1, cy1);
-        }
+        register_footprint_block(id);
         return true;
     }
     bool is_constructing(uint32_t id) const {
@@ -949,6 +968,19 @@ public:
         return int32_t(spawn_protos_.size()) - 1;
     }
 
+    uint32_t nearest_mineral_node(Fixed x, Fixed y) const {
+        uint32_t node = kNoTarget;
+        Fixed best;
+        for (uint32_t i = 0; i < units_.size(); ++i) {
+            const Unit& n = units_[i];
+            if (!n.alive || n.resource_left <= 0 || n.is_gas) continue;
+            const Fixed dx = n.x - x, dy = n.y - y;
+            const Fixed d2 = dx * dx + dy * dy;
+            if (node == kNoTarget || d2 < best) { best = d2; node = i; }
+        }
+        return node;
+    }
+
     void begin_morph(uint32_t id, int32_t proto, Fixed time) {
         if (id >= units_.size() || proto < 0 || proto >= int32_t(spawn_protos_.size())) return;
         units_[id].morph_proto = proto;
@@ -1005,6 +1037,10 @@ public:
             pending_spawns_.push_back(
                 {proto, 1, units_[id].x, units_[id].y, units_[id].player, id, false});
     }
+    void set_larva_egg_proto(int32_t proto) {
+        egg_proto_ = (proto >= 0 && proto < int32_t(spawn_protos_.size())) ? proto : -1;
+        larva_egg_morph_ = egg_proto_ >= 0;
+    }
     int spawner_brood(uint32_t id) const {
         int n = 0;
         for (const Unit& u : units_)
@@ -1018,26 +1054,6 @@ public:
         return n;
     }
 
-    bool cast_inject(uint32_t queen, uint32_t hall, Fixed energy_cost, int32_t proto, int32_t count,
-                     Fixed hatch_delay, Fixed stun_dur) {
-        if (queen >= units_.size() || hall >= units_.size()) return false;
-        if (proto < 0 || proto >= int32_t(spawn_protos_.size()) || count <= 0) return false;
-        Unit& q = units_[queen];
-        if (q.energy < energy_cost) return false;
-        q.energy = q.energy - energy_cost;
-        Unit& h = units_[hall];
-        h.inject_proto = proto;
-        h.inject_count = count;
-        h.inject_timer = hatch_delay;
-        if (stun_dur.raw() > 0) {
-            BehaviorInstance b;
-            b.kind = kCastBehaviorKind;
-            b.timer = stun_dur;
-            b.stun = true;
-            add_behavior(queen, b);
-        }
-        return true;
-    }
     bool inject_pending(uint32_t id) const {
         return id < units_.size() && units_[id].inject_proto >= 0;
     }
@@ -1145,6 +1161,42 @@ public:
         creep_masks_[std::move(catalog_id)] = std::move(mask);
     }
 
+    void register_attack_spawn(std::string catalog_id, int32_t proto_idx, int32_t count) {
+        attack_spawn_reg_[std::move(catalog_id)] = {proto_idx, count};
+    }
+
+    void register_interceptor_arm(std::string catalog_id, int32_t proto_idx, int32_t count,
+                                  int32_t count_max, Fixed leash, Fixed build_time) {
+        interceptor_arm_reg_[std::move(catalog_id)] =
+            InterceptorArm{proto_idx, count, count_max, leash, build_time};
+    }
+    void step_interceptors(Fixed dt);
+    int interceptors_deployed(uint32_t carrier) const {
+        for (const Carrier& c : carriers_)
+            if (c.carrier == carrier) {
+                int n = 0;
+                for (uint32_t id : c.wing)
+                    if (id < units_.size() && units_[id].alive && !units_[id].loaded) ++n;
+                return n;
+            }
+        return 0;
+    }
+    std::size_t carrier_count() const { return carriers_.size(); }
+
+    void register_nova_launch(std::string catalog_id, Fixed speed, Fixed radius, Fixed damage,
+                              Fixed shield_bonus, Fixed duration, Fixed cooldown = Fixed()) {
+        nova_launch_reg_[std::move(catalog_id)] =
+            NovaArm{speed, radius, damage, shield_bonus, duration, cooldown};
+    }
+    bool launch_nova(uint32_t caster, Fixed tx, Fixed ty);
+    void step_nova(Fixed dt);
+    int novas_active() const {
+        int k = 0;
+        for (const Nova& n : novas_)
+            if (n.active) ++k;
+        return k;
+    }
+
     void set_death_reveal(bool on) { death_reveal_enabled_ = on; }
     bool death_reveal_enabled() const { return death_reveal_enabled_; }
 
@@ -1217,6 +1269,34 @@ public:
                 }
         destructibles_.push_back(std::move(d));
     }
+    void register_destructible_cells(uint32_t unit_id, const std::vector<std::pair<int, int>>& cells) {
+        Destructible d;
+        d.id = unit_id;
+        for (const auto& [x, y] : cells)
+            if (nav_.in_bounds(x, y) && !nav_.is_blocked_cell(x, y)) {
+                nav_.set_blocked(x, y, true);
+                d.cells.emplace_back(x, y);
+            }
+        destructibles_.push_back(std::move(d));
+    }
+    void register_footprint_block(uint32_t id) {
+        if (id >= units_.size() || !nav_.configured()) return;
+        const Unit& u = units_[id];
+        if (!u.footprint_offsets.empty()) {
+            int ocx, ocy;
+            nav_.to_cell(u.x, u.y, ocx, ocy);
+            std::vector<std::pair<int, int>> cells;
+            cells.reserve(u.footprint_offsets.size());
+            for (const auto& [dx, dy] : u.footprint_offsets)
+                cells.emplace_back(ocx + int(dx), ocy + int(dy));
+            register_destructible_cells(id, cells);
+        } else if (u.radius.raw() > 0) {
+            int cx0, cy0, cx1, cy1;
+            nav_.to_cell(u.x - u.radius, u.y - u.radius, cx0, cy0);
+            nav_.to_cell(u.x + u.radius, u.y + u.radius, cx1, cy1);
+            register_destructible(id, cx0, cy0, cx1, cy1);
+        }
+    }
     void update_destructibles();
 
     void register_conjoined_group(std::vector<uint32_t> members, int32_t debris_proto = -1) {
@@ -1235,8 +1315,6 @@ public:
     int winner() const;
 
 private:
-    static bool mod_matches(const Unit& u, const UpgradeMod& m);
-    void apply_mod_to_unit(Unit& u, const UpgradeMod& m);
     void emit_death_reveal(const Unit& victim, uint32_t killer);
 
     struct Watchtower {
@@ -1260,6 +1338,42 @@ private:
     };
     std::vector<Conjoined> conjoined_;
 
+    struct InterceptorArm {
+        int32_t proto_idx = -1;
+        int32_t count = 0;
+        int32_t count_max = 0;
+        Fixed leash;
+        Fixed build_time;
+    };
+    struct Carrier {
+        uint32_t carrier = kNoTarget;
+        int32_t count = 0;
+        int32_t count_max = 0;
+        Fixed leash;
+        Fixed build_time;
+        Fixed build_timer;
+        int32_t proto_idx = -1;
+        std::vector<uint32_t> wing;
+    };
+    std::unordered_map<std::string, InterceptorArm> interceptor_arm_reg_;
+    std::vector<Carrier> carriers_;
+
+    struct NovaArm {
+        Fixed speed, radius, damage, shield_bonus, duration;
+        Fixed cooldown;
+    };
+    static constexpr int32_t kNovaCooldownSlot = -1000;
+    struct Nova {
+        Fixed x, y, tx, ty;
+        Fixed speed, radius, damage, shield_bonus;
+        Fixed remaining;
+        int32_t owner = -1;
+        uint32_t caster = kNoTarget;
+        bool active = false;
+    };
+    std::unordered_map<std::string, NovaArm> nova_launch_reg_;
+    std::vector<Nova> novas_;
+
     struct Pending {
         uint32_t producer;
         Unit proto;
@@ -1269,6 +1383,7 @@ private:
         int32_t count = 1;
         int32_t mineral_cost = 0, gas_cost = 0;
         uint32_t consumed_larva = kNoTarget;
+        uint32_t egg = kNoTarget;
     };
 
     struct WorkerBuild {
@@ -1284,6 +1399,7 @@ private:
     std::vector<Player> players_;
     std::vector<Pending> pending_;
     std::vector<WorkerBuild> worker_builds_;
+    std::unordered_map<uint32_t, Unit> morph_founder_;
     std::vector<PersistentInstance> persistents_;
     std::vector<HealerInstance> healers_;
     std::vector<StatModInstance> stat_mods_;
@@ -1315,9 +1431,12 @@ private:
         return u.chrono_timer.raw() > 0 ? dt + dt / Fixed::from_int(2) : dt;
     }
     std::vector<Unit> spawn_protos_;
+    int32_t egg_proto_ = -1;
+    bool larva_egg_morph_ = false;
     struct PendingSpawn { int32_t proto; int32_t count; Fixed x, y; int32_t owner;
                           uint32_t parent = kNoTarget; bool injected = false;
-                          uint32_t phase_link = kNoTarget; Fixed move_x, move_y; };
+                          uint32_t phase_link = kNoTarget; Fixed move_x, move_y;
+                          uint32_t gather_node = kNoTarget, depot = kNoTarget; };
     std::vector<PendingSpawn> pending_spawns_;
     struct PendingHit {
         std::uint32_t attacker, target;
@@ -1327,6 +1446,7 @@ private:
         std::uint32_t battr;
         Fixed bamt;
         Fixed life;
+        Fixed ar{Fixed::from_int(1)};
     };
     std::vector<PendingHit> pending_hits_;
     std::vector<VeterancyDef> vet_defs_;
@@ -1344,6 +1464,7 @@ private:
     }
     CreepSystem creep_;
     std::unordered_map<std::string, std::vector<std::pair<int32_t, int32_t>>> creep_masks_;
+    std::unordered_map<std::string, std::pair<int32_t, int32_t>> attack_spawn_reg_;
     DeathReveal death_reveal_;
     bool death_reveal_enabled_ = false;
     ScanSweep scan_sweep_;
@@ -1354,6 +1475,8 @@ private:
     NavGrid nav_;
     Rng rng_;
     int tick_ = 0;
+    OrderSink* order_sink_ = nullptr;
+    bool in_step_ = false;
     bool separation_ = false;
     bool fog_acquire_ = false;
     bool target_sort_ = false;

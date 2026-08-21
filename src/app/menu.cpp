@@ -6,6 +6,7 @@
 #include <vector>
 
 #include "sc2/casc/storage.hpp"
+#include "sc2/data/strings.hpp"
 #include "sc2/ui/interact.hpp"
 
 namespace sc2::app {
@@ -53,14 +54,43 @@ std::optional<MainMenu> MainMenu::from_install(const std::string& data_dir,
         std::string xml(bytes.begin(), bytes.end());
 
         ui::LayoutSet set;
-        set.add_xml(layout_path, xml);
-        if (set.docs.empty()) return std::nullopt;
+        std::string prefix;
+        if (std::size_t p = layout_path.find("base.sc2data/"); p != std::string::npos)
+            prefix = layout_path.substr(0, p + 13);
+        try {
+            auto di = store.read_by_name(prefix + "UI/Layout/DescIndex.SC2Layout");
+            for (const std::string& inc : ui::LayoutSet::parse_includes(std::string(di.begin(), di.end()))) {
+                try {
+                    auto b = store.read_by_name(prefix + inc);
+                    set.add_xml(inc, std::string(b.begin(), b.end()));
+                } catch (const std::exception&) {   }
+            }
+        } catch (const std::exception&) {   }
 
+        ui::Layout screen = ui::parse_layout(xml);
+        set.add(layout_path, screen);
+
+        static const char* kMods[] = {"core",  "liberty",    "libertymulti", "swarm",
+                                      "swarmmulti", "void",   "voidmulti"};
+        data::StringTable strings;
+        for (const char* mod : kMods) {
+            try {
+                strings.load(store.read_by_name(std::string("mods/") + mod +
+                             ".sc2mod/enus.sc2data/LocalizedData/GameStrings.txt"));
+            } catch (const std::exception&) {   }
+        }
+        ui::TextResolver resolve_text = [&strings](const std::string& ref) { return strings.resolve(ref); };
+
+        const float cx0 = canvas.x, cy0 = canvas.y, cx1 = canvas.x + canvas.w, cy1 = canvas.y + canvas.h;
         MainMenu m;
-        for (const ui::Frame& top : set.docs.front().layout.frames) {
+        for (const ui::Frame& top : screen.frames) {
             ui::Frame inst = set.instantiate(top);
-            for (const ui::SolvedFrame& sf : ui::solve_layout(inst, canvas)) {
-                if (ui::is_interactive(sf) && !sf.name.empty()) m.add(sf.name, sf.rect);
+            for (const ui::SolvedFrame& sf : ui::solve_layout(inst, canvas, resolve_text)) {
+                if (!ui::is_interactive(sf) || sf.name.empty()) continue;
+                const float mx = sf.rect.x + sf.rect.w * 0.5f, my = sf.rect.y + sf.rect.h * 0.5f;
+                if (mx < cx0 || mx > cx1 || my < cy0 || my > cy1) continue;
+                if (sf.rect.w >= canvas.w || sf.rect.h >= canvas.h) continue;
+                m.add(sf.name, sf.rect);
             }
         }
         return m;

@@ -17,6 +17,8 @@ struct BuildItem {
     sim::Fixed build_time = sim::Fixed::from_int(1);
     bool army = false;
     int count = 1;
+    bool morph_self = false;
+    bool addon_self = false;
 };
 
 struct MeleeConfig {
@@ -25,6 +27,7 @@ struct MeleeConfig {
     BuildItem army_unit2;
     bool has_army_unit2 = false;
     std::string army_unit2_gate;
+    std::vector<BuildItem> tech_chain;
     BuildItem supply_unit;
     BuildItem worker_unit;
     int worker_target = 0;

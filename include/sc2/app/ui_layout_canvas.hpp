@@ -1,5 +1,8 @@
 #pragma once
 
+#include <utility>
+#include <vector>
+
 #include "sc2/app/ui_canvas.hpp"
 #include "sc2/ui/layout.hpp"
 
@@ -16,6 +19,18 @@ inline ui::Rect solved_to_physical(const Canvas& c, const ui::Rect& solved) {
 inline void physical_point_to_virtual(const Canvas& c, float px, float py, float& vx, float& vy) {
     vx = phys_to_virt(c, px);
     vy = phys_to_virt(c, py);
+}
+
+inline std::vector<ui::SolvedFrame> relayout_to_physical(const std::vector<ui::SolvedFrame>& solved,
+                                                         const Canvas& c) {
+    std::vector<ui::SolvedFrame> out;
+    out.reserve(solved.size());
+    for (const ui::SolvedFrame& f : solved) {
+        ui::SolvedFrame p = f;
+        p.rect = solved_to_physical(c, f.rect);
+        out.push_back(std::move(p));
+    }
+    return out;
 }
 
 }

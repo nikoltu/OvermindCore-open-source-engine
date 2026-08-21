@@ -14,18 +14,26 @@ struct ActorRules;
 
 struct AudioSink;
 
-enum class AnimState { Birth, Stand, Walk, Attack, Death, Gather, Cast };
+enum class AnimState {
+    Birth, Stand, Walk, Attack, Death, Gather, Cast,
+    FlyStart, FlyStand, FlyWalk, FlyEnd
+};
+inline constexpr int kAnimStateCount = 11;
 
 struct ActorInstance {
     const formats::Model* model = nullptr;
     const ActorRules* rules = nullptr;
     uint64_t seed = 0;
+    float facing = 0.0f;
+    bool facing_known = false;
     AnimState baseline = AnimState::Stand;
     AnimState oneshot = AnimState::Birth;
     bool has_oneshot = true;
     bool dead = false;
     float clock = 0;
-    int cached_seq[7] = {-2, -2, -2, -2, -2, -2, -2};
+    float walk_scale = 1.0f;
+    uint32_t swing = 0;
+    int cached_seq[kAnimStateCount] = {-2, -2, -2, -2, -2, -2, -2, -2, -2, -2, -2};
 
     std::vector<formats::M3Event> last_events;
 
@@ -34,8 +42,11 @@ struct ActorInstance {
     int sequence_of(AnimState s);
     void trigger(AnimState s);
     void set_moving(bool moving);
+    void set_air_activity(bool moving);
     void set_activity(bool moving, bool gathering);
     void advance(float dt_ms);
+    Mat4 orient() const { return rotation_z(facing); }
+
     std::vector<Mat4> pose_now();
     bool attachment(const std::string& name, Mat4& out);
 };
@@ -46,6 +57,7 @@ struct ActorDriver {
         bool alive = true;
         sim::Fixed x, y, cooldown;
         std::uint32_t cast_count = 0;
+        bool flying = false;
     };
     std::vector<Shadow> shadows;
     std::vector<ActorInstance> actors;

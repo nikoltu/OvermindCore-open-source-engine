@@ -27,10 +27,15 @@ inline std::vector<AbilityCardEntry> build_ability_card_entries(
     if (unit_catalog_id.empty()) return out;
     for (const data::Catalog::AbilityCardButton& b : cat.unit_ability_card_buttons(unit_catalog_id)) {
         if (is_universal_ability(b.ability)) continue;
+        if (const data::Catalog::Entry* ce = cat.find("CAbil", b.ability)) {
+            if (ce->tag == "CAbilTrain" || ce->tag == "CAbilWarpTrain") continue;
+            if (ce->tag == "CAbilBuild" && !cat.build_spec(b.ability).has_value()) continue;
+        }
         AbilityCardEntry e;
         e.ability = b.ability;
         e.command = b.command;
         e.name = b.face;
+        if (auto nm = cat.button_display_name(b.face)) e.name = std::move(*nm);
         if (auto ic = cat.button_icon(b.face)) e.icon = std::move(*ic);
         if (b.row >= 0 && b.col >= 0) e.slot = b.row * 5 + b.col;
         e.requirement_met =

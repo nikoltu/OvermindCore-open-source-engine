@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cctype>
+#include <cstring>
 #include <string>
 #include <unordered_set>
 #include <vector>
@@ -99,6 +100,32 @@ inline bool describe_casc_map(const casc::Storage& store, CascMap& map) {
         return false;
     }
     return fill_map_facts(std::move(bytes), map);
+}
+
+inline std::string doc_header_name(const std::vector<std::uint8_t>& header) {
+    static const char kKey[] = "DocInfo/Name";
+    const std::size_t kl = 12;
+    for (std::size_t i = 0; i + 2 + kl + 4 + 2 <= header.size(); ++i) {
+        if (header[i] == 0x0c && header[i + 1] == 0x00 &&
+            std::memcmp(&header[i + 2], kKey, kl) == 0) {
+            std::size_t p = i + 2 + kl + 4;
+            const std::uint16_t vl = std::uint16_t(header[p] | (header[p + 1] << 8));
+            p += 2;
+            if (vl == 0 || vl > 256 || p + vl > header.size()) return {};
+            return std::string(reinterpret_cast<const char*>(&header[p]), vl);
+        }
+    }
+    return {};
+}
+
+inline std::string read_casc_map_name(const std::vector<std::uint8_t>& archive_bytes) {
+    try {
+        formats::Mpq a = formats::Mpq::open(archive_bytes);
+        if (!a.contains("DocumentHeader")) return {};
+        return doc_header_name(a.read_file("DocumentHeader"));
+    } catch (const std::exception&) {
+        return {};
+    }
 }
 
 inline std::vector<platform::MapEntry> casc_maps_to_entries(const std::vector<CascMap>& maps) {

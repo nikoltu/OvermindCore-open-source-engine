@@ -24,6 +24,7 @@ struct Weapon {
     Fixed period;
     uint32_t bonus_attr = 0;
     Fixed bonus_amount = Fixed();
+    Fixed armor_reduction = Fixed::from_int(1);
 };
 
 inline Fixed min_damage() { return Fixed::from_ratio(1, 2); }
@@ -32,7 +33,7 @@ inline void apply_hit(const Weapon& w, Defender& d) {
     const Fixed armor = d.shields.raw() > 0 ? d.shield_armor : d.armor;
     Fixed base = w.damage;
     if (w.bonus_attr != 0 && (d.attributes & w.bonus_attr) != 0) base = base + w.bonus_amount;
-    Fixed eff = base - armor - d.damage_reduction;
+    Fixed eff = base - armor * w.armor_reduction - d.damage_reduction;
     eff = eff * d.dmg_fraction;
     if (d.dmg_clamp_max.raw() > 0 && eff > d.dmg_clamp_max) eff = d.dmg_clamp_max;
     if (eff < d.dmg_minimum) eff = d.dmg_minimum;
@@ -73,7 +74,7 @@ inline CombatResult time_to_kill(const Weapon& w, Defender d) {
 }
 
 inline bool in_line_splash(Fixed ax, Fixed ay, Fixed tx, Fixed ty, Fixed first, Fixed step, int count,
-                           Fixed radius, Fixed px, Fixed py) {
+                           Fixed radius, Fixed px, Fixed py, bool from_source = false) {
     if (count <= 0 || radius.raw() <= 0) return false;
     const Fixed r2 = radius * radius;
     Fixed dirx = Fixed(), diry = Fixed();
@@ -83,9 +84,10 @@ inline bool in_line_splash(Fixed ax, Fixed ay, Fixed tx, Fixed ty, Fixed first, 
         dirx = bvx / blen;
         diry = bvy / blen;
     }
+    const Fixed anchx = from_source ? ax : tx, anchy = from_source ? ay : ty;
     for (int k = 0; k < count; ++k) {
         const Fixed off = first + step * Fixed::from_int(k);
-        const Fixed cx = tx + dirx * off, cy = ty + diry * off;
+        const Fixed cx = anchx + dirx * off, cy = anchy + diry * off;
         const Fixed ex = px - cx, ey = py - cy;
         if (ex * ex + ey * ey <= r2) return true;
     }

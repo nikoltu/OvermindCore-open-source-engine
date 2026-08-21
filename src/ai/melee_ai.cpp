@@ -124,11 +124,48 @@ void MeleeAI::run_production(sim::World& w) {
     }
     if (int(w.pending_count()) >= cfg_.max_pending) return;
 
+    if (cfg_.has_army_unit2 && !cfg_.tech_chain.empty() && base_.depot < w.units().size() &&
+        w.unit(base_.depot).alive) {
+        for (const BuildItem& tb : cfg_.tech_chain) {
+            if (tb.addon_self) {
+                const uint32_t prod = base_.producer;
+                if (prod >= w.units().size() || !w.unit(prod).alive) break;
+                if (w.addon_of(prod) == sim::World::kAddonTechLab) continue;
+                if (w.unit(prod).addon_building != 0) return;
+                if (!afford(w, tb)) break;
+                w.player(player_).minerals -= tb.minerals;
+                w.player(player_).gas -= tb.gas;
+                w.build_addon(prod, sim::World::kAddonTechLab, tb.build_time);
+                return;
+            }
+            bool have = false;
+            for (const Unit& u : w.units())
+                if (u.alive && u.player == player_ && u.catalog_id == tb.proto.catalog_id) { have = true; break; }
+            if (have) continue;
+            if (tb.morph_self) {
+                if (w.is_morphing(base_.depot)) return;
+                if (!afford(w, tb)) break;
+                w.player(player_).minerals -= tb.minerals;
+                w.player(player_).gas -= tb.gas;
+                const int32_t idx = w.add_spawn_proto(tb.proto);
+                w.begin_morph(base_.depot, idx, tb.build_time);
+                return;
+            }
+            if (afford(w, tb) &&
+                w.queue_train(base_.depot, tb.proto, tb.minerals, tb.gas, tb.build_time))
+                return;
+            break;
+        }
+    }
+
     if (cfg_.has_supply) {
         Fixed used = w.supply_used(player_), cap = w.supply_max(player_);
         if (cap < Fixed::from_int(200) && used + cfg_.supply_margin >= cap &&
             afford(w, cfg_.supply_unit)) {
-            w.queue_train(base_.producer, cfg_.supply_unit.proto,
+            const bool morph_at_hall = base_.depot < w.units().size() &&
+                                       w.unit(base_.depot).spawner_proto >= 0 &&
+                                       cfg_.supply_unit.proto.speed.raw() > 0;
+            w.queue_train(morph_at_hall ? base_.depot : base_.producer, cfg_.supply_unit.proto,
                           cfg_.supply_unit.minerals, cfg_.supply_unit.gas,
                           cfg_.supply_unit.build_time);
             return;
@@ -141,10 +178,14 @@ void MeleeAI::run_production(sim::World& w) {
         in_order ? cfg_.build_order[build_idx_]
                  : (want2 ? cfg_.army_unit2 : cfg_.army_unit);
     if (afford(w, item) && supply_ok(w, item)) {
-        w.queue_train(base_.producer, item.proto, item.minerals, item.gas,
-                      item.build_time, item.count);
-        if (in_order) ++build_idx_;
-        else if (cfg_.has_army_unit2) army_alt_ = !army_alt_;
+        const bool morph_at_hall = base_.depot < w.units().size() &&
+                                   w.unit(base_.depot).spawner_proto >= 0 &&
+                                   item.proto.speed.raw() > 0;
+        const uint32_t train_from = morph_at_hall ? base_.depot : base_.producer;
+        if (w.queue_train(train_from, item.proto, item.minerals, item.gas, item.build_time, item.count)) {
+            if (in_order) ++build_idx_;
+            else if (cfg_.has_army_unit2) army_alt_ = !army_alt_;
+        }
     }
 }
 

@@ -13,14 +13,17 @@ struct RaceUnits {
     const char* producer;
     const char* supply;
     const char* army;
+    const char* tech;
 };
 
 inline RaceUnits race_units(Race r) {
     switch (r) {
-        case Race::Protoss: return {"Nexus", "Probe", "Gateway", "Pylon", "Zealot"};
-        case Race::Zerg:    return {"Hatchery", "Drone", "SpawningPool", "Overlord", "Zergling"};
+        case Race::Protoss: return {"Nexus", "Probe", "Gateway", "Pylon", "Zealot", "Forge"};
+        case Race::Zerg:    return {"Hatchery", "Drone", "SpawningPool", "Overlord", "Zergling",
+                                    "EvolutionChamber"};
         case Race::Terran:
-        default:            return {"CommandCenter", "SCV", "Barracks", "SupplyDepot", "Marine"};
+        default:            return {"CommandCenter", "SCV", "Barracks", "SupplyDepot", "Marine",
+                                    "EngineeringBay"};
     }
 }
 
@@ -75,6 +78,74 @@ inline void apply_race_costs(MeleePlayerSetup& p, const data::Catalog& cat, Race
     p.army_build_time = secs(u.army, 18);
     p.army_count = prod.train_count(u.army);
     p.army_threshold = 5;
+    const data::UnitCost tcost = data::unit_cost(cat, u.tech);
+    p.tech_unit = make_unit(cat, u.tech, 0);
+    p.tech_unit.speed = Fixed();
+    p.tech_mineral_cost = tcost.minerals > 0 ? tcost.minerals : 125;
+    p.tech_gas_cost = tcost.gas;
+    p.tech_build_time = secs(u.tech, 25);
+    p.has_tech = true;
+
+    const char* caster = nullptr;
+    const char* gate = nullptr;
+    const char* chain[3] = {nullptr, nullptr, nullptr};
+    bool chain_morph[3] = {false, false, false};
+    bool chain_addon[3] = {false, false, false};
+    if (r == Race::Protoss) {
+        caster = "HighTemplar";
+        gate = "TemplarArchive";
+        chain[0] = "CyberneticsCore";
+        chain[1] = "TwilightCouncil";
+        chain[2] = "TemplarArchive";
+    } else if (r == Race::Zerg) {
+        caster = "Infestor";
+        gate = "InfestationPit";
+        chain[0] = "Lair";           chain_morph[0] = true;
+        chain[1] = "InfestationPit"; chain_morph[1] = false;
+    } else if (r == Race::Terran) {
+        caster = "Ghost";
+        gate = "GhostAcademy";
+        chain[0] = "BarracksTechLab"; chain_addon[0] = true;
+        chain[1] = "GhostAcademy";    chain_addon[1] = false;
+    }
+    if (caster) {
+        const data::UnitCost ccost = data::unit_cost(cat, caster);
+        p.has_army_unit2 = true;
+        p.army_unit2 = make_unit(cat, caster, 0);
+        p.army2_mineral_cost = ccost.minerals > 0 ? ccost.minerals : 50;
+        p.army2_gas_cost = ccost.gas;
+        p.army2_build_time = secs(caster, 55);
+        p.army_unit2_gate = gate;
+        for (int i = 0; i < 3 && chain[i]; ++i) {
+            const data::UnitCost bc = data::unit_cost(cat, chain[i]);
+            ai::BuildItem b;
+            b.proto = make_unit(cat, chain[i], 0);
+            b.proto.speed = Fixed();
+            b.minerals = bc.minerals > 0 ? bc.minerals : 150;
+            b.gas = bc.gas;
+            b.build_time = secs(chain[i], 40);
+            b.morph_self = chain_morph[i];
+            b.addon_self = chain_addon[i];
+            p.tech_chain.push_back(b);
+        }
+    }
+}
+
+inline void snap_base_to_real_resources(const formats::LoadedMap& map, int sx, int sy,
+                                        MeleePlayerSetup& p, double radius = 14.0) {
+    using sim::Fixed;
+    std::remove_reference_t<decltype(p.mineral_positions)> mins, gas;
+    for (const auto& u : map.objects.units) {
+        const double dx = u.x - sx, dy = u.y - sy;
+        if (dx * dx + dy * dy > radius * radius) continue;
+        const bool is_gas = u.unit_type.find("Geyser") != std::string::npos ||
+                            u.unit_type.find("Vespene") != std::string::npos;
+        const bool is_min = !is_gas && u.unit_type.find("Mineral") != std::string::npos;
+        if (is_gas) gas.push_back({Fixed::from_double(u.x), Fixed::from_double(u.y)});
+        else if (is_min) mins.push_back({Fixed::from_double(u.x), Fixed::from_double(u.y)});
+    }
+    if (mins.size() >= 4) p.mineral_positions = std::move(mins);
+    if (!gas.empty()) p.geyser_positions = std::move(gas);
 }
 
 inline MeleeSetup melee_setup_for_map(const formats::LoadedMap& map, const data::Catalog& cat,
@@ -90,8 +161,40 @@ inline MeleeSetup melee_setup_for_map(const formats::LoadedMap& map, const data:
         const MeleeProtos pr = race_protos(cat, r);
         const int sx = side ? st.s1x : st.s0x, sy = side ? st.s1y : st.s0y;
         MeleePlayerSetup p = map_melee_player(pr, sx, sy, st.cx, st.cy, worker_count, patches);
+        snap_base_to_real_resources(map, sx, sy, p);
         apply_race_costs(p, cat, r, prod);
         s.players.push_back(p);
+    }
+
+    {
+        using sim::Fixed;
+        const MeleeProtos npr = race_protos(cat, r0);
+        for (const auto& u : map.objects.units) {
+            const double d0 = (u.x - st.s0x) * (u.x - st.s0x) + (u.y - st.s0y) * (u.y - st.s0y);
+            const double d1 = (u.x - st.s1x) * (u.x - st.s1x) + (u.y - st.s1y) * (u.y - st.s1y);
+            if (d0 <= 196.0 || d1 <= 196.0) continue;
+            const bool gas = u.unit_type.find("Geyser") != std::string::npos ||
+                             u.unit_type.find("Vespene") != std::string::npos;
+            const bool min = !gas && u.unit_type.find("Mineral") != std::string::npos;
+            sim::Unit n;
+            if (gas) {
+                n = npr.geyser;
+            } else if (min) {
+                n = npr.mineral;
+            } else {
+                try {
+                    n = make_unit(cat, u.unit_type, -1);
+                } catch (const std::exception&) {
+                    continue;
+                }
+                n.speed = Fixed();
+            }
+            n.x = Fixed::from_double(u.x);
+            n.y = Fixed::from_double(u.y);
+            n.player = -1;
+            n.alive = true;
+            s.neutrals.push_back(std::move(n));
+        }
     }
     return s;
 }

@@ -216,28 +216,18 @@ void set_terrain_diffuse(formats::Model& m, const std::string& diffuse_path) {
     m.region_material.assign(m.regions.size(), 0);
 }
 
-GroundImage composite_map_ground(const casc::Storage& store, const formats::TextureInfo& info,
-                                 const formats::TextureMask& mask,
-                                 const std::vector<ResolvedLayer>& layers, uint32_t uv_tiles) {
+GroundImage composite_ground_images(const formats::TextureInfo& info,
+                                    const formats::TextureMask& mask,
+                                    const std::vector<LayerImage>& images, uint32_t uv_tiles) {
     GroundImage out;
-    if (info.empty() || mask.empty() || layers.empty() || uv_tiles == 0) return out;
-    if (mask.mask_w != info.width * 8 || mask.mask_h != info.height * 8) return out;
-    if (info.slots.size() < size_t(info.width) * info.height * 8) return out;
-    if (mask.texels.size() < size_t(mask.mask_w) * mask.mask_h * 4) return out;
-
-    struct Img {
-        uint32_t w = 0, h = 0;
-        std::vector<uint8_t> px;
-        bool ok = false;
-    };
-    std::vector<Img> imgs(layers.size());
-    for (size_t i = 0; i < layers.size(); ++i)
-        if (!layers[i].diffuse.empty())
-            imgs[i].ok = decode_asset(store, layers[i].diffuse, imgs[i].w, imgs[i].h, imgs[i].px);
+    if (mask.empty() || !mask.planar_ok() || images.empty() || uv_tiles == 0) return out;
+    if (!info.empty() &&
+        (mask.mask_w != info.width * 8 || mask.mask_h != info.height * 8))
+        return out;
 
     int base = -1;
-    for (size_t i = 0; i < imgs.size(); ++i)
-        if (imgs[i].ok) {
+    for (size_t i = 0; i < images.size(); ++i)
+        if (images[i].ok()) {
             base = int(i);
             break;
         }
@@ -248,37 +238,40 @@ GroundImage composite_map_ground(const casc::Storage& store, const formats::Text
     out.h = H;
     out.rgba.assign(size_t(W) * H * 4, 255);
 
-    auto sample = [](const Img& im, double u, double v, uint8_t* rgb) {
+    auto sample = [](const LayerImage& im, double u, double v, uint8_t* rgb) {
         uint32_t sx = uint32_t(u * im.w);
         uint32_t sy = uint32_t(v * im.h);
         if (sx >= im.w) sx = im.w - 1;
         if (sy >= im.h) sy = im.h - 1;
-        const uint8_t* p = &im.px[(size_t(sy) * im.w + sx) * 4];
+        const uint8_t* p = &im.rgba[(size_t(sy) * im.w + sx) * 4];
         rgb[0] = p[0];
         rgb[1] = p[1];
         rgb[2] = p[2];
     };
 
+    const uint32_t nlayers = uint32_t(images.size() < 8 ? images.size() : 8);
     for (uint32_t my = 0; my < H; ++my) {
         for (uint32_t mx = 0; mx < W; ++mx) {
-            const uint32_t cx = mx / 8, cy = my / 8;
-            const size_t cell = size_t(cy) * info.width + cx;
             double tu = (double(mx) / W) * uv_tiles;
             double tv = (double(my) / H) * uv_tiles;
             tu -= std::floor(tu);
             tv -= std::floor(tv);
-            uint8_t diff[3];
-            sample(imgs[base], tu, tv, diff);
-            const double w01 = double(mask.texels[(size_t(my) * W + mx) * 4]) / 255.0;
-            for (int k = 0; k < 8; ++k) {
-                const uint8_t s = info.slots[cell * 8 + k];
-                if (s == 0) continue;
-                const size_t li = size_t(s) - 1;
-                if (li >= imgs.size() || !imgs[li].ok) continue;
+            double acc[3] = {0, 0, 0};
+            uint32_t wsum = 0;
+            for (uint32_t L = 0; L < nlayers; ++L) {
+                if (!images[L].ok()) continue;
+                const uint8_t w = mask.layer_weight(L, mx, my);
+                if (!w) continue;
                 uint8_t ld[3];
-                sample(imgs[li], tu, tv, ld);
-                for (int c = 0; c < 3; ++c)
-                    diff[c] = uint8_t(int(diff[c]) + (int(ld[c]) - int(diff[c])) * w01 + 0.5);
+                sample(images[L], tu, tv, ld);
+                for (int c = 0; c < 3; ++c) acc[c] += double(w) * ld[c];
+                wsum += w;
+            }
+            uint8_t diff[3];
+            if (wsum == 0) {
+                sample(images[base], tu, tv, diff);
+            } else {
+                for (int c = 0; c < 3; ++c) diff[c] = uint8_t(acc[c] / wsum + 0.5);
             }
             uint8_t* o = &out.rgba[(size_t(my) * W + mx) * 4];
             o[0] = diff[0];
@@ -288,6 +281,56 @@ GroundImage composite_map_ground(const casc::Storage& store, const formats::Text
         }
     }
     return out;
+}
+
+GroundImage composite_map_ground(const casc::Storage& store, const formats::TextureInfo& info,
+                                 const formats::TextureMask& mask,
+                                 const std::vector<ResolvedLayer>& layers, uint32_t uv_tiles) {
+    std::vector<LayerImage> imgs(layers.size());
+    for (size_t i = 0; i < layers.size(); ++i)
+        if (!layers[i].diffuse.empty())
+            decode_asset(store, layers[i].diffuse, imgs[i].w, imgs[i].h, imgs[i].rgba);
+    return composite_ground_images(info, mask, imgs, uv_tiles);
+}
+
+GroundImage composite_retail_ground(const casc::Storage& store,
+                                    const std::vector<std::string>& layer_names,
+                                    const formats::TextureMask& mask, uint32_t uv_tiles) {
+    std::vector<ResolvedLayer> layers = resolve_map_layers(store, layer_names);
+    std::vector<LayerImage> imgs(layers.size());
+    for (size_t i = 0; i < layers.size(); ++i)
+        if (!layers[i].diffuse.empty())
+            decode_asset(store, layers[i].diffuse, imgs[i].w, imgs[i].h, imgs[i].rgba);
+    return composite_ground_images(formats::TextureInfo{}, mask, imgs, uv_tiles);
+}
+
+bool set_terrain_splat_gpu(formats::Model& m, const casc::Storage& store,
+                           const std::vector<std::string>& layer_names,
+                           const formats::TextureMask& mask, float extent_x, float extent_y) {
+    if (!mask.planar_ok() || layer_names.empty() || extent_x <= 0 || extent_y <= 0)
+        return false;
+    std::vector<ResolvedLayer> layers = resolve_map_layers(store, layer_names);
+    std::vector<formats::Model::SplatLayerImage> imgs(layers.size() < 8 ? layers.size() : 8);
+    bool any = false;
+    for (size_t i = 0; i < imgs.size(); ++i)
+        if (!layers[i].diffuse.empty() &&
+            decode_asset(store, layers[i].diffuse, imgs[i].w, imgs[i].h, imgs[i].rgba))
+            any = true;
+    if (!any) return false;
+    std::vector<uint8_t> planes(size_t(mask.mask_w) * mask.mask_h * 8);
+    for (uint32_t L = 0; L < 8; ++L) {
+        uint8_t* dst = planes.data() + size_t(L) * mask.mask_w * mask.mask_h;
+        for (uint32_t y = 0; y < mask.mask_h; ++y)
+            for (uint32_t x = 0; x < mask.mask_w; ++x)
+                dst[size_t(y) * mask.mask_w + x] = mask.layer_weight(L, x, y);
+    }
+    m.splat_layers = std::move(imgs);
+    m.splat_w = mask.mask_w;
+    m.splat_h = mask.mask_h;
+    m.splat_weights = std::move(planes);
+    m.splat_extent_x = extent_x;
+    m.splat_extent_y = extent_y;
+    return true;
 }
 
 void set_terrain_diffuse_rgba(formats::Model& m, uint32_t w, uint32_t h,

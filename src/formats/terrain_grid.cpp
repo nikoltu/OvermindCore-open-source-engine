@@ -58,9 +58,10 @@ TerrainGrid build_terrain_grid(const HeightMap& hm, const std::vector<uint8_t>& 
 
 size_t terrain_grid_to_nav(const TerrainGrid& tg, sim::NavGrid& out,
                            sim::Fixed cell_size, sim::Fixed origin_x,
-                           sim::Fixed origin_y) {
+                           sim::Fixed origin_y, bool apply_slope) {
     out.configure(int(tg.width), int(tg.height), cell_size, origin_x, origin_y);
     size_t blocked = 0;
+    if (!apply_slope) return blocked;
     for (uint32_t y = 0; y < tg.height; ++y)
         for (uint32_t x = 0; x < tg.width; ++x)
             if (tg.blocked[tg.idx(x, y)]) {

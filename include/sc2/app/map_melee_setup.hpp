@@ -1,5 +1,7 @@
 #pragma once
 
+#include <cmath>
+#include <array>
 #include <algorithm>
 #include <cstdint>
 #include <cstdlib>
@@ -57,8 +59,68 @@ inline MapMeleeStarts map_melee_starts(const formats::LoadedMap& map) {
         return {tx, ty};
     };
 
-    auto [s0x, s0y] = nearest_walkable(minx + insetx, miny + insety);
-    auto [s1x, s1y] = nearest_walkable(maxx - insetx, maxy - insety);
+    {
+        const auto& sl = map.objects.start_locations;
+        if (sl.size() >= 2) {
+            std::size_t ai = 0, bi = 1;
+            double bestD = -1.0;
+            for (std::size_t i = 0; i < sl.size(); ++i)
+                for (std::size_t j = i + 1; j < sl.size(); ++j) {
+                    const double dx = double(sl[i].first) - sl[j].first,
+                                 dy = double(sl[i].second) - sl[j].second;
+                    const double d = dx * dx + dy * dy;
+                    if (d > bestD) { bestD = d; ai = i; bi = j; }
+                }
+            auto near0 = [&](const std::pair<float, float>& p) {
+                const double dx = double(p.first) - minx, dy = double(p.second) - miny;
+                return dx * dx + dy * dy;
+            };
+            std::pair<float, float> a = sl[ai], b = sl[bi];
+            if (near0(b) < near0(a)) std::swap(a, b);
+            const auto A = nearest_walkable(int(a.first + 0.5f), int(a.second + 0.5f));
+            const auto B = nearest_walkable(int(b.first + 0.5f), int(b.second + 0.5f));
+            return {A.first, A.second, B.first, B.second, (minx + maxx) / 2, (miny + maxy) / 2};
+        }
+    }
+
+    std::vector<std::array<double, 3>> cl;
+    for (const auto& u : map.objects.units) {
+        if (u.unit_type.find("Mineral") == std::string::npos) continue;
+        int best = -1;
+        for (std::size_t c = 0; c < cl.size(); ++c) {
+            const double cx = cl[c][0] / cl[c][2], cy = cl[c][1] / cl[c][2];
+            if (std::abs(u.x - cx) <= 10.0 && std::abs(u.y - cy) <= 10.0) { best = int(c); break; }
+        }
+        if (best < 0) cl.push_back({double(u.x), double(u.y), 1.0});
+        else { cl[best][0] += u.x; cl[best][1] += u.y; cl[best][2] += 1.0; }
+    }
+    std::vector<std::pair<int, int>> mains;
+    for (const auto& c : cl)
+        if (c[2] >= 4.0) mains.push_back({int(c[0] / c[2] + 0.5), int(c[1] / c[2] + 0.5)});
+
+    int s0x, s0y, s1x, s1y;
+    if (mains.size() >= 2) {
+        std::size_t ai = 0, bi = 1;
+        double bestD = -1.0;
+        for (std::size_t i = 0; i < mains.size(); ++i)
+            for (std::size_t j = i + 1; j < mains.size(); ++j) {
+                const double dx = mains[i].first - mains[j].first,
+                             dy = mains[i].second - mains[j].second;
+                const double d = dx * dx + dy * dy;
+                if (d > bestD) { bestD = d; ai = i; bi = j; }
+            }
+        auto near0 = [&](std::pair<int, int> p) {
+            const double dx = p.first - minx, dy = p.second - miny;
+            return dx * dx + dy * dy;
+        };
+        std::pair<int, int> a = mains[ai], b = mains[bi];
+        if (near0(b) < near0(a)) std::swap(a, b);
+        std::tie(s0x, s0y) = nearest_walkable(a.first, a.second);
+        std::tie(s1x, s1y) = nearest_walkable(b.first, b.second);
+    } else {
+        std::tie(s0x, s0y) = nearest_walkable(minx + insetx, miny + insety);
+        std::tie(s1x, s1y) = nearest_walkable(maxx - insetx, maxy - insety);
+    }
     return {s0x, s0y, s1x, s1y, (minx + maxx) / 2, (miny + maxy) / 2};
 }
 

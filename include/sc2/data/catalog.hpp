@@ -1,5 +1,6 @@
 #pragma once
 
+#include <algorithm>
 #include <cmath>
 #include <cstdlib>
 #include <functional>
@@ -11,6 +12,7 @@
 #include <vector>
 
 #include "sc2/core/xml.hpp"
+#include "sc2/data/strings.hpp"
 
 namespace sc2::casc {
 class Storage;
@@ -41,6 +43,23 @@ public:
 
     void load_files(const casc::Storage& store,
                     const std::vector<std::string>& basenames);
+
+    void load_strings(const casc::Storage& store);
+
+    void load_root_files(const casc::Storage& store,
+                         const std::vector<std::string>& roots,
+                         const std::vector<std::string>& basenames);
+
+    void load_campaign(const casc::Storage& store,
+                       const std::vector<std::string>& campaign_roots,
+                       const std::string& mission_local_root = "");
+
+    void load_strings_text(const std::string& text) { strings_.load_text(text); }
+    const StringTable& strings() const { return strings_; }
+
+    std::optional<std::string> button_display_name(const std::string& button_id) const;
+    std::optional<std::string> unit_display_name(const std::string& unit_id) const;
+    std::optional<std::string> ability_display_name(const std::string& ability_id) const;
 
     void ingest(const std::vector<uint8_t>& xml);
 
@@ -94,6 +113,12 @@ public:
 
     std::optional<double> weapon_radius_split_no_splash(const std::string& weapon_id) const;
 
+    struct PointDefense {
+        double radius = 0;
+        int max = 0;
+    };
+    std::optional<PointDefense> point_defense_of(const std::string& unit_id) const;
+
     std::optional<int> weapon_hit_count(const std::string& weapon_id) const;
 
     std::string ability_command_requirement(const std::string& abil_id,
@@ -113,6 +138,14 @@ public:
     };
     std::vector<AbilityCardButton> unit_ability_card_buttons(const std::string& unit_id) const;
 
+    struct AbilityAutocast {
+        bool offered = false;
+        bool on_by_default = false;
+        double range = 0.0;
+        bool targets_allies = false;
+    };
+    AbilityAutocast ability_autocast(const std::string& abil_id) const;
+
     std::map<std::string, int> weapon_attribute_bonus(const std::string& weapon_id) const;
 
     std::string weapon_effect_id(const std::string& weapon_id) const {
@@ -126,6 +159,18 @@ public:
         if (auto disp = scalar("CWeapon", weapon_id, "DisplayEffect"); disp && !disp->empty())
             return damage_effect_id(*disp, 0);
         return std::nullopt;
+    }
+
+    double weapon_armor_reduction(const std::string& weapon_id) const {
+        if (auto id = weapon_damage_effect_id(weapon_id))
+            if (auto v = scalar_num("CEffect", *id, "ArmorReduction")) return *v;
+        return 1.0;
+    }
+
+    double effect_armor_reduction(const std::string& effect_id) const {
+        if (auto id = damage_effect_id(effect_id, 0))
+            if (auto v = scalar_num("CEffect", *id, "ArmorReduction")) return *v;
+        return 1.0;
     }
 
     std::optional<int> effect_damage(const std::string& effect_id) const {
@@ -319,6 +364,33 @@ public:
         return effect_create_unit(effect_id, 0);
     }
 
+    struct AttackSpawnSpec {
+        std::string unit;
+        int count = 0;
+        double life = 0;
+    };
+    std::optional<AttackSpawnSpec> attack_spawn_of(const std::string& unit_id) const;
+
+    struct InterceptorMagSpec {
+        std::string unit;
+        int count = 0;
+        int count_max = 0;
+        double leash = 0;
+        double build_time = 0;
+    };
+    std::optional<InterceptorMagSpec> interceptor_magazine_of(const std::string& unit_id) const;
+
+    struct NovaLaunchSpec {
+        std::string ability;
+        std::string unit;
+        double speed = 0;
+        double radius = 0;
+        double damage = 0;
+        double shield_bonus = 0;
+        double duration = 0;
+    };
+    std::optional<NovaLaunchSpec> nova_launch_of(const std::string& unit_id) const;
+
     struct PersistentSpec {
         double amount = 0;
         double radius = 0;
@@ -328,6 +400,7 @@ public:
         double line_first = 0;
         double line_last = 0;
         double line_step = 0;
+        bool line_from_source = false;
     };
     std::optional<PersistentSpec> effect_persistent(const std::string& effect_id) const {
         return effect_persistent(effect_id, 0);
@@ -379,6 +452,11 @@ public:
     std::optional<double> repair_time(const std::string& unit_id) const {
         if (auto v = scalar_num("CUnit", unit_id, "RepairTime")) return *v;
         return std::nullopt;
+    }
+
+    float unit_display_height(const std::string& unit_id) const {
+        if (auto v = scalar_num("CUnit", unit_id, "Height")) return float(*v);
+        return 0.0f;
     }
 
     std::optional<int> cargo_size(const std::string& unit_id) const {
@@ -486,6 +564,59 @@ public:
         return {};
     }
 
+    std::vector<std::pair<int, int>> unit_pathing_footprint_offsets(const std::string& unit_id) const {
+        auto fp = scalar("CUnit", unit_id, "Footprint");
+        if (!fp) return {};
+        std::vector<std::pair<int, int>> result;
+        auto has = [&](int x, int y) {
+            for (const auto& c : result)
+                if (c.first == x && c.second == y) return true;
+            return false;
+        };
+        std::string aux;
+        for (const core::XmlNode& layer : resolved("CFootprint", *fp)) {
+            if (layer.name != "Layers" || layer.attr_or("index", "") != "Place") continue;
+            for (const core::XmlNode& s : layer.children)
+                if (s.name == "Sets")
+                    if (const std::string* c = s.attr("Character"); c && !c->empty())
+                        if (aux.find((*c)[0]) == std::string::npos) aux.push_back((*c)[0]);
+        }
+        for (const core::XmlNode& layer : resolved("CFootprint", *fp)) {
+            if (layer.name != "Layers" || layer.attr_or("index", "") != "Place") continue;
+            std::vector<std::pair<std::string, int>> rows;
+            int seq = 0, maxcols = 0;
+            for (const core::XmlNode& row : layer.children) {
+                if (row.name != "Rows") continue;
+                const std::string* v = row.attr("value");
+                const std::string& bits = v ? *v : row.text;
+                const std::string* ri = row.attr("index");
+                const int r = ri ? std::atoi(ri->c_str()) : seq;
+                rows.emplace_back(bits, r);
+                if (int(bits.size()) > maxcols) maxcols = int(bits.size());
+                ++seq;
+            }
+            if (rows.empty()) continue;
+            int minx, miny, mx, my, mw, mh;
+            const std::string* area = layer.attr("Area");
+            if (area && std::sscanf(area->c_str(), "%d,%d,%d,%d", &mx, &my, &mw, &mh) == 4) {
+                minx = mx;
+                miny = my;
+            } else {
+                minx = -(maxcols / 2);
+                miny = -(seq / 2);
+            }
+            for (const auto& [bits, r] : rows)
+                for (std::size_t col = 0; col < bits.size(); ++col) {
+                    const char ch = bits[col];
+                    if (ch == '.' || ch == ' ' || ch == '\t' || ch == '\r' || ch == '\n') continue;
+                    if (aux.find(ch) != std::string::npos) continue;
+                    const int x = minx + int(col), y = miny + r;
+                    if (!has(x, y)) result.emplace_back(x, y);
+                }
+        }
+        return result;
+    }
+
     bool unit_can_build_addon(const std::string& unit_id) const {
         for (const std::string& ab : array_links("CUnit", unit_id, "AbilArray")) {
             if (ab.empty()) continue;
@@ -503,6 +634,34 @@ public:
             if (e && e->tag == "CAbilMerge") return ab;
         }
         return {};
+    }
+
+    bool structure_requires_vespene(const std::string& unit_id) const {
+        if (unit_id.empty()) return false;
+        auto fam = families_.find("CAbil");
+        if (fam == families_.end()) return false;
+        for (const auto& [abil_id, entry] : fam->second) {
+            if (entry.tag != "CAbilBuild") continue;
+            for (const core::XmlNode& n : resolved("CAbil", abil_id)) {
+                if (n.name != "InfoArray") continue;
+                const std::string* built = n.attr("Unit");
+                if (!built || *built != unit_id) continue;
+                auto names_resource_validator = [&](const std::string& v) {
+                    if (v.empty()) return false;
+                    const Entry* ve = find("CValidator", v);
+                    return ve && ve->tag == "CValidatorUnitCompareResourceContents";
+                };
+                if (const std::string* va = n.attr("ValidatorArray");
+                    va && names_resource_validator(*va))
+                    return true;
+                for (const core::XmlNode& c : n.children) {
+                    if (c.name != "ValidatorArray") continue;
+                    if (const std::string* v = c.attr("value"); v && names_resource_validator(*v))
+                        return true;
+                }
+            }
+        }
+        return false;
     }
 
     std::string burrow_ability(const std::string& unit_id) const {
@@ -985,7 +1144,15 @@ public:
         double delay = 0;
         double stun = 0;
     };
-    InjectInfo inject_ability(const std::string& unit_id) const {
+    struct InjectSpec {
+        bool found = false;
+        int count = 0;
+        double delay = 0;
+        double stun = 0;
+    };
+    InjectSpec inject_spec(const std::string& abil_id) const {
+        const Entry* ae = find("CAbil", abil_id);
+        if (!ae || ae->tag != "CAbilEffectTarget") return {};
         auto walk = [this](const std::string& root, auto&& visit) {
             std::vector<std::string> stack{root}, seen;
             auto seen_before = [&seen](const std::string& s) {
@@ -1017,40 +1184,89 @@ public:
                 }
             }
         };
+        std::string root = scalar("CAbil", abil_id, "Effect").value_or("");
+        if (root.empty()) root = abil_id;
+        double delay = 0, stun = 0;
+        std::string expire;
+        walk(root, [&](const std::string& cur, const Entry& ee) {
+            if (ee.tag != "CEffectApplyBehavior") return;
+            const std::string buff = scalar("CEffect", cur, "Behavior").value_or("");
+            if (buff.empty()) return;
+            const Entry* be = find("CBehavior", buff);
+            if (!be || be->tag != "CBehaviorBuff") return;
+            const double dur = scalar_num("CBehavior", buff, "Duration").value_or(0.0);
+            if (dur <= 0) return;
+            const std::string exp = scalar("CBehavior", buff, "ExpireEffect").value_or("");
+            if (!exp.empty()) {
+                if (delay <= 0) { delay = dur; expire = exp; }
+            } else if (stun <= 0) {
+                stun = dur;
+            }
+        });
+        if (delay <= 0 || expire.empty()) return {};
+        int count = 0;
+        walk(expire, [&](const std::string& cur, const Entry& ee) {
+            if (count > 0) return;
+            if (ee.tag != "CEffectApplyBehavior") return;
+            if (auto c = scalar_num("CEffect", cur, "Count")) count = int(*c);
+        });
+        if (count <= 0) return {};
+        return {true, count, delay, stun};
+    }
+    InjectInfo inject_ability(const std::string& unit_id) const {
         for (const std::string& ab : array_links("CUnit", unit_id, "AbilArray")) {
             if (ab.empty()) continue;
-            const Entry* ae = find("CAbil", ab);
-            if (!ae || ae->tag != "CAbilEffectTarget") continue;
-            std::string root = scalar("CAbil", ab, "Effect").value_or("");
-            if (root.empty()) root = ab;
-            double delay = 0, stun = 0;
-            std::string expire;
-            walk(root, [&](const std::string& cur, const Entry& ee) {
-                if (ee.tag != "CEffectApplyBehavior") return;
-                const std::string buff = scalar("CEffect", cur, "Behavior").value_or("");
-                if (buff.empty()) return;
-                const Entry* be = find("CBehavior", buff);
-                if (!be || be->tag != "CBehaviorBuff") return;
-                const double dur = scalar_num("CBehavior", buff, "Duration").value_or(0.0);
-                if (dur <= 0) return;
-                const std::string exp = scalar("CBehavior", buff, "ExpireEffect").value_or("");
-                if (!exp.empty()) {
-                    if (delay <= 0) { delay = dur; expire = exp; }
-                } else if (stun <= 0) {
-                    stun = dur;
-                }
-            });
-            if (delay <= 0 || expire.empty()) continue;
-            int count = 0;
-            walk(expire, [&](const std::string& cur, const Entry& ee) {
-                if (count > 0) return;
-                if (ee.tag != "CEffectApplyBehavior") return;
-                if (auto c = scalar_num("CEffect", cur, "Count")) count = int(*c);
-            });
-            if (count <= 0) continue;
-            return {true, ab, count, delay, stun};
+            if (auto iv = inject_spec(ab); iv.found) return {true, ab, iv.count, iv.delay, iv.stun};
         }
         return {};
+    }
+
+    struct MuleCalldownSpec { bool found = false; std::string unit; double life = 0; };
+    MuleCalldownSpec mule_calldown_spec(const std::string& abil_id) const {
+        const Entry* ae = find("CAbil", abil_id);
+        if (!ae || ae->tag != "CAbilEffectTarget") return {};
+        const std::string root = scalar("CAbil", abil_id, "Effect").value_or("");
+        if (root.empty()) return {};
+        auto is_harvester = [this](const std::string& uid) {
+            for (const std::string& ab : array_links("CUnit", uid, "AbilArray")) {
+                const Entry* e = ab.empty() ? nullptr : find("CAbil", ab);
+                if (e && e->tag == "CAbilHarvest") return true;
+            }
+            return false;
+        };
+        std::string unit;
+        double life = 0;
+        std::vector<std::string> stack{root}, seen;
+        while (!stack.empty() && seen.size() < 256) {
+            const std::string cur = stack.back();
+            stack.pop_back();
+            if (cur.empty() || std::find(seen.begin(), seen.end(), cur) != seen.end()) continue;
+            seen.push_back(cur);
+            const Entry* ee = find("CEffect", cur);
+            if (!ee) continue;
+            if (ee->tag == "CEffectCreateUnit") {
+                const std::string su = scalar("CEffect", cur, "SpawnUnit").value_or("");
+                if (unit.empty() && !su.empty() && is_harvester(su)) unit = su;
+            } else if (ee->tag == "CEffectApplyBehavior") {
+                const std::string buff = scalar("CEffect", cur, "Behavior").value_or("");
+                if (!buff.empty())
+                    if (const Entry* be = find("CBehavior", buff); be && be->tag == "CBehaviorBuff")
+                        if (const double dur = scalar_num("CBehavior", buff, "Duration").value_or(0.0);
+                            dur > life && !scalar("CBehavior", buff, "ExpireEffect").value_or("").empty())
+                            life = dur;
+            }
+            for (const core::XmlNode& n : resolved("CEffect", cur))
+                if (n.name == "EffectArray" || n.name == "PeriodicEffectArray" || n.name == "CaseArray" ||
+                    n.name == "CaseDefault" || n.name == "Effect" || n.name == "SpawnEffect" ||
+                    n.name == "FinalEffect" || n.name == "ImpactEffect") {
+                    std::string id = n.attr_or("value", "");
+                    if (id.empty()) id = n.attr_or("Effect", "");
+                    if (id.empty()) id = n.attr_or("Link", "");
+                    if (!id.empty()) stack.push_back(id);
+                }
+        }
+        if (unit.empty()) return {};
+        return {true, unit, life};
     }
 
     struct CreepTumorInfo {
@@ -1135,64 +1351,67 @@ public:
         double energy = 0;
         double life = 0;
     };
+    InfestedTerranInfo infested_terran_spec(const std::string& abil_id) const {
+        const Entry* ae = find("CAbil", abil_id);
+        if (!ae || ae->tag != "CAbilEffectTarget") return {};
+        std::string eff;
+        for (const core::XmlNode& n : resolved("CAbil", abil_id))
+            if (n.name == "Effect") {
+                const std::string v = n.attr_or("value", "");
+                if (!v.empty()) eff = v;
+            }
+        if (eff.empty()) return {};
+        const auto cu = effect_create_unit(eff);
+        if (!cu || cu->unit.empty()) return {};
+        const std::string egg = cu->unit;
+        std::string combat, finish_effect;
+        for (const std::string& m : array_links("CUnit", egg, "AbilArray")) {
+            if (m.empty()) continue;
+            const Entry* me = find("CAbil", m);
+            if (!me || me->tag != "CAbilMorph") continue;
+            for (const core::XmlNode& info : resolved("CAbil", m)) {
+                if (info.name != "InfoArray") continue;
+                std::string u = info.attr_or("Unit", "");
+                if (u.empty())
+                    for (const core::XmlNode& ch : info.children)
+                        if (ch.name == "Unit") {
+                            if (const std::string* v = ch.attr("value")) u = *v;
+                            break;
+                        }
+                if (u.empty()) continue;
+                combat = u;
+                for (const core::XmlNode& sec : info.children) {
+                    if (sec.name != "SectionArray") continue;
+                    for (const core::XmlNode& fx : sec.children)
+                        if (fx.name == "EffectArray" && fx.attr_or("index", "") == "Finish") {
+                            const std::string v = fx.attr_or("value", "");
+                            if (!v.empty()) finish_effect = v;
+                        }
+                }
+            }
+            if (!combat.empty()) break;
+        }
+        if (combat.empty()) return {};
+        double energy = 0;
+        for (const core::XmlNode& c : resolved("CAbil", abil_id)) {
+            if (c.name != "Cost") continue;
+            for (const core::XmlNode& g : c.children)
+                if (g.name == "Vital" && g.attr_or("index", "") == "Energy") {
+                    const std::string v = g.attr_or("value", "");
+                    if (!v.empty()) energy = std::atof(v.c_str());
+                }
+        }
+        double life = 0;
+        if (!finish_effect.empty())
+            if (auto beh = effect_apply_behavior(finish_effect))
+                if (auto bb = behavior_buff(*beh))
+                    life = bb->duration;
+        return {true, abil_id, egg, combat, cu->count, energy, life};
+    }
     InfestedTerranInfo infested_terran_ability(const std::string& unit_id) const {
         for (const std::string& ab : array_links("CUnit", unit_id, "AbilArray")) {
             if (ab.empty()) continue;
-            const Entry* ae = find("CAbil", ab);
-            if (!ae || ae->tag != "CAbilEffectTarget") continue;
-            std::string eff;
-            for (const core::XmlNode& n : resolved("CAbil", ab))
-                if (n.name == "Effect") {
-                    const std::string v = n.attr_or("value", "");
-                    if (!v.empty()) eff = v;
-                }
-            if (eff.empty()) continue;
-            const auto cu = effect_create_unit(eff);
-            if (!cu || cu->unit.empty()) continue;
-            const std::string egg = cu->unit;
-            std::string combat, finish_effect;
-            for (const std::string& m : array_links("CUnit", egg, "AbilArray")) {
-                if (m.empty()) continue;
-                const Entry* me = find("CAbil", m);
-                if (!me || me->tag != "CAbilMorph") continue;
-                for (const core::XmlNode& info : resolved("CAbil", m)) {
-                    if (info.name != "InfoArray") continue;
-                    std::string u = info.attr_or("Unit", "");
-                    if (u.empty())
-                        for (const core::XmlNode& ch : info.children)
-                            if (ch.name == "Unit") {
-                                if (const std::string* v = ch.attr("value")) u = *v;
-                                break;
-                            }
-                    if (u.empty()) continue;
-                    combat = u;
-                    for (const core::XmlNode& sec : info.children) {
-                        if (sec.name != "SectionArray") continue;
-                        for (const core::XmlNode& fx : sec.children)
-                            if (fx.name == "EffectArray" && fx.attr_or("index", "") == "Finish") {
-                                const std::string v = fx.attr_or("value", "");
-                                if (!v.empty()) finish_effect = v;
-                            }
-                    }
-                }
-                if (!combat.empty()) break;
-            }
-            if (combat.empty()) continue;
-            double energy = 0;
-            for (const core::XmlNode& c : resolved("CAbil", ab)) {
-                if (c.name != "Cost") continue;
-                for (const core::XmlNode& g : c.children)
-                    if (g.name == "Vital" && g.attr_or("index", "") == "Energy") {
-                        const std::string v = g.attr_or("value", "");
-                        if (!v.empty()) energy = std::atof(v.c_str());
-                    }
-            }
-            double life = 0;
-            if (!finish_effect.empty())
-                if (auto beh = effect_apply_behavior(finish_effect))
-                    if (auto bb = behavior_buff(*beh))
-                        life = bb->duration;
-            return {true, ab, egg, combat, cu->count, energy, life};
+            if (auto s = infested_terran_spec(ab); s.found) return s;
         }
         return {};
     }
@@ -1229,6 +1448,97 @@ public:
             }
         }
         return {};
+    }
+
+    struct TrainProduct {
+        std::string unit;
+        std::string ability;
+        std::string command;
+        std::string face;
+        int row = -1, col = -1;
+        double time = 0;
+        bool requires_techlab = false;
+    };
+    std::vector<TrainProduct> unit_train_products(const std::string& producer_id) const {
+        std::vector<TrainProduct> out;
+        for (const AbilityCardButton& b : unit_ability_card_buttons(producer_id)) {
+            const Entry* e = find("CAbil", b.ability);
+            if (!e || e->tag != "CAbilTrain") continue;
+            if (b.command.empty()) continue;
+            TrainProduct p;
+            p.ability = b.ability;
+            p.command = b.command;
+            p.face = b.face;
+            p.row = b.row;
+            p.col = b.col;
+            for (const core::XmlNode& info : resolved("CAbil", b.ability)) {
+                if (info.name != "InfoArray") continue;
+                if (info.attr_or("index", "") != b.command) continue;
+                std::string unit = info.attr_or("Unit", "");
+                if (const std::string t = info.attr_or("Time", ""); !t.empty()) p.time = std::atof(t.c_str());
+                for (const core::XmlNode& ch : info.children) {
+                    if (ch.name == "Unit") {
+                        if (const std::string* v = ch.attr("value")) unit = *v;
+                    } else if (ch.name == "Time") {
+                        if (const std::string* v = ch.attr("value")) p.time = std::atof(v->c_str());
+                    } else if (ch.name == "Button") {
+                        const std::string req = ch.attr_or("Requirements", "");
+                        if (req.find("Attached") != std::string::npos &&
+                            req.find("TechLab") != std::string::npos)
+                            p.requires_techlab = true;
+                    }
+                }
+                p.unit = std::move(unit);
+                break;
+            }
+            if (p.unit.empty()) continue;
+            out.push_back(std::move(p));
+        }
+        return out;
+    }
+
+    struct BuildProduct {
+        std::string unit;
+        std::string ability;
+        std::string command;
+        std::string face;
+        int row = -1, col = -1;
+        double time = 0;
+        bool is_gas = false;
+    };
+    std::vector<BuildProduct> unit_build_products(const std::string& worker_id) const {
+        std::vector<BuildProduct> out;
+        for (const AbilityCardButton& b : unit_ability_card_buttons(worker_id)) {
+            const Entry* e = find("CAbil", b.ability);
+            if (!e || e->tag != "CAbilBuild") continue;
+            if (b.command.empty()) continue;
+            BuildProduct p;
+            p.ability = b.ability;
+            p.command = b.command;
+            p.face = b.face;
+            p.row = b.row;
+            p.col = b.col;
+            bool unit_set = false;
+            for (const core::XmlNode& info : resolved("CAbil", b.ability)) {
+                if (info.name != "InfoArray") continue;
+                if (info.attr_or("index", "") != b.command) continue;
+                if (const std::string* u = info.attr("Unit")) { p.unit = *u; unit_set = true; }
+                if (const std::string t = info.attr_or("Time", ""); !t.empty()) p.time = std::atof(t.c_str());
+                for (const core::XmlNode& ch : info.children) {
+                    if (ch.name == "Unit") {
+                        if (const std::string* v = ch.attr("value")) { p.unit = *v; unit_set = true; }
+                    } else if (ch.name == "Time") {
+                        if (const std::string* v = ch.attr("value")) p.time = std::atof(v->c_str());
+                    } else if (ch.name == "ValidatorArray") {
+                        const std::string v = ch.attr_or("value", "");
+                        if (v.find("Vespene") != std::string::npos) p.is_gas = true;
+                    }
+                }
+            }
+            if (!unit_set || p.unit.empty()) continue;
+            out.push_back(std::move(p));
+        }
+        return out;
     }
 
     struct ResearchInfo {
@@ -1420,6 +1730,9 @@ public:
 
     const std::vector<core::XmlNode>& singleton_fields(const std::string& family) const;
 
+    std::optional<std::string> tag_default_scalar(const std::string& tag,
+                                                  const std::string& field) const;
+
 private:
     struct TwoSlot { std::string link; bool present = false; bool dead = false; };
     std::vector<TwoSlot> resolve_array_slots(const std::string& family,
@@ -1430,6 +1743,8 @@ private:
     std::unordered_map<std::string, IdMap> families_;
     std::unordered_map<std::string, std::string> consts_;
     std::unordered_map<std::string, std::vector<core::XmlNode>> singletons_;
+    std::unordered_map<std::string, std::vector<core::XmlNode>> tag_defaults_;
+    StringTable strings_;
 
     mutable std::unordered_map<std::string, std::vector<core::XmlNode>> resolved_cache_;
 
@@ -1506,6 +1821,7 @@ private:
     std::optional<std::string> effect_apply_behavior(const std::string& effect_id, int depth) const;
     std::optional<CreateUnitSpec> effect_create_unit(const std::string& effect_id, int depth) const;
     std::optional<PersistentSpec> effect_persistent(const std::string& effect_id, int depth) const;
+    std::optional<double> apply_behavior_duration(const std::string& effect_id, int depth) const;
     std::optional<std::pair<double, double>> area_damage_radius(const std::string& effect_id,
                                                                int depth) const;
     std::optional<std::string> damage_effect_id(const std::string& effect_id,

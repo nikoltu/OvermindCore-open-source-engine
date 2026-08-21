@@ -120,12 +120,18 @@ std::vector<std::string> split_path(const std::string& s) {
     return out;
 }
 
+bool prop_overrides(const XmlNode& a, const XmlNode& b) {
+    if (a.name != b.name) return false;
+    if (a.name == "Anchor") return a.attr_or("side", "") == b.attr_or("side", "");
+    return true;
+}
+
 void overlay(Frame& dst, const Frame& src) {
     if (!src.type.empty()) dst.type = src.type;
     for (const XmlNode& p : src.props) {
         bool replaced = false;
         for (XmlNode& q : dst.props)
-            if (q.name == p.name) { q = p; replaced = true; break; }
+            if (prop_overrides(q, p)) { q = p; replaced = true; break; }
         if (!replaced) dst.props.push_back(p);
     }
     for (const Frame& c : src.children) {
@@ -210,7 +216,7 @@ Frame instantiate_impl(const LayoutSet& set, const Frame& f,
     for (const XmlNode& p : f.props) {
         bool replaced = false;
         for (XmlNode& q : base.props)
-            if (q.name == p.name) { q = p; replaced = true; break; }
+            if (prop_overrides(q, p)) { q = p; replaced = true; break; }
         if (!replaced) base.props.push_back(p);
     }
     for (const Frame& c : f.children) {
@@ -271,9 +277,50 @@ int ancestor_depth(const std::string& rel) {
     return depth;
 }
 
-const Rect& anchor_target(const std::string& rel, const Rect& parent,
-                          const std::unordered_map<std::string, Rect>& siblings,
-                          const std::vector<const Rect*>& ancestors) {
+const Frame* frame_child(const Frame* f, const std::string& name) {
+    if (!f) return nullptr;
+    for (const Frame& c : f->children)
+        if (c.name == name) return &c;
+    return nullptr;
+}
+
+const Frame* walk_ref(const Frame* self, const std::vector<const Frame*>& ancestorsF,
+                      const std::string& rel) {
+    std::vector<std::string> seg = split_path(rel);
+    if (seg.empty()) return nullptr;
+    const Frame* cur = self;
+    std::size_t up = 0;
+    bool descended = false;
+    for (const std::string& s : seg) {
+        if (s == "$this") {
+            if (descended || up != 0) return nullptr;
+            cur = self;
+        } else if (s == "$parent") {
+            if (descended) return nullptr;
+            ++up;
+            if (up > ancestorsF.size()) return nullptr;
+            cur = ancestorsF[ancestorsF.size() - up];
+        } else if (!s.empty() && s[0] == '$') {
+            return nullptr;
+        } else {
+            cur = frame_child(cur, s);
+            if (!cur) return nullptr;
+            descended = true;
+        }
+    }
+    return cur == self ? nullptr : cur;
+}
+
+struct GlobalResolve {
+    const std::unordered_map<const Frame*, Rect>* prev;
+    std::unordered_map<const Frame*, Rect>* cur;
+    const TextResolver* text = nullptr;
+};
+
+Rect anchor_target(const std::string& rel, const Rect& parent,
+                   const std::unordered_map<std::string, Rect>& siblings,
+                   const std::vector<const Rect*>& ancestors, const Frame& self,
+                   const std::vector<const Frame*>& ancestorsF, const GlobalResolve* g) {
     if (int d = ancestor_depth(rel)) {
         if (ancestors.empty()) return parent;
         const std::size_t k = static_cast<std::size_t>(d);
@@ -281,14 +328,38 @@ const Rect& anchor_target(const std::string& rel, const Rect& parent,
         return *ancestors[idx];
     }
     const std::string name = sibling_ref_name(rel);
-    if (name.empty()) return parent;
-    auto it = siblings.find(name);
-    return it != siblings.end() ? it->second : parent;
+    if (!name.empty()) {
+        auto it = siblings.find(name);
+        return it != siblings.end() ? it->second : parent;
+    }
+    if (g) {
+        if (const Frame* tgt = walk_ref(&self, ancestorsF, rel)) {
+            auto ic = g->cur->find(tgt);
+            if (ic != g->cur->end()) return ic->second;
+            if (g->prev) {
+                auto ip = g->prev->find(tgt);
+                if (ip != g->prev->end()) return ip->second;
+            }
+        }
+    }
+    return parent;
+}
+
+std::string measurable_text(const Frame& f, const TextResolver* resolver) {
+    const XmlNode* tp = f.prop("Text");
+    if (!tp) return "";
+    std::string raw = tp->attr_or("val", "");
+    if (raw.empty()) return "";
+    if (resolver && *resolver) return (*resolver)(raw);
+    if (raw.size() >= 2 && (raw[0] == '#' || raw[0] == '@') && raw[1] == raw[0]) return raw.substr(1);
+    if (raw[0] == '#' || raw[0] == '@') return raw.substr(1);
+    return raw;
 }
 
 Rect solve_one(const Frame& f, const Rect& parent,
                const std::unordered_map<std::string, Rect>& siblings,
-               const std::vector<const Rect*>& ancestors) {
+               const std::vector<const Rect*>& ancestors,
+               const std::vector<const Frame*>& ancestorsF, const GlobalResolve* g) {
     bool haveL = false, haveR = false, haveT = false, haveB = false;
     bool haveW = false, haveH = false;
     float L = parent.x, R = parent.x + parent.w;
@@ -302,13 +373,21 @@ Rect solve_one(const Frame& f, const Rect& parent,
             if (side.empty()) continue;
             std::string pos = p.attr_or("pos", "Min");
             float off = attr_f(p, "offset", 0);
-            const Rect& base = anchor_target(p.attr_or("relative", ""), parent, siblings, ancestors);
+            Rect base = anchor_target(p.attr_or("relative", ""), parent, siblings, ancestors, f,
+                                      ancestorsF, g);
             bool horiz = (side == "Left" || side == "Right");
             float c = anchor_base(base, horiz, pos) + off;
             if (side == "Left") { L = c; haveL = true; }
             else if (side == "Right") { R = c; haveR = true; }
             else if (side == "Top") { T = c; haveT = true; }
             else if (side == "Bottom") { B = c; haveB = true; }
+        }
+    }
+    if ((!haveW && !(haveL && haveR)) || (!haveH && !(haveT && haveB))) {
+        std::string label = measurable_text(f, g ? g->text : nullptr);
+        if (!label.empty()) {
+            if (!haveW && !(haveL && haveR)) { W = float(measure_text(label, 1)); haveW = W > 0; }
+            if (!haveH && !(haveT && haveB)) { H = float(kFontH); haveH = H > 0; }
         }
     }
     Rect r;
@@ -329,7 +408,11 @@ Rect solve_one(const Frame& f, const Rect& parent,
     return r;
 }
 
-std::string display_text(const Frame& f) {
+std::string display_text(const Frame& f, const TextResolver* resolver = nullptr) {
+    if (const XmlNode* tp = f.prop("Text")) {
+        std::string v = tp->attr_or("val", "");
+        if (!v.empty() && resolver && *resolver) return (*resolver)(v);
+    }
     std::string t;
     if (const XmlNode* tp = f.prop("Text")) t = tp->attr_or("val", "");
     if (t.empty()) t = f.name;
@@ -339,6 +422,21 @@ std::string display_text(const Frame& f) {
     if (t[0] == '#' || t[0] == '@')
         return t.substr(1);
     return t;
+}
+
+void propagate_label_text(Frame& f) {
+    if (const XmlNode* tp = f.prop("Text")) {
+        std::string val = tp->attr_or("val", "");
+        if (!val.empty())
+            for (Frame& c : f.children)
+                if (c.type == "Label" && !c.prop("Text")) {
+                    XmlNode t;
+                    t.name = "Text";
+                    t.attrs.push_back({"val", val});
+                    c.props.push_back(t);
+                }
+    }
+    for (Frame& c : f.children) propagate_label_text(c);
 }
 
 std::string texture_ref(const Frame& f) {
@@ -385,32 +483,76 @@ std::vector<std::size_t> sibling_solve_order(const std::vector<Frame>& children)
 }
 
 void emit_tree(const Frame& f, const Rect& rect, int depth, std::vector<SolvedFrame>& out,
-               std::vector<const Rect*>& chain) {
-    out.push_back({rect, f.type, f.name, display_text(f), depth, texture_ref(f)});
+               std::vector<const Rect*>& chain, std::vector<const Frame*>& chainF,
+               const GlobalResolve* g) {
+    if (g && g->cur) (*g->cur)[&f] = rect;
+    out.push_back({rect, f.type, f.name, display_text(f, g ? g->text : nullptr), depth, texture_ref(f)});
     const std::size_t n = f.children.size();
     if (n == 0) return;
     chain.push_back(&rect);
+    chainF.push_back(&f);
     std::unordered_map<std::string, Rect> child_siblings;
     std::vector<Rect> solved(n);
     for (std::size_t idx : sibling_solve_order(f.children)) {
         const Frame& c = f.children[idx];
-        Rect cr = solve_one(c, rect, child_siblings, chain);
+        Rect cr = solve_one(c, rect, child_siblings, chain, chainF, g);
         solved[idx] = cr;
         if (!c.name.empty()) child_siblings[c.name] = cr;
     }
     for (std::size_t i = 0; i < n; ++i)
-        emit_tree(f.children[i], solved[i], depth + 1, out, chain);
+        emit_tree(f.children[i], solved[i], depth + 1, out, chain, chainF, g);
     chain.pop_back();
-}
+    chainF.pop_back();
 }
 
-std::vector<SolvedFrame> solve_layout(const Frame& root, const Rect& canvas) {
+std::vector<SolvedFrame> solve_pass(const Frame& root, const Rect& canvas, const GlobalResolve& g) {
     std::vector<SolvedFrame> out;
     const std::unordered_map<std::string, Rect> no_siblings;
     const std::vector<const Rect*> no_ancestors;
-    const Rect root_rect = solve_one(root, canvas, no_siblings, no_ancestors);
+    const std::vector<const Frame*> no_ancestorsF;
+    const Rect root_rect = solve_one(root, canvas, no_siblings, no_ancestors, no_ancestorsF, &g);
     std::vector<const Rect*> chain;
-    emit_tree(root, root_rect, 0, out, chain);
+    std::vector<const Frame*> chainF;
+    emit_tree(root, root_rect, 0, out, chain, chainF, &g);
+    return out;
+}
+
+bool rects_equal(const std::vector<SolvedFrame>& a, const std::vector<SolvedFrame>& b) {
+    if (a.size() != b.size()) return false;
+    for (std::size_t i = 0; i < a.size(); ++i) {
+        const Rect& x = a[i].rect;
+        const Rect& y = b[i].rect;
+        if (x.x != y.x || x.y != y.y || x.w != y.w || x.h != y.h) return false;
+    }
+    return true;
+}
+}
+
+int measure_text(const std::string& text, int scale) {
+    if (scale < 1) scale = 1;
+    return int(text.size()) * (kFontW + 1) * scale;
+}
+
+std::vector<SolvedFrame> solve_layout(const Frame& root, const Rect& canvas) {
+    return solve_layout(root, canvas, TextResolver{});
+}
+
+std::vector<SolvedFrame> solve_layout(const Frame& root, const Rect& canvas,
+                                      const TextResolver& resolve_text) {
+    Frame tree = root;
+    propagate_label_text(tree);
+    constexpr int kMaxPasses = 64;
+    std::unordered_map<const Frame*, Rect> prev;
+    std::vector<SolvedFrame> out;
+    for (int pass = 0; pass < kMaxPasses; ++pass) {
+        std::unordered_map<const Frame*, Rect> cur;
+        GlobalResolve g{pass == 0 ? nullptr : &prev, &cur, &resolve_text};
+        std::vector<SolvedFrame> next = solve_pass(tree, canvas, g);
+        const bool stable = pass > 0 && rects_equal(next, out);
+        out = std::move(next);
+        if (stable) break;
+        prev = std::move(cur);
+    }
     return out;
 }
 

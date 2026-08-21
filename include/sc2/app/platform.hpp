@@ -17,6 +17,7 @@ void alert(const std::string& title, const std::string& message);
 struct MapEntry {
     std::string path;
     std::string name;
+    bool casc = false;
 };
 std::vector<MapEntry> list_maps(const std::string& root, int max_depth = 4);
 

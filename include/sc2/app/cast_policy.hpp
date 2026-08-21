@@ -8,6 +8,7 @@
 #include "sc2/app/spawn.hpp"
 #include "sc2/data/catalog.hpp"
 #include "sc2/sim/ability_system.hpp"
+#include "sc2/sim/mule.hpp"
 #include "sc2/sim/world.hpp"
 
 namespace sc2::app {
@@ -34,6 +35,7 @@ public:
         if (eff_kind == sim::EffectKind::Reveal) return false;
         if (eff_kind == sim::EffectKind::Force) return false;
         if (eff_kind == sim::EffectKind::PhaseShift) return false;
+        if (eff_kind == sim::EffectKind::Inject) return false;
         if (eff_kind == sim::EffectKind::RemoveBehavior) return false;
         if (eff_kind == sim::EffectKind::ApplyBehavior) {
             const bool root_ = rn ? rn->beh_root : b->def.beh_root;
@@ -85,6 +87,48 @@ public:
         return true;
     }
 
+    bool autocast_on(std::uint32_t unit, const std::string& abil, bool authored_default) const {
+        auto it = autocast_toggle_.find(toggle_key(unit, abil));
+        return it == autocast_toggle_.end() ? authored_default : it->second;
+    }
+    bool toggle_autocast(sim::World& world, std::uint32_t unit, const std::string& abil_id) {
+        if (unit >= world.units().size()) return false;
+        const sim::Unit& u = world.units()[unit];
+        bool cur = cat_->ability_autocast(abil_id).on_by_default;
+        for (const Entry& e : autocast_entries(world, u.catalog_id))
+            if (e.abil_id == abil_id) { cur = autocast_on(unit, e.abil_id, e.autocast_default_on); break; }
+        autocast_toggle_[toggle_key(unit, abil_id)] = !cur;
+        return !cur;
+    }
+    bool autocast_state(sim::World& world, std::uint32_t unit, const std::string& abil_id) {
+        if (unit >= world.units().size()) return false;
+        const sim::Unit& u = world.units()[unit];
+        for (const Entry& e : autocast_entries(world, u.catalog_id))
+            if (e.abil_id == abil_id) return autocast_on(unit, e.abil_id, e.autocast_default_on);
+        return cat_->ability_autocast(abil_id).on_by_default;
+    }
+
+    int run_autocast(sim::World& world, int player) {
+        int casts = 0;
+        const auto& units = world.units();
+        for (std::uint32_t ci = 0; ci < units.size(); ++ci) {
+            const sim::Unit& u = units[ci];
+            if (!u.alive || u.player != player || u.catalog_id.empty()) continue;
+            for (const Entry& e : autocast_entries(world, u.catalog_id)) {
+                if (!autocast_on(ci, e.abil_id, e.autocast_default_on)) continue;
+                if (!abils_.ready(world, ci, e.slot)) continue;
+                const std::uint32_t tgt = e.support ? wounded_ally(world, u, e.engage_range)
+                                                    : best_target(world, u, e);
+                if (tgt == sim::kNoTarget) continue;
+                if (abils_.try_cast(world, ci, e.slot, tgt)) {
+                    ++casts;
+                    break;
+                }
+            }
+        }
+        return casts;
+    }
+
     int run(sim::World& world, int player) {
         int casts = 0;
         const auto& units = world.units();
@@ -131,6 +175,7 @@ public:
             return false;
         }
         if (e->requires_ground && t.flying) return false;
+        if (e->requires_spawner && t.spawner_proto < 0) return false;
         const Fixed dx = t.x - c.x, dy = t.y - c.y;
         const Fixed reach = e->range + c.radius + t.radius;
         if (dx * dx + dy * dy > reach * reach) return false;
@@ -169,8 +214,11 @@ private:
         bool self_cast = false;
         bool support = false;
         Fixed engage_range;
+        std::string abil_id;
+        bool autocast_default_on = false;
         bool requires_creep = false;
         bool requires_ground = false;
+        bool requires_spawner = false;
     };
 
     static bool enemy_within(const sim::World& world, const sim::Unit& caster, Fixed range) {
@@ -189,6 +237,7 @@ private:
         for (const sim::Unit& o : world.units()) {
             if (!o.alive || o.id == caster.id || o.player != caster.player) continue;
             if (o.hp >= o.hp_max) continue;
+            if (o.loaded) continue;
             const Fixed dx = o.x - caster.x, dy = o.y - caster.y;
             const Fixed reach = range + caster.radius + o.radius;
             const Fixed d2 = dx * dx + dy * dy;
@@ -199,6 +248,26 @@ private:
             }
         }
         return best;
+    }
+
+    const std::vector<Entry>& autocast_entries(sim::World& world, const std::string& unit_id) {
+        auto it = autocast_cache_.find(unit_id);
+        if (it != autocast_cache_.end()) return it->second;
+        std::vector<Entry> out;
+        for (const data::Catalog::AbilityCardButton& btn : cat_->unit_ability_card_buttons(unit_id)) {
+            const auto ac = cat_->ability_autocast(btn.ability);
+            if (!ac.offered || ac.range <= 0.0) continue;
+            auto b = make_ability(*cat_, btn.ability);
+            if (!b) continue;
+            Entry e = book_entry(world, unit_id, *b);
+            e.support = ac.targets_allies;
+            e.engage_range = Fixed::from_double(ac.range);
+            e.range = e.engage_range;
+            e.abil_id = btn.ability;
+            e.autocast_default_on = ac.on_by_default;
+            out.push_back(std::move(e));
+        }
+        return autocast_cache_.emplace(unit_id, std::move(out)).first->second;
     }
 
     Entry book_entry(sim::World& world, const std::string& unit_id, const AbilityBuild& b) {
@@ -235,14 +304,23 @@ private:
             !b->spawn_unit.empty() && b->def.spawn_proto < 0) {
             sim::Unit proto = make_unit(*cat_, b->spawn_unit, 0);
             if (b->spawn_life.raw() > 0) proto.time_life = b->spawn_life;
+            if (b->def.spawn_snap_resource) {
+                const sim::MuleSystem::MuleStats st;
+                proto.carry_amount = st.carry_amount;
+                proto.carry_override = true;
+                proto.saturation_exempt = true;
+                proto.mine_time = st.mine_time;
+            }
             b->def.spawn_proto = world.add_spawn_proto(std::move(proto));
         }
         Entry e = book_entry(world, unit_id, *b);
         e.requires_creep = b->spawn_requires_creep;
+        e.requires_spawner = b->requires_spawner_target;
         const bool has_tree =
             !b->tree.empty() && b->tree_root >= 0 && b->tree_root < int32_t(b->tree.size());
         const sim::EffectKind kind = has_tree ? b->tree[b->tree_root].kind : b->def.kind;
-        e.support = (kind == sim::EffectKind::Heal || kind == sim::EffectKind::CreateHealer);
+        e.support = (kind == sim::EffectKind::Heal || kind == sim::EffectKind::CreateHealer ||
+                     kind == sim::EffectKind::Inject);
         return &(ondemand_[key] = std::move(e));
     }
 
@@ -279,6 +357,7 @@ private:
         const auto& units = world.units();
         for (const sim::Unit& o : units) {
             if (!o.alive || o.player == caster.player || o.player < 0) continue;
+            if (o.loaded) continue;
             if ((o.attributes & e.req_attr) != e.req_attr) continue;
             if (o.attributes & e.exc_attr) continue;
             if (e.req_energy && o.energy.raw() <= 0) continue;
@@ -298,6 +377,11 @@ private:
     sim::AbilitySystem abils_;
     std::unordered_map<std::string, Entry> ondemand_;
     std::vector<Entry> entries_;
+    std::unordered_map<std::string, std::vector<Entry>> autocast_cache_;
+    std::unordered_map<std::string, bool> autocast_toggle_;
+    static std::string toggle_key(std::uint32_t unit, const std::string& abil) {
+        return std::to_string(unit) + "|" + abil;
+    }
 };
 
 }

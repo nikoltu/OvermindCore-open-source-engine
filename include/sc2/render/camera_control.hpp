@@ -14,6 +14,7 @@ struct CameraControl {
     float distance = 20.0f;
     float yaw = 0.7853981634f;
     float pitch = 1.0f;
+    float height_offset = 0.0f;
 
     float min_distance = 2.0f;
     float max_distance = 200.0f;
@@ -30,10 +31,11 @@ struct CameraControl {
         float cp = std::cos(pitch), sp = std::sin(pitch);
         return {cp * std::cos(yaw), cp * std::sin(yaw), sp};
     }
+    Vec3 target() const { return {focus.x, focus.y, focus.z + height_offset}; }
     Vec3 eye() const {
         Vec3 d = offset_dir();
-        return {focus.x + d.x * distance, focus.y + d.y * distance,
-                focus.z + d.z * distance};
+        Vec3 t = target();
+        return {t.x + d.x * distance, t.y + d.y * distance, t.z + d.z * distance};
     }
     Vec3 forward() const {
         Vec3 d = offset_dir();
@@ -78,7 +80,7 @@ struct CameraControl {
     Camera camera() const {
         Camera c;
         c.eye = eye();
-        c.center = focus;
+        c.center = target();
         c.up = world_up;
         c.fovy = fovy;
         c.znear = znear;
@@ -122,5 +124,41 @@ struct CameraControl {
         zfar = std::max(dmax * 2.0f + 1.0f, znear + 1.0f);
     }
 };
+
+inline constexpr float kDegToRad = 3.14159265358979323846f / 180.0f;
+struct MeleeZoomStep {
+    float distance;
+    float pitch_deg;
+    float height_offset;
+};
+inline constexpr MeleeZoomStep kMeleeZoomTable[5] = {
+    {30.0f, 54.0f, -1.75f},
+    {26.0f, 50.0f, -1.00f},
+    {22.0f, 46.0f, -0.25f},
+    {18.0f, 42.0f, 0.00f},
+    {14.0f, 42.0f, 0.50f},
+};
+inline constexpr int kMeleeZoomSteps = 5;
+inline constexpr float kMeleeRestPitch = 54.0f * kDegToRad;
+inline constexpr float kMeleeFovY = 37.5f * kDegToRad;
+inline constexpr float kMeleeRestDistance = 30.0f;
+inline constexpr float kMeleeMinDistance = 14.0f;
+inline constexpr float kMeleeMaxScrollRate = 68.5f;
+
+inline int apply_melee_zoom(CameraControl& c, int step) {
+    step = std::clamp(step, 0, kMeleeZoomSteps - 1);
+    const MeleeZoomStep& z = kMeleeZoomTable[step];
+    c.distance = z.distance;
+    c.pitch = z.pitch_deg * kDegToRad;
+    c.height_offset = z.height_offset;
+    return step;
+}
+
+inline void apply_melee_rest_frame(CameraControl& c) {
+    apply_melee_zoom(c, 0);
+    c.fovy = kMeleeFovY;
+    c.min_distance = kMeleeMinDistance;
+    c.max_distance = kMeleeRestDistance;
+}
 
 }

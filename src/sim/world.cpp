@@ -262,6 +262,7 @@ bool World::advance_turn(Unit& u, Fixed tx, Fixed ty) {
 }
 
 bool World::move_unit_toward(Unit& u, Fixed gx, Fixed gy, Fixed step) {
+    u.moved_this_tick = true;
     if (!nav_.has_blocked() || u.flying) {
         if (!advance_turn(u, gx, gy)) return false;
         if (arc_movement_ && acceleration_ && u.cur_speed.raw() > 0 && u.lateral_accel.raw() > 0) {
@@ -330,6 +331,11 @@ void World::apply_separation() {
             if (!units_[j].alive) continue;
             const Unit& a = units_[i];
             const Unit& b = units_[j];
+            if (a.flying || b.flying) continue;
+            if (a.burrowed || b.burrowed) continue;
+            if (a.collide_flags != 0 && b.collide_flags != 0 &&
+                (a.collide_flags & b.collide_flags) == 0)
+                continue;
             const Fixed ar = a.sep_radius.raw() > 0 ? a.sep_radius : a.radius;
             const Fixed br = b.sep_radius.raw() > 0 ? b.sep_radius : b.radius;
             const Fixed rsum = ar + br;
@@ -354,14 +360,34 @@ void World::apply_separation() {
             if (!mov_i && !mov_j) continue;
             Fixed pi, pj;
             if (mov_i && mov_j) {
-                const bool massed = a.sep_radius.raw() > 0 || b.sep_radius.raw() > 0;
-                if (massed) {
-                    const Fixed half = pen / Fixed::from_int(2);
-                    pi = half * (br / rsum);
-                    pj = half * (ar / rsum);
+                if (a.moved_this_tick != b.moved_this_tick) {
+                    if (a.moved_this_tick) {
+                        pi = Fixed();
+                        pj = pen / Fixed::from_int(2);
+                    } else {
+                        pi = pen / Fixed::from_int(2);
+                        pj = Fixed();
+                    }
                 } else {
-                    pi = pen / Fixed::from_int(4);
-                    pj = pi;
+                    const bool allied = are_allied(a.player, b.player);
+                    int32_t ra, rb;
+                    if (allied && a.allied_push_priority != b.allied_push_priority) {
+                        ra = a.allied_push_priority;
+                        rb = b.allied_push_priority;
+                    } else {
+                        ra = a.push_priority;
+                        rb = b.push_priority;
+                    }
+                    if (ra > rb) {
+                        pi = Fixed();
+                        pj = pen / Fixed::from_int(2);
+                    } else if (rb > ra) {
+                        pi = pen / Fixed::from_int(2);
+                        pj = Fixed();
+                    } else {
+                        pi = pen / Fixed::from_int(4);
+                        pj = pi;
+                    }
                 }
             } else if (mov_i) {
                 pi = pen / Fixed::from_int(2);
@@ -381,6 +407,7 @@ void World::apply_separation() {
         units_[i].x = units_[i].x + ax[i];
         units_[i].y = units_[i].y + ay[i];
     }
+    for (Unit& u : units_) u.moved_this_tick = false;
 }
 
 Player& World::player(int32_t p) {
@@ -417,60 +444,6 @@ void World::set_upgrade_level(int32_t player_id, int32_t upgrade_id, int32_t lev
     Player& pl = player(player_id);
     if (int32_t(pl.upgrades.size()) <= upgrade_id) pl.upgrades.resize(upgrade_id + 1, 0);
     pl.upgrades[upgrade_id] = level;
-}
-
-bool World::mod_matches(const Unit& u, const UpgradeMod& m) {
-    if (!m.catalog_ids.empty()) {
-        bool named = false;
-        for (const std::string& id : m.catalog_ids)
-            if (u.catalog_id == id) { named = true; break; }
-        if (!named) return false;
-    }
-    if (m.attr_mask != 0 && (u.attributes & m.attr_mask) == 0) return false;
-    return true;
-}
-
-void World::apply_mod_to_unit(Unit& u, const UpgradeMod& m) {
-    if (!u.alive || !mod_matches(u, m)) return;
-    auto op = [&](Fixed& f) {
-        switch (m.op) {
-            case UpgradeMod::Op::Add: f = f + m.value; break;
-            case UpgradeMod::Op::Multiply: f = f * m.value; break;
-            case UpgradeMod::Op::Set: f = m.value; break;
-        }
-    };
-    switch (m.field) {
-        case UpgradeMod::Field::WeaponDamage:
-            if (u.wpn_damage.raw() > 0 || m.op == UpgradeMod::Op::Set) op(u.wpn_damage);
-            if (u.wpn2_damage.raw() > 0) op(u.wpn2_damage);
-            if (u.wpn_damage.raw() < 0) u.wpn_damage = Fixed::from_int(0);
-            if (u.wpn2_damage.raw() < 0) u.wpn2_damage = Fixed::from_int(0);
-            break;
-        case UpgradeMod::Field::WeaponRange:
-            if (u.wpn_range.raw() > 0 || m.op == UpgradeMod::Op::Set) op(u.wpn_range);
-            if (u.wpn2_range.raw() > 0) op(u.wpn2_range);
-            break;
-        case UpgradeMod::Field::LifeArmor: op(u.armor); break;
-        case UpgradeMod::Field::ShieldArmor: op(u.shield_armor); break;
-        case UpgradeMod::Field::ShieldMax: op(u.shields_max); break;
-        case UpgradeMod::Field::LifeMax: {
-            const Fixed before = u.hp_max;
-            op(u.hp_max);
-            if (m.op == UpgradeMod::Op::Add) u.hp = u.hp + (u.hp_max - before);
-            if (u.hp > u.hp_max) u.hp = u.hp_max;
-            break;
-        }
-        case UpgradeMod::Field::Sight: op(u.sight); break;
-        case UpgradeMod::Field::MoveSpeed: op(u.speed); break;
-    }
-}
-
-void World::apply_upgrade_mod(int32_t player_id, const UpgradeMod& mod) {
-    if (player_id < 0) return;
-    Player& pl = player(player_id);
-    pl.stat_mods.push_back(mod);
-    for (Unit& u : units_)
-        if (u.player == player_id) apply_mod_to_unit(u, mod);
 }
 
 Order World::smart_order(uint32_t actor, uint32_t target, Fixed tx, Fixed ty) const {
@@ -552,6 +525,7 @@ int32_t World::add_ability(AbilityDef def) {
     n.period_count = def.period_count;
     n.spawn_proto = def.spawn_proto;
     n.spawn_count = def.spawn_count;
+    n.spawn_snap_resource = def.spawn_snap_resource;
     n.mineral_cost = def.mineral_cost;
     n.gas_cost = def.gas_cost;
     n.morph_heal_life_frac = def.morph_heal_life_frac;
@@ -763,8 +737,19 @@ void World::execute_effect(EffectRef ref, const EffectContext& ctx, int depth) {
         }
         case EffectKind::CreateUnit: {
             if (n.spawn_proto >= 0 && n.spawn_proto < int32_t(spawn_protos_.size()) &&
-                n.spawn_count > 0)
-                pending_spawns_.push_back({n.spawn_proto, n.spawn_count, ctx.tx, ctx.ty, ctx.origin});
+                n.spawn_count > 0) {
+                PendingSpawn ps{n.spawn_proto, n.spawn_count, ctx.tx, ctx.ty, ctx.origin};
+                if (n.spawn_snap_resource) {
+                    const uint32_t node = nearest_mineral_node(ctx.tx, ctx.ty);
+                    if (node != kNoTarget) {
+                        ps.x = units_[node].x;
+                        ps.y = units_[node].y;
+                        ps.gather_node = node;
+                        ps.depot = ctx.source;
+                    }
+                }
+                pending_spawns_.push_back(ps);
+            }
             return;
         }
         case EffectKind::Reveal:
@@ -788,6 +773,23 @@ void World::execute_effect(EffectRef ref, const EffectContext& ctx, int depth) {
             ps.move_y = ctx.ty;
             pending_spawns_.push_back(ps);
             units_[ctx.source].phase_timer = n.duration;
+            return;
+        }
+        case EffectKind::Inject: {
+            if (ctx.source >= units_.size() || !units_[ctx.source].alive) return;
+            if (ctx.target >= units_.size() || !units_[ctx.target].alive) return;
+            Unit& hall = units_[ctx.target];
+            if (hall.spawner_proto < 0 || n.spawn_count <= 0 || n.duration.raw() <= 0) return;
+            hall.inject_proto = hall.spawner_proto;
+            hall.inject_count = n.spawn_count;
+            hall.inject_timer = n.duration;
+            if (n.period.raw() > 0) {
+                BehaviorInstance b;
+                b.kind = kCastBehaviorKind;
+                b.timer = n.period;
+                b.stun = true;
+                add_behavior(ctx.source, b);
+            }
             return;
         }
         case EffectKind::Morph: {
@@ -814,7 +816,7 @@ void World::execute_effect(EffectRef ref, const EffectContext& ctx, int depth) {
                     st.shields = st.shields - strip;
                 }
             }
-            apply_spell_damage(ctx.target, n.amount, ctx.source);
+            apply_spell_damage(ctx.target, n.amount, ctx.source, n.armor_reduction);
             return;
         case EffectKind::DrainEnergy: {
             if (ctx.target >= units_.size()) return;
@@ -890,16 +892,30 @@ void World::execute_effect(EffectRef ref, const EffectContext& ctx, int depth) {
             Unit& tgt = units_[ctx.target];
             const Fixed dmg = tgt.energy * n.energy_fraction;
             tgt.energy = Fixed();
-            apply_spell_damage(ctx.target, dmg, ctx.source);
+            apply_spell_damage(ctx.target, dmg, ctx.source, n.armor_reduction);
             return;
         }
     }
 }
 
-void World::apply_spell_damage(uint32_t target, Fixed dmg, uint32_t caster) {
+void World::apply_spell_damage(uint32_t target, Fixed dmg, uint32_t caster, Fixed armor_reduction) {
     if (target >= units_.size()) return;
     Unit& t = units_[target];
     if (!t.alive) return;
+    const Fixed vitals_before = t.hp + t.shields;
+    const bool barrier_was_up = t.barrier.raw() > 0;
+    (void)armor_reduction;
+    dmg = dmg * t.dmg_fraction;
+    if (dmg.raw() > 0 && dmg < min_damage()) dmg = min_damage();
+    if (t.barrier.raw() > 0 && dmg.raw() > 0) {
+        if (dmg <= t.barrier) {
+            t.barrier = t.barrier - dmg;
+            dmg = Fixed();
+        } else {
+            dmg = dmg - t.barrier;
+            t.barrier = Fixed();
+        }
+    }
     if (t.shields.raw() > 0) {
         if (t.shields >= dmg) {
             t.shields = t.shields - dmg;
@@ -910,15 +926,21 @@ void World::apply_spell_damage(uint32_t target, Fixed dmg, uint32_t caster) {
         }
     }
     if (dmg.raw() > 0) t.hp = t.hp - dmg;
+    if (t.hp.raw() > 0 && t.barrier_max.raw() > 0 && t.barrier_cd.raw() == 0 && !barrier_was_up &&
+        (t.hp + t.shields) < vitals_before) {
+        t.barrier = t.barrier_max;
+        t.barrier_cd = t.barrier_cd_max;
+    }
     if (t.hp.raw() <= 0 && t.alive) {
         t.alive = false;
-        if (caster < units_.size()) award_kill_xp(units_[caster], t.kill_xp);
+        if (caster < units_.size() && units_[caster].alive) award_kill_xp(units_[caster], t.kill_xp);
         emit_death_reveal(t, caster);
     }
+    record_flee_trigger(t, caster, vitals_before);
 }
 
 void World::apply_weapon_hit(uint32_t target, Fixed base, uint32_t bonus_attr, Fixed bonus_amount,
-                             uint32_t attacker) {
+                             uint32_t attacker, Fixed armor_reduction) {
     if (target >= units_.size()) return;
     Unit& t = units_[target];
     if (!t.alive) return;
@@ -931,7 +953,7 @@ void World::apply_weapon_hit(uint32_t target, Fixed base, uint32_t bonus_attr, F
     d.barrier = t.barrier;
     const bool barrier_was_up = t.barrier.raw() > 0;
     const Fixed vitals_before = t.hp + t.shields;
-    apply_hit(Weapon{base, Fixed(), bonus_attr, bonus_amount}, d);
+    apply_hit(Weapon{base, Fixed(), bonus_attr, bonus_amount, armor_reduction}, d);
     t.hp = d.life;
     t.shields = d.shields;
     t.barrier = d.barrier;
@@ -945,6 +967,10 @@ void World::apply_weapon_hit(uint32_t target, Fixed base, uint32_t bonus_attr, F
         if (attacker < units_.size() && units_[attacker].alive) award_kill_xp(units_[attacker], t.kill_xp);
         emit_death_reveal(t, attacker);
     }
+    record_flee_trigger(t, attacker, vitals_before);
+}
+
+void World::record_flee_trigger(Unit& t, uint32_t attacker, Fixed vitals_before) {
     if (t.alive && t.flees_when_attacked && (t.hp + t.shields) < vitals_before &&
         attacker < units_.size() && units_[attacker].alive && units_[attacker].player >= 0 &&
         units_[attacker].player != t.player)
@@ -952,7 +978,7 @@ void World::apply_weapon_hit(uint32_t target, Fixed base, uint32_t bonus_attr, F
 }
 
 void World::apply_weapon_fire(uint32_t attacker, uint32_t target, Fixed w_dmg, uint32_t w_battr,
-                              Fixed w_bamt, int hits) {
+                              Fixed w_bamt, int hits, Fixed w_ar) {
     Unit& u = units_[attacker];
     Unit& tgt = units_[target];
     const uint32_t atk = target;
@@ -987,10 +1013,10 @@ void World::apply_weapon_fire(uint32_t attacker, uint32_t target, Fixed w_dmg, u
             const Fixed bh = last ? (w_bamt - bacc) : bper;
             dacc = dacc + per;
             bacc = bacc + bper;
-            apply_weapon_hit(tgt.id, h, w_battr, bh, u.id);
+            apply_weapon_hit(tgt.id, h, w_battr, bh, u.id, w_ar);
         }
     } else {
-        apply_weapon_hit(tgt.id, primary_dmg, w_battr, w_bamt, u.id);
+        apply_weapon_hit(tgt.id, primary_dmg, w_battr, w_bamt, u.id, w_ar);
     }
     if (u.attack_spawn_proto >= 0 && u.attack_spawn_count > 0 &&
         u.attack_spawn_proto < int32_t(spawn_protos_.size()))
@@ -1009,7 +1035,7 @@ void World::apply_weapon_fire(uint32_t attacker, uint32_t target, Fixed w_dmg, u
             else if (d2 <= u.splash_mid * u.splash_mid) frac = u.splash_mid_frac;
             else if (d2 <= u.splash_outer * u.splash_outer) frac = u.splash_outer_frac;
             else continue;
-            apply_weapon_hit(o.id, w_dmg * frac, w_battr, w_bamt * frac, u.id);
+            apply_weapon_hit(o.id, w_dmg * frac, w_battr, w_bamt * frac, u.id, w_ar);
         }
     }
     if (u.splash_line_count > 0) {
@@ -1018,8 +1044,9 @@ void World::apply_weapon_fire(uint32_t attacker, uint32_t target, Fixed w_dmg, u
             if (!o.alive || o.id == atk || are_allied(o.player, u.player)) continue;
             if (o.loaded || o.burrowed || o.flying) continue;
             if (in_line_splash(u.x, u.y, tx, ty, u.splash_line_first, u.splash_line_step,
-                               u.splash_line_count, u.splash_line_radius, o.x, o.y))
-                apply_weapon_hit(o.id, w_dmg, w_battr, w_bamt, u.id);
+                               u.splash_line_count, u.splash_line_radius, o.x, o.y,
+                               u.splash_line_from_source))
+                apply_weapon_hit(o.id, w_dmg, w_battr, w_bamt, u.id, w_ar);
         }
     }
     if (u.arc_radius[0].raw() > 0 || u.arc_radius[1].raw() > 0) {
@@ -1033,7 +1060,7 @@ void World::apply_weapon_fire(uint32_t attacker, uint32_t target, Fixed w_dmg, u
                     in_arc(u.x, u.y, tx, ty, u.arc_radius[k], u.arc_cos[k], o.x, o.y))
                     frac = frac + u.arc_frac[k];
             if (frac.raw() > 0)
-                apply_weapon_hit(o.id, w_dmg * frac, w_battr, w_bamt * frac, u.id);
+                apply_weapon_hit(o.id, w_dmg * frac, w_battr, w_bamt * frac, u.id, w_ar);
         }
     }
     if (u.bounce_count > 0 && u.bounce_range.raw() > 0) {
@@ -1064,7 +1091,7 @@ void World::apply_weapon_fire(uint32_t attacker, uint32_t target, Fixed w_dmg, u
                 }
             }
             if (best == kNoTarget) break;
-            apply_weapon_hit(best, u.bounce_amount[b], 0u, Fixed(), u.id);
+            apply_weapon_hit(best, u.bounce_amount[b], 0u, Fixed(), u.id, w_ar);
             hit[best] = 1;
             from = best;
         }
@@ -1115,21 +1142,21 @@ void World::step_windup(Fixed dt) {
         u.windup_ps = Fixed();
         if (u.alive && t < units_.size() && units_[t].alive) {
             if (projectile_travel_ && ps.raw() > 0)
-                queue_projectile(i, u.x, u.y, t, ps, u.windup_dmg, u.windup_battr, u.windup_bamt);
+                queue_projectile(i, u.x, u.y, t, ps, u.windup_dmg, u.windup_battr, u.windup_bamt, u.windup_ar);
             else
-                apply_weapon_fire(i, t, u.windup_dmg, u.windup_battr, u.windup_bamt);
+                apply_weapon_fire(i, t, u.windup_dmg, u.windup_battr, u.windup_bamt, 1, u.windup_ar);
         }
     }
 }
 
 void World::queue_projectile(std::uint32_t attacker, Fixed px, Fixed py, std::uint32_t target, Fixed speed,
-                             Fixed dmg, std::uint32_t battr, Fixed bamt) {
+                             Fixed dmg, std::uint32_t battr, Fixed bamt, Fixed ar) {
     Fixed flife = Fixed::from_int(1);
     if (target < units_.size()) {
         const Fixed fdx = units_[target].x - px, fdy = units_[target].y - py;
         flife = isqrt(fdx * fdx + fdy * fdy) * Fixed::from_int(4) / speed + Fixed::from_int(1);
     }
-    pending_hits_.push_back({attacker, target, px, py, speed, dmg, battr, bamt, flife});
+    pending_hits_.push_back({attacker, target, px, py, speed, dmg, battr, bamt, flife, ar});
 }
 
 void World::step_projectiles(Fixed dt) {
@@ -1146,7 +1173,7 @@ void World::step_projectiles(Fixed dt) {
         const Fixed dx = t.x - p.px, dy = t.y - p.py;
         const Fixed d2 = dx * dx + dy * dy;
         if (d2 <= step * step) {
-            apply_weapon_fire(p.attacker, p.target, p.dmg, p.battr, p.bamt);
+            apply_weapon_fire(p.attacker, p.target, p.dmg, p.battr, p.bamt, 1, p.ar);
             continue;
         }
         const Fixed d = isqrt(d2);
@@ -1212,13 +1239,26 @@ bool World::queue_train(uint32_t producer, const Unit& proto, int32_t mineral_co
         if (in_flight >= slots) return false;
     }
     uint32_t consumed_larva = kNoTarget;
+    uint32_t egg_id = kNoTarget;
     if (units_[producer].spawner_proto >= 0 && proto.speed.raw() > 0) {
         uint32_t larva = kNoTarget;
         for (uint32_t i = 0; i < units_.size(); ++i)
             if (units_[i].alive && units_[i].spawn_parent == producer) { larva = i; break; }
         if (larva == kNoTarget) return false;
-        units_[larva].alive = false;
-        consumed_larva = larva;
+        if (larva_egg_morph_ && egg_proto_ >= 0) {
+            const Fixed lx = units_[larva].x, ly = units_[larva].y;
+            Unit egg = spawn_protos_[egg_proto_];
+            egg.id = units_[larva].id;
+            egg.player = units_[larva].player;
+            egg.x = lx;
+            egg.y = ly;
+            egg.spawn_parent = kNoTarget;
+            units_[larva] = egg;
+            egg_id = larva;
+        } else {
+            units_[larva].alive = false;
+            consumed_larva = larva;
+        }
     }
     int32_t pl = units_[producer].player;
     Player& pp = player(pl);
@@ -1232,6 +1272,12 @@ bool World::queue_train(uint32_t producer, const Unit& proto, int32_t mineral_co
     pd.mineral_cost = mineral_cost * n;
     pd.gas_cost = gas_cost * n;
     pd.consumed_larva = consumed_larva;
+    if (egg_id != kNoTarget) {
+        pd.egg = egg_id;
+        pd.has_pos = true;
+        pd.px = units_[egg_id].x;
+        pd.py = units_[egg_id].y;
+    }
     pending_.push_back(std::move(pd));
     return true;
 }
@@ -1245,8 +1291,11 @@ bool World::cancel_train(uint32_t producer) {
     Player& pp = player(pd.proto.player);
     pp.minerals += pd.mineral_cost;
     pp.gas += pd.gas_cost;
-    if (pd.consumed_larva < units_.size() && !units_[pd.consumed_larva].alive)
+    if (pd.egg != kNoTarget) {
+        if (pd.egg < units_.size()) units_[pd.egg].alive = false;
+    } else if (pd.consumed_larva < units_.size() && !units_[pd.consumed_larva].alive) {
         units_[pd.consumed_larva].alive = true;
+    }
     pending_.erase(pending_.begin() + idx);
     return true;
 }
@@ -1258,8 +1307,27 @@ bool World::cancel_construction(uint32_t building, int32_t mineral_cost, int32_t
     Player& pp = player(u.player);
     pp.minerals += (mineral_cost * 3) / 4;
     pp.gas += (gas_cost * 3) / 4;
+    const Fixed bx = u.x, by = u.y;
+    const int32_t bplayer = u.player;
     u.alive = false;
     u.constructing = false;
+    auto mf = morph_founder_.find(building);
+    if (mf != morph_founder_.end()) {
+        Unit drone = mf->second;
+        morph_founder_.erase(mf);
+        drone.player = bplayer;
+        drone.x = bx;
+        drone.y = by;
+        drone.alive = true;
+        drone.constructing = false;
+        drone.hp = drone.hp_max;
+        drone.shields = drone.shields_max;
+        drone.cooldown = Fixed();
+        drone.target = kNoTarget;
+        drone.construct_target = kNoTarget;
+        drone.orders.clear();
+        add_unit(drone);
+    }
     return true;
 }
 
@@ -1300,6 +1368,19 @@ bool World::issue_worker_build(uint32_t builder, Fixed x, Fixed y, const Unit& p
     if (builder >= units_.size() || !units_[builder].alive) return false;
     if (proto.requires_creep && !creep_.is_creep(x, y)) return false;
     if (proto.needs_power && !powered_at(x, y, units_[builder].player)) return false;
+    if (proto.requires_vespene) {
+        bool on_node = false;
+        for (const Unit& n : units_) {
+            if (!n.alive || !n.is_gas || n.resource_left <= 0) continue;
+            const Fixed dx = n.x - x, dy = n.y - y;
+            const Fixed rr = n.radius.raw() > 0 ? n.radius : Fixed::from_int(1);
+            if (dx * dx + dy * dy <= rr * rr) {
+                on_node = true;
+                break;
+            }
+        }
+        if (!on_node) return false;
+    }
     Player& pp = player(units_[builder].player);
     pp.minerals -= mineral_cost;
     pp.gas -= gas_cost;
@@ -1347,6 +1428,7 @@ void World::step_worker_builds() {
             Unit& drone = units_[wb.builder];
             drone.construct_target = kNoTarget;
             drone.orders.clear();
+            morph_founder_[id] = drone;
             drone.alive = false;
         } else {
             units_[id].needs_builder = true;
@@ -1633,6 +1715,10 @@ void World::step_healers(Fixed dt) {
 void World::step_production(Fixed dt) {
     for (size_t i = 0; i < pending_.size();) {
         Pending& pd = pending_[i];
+        if (pd.egg != kNoTarget && (pd.egg >= units_.size() || !units_[pd.egg].alive)) {
+            pending_.erase(pending_.begin() + i);
+            continue;
+        }
         if (pd.producer < units_.size()) {
             const Unit& pr = units_[pd.producer];
             if (pr.needs_power && pr.power_managed && !pr.powered) { ++i; continue; }
@@ -1642,6 +1728,7 @@ void World::step_production(Fixed dt) {
             adv = adv + adv / Fixed::from_int(2);
         pd.timer = pd.timer - adv;
         if (pd.timer.raw() <= 0) {
+            if (pd.egg != kNoTarget && pd.egg < units_.size()) units_[pd.egg].alive = false;
             Unit u = pd.proto;
             bool rally = false;
             Fixed rx, ry;
@@ -1779,8 +1866,132 @@ void World::step_gather(Unit& u, Fixed dt) {
     }
 }
 
+void World::step_interceptors(Fixed dt) {
+    if (carriers_.empty()) return;
+    for (Carrier& c : carriers_) {
+        if (c.carrier >= units_.size()) continue;
+        if (!units_[c.carrier].alive) {
+            for (uint32_t id : c.wing)
+                if (id < units_.size()) units_[id].alive = false;
+            continue;
+        }
+        if (c.count < c.count_max && c.build_time.raw() > 0) {
+            c.build_timer = c.build_timer - dt;
+            if (c.build_timer.raw() <= 0) {
+                ++c.count;
+                c.build_timer = c.build_time;
+            }
+        }
+        const Unit host = units_[c.carrier];
+
+        uint32_t target = kNoTarget;
+        if (!host.orders.empty() && host.orders.front().type == OrderType::Attack) {
+            const uint32_t tgt = host.orders.front().target;
+            if (tgt < units_.size() && units_[tgt].alive) {
+                const Fixed dx = units_[tgt].x - host.x, dy = units_[tgt].y - host.y;
+                if (c.leash.raw() <= 0 || dx * dx + dy * dy <= c.leash * c.leash) target = tgt;
+            }
+        }
+
+        if (target != kNoTarget) {
+            while (int32_t(c.wing.size()) < c.count && c.proto_idx >= 0 &&
+                   c.proto_idx < int32_t(spawn_protos_.size())) {
+                Unit ic = spawn_protos_[c.proto_idx];
+                ic.player = host.player;
+                ic.x = host.x;
+                ic.y = host.y;
+                ic.loaded = true;
+                ic.alive = true;
+                ic.orders.clear();
+                ic.target = kNoTarget;
+                c.wing.push_back(add_unit(ic));
+            }
+            for (uint32_t id : c.wing) {
+                if (id >= units_.size()) continue;
+                Unit& ic = units_[id];
+                if (!ic.alive) continue;
+                if (ic.loaded) {
+                    ic.loaded = false;
+                    ic.x = host.x;
+                    ic.y = host.y;
+                }
+                ic.orders.clear();
+                ic.orders.push_back(Order{OrderType::Attack, Fixed(), Fixed(), target});
+            }
+        } else {
+            for (uint32_t id : c.wing) {
+                if (id >= units_.size()) continue;
+                Unit& ic = units_[id];
+                if (!ic.alive) continue;
+                ic.loaded = true;
+                ic.orders.clear();
+                ic.target = kNoTarget;
+            }
+        }
+    }
+}
+
+bool World::launch_nova(uint32_t caster, Fixed tx, Fixed ty) {
+    if (nova_launch_reg_.empty() || caster >= units_.size() || !units_[caster].alive) return false;
+    auto it = nova_launch_reg_.find(units_[caster].catalog_id);
+    if (it == nova_launch_reg_.end()) return false;
+    const NovaArm& a = it->second;
+    if (ability_cooldown_left(caster, kNovaCooldownSlot).raw() > 0) return false;
+    Nova n;
+    n.x = units_[caster].x;
+    n.y = units_[caster].y;
+    n.tx = tx;
+    n.ty = ty;
+    n.speed = a.speed;
+    n.radius = a.radius;
+    n.damage = a.damage;
+    n.shield_bonus = a.shield_bonus;
+    n.remaining = a.duration.raw() > 0 ? a.duration : Fixed::from_int(3);
+    n.owner = units_[caster].player;
+    n.caster = caster;
+    n.active = true;
+    novas_.push_back(n);
+    if (a.cooldown.raw() > 0) arm_ability_cooldown(caster, kNovaCooldownSlot, a.cooldown);
+    return true;
+}
+
+void World::step_nova(Fixed dt) {
+    if (novas_.empty()) return;
+    for (Nova& n : novas_) {
+        if (!n.active) continue;
+        n.remaining = n.remaining - dt;
+        const Fixed dx = n.tx - n.x, dy = n.ty - n.y;
+        const Fixed dist = isqrt(dx * dx + dy * dy);
+        const Fixed step = n.speed * dt;
+        if (dist <= step || dist.raw() <= 0) {
+            n.x = n.tx;
+            n.y = n.ty;
+        } else {
+            n.x = n.x + dx * step / dist;
+            n.y = n.y + dy * step / dist;
+        }
+        if (n.remaining.raw() <= 0) {
+            const Fixed r2 = n.radius * n.radius;
+            const uint32_t k = uint32_t(units_.size());
+            for (uint32_t i = 0; i < k; ++i) {
+                Unit& u = units_[i];
+                if (!u.alive || are_allied(u.player, n.owner)) continue;
+                const Fixed ux = u.x - n.x, uy = u.y - n.y;
+                if (ux * ux + uy * uy > r2) continue;
+                if (n.shield_bonus.raw() > 0 && u.shields.raw() > 0) {
+                    const Fixed strip = u.shields < n.shield_bonus ? u.shields : n.shield_bonus;
+                    u.shields = u.shields - strip;
+                }
+                apply_spell_damage(i, n.damage, n.caster);
+            }
+            n.active = false;
+        }
+    }
+}
+
 void World::step() {
     const Fixed dt = World::dt();
+    in_step_ = true;
     update_conjoined();
     return_dead_carry();
     update_destructibles();
@@ -1854,6 +2065,8 @@ void World::step() {
     step_windup(dt);
     step_point_defense(dt);
     step_projectiles(dt);
+    step_interceptors(dt);
+    step_nova(dt);
     update_watchtowers();
     for (Unit& u : units_) {
         if (!u.alive) continue;
@@ -2214,6 +2427,7 @@ void World::step() {
             }
             case OrderType::Idle:
             default:
+                if (u.is_worker || u.flees_when_attacked) break;
                 atk = acquire_target(u, u.acquire_range);
                 if (leash_) {
                     if (!u.guarding) { u.guard_x = u.x; u.guard_y = u.y; u.guarding = true; }
@@ -2254,6 +2468,7 @@ void World::step() {
             Fixed w_bs = u.wpn_backswing;
             Fixed w_ps = u.wpn_projectile_speed;
             int w_hits = u.wpn_hits;
+            Fixed w_ar = u.wpn_armor_reduction;
             const uint32_t plane_bit = tgt.flying ? 2u : 1u;
             const bool w1_cov = (u.wpn_target_filter & plane_bit) != 0;
             const bool w2_cov = u.wpn2_damage.raw() > 0 && (u.wpn2_target_filter & plane_bit) != 0;
@@ -2268,10 +2483,7 @@ void World::step() {
                 w_bs = u.wpn2_backswing;
                 w_ps = u.wpn2_projectile_speed;
                 w_hits = u.wpn2_hits;
-            }
-            if (u.player >= 0) {
-                const int32_t wu = player(u.player).weapon_upgrade;
-                if (wu != 0) w_dmg = w_dmg + Fixed::from_int(wu);
+                w_ar = u.wpn2_armor_reduction;
             }
             const bool can_hit_plane = w1_cov || w2_cov;
             Fixed reach = w_rng + u.radius + tgt.radius;
@@ -2290,13 +2502,14 @@ void World::step() {
                         u.windup_timer = w_dp;
                         u.windup_target = tgt.id;
                         u.windup_dmg = w_dmg;
+                        u.windup_ar = w_ar;
                         u.windup_battr = w_battr;
                         u.windup_bamt = w_bamt;
                         u.windup_ps = projectile_travel_ ? w_ps : Fixed();
                     } else if (projectile_travel_ && w_ps.raw() > 0) {
-                        queue_projectile(u.id, u.x, u.y, tgt.id, w_ps, w_dmg, w_battr, w_bamt);
+                        queue_projectile(u.id, u.x, u.y, tgt.id, w_ps, w_dmg, w_battr, w_bamt, w_ar);
                     } else {
-                        apply_weapon_fire(u.id, tgt.id, w_dmg, w_battr, w_bamt, w_hits);
+                        apply_weapon_fire(u.id, tgt.id, w_dmg, w_battr, w_bamt, w_hits, w_ar);
                     }
                     u.cooldown = u.atk_speed_mult.raw() == Fixed::from_int(1).raw()
                                      ? w_per
@@ -2327,10 +2540,16 @@ void World::step() {
                 s.spawn_parent = ps.parent;
                 s.larva_injected = ps.injected;
                 const bool is_shade = ps.phase_link != kNoTarget;
-                s.x = is_shade ? ps.x : ps.x + Fixed::from_int(DX[i & 7]);
-                s.y = is_shade ? ps.y : ps.y + Fixed::from_int(DY[i & 7]);
+                const bool exact = is_shade || ps.gather_node != kNoTarget;
+                s.x = exact ? ps.x : ps.x + Fixed::from_int(DX[i & 7]);
+                s.y = exact ? ps.y : ps.y + Fixed::from_int(DY[i & 7]);
                 s.alive = true;
+                if (ps.gather_node != kNoTarget) {
+                    s.gather_target = ps.gather_node;
+                    s.home_depot = ps.depot;
+                }
                 const uint32_t sid = add_unit(s);
+                if (ps.gather_node != kNoTarget) issue(sid, Order{OrderType::Gather});
                 if (is_shade && ps.phase_link < units_.size()) {
                     units_[ps.phase_link].phase_shade = sid;
                     issue(sid, Order{OrderType::Move, ps.move_x, ps.move_y});
@@ -2351,6 +2570,7 @@ void World::step() {
         }
     }
     apply_separation();
+    in_step_ = false;
     ++tick_;
 }
 
@@ -2377,6 +2597,21 @@ uint64_t World::state_hash() const {
         h = mix(h, uint32_t(ff.x.raw()));
         h = mix(h, uint32_t(ff.y.raw()));
         h = mix(h, uint32_t(ff.timer.raw()));
+    }
+    for (const Carrier& c : carriers_) {
+        h = mix(h, c.carrier);
+        h = mix(h, uint32_t(c.count));
+        h = mix(h, uint32_t(c.count_max));
+        h = mix(h, uint32_t(c.build_timer.raw()));
+        for (uint32_t id : c.wing) h = mix(h, id);
+    }
+    for (const Nova& n : novas_) {
+        if (!n.active) continue;
+        h = mix(h, uint32_t(n.x.raw()));
+        h = mix(h, uint32_t(n.y.raw()));
+        h = mix(h, uint32_t(n.remaining.raw()));
+        h = mix(h, uint32_t(n.damage.raw()));
+        h = mix(h, uint32_t(n.owner));
     }
     for (const Unit& u : units_) {
         h = mix(h, u.id);
@@ -2422,6 +2657,7 @@ uint64_t World::state_hash() const {
             h = mix(h, u.windup_battr);
             h = mix(h, uint32_t(u.windup_bamt.raw()));
             h = mix(h, uint32_t(u.windup_ps.raw()));
+            h = mix(h, uint32_t(u.windup_ar.raw()));
         }
         if (u.backswing_timer.raw() > 0) h = mix(h, uint32_t(u.backswing_timer.raw()));
         if (u.constructing) {
@@ -2502,15 +2738,6 @@ uint64_t World::state_hash() const {
                 h = mix(h, uint32_t(i));
                 h = mix(h, uint32_t(p.upgrades[i]));
             }
-        if (p.weapon_upgrade != 0) h = mix(h, uint32_t(p.weapon_upgrade) ^ 0x5717u);
-        if (!p.stat_mods.empty()) {
-            h = mix(h, uint32_t(p.stat_mods.size()) ^ 0x11c9u);
-            for (const UpgradeMod& m : p.stat_mods) {
-                h = mix(h, uint32_t(m.field) * 131u + uint32_t(m.op));
-                h = mix(h, uint32_t(m.value.raw()));
-                h = mix(h, m.attr_mask);
-            }
-        }
     }
     for (const Pending& pd : pending_) {
         h = mix(h, pd.producer);
@@ -2545,6 +2772,7 @@ uint64_t World::state_hash() const {
         h = mix(h, p.battr);
         h = mix(h, uint32_t(p.bamt.raw()));
         h = mix(h, uint32_t(p.life.raw()));
+        h = mix(h, uint32_t(p.ar.raw()));
     }
     h = mix(h, creep_.checksum());
     return h;

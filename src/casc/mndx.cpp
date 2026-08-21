@@ -140,10 +140,10 @@ struct BitEntryArray {
         uint32_t end_bit = start_bit + bits_per_entry;
         uint32_t res;
         if (end_bit > 0x20)
-            res = (items[item_index + 1] << (0x20 - start_bit)) |
-                  (items[item_index] >> start_bit);
+            res = (items.at(item_index + 1) << (0x20 - start_bit)) |
+                  (items.at(item_index) >> start_bit);
         else
-            res = items[item_index] >> start_bit;
+            res = items.at(item_index) >> start_bit;
         return res & entry_bit_mask;
     }
 };
@@ -191,31 +191,31 @@ struct SparseArray {
     bool is_empty() const { return total == 0; }
 
     bool is_item_present(uint32_t index) const {
-        return (item_bits[index >> 5] & (1u << (index & 0x1F))) != 0;
+        return (item_bits.at(index >> 5) & (1u << (index & 0x1F))) != 0;
     }
 
     uint32_t get_item_value_at(uint32_t index) const {
-        const Baseval& bv = basevals[index >> 9];
+        const Baseval& bv = basevals.at(index >> 9);
         uint32_t val = bv.v[0];
         uint32_t sel = (index >> 6) & 0x07;
         if (sel) val += bv.v[sel];
-        if (index & 0x20) val += popcount32(item_bits[(index >> 5) - 1]);
+        if (index & 0x20) val += popcount32(item_bits.at((index >> 5) - 1));
         uint32_t mask = (1u << (index & 0x1F)) - 1;
-        val += popcount32(item_bits[index >> 5] & mask);
+        val += popcount32(item_bits.at(index >> 5) & mask);
         return val;
     }
 
     uint32_t find_group_items0(uint32_t index) const {
         uint32_t g = index >> 9;
-        uint32_t min_group = idx0[g] >> 9;
-        uint32_t max_group = (idx0[g + 1] + 0x1FF) >> 9;
+        uint32_t min_group = idx0.at(g) >> 9;
+        uint32_t max_group = (idx0.at(g + 1) + 0x1FF) >> 9;
         if ((max_group - min_group) < 10) {
-            while (index >= (min_group << 9) - basevals[min_group + 1].v[0] + 0x200)
+            while (index >= (min_group << 9) - basevals.at(min_group + 1).v[0] + 0x200)
                 ++min_group;
         } else {
             while ((min_group + 1) < max_group) {
                 uint32_t mid = (max_group + min_group) >> 1;
-                if (index < (max_group << 9) - basevals[max_group].v[0])
+                if (index < (max_group << 9) - basevals.at(max_group).v[0])
                     max_group = mid;
                 else
                     min_group = mid;
@@ -226,14 +226,14 @@ struct SparseArray {
 
     uint32_t find_group_items1(uint32_t index) const {
         uint32_t g = index >> 9;
-        uint32_t start = idx1[g] >> 9;
-        uint32_t nxt = (idx1[g + 1] + 0x1FF) >> 9;
+        uint32_t start = idx1.at(g) >> 9;
+        uint32_t nxt = (idx1.at(g + 1) + 0x1FF) >> 9;
         if ((nxt - start) < 10) {
-            while (index >= basevals[start + 1].v[0]) ++start;
+            while (index >= basevals.at(start + 1).v[0]) ++start;
         } else {
             if ((start + 1) < nxt) {
                 uint32_t mid = (nxt + start) >> 1;
-                if (index < basevals[mid].v[0])
+                if (index < basevals.at(mid).v[0])
                     nxt = mid;
                 else
                     start = mid;
@@ -243,9 +243,9 @@ struct SparseArray {
     }
 
     uint32_t get_item0(uint32_t index) const {
-        if ((index & 0x1FF) == 0) return idx0[index >> 9];
+        if ((index & 0x1FF) == 0) return idx0.at(index >> 9);
         uint32_t gi = find_group_items0(index);
-        const Baseval& bv = basevals[gi];
+        const Baseval& bv = basevals.at(gi);
         int64_t edx = uint32_t(index + bv.v[0] - (gi << 9));
         uint32_t dword_index = gi << 4;
         if (edx < int64_t(0x100) - bv.v[4]) {
@@ -282,12 +282,12 @@ struct SparseArray {
                 }
             }
         }
-        uint32_t bit_group = ~item_bits[dword_index];
+        uint32_t bit_group = ~item_bits.at(dword_index);
         uint32_t zb = get_set_bits(bit_group);
         uint32_t zb32 = (zb >> 24) & 0xFF;
         if (edx >= int64_t(zb32)) {
             ++dword_index;
-            bit_group = ~item_bits[dword_index];
+            bit_group = ~item_bits.at(dword_index);
             edx -= zb32;
             zb = get_set_bits(bit_group);
         }
@@ -318,9 +318,9 @@ struct SparseArray {
     }
 
     uint32_t get_item1(uint32_t index) const {
-        if ((index & 0x1FF) == 0) return idx1[index >> 9];
+        if ((index & 0x1FF) == 0) return idx1.at(index >> 9);
         uint32_t gi = find_group_items1(index);
-        const Baseval& bv = basevals[gi];
+        const Baseval& bv = basevals.at(gi);
         int64_t dist = uint32_t(index - bv.v[0]);
         uint32_t dword_index = gi << 4;
         if (dist < int64_t(bv.v[4])) {
@@ -357,12 +357,12 @@ struct SparseArray {
                 }
             }
         }
-        uint32_t bit_group = item_bits[dword_index];
+        uint32_t bit_group = item_bits.at(dword_index);
         uint32_t sb = get_set_bits(bit_group);
         uint32_t sb32 = (sb >> 24) & 0xFF;
         if (dist >= int64_t(sb32)) {
             ++dword_index;
-            bit_group = item_bits[dword_index];
+            bit_group = item_bits.at(dword_index);
             dist -= sb32;
             sb = get_set_bits(bit_group);
         }

@@ -37,7 +37,7 @@ struct SkirmishConfig {
     bool enable_ai = true;
     int n_marines = 5, n_zerglings = 6;
 
-    float pan_speed = 18.0f;
+    float pan_speed = 68.5f;
     float edge_margin = 6.0f;
     float orbit_speed = 1.6f;
     float orbit_mouse = 0.005f;

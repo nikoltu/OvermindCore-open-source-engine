@@ -7,10 +7,12 @@ namespace sc2::data {
 
 const char* to_string(UnitEvent event) {
     switch (event) {
-        case UnitEvent::Birth:  return "Birth";
-        case UnitEvent::Attack: return "Attack";
-        case UnitEvent::Death:  return "Death";
-        case UnitEvent::Ready:  return "Ready";
+        case UnitEvent::Birth:   return "Birth";
+        case UnitEvent::Attack:  return "Attack";
+        case UnitEvent::Death:   return "Death";
+        case UnitEvent::Ready:   return "Ready";
+        case UnitEvent::Select:  return "Select";
+        case UnitEvent::Confirm: return "Confirm";
     }
     return "";
 }
@@ -20,6 +22,8 @@ std::optional<UnitEvent> parse_unit_event(const std::string& name) {
     if (name == "Attack") return UnitEvent::Attack;
     if (name == "Death") return UnitEvent::Death;
     if (name == "Ready") return UnitEvent::Ready;
+    if (name == "Select") return UnitEvent::Select;
+    if (name == "Confirm") return UnitEvent::Confirm;
     return std::nullopt;
 }
 
@@ -32,10 +36,12 @@ struct EventSpec {
 
 EventSpec spec_for(UnitEvent e) {
     switch (e) {
-        case UnitEvent::Birth:  return {{"UnitBirth", "ActorCreation"}, {"Birth"}};
-        case UnitEvent::Attack: return {{"WeaponStart"}, {"AttackLaunch", "Attack"}};
-        case UnitEvent::Death:  return {{"UnitDeath"}, {"Death"}};
-        case UnitEvent::Ready:  return {{}, {"Ready"}};
+        case UnitEvent::Birth:   return {{"UnitBirth", "ActorCreation"}, {"Birth"}};
+        case UnitEvent::Attack:  return {{"WeaponStart"}, {"AttackLaunch", "Attack"}};
+        case UnitEvent::Death:   return {{"UnitDeath"}, {"Death"}};
+        case UnitEvent::Ready:   return {{}, {"Ready"}};
+        case UnitEvent::Select:  return {{}, {"What"}};
+        case UnitEvent::Confirm: return {{}, {"Yes"}};
     }
     return {};
 }

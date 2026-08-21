@@ -126,7 +126,7 @@ static Fixed cabil_cast_phase(const data::Catalog& cat, const std::string& id, c
     Fixed result;
     for (const core::XmlNode& c : cat.resolved("CAbil", id)) {
         if (c.name != field) continue;
-        if (c.attr("index")) continue;
+        if (const std::string* ix = c.attr("index"); ix && *ix != "0") continue;
         if (const std::string* v = c.attr("value"); v && !v->empty()) result = Fixed::parse(*v);
     }
     return result;
@@ -184,6 +184,42 @@ std::vector<std::string> army_weapon_upgrade_ids(const data::Catalog& cat, const
             continue;
         for (const data::UpgradeEffect& e : up.resolve(id))
             if (e.catalog == "Effect" && e.entry == eff && e.field == "Amount") {
+                out.push_back(id);
+                break;
+            }
+    }
+    std::stable_sort(out.begin(), out.end(),
+                     [](const std::string& a, const std::string& b) { return a.back() < b.back(); });
+    return out;
+}
+
+std::vector<std::string> army_armor_upgrade_ids(const data::UpgradeCatalog& up,
+                                                const std::string& army_unit) {
+    std::vector<std::string> out;
+    if (army_unit.empty()) return out;
+    for (const std::string& id : up.ids()) {
+        if (id.empty() || !std::isdigit(static_cast<unsigned char>(id.back())))
+            continue;
+        for (const data::UpgradeEffect& e : up.resolve(id))
+            if (e.catalog == "Unit" && e.entry == army_unit && e.field == "LifeArmor") {
+                out.push_back(id);
+                break;
+            }
+    }
+    std::stable_sort(out.begin(), out.end(),
+                     [](const std::string& a, const std::string& b) { return a.back() < b.back(); });
+    return out;
+}
+
+std::vector<std::string> army_shield_upgrade_ids(const data::UpgradeCatalog& up,
+                                                 const std::string& army_unit) {
+    std::vector<std::string> out;
+    if (army_unit.empty()) return out;
+    for (const std::string& id : up.ids()) {
+        if (id.empty() || !std::isdigit(static_cast<unsigned char>(id.back())))
+            continue;
+        for (const data::UpgradeEffect& e : up.resolve(id))
+            if (e.catalog == "Unit" && e.entry == army_unit && e.field == "ShieldArmor") {
                 out.push_back(id);
                 break;
             }
@@ -415,6 +451,53 @@ std::optional<AbilityBuild> make_ability(const data::Catalog& cat, const std::st
         b.def.duration = Fixed::from_double(ps.duration);
         b.def.spawn_count = 1;
         b.spawn_unit = ps.shade;
+        if (auto r = cat.scalar("CAbil", abil_id, "Range"); r && !r->empty())
+            b.def.range = Fixed::parse(*r);
+        b.energy_cost = cabil_energy(cat, abil_id);
+        b.life_cost = cabil_life(cat, abil_id);
+        b.cooldown = cabil_cooldown(cat, abil_id);
+        bind_cast_times(cat, abil_id, b);
+        return b;
+    }
+
+    if (auto iv = cat.inject_spec(abil_id); iv.found) {
+        AbilityBuild b;
+        b.def.kind = sim::EffectKind::Inject;
+        b.def.duration = Fixed::from_double(iv.delay);
+        b.def.spawn_count = iv.count;
+        b.def.period = Fixed::from_double(iv.stun);
+        if (auto r = cat.scalar("CAbil", abil_id, "Range"); r && !r->empty())
+            b.def.range = Fixed::parse(*r);
+        b.energy_cost = cabil_energy(cat, abil_id);
+        b.life_cost = cabil_life(cat, abil_id);
+        b.cooldown = cabil_cooldown(cat, abil_id);
+        b.requires_spawner_target = true;
+        bind_cast_times(cat, abil_id, b);
+        return b;
+    }
+
+    if (auto mc = cat.mule_calldown_spec(abil_id); mc.found) {
+        AbilityBuild b;
+        b.def.kind = sim::EffectKind::CreateUnit;
+        b.def.spawn_count = 1;
+        b.def.spawn_snap_resource = true;
+        b.spawn_unit = mc.unit;
+        b.spawn_life = Fixed::from_double(mc.life);
+        if (auto r = cat.scalar("CAbil", abil_id, "Range"); r && !r->empty())
+            b.def.range = Fixed::parse(*r);
+        b.energy_cost = cabil_energy(cat, abil_id);
+        b.life_cost = cabil_life(cat, abil_id);
+        b.cooldown = cabil_cooldown(cat, abil_id);
+        bind_cast_times(cat, abil_id, b);
+        return b;
+    }
+
+    if (auto it = cat.infested_terran_spec(abil_id); it.found && !it.unit.empty()) {
+        AbilityBuild b;
+        b.def.kind = sim::EffectKind::CreateUnit;
+        b.def.spawn_count = it.count < 1 ? 1 : it.count;
+        b.spawn_unit = it.unit;
+        b.spawn_life = Fixed::from_double(it.life);
         if (auto r = cat.scalar("CAbil", abil_id, "Range"); r && !r->empty())
             b.def.range = Fixed::parse(*r);
         b.energy_cost = cabil_energy(cat, abil_id);
@@ -774,6 +857,7 @@ int32_t build_effect_rec(const data::Catalog& cat, const std::string& eff, Abili
         n.kind = sim::EffectKind::Damage;
         n.amount = sim::Fixed::from_int(d.value_or(0));
         if (sb > 0.0) n.shield_bonus = sim::Fixed::from_double(sb);
+        n.armor_reduction = sim::Fixed::from_double(cat.effect_armor_reduction(eff));
         n.gates = parse_effect_vital_gates(cat, eff);
         b.tree.push_back(std::move(n));
         return int32_t(b.tree.size()) - 1;
@@ -888,30 +972,6 @@ sim::Unit make_unit_upgraded(const data::Catalog& cat, const data::UpgradeCatalo
     sim::Unit u = make_unit(cat, unit_id, player);
     apply_unit_upgrades(cat, up, unit_id, researched, u);
     return u;
-}
-
-std::uint32_t calldown_mule(sim::World& world, sim::MuleSystem& mules, std::uint32_t caster,
-                            sim::Fixed tx, sim::Fixed ty) {
-    using sim::Fixed;
-    const auto& us = world.units();
-    if (caster >= us.size() || !us[caster].alive) return sim::kNoTarget;
-    const Fixed cost = Fixed::from_int(50);
-    if (us[caster].energy_max.raw() <= 0 || us[caster].energy < cost) return sim::kNoTarget;
-    std::uint32_t node = sim::kNoTarget;
-    Fixed best;
-    for (std::uint32_t i = 0; i < us.size(); ++i) {
-        const sim::Unit& n = us[i];
-        if (!n.alive || n.resource_left <= 0 || n.is_gas) continue;
-        const Fixed dx = n.x - tx, dy = n.y - ty;
-        const Fixed d2 = dx * dx + dy * dy;
-        if (node == sim::kNoTarget || d2 < best) { best = d2; node = i; }
-    }
-    if (node == sim::kNoTarget) return sim::kNoTarget;
-    const std::int32_t player = us[caster].player;
-    const Fixed nx = us[node].x, ny = us[node].y;
-    world.unit(caster).energy = world.unit(caster).energy - cost;
-    return mules.calldown(world, player, nx, ny, node, caster,
-                          Fixed::from_int(sim::MuleSystem::kLifetimeSeconds));
 }
 
 bool order_repair(const data::Catalog& cat, sim::World& world, sim::RepairSystem& repairs,

@@ -84,7 +84,16 @@ static void decode_bc_chan(const uint8_t* b, int out[16]) {
 
 std::vector<uint8_t> decode_dxt(const std::vector<uint8_t>& data, size_t off,
                                 uint32_t w, uint32_t h, const std::string& fourcc) {
-    int dxt = fourcc == "DXT1" ? 1 : fourcc == "DXT3" ? 3 : 5;
+    int dxt;
+    if (fourcc == "DXT1")
+        dxt = 1;
+    else if (fourcc == "DXT2" || fourcc == "DXT3")
+        dxt = 3;
+    else if (fourcc == "DXT4" || fourcc == "DXT5")
+        dxt = 5;
+    else
+        throw std::runtime_error("dds: unsupported fourCC '" + fourcc +
+                                 "' (decode_dxt handles only DXT1/2/3/4/5 block formats)");
     size_t blk = (dxt == 1) ? 8 : 16;
     std::vector<uint8_t> out(size_t(w) * h * 4, 0);
     uint32_t bxn = (w + 3) / 4, byn = (h + 3) / 4;
