@@ -315,7 +315,24 @@ struct GlobalResolve {
     const std::unordered_map<const Frame*, Rect>* prev;
     std::unordered_map<const Frame*, Rect>* cur;
     const TextResolver* text = nullptr;
+    const FrameCollapsed* collapsed = nullptr;
 };
+
+bool declares_collapse(const Frame& f) {
+    const XmlNode* p = f.prop("CollapseLayout");
+    if (!p) return false;
+    const std::string v = p->attr_or("val", "");
+    return v == "true" || v == "True" || v == "1";
+}
+
+Rect collapse_rect(const Rect& r, bool haveL, bool haveR, bool haveT, bool haveB) {
+    Rect c = r;
+    c.x = (haveR && !haveL) ? r.x + r.w : r.x;
+    c.w = 0.0f;
+    c.y = (haveB && !haveT) ? r.y + r.h : r.y;
+    c.h = 0.0f;
+    return c;
+}
 
 Rect anchor_target(const std::string& rel, const Rect& parent,
                    const std::unordered_map<std::string, Rect>& siblings,
@@ -405,6 +422,8 @@ Rect solve_one(const Frame& f, const Rect& parent,
     else if (haveT) { r.y = T; r.h = parent.y + parent.h - T; }
     else if (haveB) { r.y = parent.y; r.h = B - parent.y; }
     else { r.y = parent.y; r.h = parent.h; }
+    if (g && g->collapsed && *g->collapsed && declares_collapse(f) && (*g->collapsed)(f))
+        return collapse_rect(r, haveL, haveR, haveT, haveB);
     return r;
 }
 
@@ -442,6 +461,11 @@ void propagate_label_text(Frame& f) {
 std::string texture_ref(const Frame& f) {
     if (const XmlNode* t = f.prop("Texture")) return t->attr_or("val", "");
     if (const XmlNode* i = f.prop("Image")) return i->attr_or("val", "");
+    return "";
+}
+
+std::string visible_ref(const Frame& f) {
+    if (const XmlNode* v = f.prop("Visible")) return v->attr_or("val", "");
     return "";
 }
 
@@ -486,7 +510,8 @@ void emit_tree(const Frame& f, const Rect& rect, int depth, std::vector<SolvedFr
                std::vector<const Rect*>& chain, std::vector<const Frame*>& chainF,
                const GlobalResolve* g) {
     if (g && g->cur) (*g->cur)[&f] = rect;
-    out.push_back({rect, f.type, f.name, display_text(f, g ? g->text : nullptr), depth, texture_ref(f)});
+    out.push_back({rect, f.type, f.name, display_text(f, g ? g->text : nullptr), depth,
+                   texture_ref(f), visible_ref(f)});
     const std::size_t n = f.children.size();
     if (n == 0) return;
     chain.push_back(&rect);
@@ -528,6 +553,164 @@ bool rects_equal(const std::vector<SolvedFrame>& a, const std::vector<SolvedFram
 }
 }
 
+namespace {
+
+bool xml_true(const std::string& v) { return v == "true" || v == "True" || v == "1"; }
+bool xml_false(const std::string& v) { return v == "false" || v == "False" || v == "0"; }
+
+template <typename FrameT>
+FrameT* walk_state_path(FrameT& owner, const std::string& path) {
+    if (path.empty() || path == "$this") return &owner;
+    FrameT* cur = &owner;
+    for (const std::string& seg : split_path(path)) {
+        if (seg == "$this") {
+            if (cur != &owner) return nullptr;
+            continue;
+        }
+        if (!seg.empty() && seg[0] == '$') return nullptr;
+        FrameT* next = nullptr;
+        for (auto& c : cur->children)
+            if (c.name == seg) { next = &c; break; }
+        if (!next) return nullptr;
+        cur = next;
+    }
+    return cur;
+}
+
+enum class Tri { False, True, Unknown };
+
+Tri evaluate_when(const Frame& owner, const XmlNode& when, float aspect) {
+    const std::string type = when.attr_or("type", "");
+    if (type != "Property") return Tri::Unknown;
+    const std::string* want = when.attr("Visible");
+    if (!want) return Tri::Unknown;
+    for (const auto& [k, v] : when.attrs) {
+        (void)v;
+        if (k != "type" && k != "frame" && k != "Visible") return Tri::Unknown;
+    }
+    const Frame* target = walk_state_path(owner, when.attr_or("frame", ""));
+    if (!target) return Tri::Unknown;
+    const bool is = frame_visible_at_aspect(*target, aspect);
+    if (xml_true(*want)) return is ? Tri::True : Tri::False;
+    if (xml_false(*want)) return is ? Tri::False : Tri::True;
+    return Tri::Unknown;
+}
+
+void set_frame_prop(Frame& f, const std::string& name, const std::string& val) {
+    if (name.empty()) return;
+    for (XmlNode& p : f.props) {
+        if (p.name.size() != name.size()) continue;
+        bool same = true;
+        for (std::size_t i = 0; i < name.size() && same; ++i) {
+            const char a = p.name[i], b = name[i];
+            same = a == b || (a | 0x20) == (b | 0x20);
+        }
+        if (!same) continue;
+        for (auto& [k, v] : p.attrs)
+            if (k == "val") { v = val; return; }
+        p.attrs.push_back({"val", val});
+        return;
+    }
+    XmlNode n;
+    n.name = name;
+    if (n.name[0] >= 'a' && n.name[0] <= 'z') n.name[0] = char(n.name[0] - 'a' + 'A');
+    n.attrs.push_back({"val", val});
+    f.props.push_back(n);
+}
+
+void apply_action(Frame& owner, const XmlNode& action) {
+    const std::string type = action.attr_or("type", "");
+    Frame* target = walk_state_path(owner, action.attr_or("frame", ""));
+    if (!target) return;
+    if (type == "SetAnchor") {
+        const std::string side = action.attr_or("side", "");
+        if (side.empty()) return;
+        XmlNode a;
+        a.name = "Anchor";
+        a.attrs.push_back({"side", side});
+        a.attrs.push_back({"relative", action.attr_or("relative", "$parent")});
+        a.attrs.push_back({"pos", action.attr_or("pos", "Min")});
+        a.attrs.push_back({"offset", action.attr_or("offset", "0")});
+        for (XmlNode& p : target->props)
+            if (p.name == "Anchor" && p.attr_or("side", "") == side) { p = a; return; }
+        target->props.push_back(a);
+        return;
+    }
+    if (type == "SetProperty") {
+        for (const auto& [k, v] : action.attrs)
+            if (k != "type" && k != "frame" && k != "index") set_frame_prop(*target, k, v);
+    }
+}
+
+}
+
+std::vector<FrameStateGroup> frame_state_groups(const Frame& f) {
+    std::vector<FrameStateGroup> out;
+    for (const XmlNode& p : f.props) {
+        if (p.name != "StateGroup") continue;
+        FrameStateGroup g;
+        g.name = p.attr_or("name", "");
+        for (const XmlNode& c : p.children) {
+            if (c.name == "DefaultState") {
+                g.default_state = c.attr_or("val", "");
+            } else if (c.name == "State") {
+                FrameState s;
+                s.name = c.attr_or("name", "");
+                for (const XmlNode& e : c.children) {
+                    if (e.name == "When") s.whens.push_back(e);
+                    else if (e.name == "Action") s.actions.push_back(e);
+                }
+                g.states.push_back(std::move(s));
+            }
+        }
+        out.push_back(std::move(g));
+    }
+    return out;
+}
+
+bool frame_visible_at_aspect(const Frame& f, float aspect) {
+    if (f.type == "AspectRatioFrame") {
+        if (const XmlNode* mn = f.prop("MinVisibleAspectRatio")) {
+            const std::string v = mn->attr_or("val", "");
+            if (!v.empty() && aspect < float(std::atof(v.c_str()))) return false;
+        }
+        if (const XmlNode* mx = f.prop("MaxVisibleAspectRatio")) {
+            const std::string v = mx->attr_or("val", "");
+            if (!v.empty() && aspect > float(std::atof(v.c_str()))) return false;
+        }
+        return true;
+    }
+    const XmlNode* v = f.prop("Visible");
+    if (!v) return true;
+    const std::string val = v->attr_or("val", "");
+    return !xml_false(val);
+}
+
+std::string selected_state(const Frame& owner, const FrameStateGroup& group, float aspect) {
+    for (const FrameState& s : group.states) {
+        if (s.whens.empty()) continue;
+        bool all_true = true;
+        for (const XmlNode& w : s.whens)
+            if (evaluate_when(owner, w, aspect) != Tri::True) { all_true = false; break; }
+        if (all_true) return s.name;
+    }
+    return group.default_state;
+}
+
+void apply_state_groups(Frame& root, float aspect) {
+    const std::vector<FrameStateGroup> groups = frame_state_groups(root);
+    for (const FrameStateGroup& g : groups) {
+        const std::string active = selected_state(root, g, aspect);
+        if (active.empty()) continue;
+        for (const FrameState& s : g.states) {
+            if (s.name != active) continue;
+            for (const XmlNode& a : s.actions) apply_action(root, a);
+            break;
+        }
+    }
+    for (Frame& c : root.children) apply_state_groups(c, aspect);
+}
+
 int measure_text(const std::string& text, int scale) {
     if (scale < 1) scale = 1;
     return int(text.size()) * (kFontW + 1) * scale;
@@ -539,14 +722,21 @@ std::vector<SolvedFrame> solve_layout(const Frame& root, const Rect& canvas) {
 
 std::vector<SolvedFrame> solve_layout(const Frame& root, const Rect& canvas,
                                       const TextResolver& resolve_text) {
+    return solve_layout(root, canvas, resolve_text, FrameCollapsed{});
+}
+
+std::vector<SolvedFrame> solve_layout(const Frame& root, const Rect& canvas,
+                                      const TextResolver& resolve_text,
+                                      const FrameCollapsed& collapsed) {
     Frame tree = root;
+    apply_state_groups(tree, canvas.h > 0.0f ? canvas.w / canvas.h : 0.0f);
     propagate_label_text(tree);
     constexpr int kMaxPasses = 64;
     std::unordered_map<const Frame*, Rect> prev;
     std::vector<SolvedFrame> out;
     for (int pass = 0; pass < kMaxPasses; ++pass) {
         std::unordered_map<const Frame*, Rect> cur;
-        GlobalResolve g{pass == 0 ? nullptr : &prev, &cur, &resolve_text};
+        GlobalResolve g{pass == 0 ? nullptr : &prev, &cur, &resolve_text, &collapsed};
         std::vector<SolvedFrame> next = solve_pass(tree, canvas, g);
         const bool stable = pass > 0 && rects_equal(next, out);
         out = std::move(next);

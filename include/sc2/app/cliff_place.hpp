@@ -1,8 +1,10 @@
 #pragma once
 
 #include <algorithm>
+#include <cmath>
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
 #include <map>
 #include <set>
 #include <string>
@@ -20,6 +22,11 @@ struct CliffField {
     std::vector<render::SceneInstance> instances;
     std::size_t missing_pieces = 0;
     std::set<std::string> missing_codes;
+    std::size_t missing_materials = 0;
+    std::size_t missing_cliff_heights = 0;
+    std::size_t first_ramp_instance = 0;
+    std::size_t ramp_pieces = 0;
+    std::size_t unresolved_ramp_frames = 0;
 };
 
 inline std::string cliff_xml_first(const std::string& xml, const std::string& open,
@@ -51,6 +58,7 @@ inline CliffField place_cliffs(casc::Storage& store, const formats::LoadedMap& m
     };
     const std::string terr = read_all_mods("TerrainData.xml");
     const std::string cliffxml = read_all_mods("CliffData.xml");
+    const std::string meshxml = read_all_mods("CliffMeshData.xml");
     std::vector<std::string> sets = map.cliff_sets;
     if (sets.empty()) {
         std::string s = map.cliff_set;
@@ -62,7 +70,7 @@ inline CliffField place_cliffs(casc::Storage& store, const formats::LoadedMap& m
     }
     if (sets.empty()) return cf;
 
-    struct SetInfo { std::string mesh, root; std::vector<formats::M3Layer> skin; };
+    struct SetInfo { std::string mesh, root; std::vector<formats::M3Layer> skin; float native = 0.0f; };
     std::vector<SetInfo> setinfo(sets.size());
     for (std::size_t s = 0; s < sets.size(); ++s) {
         std::size_t cp = cliffxml.find("<CCliff id=\"" + sets[s] + "\">");
@@ -70,12 +78,27 @@ inline CliffField place_cliffs(casc::Storage& store, const formats::LoadedMap& m
         if (mesh.empty()) continue;
         setinfo[s].mesh = mesh;
         setinfo[s].root = assetbase + "Assets/Cliffs/" + mesh + "/";
+        std::size_t mep = meshxml.find("<CCliffMesh id=\"" + mesh + "\">");
+        std::string mh = mep == std::string::npos
+                             ? ""
+                             : cliff_xml_first(meshxml.substr(mep), "<CliffHeights", "value");
+        setinfo[s].native = mh.empty() ? 0.0f : std::fabs(std::strtof(mh.c_str(), nullptr));
+        if (setinfo[s].native <= 0.0f) ++cf.missing_cliff_heights;
+        std::string mp = cp == std::string::npos
+                             ? ""
+                             : cliff_xml_first(cliffxml.substr(cp), "<CliffMaterial", "value");
+        for (char& c : mp)
+            if (c == '\\') c = '/';
+        if (mp.empty()) mp = "Assets/Cliffs/" + sets[s] + "_Material/" + sets[s] + "_Material.m3";
+        else {
+            std::size_t idp;
+            while ((idp = mp.find("##id##")) != std::string::npos) mp.replace(idp, 6, sets[s]);
+        }
         try {
-            const std::string mp =
-                assetbase + "Assets/Cliffs/" + sets[s] + "_Material/" + sets[s] + "_Material.m3";
-            formats::Model mm = formats::M3::parse(store.read_by_name(mp)).decode_model();
+            formats::Model mm = formats::M3::parse(store.read_by_name(assetbase + mp)).decode_model();
             if (!mm.materials.empty()) setinfo[s].skin = mm.materials[0].layers;
-        } catch (...) {}
+            else ++cf.missing_materials;
+        } catch (...) { ++cf.missing_materials; }
     }
     if (setinfo[0].mesh.empty()) return cf;
 
@@ -96,11 +119,21 @@ inline CliffField place_cliffs(casc::Storage& store, const formats::LoadedMap& m
         if (!have_raw || x < 0 || y < 0 || x >= int(cm.width) || y >= int(cm.height)) return false;
         return (cm.raw[std::size_t(y) * cm.width + x] & 63) != 0;
     };
-    const float kPieceWalkable = 4.8f;
-    const float zscale = tier_h / kPieceWalkable;
+    const std::vector<float> tier_z = formats::tier_heights(map);
+    auto tier_top = [&](int L) -> float {
+        if (tier_z.empty()) return float(L) * tier_h;
+        const std::size_t i = L < 0 ? 0 : std::size_t(L);
+        return tier_z[i < tier_z.size() ? i : tier_z.size() - 1];
+    };
+    auto tier_rise = [&](int L) -> float {
+        if (tier_z.size() < 2) return tier_h;
+        const std::size_t i = L < 0 ? 0 : std::size_t(L);
+        if (i + 1 < tier_z.size()) return tier_z[i + 1] - tier_z[i];
+        return tier_z[tier_z.size() - 1] - tier_z[tier_z.size() - 2];
+    };
     const float sign = (order & 1) ? -1.0f : 1.0f;
 
-    auto emit = [&](int si, const std::string& code, float wx, float wy, int mn, int steps, float xy, int var) {
+    auto load_piece = [&](int& si, const std::string& code, int var) -> const formats::Model* {
         if (si < 0 || si >= int(setinfo.size()) || setinfo[std::size_t(si)].mesh.empty()) si = 0;
         const SetInfo& S = setinfo[std::size_t(si)];
         char vc = char('0' + (var >= 0 && var <= 3 ? var : 0));
@@ -117,14 +150,23 @@ inline CliffField place_cliffs(casc::Storage& store, const formats::LoadedMap& m
                 for (formats::M3Material& mat : m.materials) mat.layers = S.skin;
             it = cf.pieces.emplace(key, std::move(m)).first;
         }
-        if (it->second.vertex_count == 0) {
+        return &it->second;
+    };
+
+    auto emit = [&](int si, const std::string& code, float wx, float wy, int mn, int steps, float xy, int var) {
+        const formats::Model* piece = load_piece(si, code, var);
+        const SetInfo& S = setinfo[std::size_t(si)];
+        if (piece->vertex_count == 0) {
             ++cf.missing_pieces;
             cf.missing_codes.insert(code);
             return;
         }
         render::SceneInstance inst;
-        inst.model = &it->second;
-        inst.world = render::translation(wx, wy, float(mn) * tier_h) *
+        inst.model = piece;
+        const float rise = tier_rise(mn);
+        const float native = S.native > 0.0f ? S.native : piece->bounds_max[2];
+        const float zscale = native > 1e-3f ? (rise > 1e-3f ? rise : tier_h) / native : 1.0f;
+        inst.world = render::translation(wx, wy, tier_top(mn)) *
                      render::rotation_z(sign * float(steps) * 1.5707963f) *
                      render::scaling(xy, xy, zscale);
         inst.team = {0, 0, 0, -1.0f};
@@ -148,7 +190,7 @@ inline CliffField place_cliffs(casc::Storage& store, const formats::LoadedMap& m
     if (!map.cliff_cells.empty() && map.cliff_grid_w > 1) {
         const int gw = int(map.cliff_grid_w);
         for (const formats::CliffCell& c : map.cliff_cells) {
-            if (c.flag != 1) continue;
+            if (!(c.flag & 1)) continue;
             const int cx = int(c.index) % gw, cy = int(c.index) / gw;
             int t[4];
             if (have_vlev) {
@@ -195,6 +237,76 @@ inline CliffField place_cliffs(casc::Storage& store, const formats::LoadedMap& m
                 emit(0, code, float(vx), float(vy), mn, steps, 0.5f, 0);
             }
     }
+    cf.first_ramp_instance = cf.instances.size();
+    if (have_vlev && !map.ramps.empty()) {
+        auto emit_ramp = [&](int si, const formats::RampFrame& f, bool left, int var) {
+            if (!f.used() || f.w <= 0.0f || f.h <= 0.0f) return;
+            const float sgn_r[4] = {-1.0f, 1.0f, 1.0f, -1.0f};
+            const float sgn_u[4] = {-1.0f, -1.0f, 1.0f, 1.0f};
+            const float ramp_side = left ? 1.0f : -1.0f;
+            int lv[4];
+            std::string letters(4, ' ');
+            for (int k = 0; k < 4; ++k) {
+                const float x = f.cx + sgn_r[k] * f.w * f.rx + sgn_u[k] * f.h * f.ux;
+                const float y = f.cy + sgn_r[k] * f.w * f.ry + sgn_u[k] * f.h * f.uy;
+                lv[k] = vlvl(int(std::lround(x)), int(std::lround(y)));
+                if (lv[k] < 0) return;
+                if (sgn_r[k] == ramp_side) {
+                    if (lv[k] < 1 || lv[k] > 3) return;
+                    letters[std::size_t(k)] = "QRS"[lv[k] - 1];
+                } else {
+                    if (lv[k] > 3) return;
+                    letters[std::size_t(k)] = "ABCD"[lv[k]];
+                }
+            }
+            const float want_r = 2.0f * f.w, want_u = 2.0f * f.h;
+            for (int yaw = 0; yaw < 4; ++yaw) {
+                std::string code(4, ' ');
+                for (int k = 0; k < 4; ++k) code[std::size_t(k)] = letters[std::size_t((k + yaw) & 3)];
+                int use = si;
+                const formats::Model* piece = load_piece(use, code, var);
+                if (piece->vertex_count == 0) continue;
+                const float ex = piece->bounds_max[0] - piece->bounds_min[0];
+                const float ey = piece->bounds_max[1] - piece->bounds_min[1];
+                const float need_x = (yaw & 1) ? want_u : want_r;
+                const float need_y = (yaw & 1) ? want_r : want_u;
+                if (need_x != need_y) {
+                    const bool frame_x_longer = need_x > need_y;
+                    const bool mesh_x_longer = ex > ey;
+                    if (frame_x_longer != mesh_x_longer) continue;
+                }
+                int lo = lv[0], hi = lv[0];
+                for (int k = 1; k < 4; ++k) { lo = lv[k] < lo ? lv[k] : lo; hi = lv[k] > hi ? lv[k] : hi; }
+                const float rspan = piece->bounds_max[2] - piece->bounds_min[2];
+                const float rnative = setinfo[std::size_t(use)].native > 0.0f
+                                          ? setinfo[std::size_t(use)].native
+                                          : rspan;
+                const float zscale = rnative > 1e-3f && hi > lo
+                                         ? (tier_top(hi) - tier_top(lo)) / rnative
+                                         : 1.0f;
+                render::SceneInstance inst;
+                inst.model = piece;
+                inst.world = render::translation(f.cx, f.cy,
+                                                 tier_top(lo) - zscale * piece->bounds_min[2]) *
+                             render::rotation_z(std::atan2(f.ry, f.rx) +
+                                                sign * float(yaw) * 1.5707963f) *
+                             render::scaling(1.0f, 1.0f, zscale);
+                inst.team = {0, 0, 0, -1.0f};
+                inst.seq = -1;
+                cf.instances.push_back(inst);
+                ++cf.ramp_pieces;
+                return;
+            }
+            ++cf.unresolved_ramp_frames;
+        };
+        for (const formats::TerrainRamp& r : map.ramps) {
+            emit_ramp(int(r.cid), r.left_lo, true, int(r.left_lo_var));
+            emit_ramp(int(r.cid), r.right_lo, false, int(r.right_lo_var));
+            emit_ramp(int(r.cid), r.left_hi, true, int(r.left_hi_var));
+            emit_ramp(int(r.cid), r.right_hi, false, int(r.right_hi_var));
+        }
+    }
+
     return cf;
 }
 

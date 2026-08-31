@@ -44,7 +44,7 @@ DemoLayout build_demo(sim::World& w, int human_player, int ai_player, int n_mari
         u.player = human_player;
         u.x = Fixed::from_int(3 + i * 2);
         u.y = Fixed::from_int(3);
-        set_stats(u, 45, 6, 0.86f, 5.0f, 2.25f, 0.5f);
+        set_stats(u, 45, 6, 0.8608f, 5.0f, 2.25f, 0.375f);
         L.marines.push_back(w.add_unit(u));
     }
     for (int i = 0; i < n_zerglings; ++i) {
@@ -52,7 +52,7 @@ DemoLayout build_demo(sim::World& w, int human_player, int ai_player, int n_mari
         u.player = ai_player;
         u.x = Fixed::from_int(2 + i * 2);
         u.y = Fixed::from_int(15);
-        set_stats(u, 35, 5, 0.70f, 0.3f, 3.5f, 0.4f);
+        set_stats(u, 35, 5, 0.696f, 0.1f, 2.953125f, 0.375f);
         L.zerglings.push_back(w.add_unit(u));
     }
     return L;

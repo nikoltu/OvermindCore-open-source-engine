@@ -4,6 +4,7 @@
 #include <string>
 #include <vector>
 
+#include "sc2/app/map_world.hpp"
 #include "sc2/app/spawn.hpp"
 #include "sc2/data/catalog.hpp"
 
@@ -190,7 +191,7 @@ class MissionWorldHost : public NativeHost {
 }
 
 MissionRuntime::MissionRuntime(const data::Catalog& cat, const formats::LoadedMap& map) : cat_(cat) {
-    world_ = formats::build_world(map, [&cat](const std::string& type, sim::Unit& u) {
+    world_ = app::build_world(map, [&cat](const std::string& type, sim::Unit& u) {
         const sim::Fixed x = u.x, y = u.y;
         const int player = u.player;
         try {

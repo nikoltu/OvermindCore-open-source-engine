@@ -17,6 +17,12 @@ struct ScreenPoint {
     float x = 0, y = 0;
 };
 
+struct GroundHeight {
+    virtual ~GroundHeight() = default;
+    virtual float z_at(float wx, float wy) const = 0;
+    virtual float max_z() const = 0;
+};
+
 enum class CommandKind {
     None,
     Move,
@@ -39,6 +45,9 @@ public:
     std::vector<uint32_t> box_select(const sim::World& world,
                                      const ScreenRect& rect) const;
 
+    void set_ground_height(const GroundHeight* g) { ground_ = g; }
+    const GroundHeight* ground_height() const { return ground_; }
+
     bool ground_point(const sim::World& world, const ScreenPoint& p, sim::Fixed& wx,
                       sim::Fixed& wy) const;
 
@@ -52,7 +61,8 @@ public:
                             bool attack_move = false) const;
 
     Command issue_command(sim::World& world, const std::vector<uint32_t>& selection,
-                          const ScreenPoint& p, bool attack_move = false) const;
+                          const ScreenPoint& p, bool attack_move = false,
+                          bool queued = false) const;
 
     void set_pick_radius(sim::Fixed r) { pick_radius_ = r; }
     sim::Fixed pick_radius() const { return pick_radius_; }
@@ -64,8 +74,11 @@ private:
     uint32_t view_w_ = 0, view_h_ = 0;
     int32_t player_ = 0;
     sim::Fixed pick_radius_ = sim::Fixed::from_ratio(1, 2);
+    const GroundHeight* ground_ = nullptr;
 
     bool project(float x, float y, float z, float& px, float& py) const;
+
+    float ground_z(float x, float y) const { return ground_ ? ground_->z_at(x, y) : 0.0f; }
 };
 
 }

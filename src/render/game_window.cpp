@@ -1,5 +1,7 @@
 #include "sc2/render/game_window.hpp"
 
+#include "sc2/core/version.hpp"
+
 #ifndef NOMINMAX
 #define NOMINMAX
 #endif
@@ -159,7 +161,9 @@ WindowResult run_game_window(const GameFrameFn& frame, const casc::Storage* stor
     const wchar_t* cls = game_window_class(hinst);
     RECT rc{0, 0, LONG(width), LONG(height)};
     AdjustWindowRect(&rc, WS_OVERLAPPEDWINDOW, FALSE);
-    HWND rawWin = CreateWindowExW(0, cls, L"sc2 game", WS_OVERLAPPEDWINDOW, CW_USEDEFAULT,
+    std::wstring wtitle(L"sc2 game ");
+    for (const char* p = sc2::kVersion; *p; ++p) wtitle.push_back(wchar_t(*p));
+    HWND rawWin = CreateWindowExW(0, cls, wtitle.c_str(), WS_OVERLAPPEDWINDOW, CW_USEDEFAULT,
                                   CW_USEDEFAULT, rc.right - rc.left, rc.bottom - rc.top,
                                   nullptr, nullptr, hinst, nullptr);
     if (!rawWin) unavailable("CreateWindowEx failed");
@@ -206,14 +210,16 @@ WindowResult run_game_window(const GameFrameFn& frame, const casc::Storage* stor
     SceneRenderer scene_renderer(pd, dev, queue, gfx, width, height, fmt.format, storage,
                                  texture_root);
 
-    VkCommandPoolCreateInfo cpi{VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO};
+    VkCommandPoolCreateInfo cpi{};
+    cpi.sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO;
     cpi.flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
     cpi.queueFamilyIndex = gfx;
     VkCommandPool rawCmdPool = VK_NULL_HANDLE;
     check(vkCreateCommandPool(dev, &cpi, nullptr, &rawCmdPool), "vkCreateCommandPool");
     Unique<VkCommandPool> cmdPool(rawCmdPool, [dev](VkCommandPool p) { vkDestroyCommandPool(dev, p, nullptr); });
 
-    VkSamplerCreateInfo smi{VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO};
+    VkSamplerCreateInfo smi{};
+    smi.sType = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO;
     smi.magFilter = smi.minFilter = VK_FILTER_LINEAR;
     smi.addressModeU = smi.addressModeV = smi.addressModeW = VK_SAMPLER_ADDRESS_MODE_REPEAT;
     smi.maxLod = 1.0f;
@@ -242,7 +248,8 @@ WindowResult run_game_window(const GameFrameFn& frame, const casc::Storage* stor
     dep.dstStageMask = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
     dep.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
     dep.dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
-    VkRenderPassCreateInfo rpi{VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO};
+    VkRenderPassCreateInfo rpi{};
+    rpi.sType = VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO;
     rpi.attachmentCount = 1;
     rpi.pAttachments = &att;
     rpi.subpassCount = 1;
@@ -253,21 +260,26 @@ WindowResult run_game_window(const GameFrameFn& frame, const casc::Storage* stor
     check(vkCreateRenderPass(dev, &rpi, nullptr, &rawPass), "vkCreateRenderPass");
     Unique<VkRenderPass> renderPass(rawPass, [dev](VkRenderPass p) { vkDestroyRenderPass(dev, p, nullptr); });
 
-    VkPipelineInputAssemblyStateCreateInfo ia{VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO};
+    VkPipelineInputAssemblyStateCreateInfo ia{};
+    ia.sType = VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO;
     ia.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
-    VkPipelineViewportStateCreateInfo vps{VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO};
+    VkPipelineViewportStateCreateInfo vps{};
+    vps.sType = VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO;
     vps.viewportCount = 1;
     vps.scissorCount = 1;
     VkDynamicState dynStates[2] = {VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR};
-    VkPipelineDynamicStateCreateInfo dyn{VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO};
+    VkPipelineDynamicStateCreateInfo dyn{};
+    dyn.sType = VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO;
     dyn.dynamicStateCount = 2;
     dyn.pDynamicStates = dynStates;
-    VkPipelineRasterizationStateCreateInfo rs{VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO};
+    VkPipelineRasterizationStateCreateInfo rs{};
+    rs.sType = VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO;
     rs.polygonMode = VK_POLYGON_MODE_FILL;
     rs.cullMode = VK_CULL_MODE_NONE;
     rs.frontFace = VK_FRONT_FACE_COUNTER_CLOCKWISE;
     rs.lineWidth = 1.0f;
-    VkPipelineMultisampleStateCreateInfo ms{VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO};
+    VkPipelineMultisampleStateCreateInfo ms{};
+    ms.sType = VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO;
     ms.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
 
     const VkFormat kTexColor = VK_FORMAT_R8G8B8A8_UNORM;
@@ -276,14 +288,16 @@ WindowResult run_game_window(const GameFrameFn& frame, const casc::Storage* stor
     ovlB.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
     ovlB.descriptorCount = 1;
     ovlB.stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
-    VkDescriptorSetLayoutCreateInfo ovlLi{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
+    VkDescriptorSetLayoutCreateInfo ovlLi{};
+    ovlLi.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
     ovlLi.bindingCount = 1;
     ovlLi.pBindings = &ovlB;
     VkDescriptorSetLayout rawOvlSetLayout = VK_NULL_HANDLE;
     check(vkCreateDescriptorSetLayout(dev, &ovlLi, nullptr, &rawOvlSetLayout), "vkCreateDescriptorSetLayout(overlay)");
     Unique<VkDescriptorSetLayout> ovlSetLayout(rawOvlSetLayout, [dev](VkDescriptorSetLayout l) {
         vkDestroyDescriptorSetLayout(dev, l, nullptr); });
-    VkPipelineLayoutCreateInfo ovlPli{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
+    VkPipelineLayoutCreateInfo ovlPli{};
+    ovlPli.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
     ovlPli.setLayoutCount = 1;
     ovlPli.pSetLayouts = &rawOvlSetLayout;
     VkPipelineLayout rawOvlLayout = VK_NULL_HANDLE;
@@ -301,8 +315,10 @@ WindowResult run_game_window(const GameFrameFn& frame, const casc::Storage* stor
     ovlStages[1].stage = VK_SHADER_STAGE_FRAGMENT_BIT;
     ovlStages[1].module = ovlFs.get();
     ovlStages[1].pName = "main";
-    VkPipelineVertexInputStateCreateInfo ovlVin{VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO};
-    VkPipelineDepthStencilStateCreateInfo ovlDss{VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO};
+    VkPipelineVertexInputStateCreateInfo ovlVin =
+        vk_init<VkPipelineVertexInputStateCreateInfo>(VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO);
+    VkPipelineDepthStencilStateCreateInfo ovlDss{};
+    ovlDss.sType = VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO;
     ovlDss.depthTestEnable = VK_FALSE;
     ovlDss.depthWriteEnable = VK_FALSE;
     VkPipelineColorBlendAttachmentState ovlCba{};
@@ -315,10 +331,12 @@ WindowResult run_game_window(const GameFrameFn& frame, const casc::Storage* stor
     ovlCba.alphaBlendOp = VK_BLEND_OP_ADD;
     ovlCba.colorWriteMask = VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT |
                             VK_COLOR_COMPONENT_B_BIT | VK_COLOR_COMPONENT_A_BIT;
-    VkPipelineColorBlendStateCreateInfo ovlCb{VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO};
+    VkPipelineColorBlendStateCreateInfo ovlCb{};
+    ovlCb.sType = VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO;
     ovlCb.attachmentCount = 1;
     ovlCb.pAttachments = &ovlCba;
-    VkGraphicsPipelineCreateInfo ovlGpi{VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO};
+    VkGraphicsPipelineCreateInfo ovlGpi{};
+    ovlGpi.sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO;
     ovlGpi.stageCount = 2;
     ovlGpi.pStages = ovlStages;
     ovlGpi.pVertexInputState = &ovlVin;
@@ -342,7 +360,8 @@ WindowResult run_game_window(const GameFrameFn& frame, const casc::Storage* stor
     Buffer ovlStaging = make_buffer(pd, dev, VkDeviceSize(width) * height * 4,
                                     VK_BUFFER_USAGE_TRANSFER_SRC_BIT, nullptr);
     VkDescriptorPoolSize ovlPsz{VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1};
-    VkDescriptorPoolCreateInfo ovlDpi{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
+    VkDescriptorPoolCreateInfo ovlDpi{};
+    ovlDpi.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
     ovlDpi.maxSets = 1;
     ovlDpi.poolSizeCount = 1;
     ovlDpi.pPoolSizes = &ovlPsz;
@@ -351,13 +370,15 @@ WindowResult run_game_window(const GameFrameFn& frame, const casc::Storage* stor
     Unique<VkDescriptorPool> ovlPool(rawOvlPool, [dev](VkDescriptorPool p) { vkDestroyDescriptorPool(dev, p, nullptr); });
     VkDescriptorSet ovlSet = VK_NULL_HANDLE;
     {
-        VkDescriptorSetAllocateInfo dsa{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
+        VkDescriptorSetAllocateInfo dsa{};
+        dsa.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
         dsa.descriptorPool = rawOvlPool;
         dsa.descriptorSetCount = 1;
         dsa.pSetLayouts = &rawOvlSetLayout;
         check(vkAllocateDescriptorSets(dev, &dsa, &ovlSet), "vkAllocateDescriptorSets(overlay)");
         VkDescriptorImageInfo dii{rawSampler, ovlTex.view.get(), VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL};
-        VkWriteDescriptorSet w{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
+        VkWriteDescriptorSet w{};
+        w.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
         w.dstSet = ovlSet;
         w.dstBinding = 0;
         w.descriptorCount = 1;
@@ -366,18 +387,22 @@ WindowResult run_game_window(const GameFrameFn& frame, const casc::Storage* stor
         vkUpdateDescriptorSets(dev, 1, &w, 0, nullptr);
     }
 
-    VkCommandBufferAllocateInfo cbi{VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
+    VkCommandBufferAllocateInfo cbi{};
+    cbi.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
     cbi.commandPool = rawCmdPool;
     cbi.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
     cbi.commandBufferCount = 1;
     VkCommandBuffer cmd = VK_NULL_HANDLE;
     check(vkAllocateCommandBuffers(dev, &cbi, &cmd), "vkAllocateCommandBuffers");
 
-    VkSemaphoreCreateInfo semi{VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO};
+    VkSemaphoreCreateInfo semi{};
+
+    semi.sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO;
     VkSemaphore aRaw = VK_NULL_HANDLE;
     check(vkCreateSemaphore(dev, &semi, nullptr, &aRaw), "vkCreateSemaphore(acquire)");
     Unique<VkSemaphore> acquireSem(aRaw, [dev](VkSemaphore s) { vkDestroySemaphore(dev, s, nullptr); });
-    VkFenceCreateInfo fi{VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
+    VkFenceCreateInfo fi{};
+    fi.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO;
     fi.flags = VK_FENCE_CREATE_SIGNALED_BIT;
     VkFence fRaw = VK_NULL_HANDLE;
     check(vkCreateFence(dev, &fi, nullptr, &fRaw), "vkCreateFence");
@@ -412,7 +437,8 @@ WindowResult run_game_window(const GameFrameFn& frame, const casc::Storage* stor
 
         uint32_t want_images = caps.minImageCount + 1;
         if (caps.maxImageCount > 0 && want_images > caps.maxImageCount) want_images = caps.maxImageCount;
-        VkSwapchainCreateInfoKHR sci{VK_STRUCTURE_TYPE_SWAPCHAIN_CREATE_INFO_KHR};
+        VkSwapchainCreateInfoKHR sci{};
+        sci.sType = VK_STRUCTURE_TYPE_SWAPCHAIN_CREATE_INFO_KHR;
         sci.surface = rawSurf;
         sci.minImageCount = want_images;
         sci.imageFormat = fmt.format;
@@ -442,7 +468,8 @@ WindowResult run_game_window(const GameFrameFn& frame, const casc::Storage* stor
         framebuffers.resize(nimg);
         submitSem.resize(nimg);
         for (uint32_t i = 0; i < nimg; ++i) {
-            VkImageViewCreateInfo vi{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
+            VkImageViewCreateInfo vi{};
+            vi.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
             vi.image = swap_images[i];
             vi.viewType = VK_IMAGE_VIEW_TYPE_2D;
             vi.format = fmt.format;
@@ -452,7 +479,8 @@ WindowResult run_game_window(const GameFrameFn& frame, const casc::Storage* stor
             swap_views[i] = Unique<VkImageView>(rawv, [dev](VkImageView v) { vkDestroyImageView(dev, v, nullptr); });
 
             VkImageView fbView = rawv;
-            VkFramebufferCreateInfo fbi{VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO};
+            VkFramebufferCreateInfo fbi{};
+            fbi.sType = VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO;
             fbi.renderPass = rawPass;
             fbi.attachmentCount = 1;
             fbi.pAttachments = &fbView;
@@ -602,12 +630,14 @@ WindowResult run_game_window(const GameFrameFn& frame, const casc::Storage* stor
         vkResetFences(dev, 1, &raw_fence);
 
         check(vkResetCommandBuffer(cmd, 0), "vkResetCommandBuffer");
-        VkCommandBufferBeginInfo bbi{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+        VkCommandBufferBeginInfo bbi{};
+        bbi.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
         check(vkBeginCommandBuffer(cmd, &bbi), "vkBeginCommandBuffer");
 
         scene_renderer.record(cmd, live, cam, pverts, pgroups);
 
-        VkImageMemoryBarrier lb{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
+        VkImageMemoryBarrier lb{};
+        lb.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
         lb.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
         lb.newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
         lb.srcQueueFamilyIndex = lb.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
@@ -618,7 +648,8 @@ WindowResult run_game_window(const GameFrameFn& frame, const casc::Storage* stor
         vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
                              VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr, 1, &lb);
 
-        VkImageMemoryBarrier sb{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
+        VkImageMemoryBarrier sb{};
+        sb.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
         sb.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
         sb.newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
         sb.srcQueueFamilyIndex = sb.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
@@ -644,7 +675,8 @@ WindowResult run_game_window(const GameFrameFn& frame, const casc::Storage* stor
             check(vkMapMemory(dev, ovlStaging.mem.get(), 0, overlay.size(), 0, &p), "vkMapMemory(overlay)");
             std::memcpy(p, overlay.data(), overlay.size());
             vkUnmapMemory(dev, ovlStaging.mem.get());
-            VkImageMemoryBarrier b{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
+            VkImageMemoryBarrier b{};
+            b.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
             b.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
             b.newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
             b.image = ovlTex.img.get();
@@ -665,7 +697,9 @@ WindowResult run_game_window(const GameFrameFn& frame, const casc::Storage* stor
             vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
                                  0, 0, nullptr, 0, nullptr, 1, &b);
 
-            VkRenderPassBeginInfo rbi{VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO};
+            VkRenderPassBeginInfo rbi{};
+
+            rbi.sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO;
             rbi.renderPass = rawPass;
             rbi.framebuffer = framebuffers[idx].get();
             rbi.renderArea = {{0, 0}, {sc_w, sc_h}};
@@ -681,7 +715,8 @@ WindowResult run_game_window(const GameFrameFn& frame, const casc::Storage* stor
             vkCmdDraw(cmd, 3, 1, 0, 0);
             vkCmdEndRenderPass(cmd);
         } else {
-            VkImageMemoryBarrier pb{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
+            VkImageMemoryBarrier pb{};
+            pb.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
             pb.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
             pb.newLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
             pb.srcQueueFamilyIndex = pb.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
@@ -696,7 +731,8 @@ WindowResult run_game_window(const GameFrameFn& frame, const casc::Storage* stor
 
         VkPipelineStageFlags wait_stage = VK_PIPELINE_STAGE_TRANSFER_BIT;
         VkSemaphore waitSem = acquireSem.get(), sigSem = submitSem[idx].get();
-        VkSubmitInfo si{VK_STRUCTURE_TYPE_SUBMIT_INFO};
+        VkSubmitInfo si{};
+        si.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
         si.waitSemaphoreCount = 1;
         si.pWaitSemaphores = &waitSem;
         si.pWaitDstStageMask = &wait_stage;
@@ -706,7 +742,9 @@ WindowResult run_game_window(const GameFrameFn& frame, const casc::Storage* stor
         si.pSignalSemaphores = &sigSem;
         check(vkQueueSubmit(queue, 1, &si, raw_fence), "vkQueueSubmit");
 
-        VkPresentInfoKHR ppi{VK_STRUCTURE_TYPE_PRESENT_INFO_KHR};
+        VkPresentInfoKHR ppi{};
+
+        ppi.sType = VK_STRUCTURE_TYPE_PRESENT_INFO_KHR;
         ppi.waitSemaphoreCount = 1;
         ppi.pWaitSemaphores = &sigSem;
         ppi.swapchainCount = 1;

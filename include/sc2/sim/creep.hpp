@@ -84,6 +84,17 @@ private:
     std::vector<uint8_t> cover_;
 };
 
+inline int mask_growth_radius(const std::vector<std::pair<int, int>>& mask) {
+    long worst = 0;
+    for (const auto& o : mask) {
+        const long d = long(o.first) * o.first + long(o.second) * o.second;
+        if (d > worst) worst = d;
+    }
+    int r = 0;
+    while (long(r) * r < worst) ++r;
+    return r;
+}
+
 struct CreepSource {
     int cx = 0, cy = 0;
     int radius = 1;
@@ -107,7 +118,7 @@ public:
                    std::vector<std::pair<int, int>> mask) {
         CreepSource s;
         grid_.to_cell(wx, wy, s.cx, s.cy);
-        s.max_radius = max_radius;
+        s.max_radius = mask.empty() ? max_radius : mask_growth_radius(mask);
         s.period_ticks = period_ticks;
         s.timer = period_ticks;
         s.radius = 1;

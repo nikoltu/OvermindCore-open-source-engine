@@ -71,15 +71,41 @@ struct SolvedFrame {
     std::string text;
     int depth = 0;
     std::string texture;
+    std::string visible;
 };
 
 int measure_text(const std::string& text, int scale = 1);
 
 using TextResolver = std::function<std::string(const std::string& ref)>;
 
+using FrameCollapsed = std::function<bool(const Frame& frame)>;
+
 std::vector<SolvedFrame> solve_layout(const Frame& root, const Rect& canvas);
 std::vector<SolvedFrame> solve_layout(const Frame& root, const Rect& canvas,
                                       const TextResolver& resolve_text);
+std::vector<SolvedFrame> solve_layout(const Frame& root, const Rect& canvas,
+                                      const TextResolver& resolve_text,
+                                      const FrameCollapsed& collapsed);
+
+struct FrameState {
+    std::string name;
+    std::vector<core::XmlNode> whens;
+    std::vector<core::XmlNode> actions;
+};
+
+struct FrameStateGroup {
+    std::string name;
+    std::string default_state;
+    std::vector<FrameState> states;
+};
+
+std::vector<FrameStateGroup> frame_state_groups(const Frame& f);
+
+bool frame_visible_at_aspect(const Frame& f, float aspect);
+
+std::string selected_state(const Frame& owner, const FrameStateGroup& group, float aspect);
+
+void apply_state_groups(Frame& root, float aspect);
 
 std::vector<uint8_t> rasterize_layout(const std::vector<SolvedFrame>& frames,
                                       uint32_t w, uint32_t h);

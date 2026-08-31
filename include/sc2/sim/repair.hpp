@@ -103,7 +103,7 @@ private:
         Fixed rate;
         Fixed mineral_per_hp;
         Fixed gas_per_hp;
-        Fixed gas_accum;
+        Fixed gas_accum{};
     };
     Fixed rate_, cost_per_hp_, range_;
     std::vector<Job> jobs_;

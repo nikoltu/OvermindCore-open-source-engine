@@ -5,6 +5,7 @@
 
 #include "sc2/asset/manager.hpp"
 #include "sc2/casc/storage.hpp"
+#include "sc2/data/melee_mods.hpp"
 
 namespace sc2::app {
 
@@ -25,13 +26,10 @@ BootResult boot(const std::string& install_root) {
         }
 
         asset::AssetManager assets(store);
-        static const char* kMods[] = {"core",       "liberty", "libertymulti",
-                                      "swarm",      "swarmmulti", "void",
-                                      "voidmulti"};
         static const char* kFiles[] = {"UnitData.xml", "WeaponData.xml",
                                        "EffectData.xml", "AbilData.xml"};
         std::vector<std::string> manifest;
-        for (const char* mod : kMods)
+        for (const char* mod : data::kMeleeMods)
             for (const char* file : kFiles)
                 manifest.push_back(std::string("mods/") + mod +
                                    ".sc2mod/base.sc2data/GameData/" + file);

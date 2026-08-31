@@ -1,0 +1,15 @@
+// Generated from CMakeLists.txt by configure_file - never edit the generated copy under build/.
+// The single source of the engine's version; the scheme is vX.Y.Z.ABC-stage, four numeric parts,
+// ABC zero-padded to three digits and bumped once per completed work cycle.
+#pragma once
+
+namespace sc2 {
+
+inline constexpr const char* kVersion = "v@PROJECT_VERSION@.@SC2_ENGINE_BUILD@-@SC2_ENGINE_STAGE@";
+inline constexpr int kVersionMajor = @PROJECT_VERSION_MAJOR@;
+inline constexpr int kVersionMinor = @PROJECT_VERSION_MINOR@;
+inline constexpr int kVersionPatch = @PROJECT_VERSION_PATCH@;
+inline constexpr const char* kVersionBuild = "@SC2_ENGINE_BUILD@";
+inline constexpr const char* kVersionStage = "@SC2_ENGINE_STAGE@";
+
+}  // namespace sc2

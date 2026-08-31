@@ -7,6 +7,10 @@
 
 #include "sc2/ui/layout.hpp"
 
+namespace sc2::casc {
+class Storage;
+}
+
 namespace sc2::app {
 
 enum class MenuAction { None, StartSkirmish, Quit };
@@ -22,11 +26,16 @@ public:
 
     MainMenu& add(const std::string& name, const ui::Rect& rect);
 
+    MainMenu& add(const std::string& name, const ui::Rect& body, const ui::Rect& hit);
+
     static MainMenu from_buttons(const std::vector<Button>& buttons);
 
     static std::optional<MainMenu> from_install(const std::string& data_dir,
                                                 const std::string& layout_path,
                                                 const ui::Rect& canvas);
+
+    static std::optional<MainMenu> from_store(casc::Storage& store, const std::string& layout_path,
+                                              const ui::Rect& canvas);
 
     MenuAction click(float x, float y) const;
 
@@ -36,8 +45,11 @@ public:
 
     const std::vector<ui::SolvedFrame>& buttons() const { return buttons_; }
 
+    const ui::Rect& hit_rect(std::size_t i) const { return hits_[i]; }
+
 private:
     std::vector<ui::SolvedFrame> buttons_;
+    std::vector<ui::Rect> hits_;
 };
 
 }

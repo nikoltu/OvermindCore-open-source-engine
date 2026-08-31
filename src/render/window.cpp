@@ -149,7 +149,9 @@ WindowResult render_window(const std::vector<SceneInstance>& instances,
     if (caps.maxImageCount > 0 && want_images > caps.maxImageCount)
         want_images = caps.maxImageCount;
 
-    VkSwapchainCreateInfoKHR sci{VK_STRUCTURE_TYPE_SWAPCHAIN_CREATE_INFO_KHR};
+    VkSwapchainCreateInfoKHR sci{};
+
+    sci.sType = VK_STRUCTURE_TYPE_SWAPCHAIN_CREATE_INFO_KHR;
     sci.surface = rawSurf;
     sci.minImageCount = want_images;
     sci.imageFormat = fmt.format;
@@ -178,7 +180,8 @@ WindowResult render_window(const std::vector<SceneInstance>& instances,
     std::vector<Unique<VkImageView>> swap_views(nimg);
     std::vector<Image> depths(nimg);
     for (uint32_t i = 0; i < nimg; ++i) {
-        VkImageViewCreateInfo vi{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
+        VkImageViewCreateInfo vi{};
+        vi.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
         vi.image = swap_images[i];
         vi.viewType = VK_IMAGE_VIEW_TYPE_2D;
         vi.format = fmt.format;
@@ -330,7 +333,9 @@ WindowResult render_window(const std::vector<SceneInstance>& instances,
                                       VK_BUFFER_USAGE_TRANSFER_SRC_BIT, td.rgba.data()));
     }
 
-    VkSamplerCreateInfo smi{VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO};
+    VkSamplerCreateInfo smi{};
+
+    smi.sType = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO;
     smi.magFilter = smi.minFilter = VK_FILTER_LINEAR;
     smi.addressModeU = smi.addressModeV = smi.addressModeW = VK_SAMPLER_ADDRESS_MODE_REPEAT;
     smi.maxLod = 1.0f;
@@ -345,7 +350,8 @@ WindowResult render_window(const std::vector<SceneInstance>& instances,
         texb[s].descriptorCount = 1;
         texb[s].stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
     }
-    VkDescriptorSetLayoutCreateInfo texli{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
+    VkDescriptorSetLayoutCreateInfo texli{};
+    texli.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
     texli.bindingCount = kNumSlots;
     texli.pBindings = texb;
     VkDescriptorSetLayout rawTexLayout = VK_NULL_HANDLE;
@@ -358,7 +364,8 @@ WindowResult render_window(const std::vector<SceneInstance>& instances,
     boneb.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
     boneb.descriptorCount = 1;
     boneb.stageFlags = VK_SHADER_STAGE_VERTEX_BIT;
-    VkDescriptorSetLayoutCreateInfo boneli{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
+    VkDescriptorSetLayoutCreateInfo boneli{};
+    boneli.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
     boneli.bindingCount = 1;
     boneli.pBindings = &boneb;
     VkDescriptorSetLayout rawBoneLayout = VK_NULL_HANDLE;
@@ -371,7 +378,8 @@ WindowResult render_window(const std::vector<SceneInstance>& instances,
     VkDescriptorPoolSize psizes[2] = {
         {VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, kNumSlots * (mat_sets ? mat_sets : 1)},
         {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, uint32_t(live.size())}};
-    VkDescriptorPoolCreateInfo dpi{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
+    VkDescriptorPoolCreateInfo dpi{};
+    dpi.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
     dpi.maxSets = mat_sets + uint32_t(live.size());
     dpi.poolSizeCount = 2;
     dpi.pPoolSizes = psizes;
@@ -383,7 +391,8 @@ WindowResult render_window(const std::vector<SceneInstance>& instances,
     for (Mesh& mesh : meshes) {
         mesh.draw_set.assign(mesh.draws.size(), VK_NULL_HANDLE);
         for (size_t d = 0; d < mesh.draws.size(); ++d) {
-            VkDescriptorSetAllocateInfo dsa{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
+            VkDescriptorSetAllocateInfo dsa{};
+            dsa.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
             dsa.descriptorPool = rawPool;
             dsa.descriptorSetCount = 1;
             dsa.pSetLayouts = &rawTexLayout;
@@ -394,7 +403,7 @@ WindowResult render_window(const std::vector<SceneInstance>& instances,
             for (int s = 0; s < kNumSlots; ++s) {
                 dii[s] = {rawSampler, textures[mesh.draw_tex[d][s]].view.get(),
                           VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL};
-                w[s] = VkWriteDescriptorSet{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
+                w[s] = vk_init<VkWriteDescriptorSet>(VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET);
                 w[s].dstSet = mesh.draw_set[d];
                 w[s].dstBinding = uint32_t(s);
                 w[s].descriptorCount = 1;
@@ -406,13 +415,15 @@ WindowResult render_window(const std::vector<SceneInstance>& instances,
     }
     std::vector<VkDescriptorSet> bone_set(live.size(), VK_NULL_HANDLE);
     for (size_t i = 0; i < live.size(); ++i) {
-        VkDescriptorSetAllocateInfo dsa{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
+        VkDescriptorSetAllocateInfo dsa{};
+        dsa.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
         dsa.descriptorPool = rawPool;
         dsa.descriptorSetCount = 1;
         dsa.pSetLayouts = &rawBoneLayout;
         check(vkAllocateDescriptorSets(dev, &dsa, &bone_set[i]), "vkAllocateDescriptorSets(bone)");
         VkDescriptorBufferInfo bdi{bonebufs[i].buf.get(), 0, VK_WHOLE_SIZE};
-        VkWriteDescriptorSet bw{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
+        VkWriteDescriptorSet bw{};
+        bw.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
         bw.dstSet = bone_set[i]; bw.dstBinding = 0; bw.descriptorCount = 1;
         bw.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER; bw.pBufferInfo = &bdi;
         vkUpdateDescriptorSets(dev, 1, &bw, 0, nullptr);
@@ -454,7 +465,8 @@ WindowResult render_window(const std::vector<SceneInstance>& instances,
     deps[1].dstStageMask = VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT;
     deps[1].srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
     deps[1].dstAccessMask = 0;
-    VkRenderPassCreateInfo rpi{VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO};
+    VkRenderPassCreateInfo rpi{};
+    rpi.sType = VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO;
     rpi.attachmentCount = 2; rpi.pAttachments = att;
     rpi.subpassCount = 1; rpi.pSubpasses = &subp;
     rpi.dependencyCount = 2; rpi.pDependencies = deps;
@@ -465,7 +477,8 @@ WindowResult render_window(const std::vector<SceneInstance>& instances,
     std::vector<Unique<VkFramebuffer>> framebuffers(nimg);
     for (uint32_t i = 0; i < nimg; ++i) {
         VkImageView fbViews[2] = {swap_views[i].get(), depths[i].view.get()};
-        VkFramebufferCreateInfo fbi{VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO};
+        VkFramebufferCreateInfo fbi{};
+        fbi.sType = VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO;
         fbi.renderPass = rawPass; fbi.attachmentCount = 2; fbi.pAttachments = fbViews;
         fbi.width = width; fbi.height = height; fbi.layers = 1;
         VkFramebuffer rawFb = VK_NULL_HANDLE;
@@ -476,7 +489,8 @@ WindowResult render_window(const std::vector<SceneInstance>& instances,
 
     VkPushConstantRange pcr{VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0, 80};
     VkDescriptorSetLayout set_layouts[2] = {rawTexLayout, rawBoneLayout};
-    VkPipelineLayoutCreateInfo pli{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
+    VkPipelineLayoutCreateInfo pli{};
+    pli.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
     pli.setLayoutCount = 2;
     pli.pSetLayouts = set_layouts;
     pli.pushConstantRangeCount = 1;
@@ -500,29 +514,38 @@ WindowResult render_window(const std::vector<SceneInstance>& instances,
         {2, 0, VK_FORMAT_R32G32_SFLOAT, 24},
         {3, 0, VK_FORMAT_R32G32B32A32_SFLOAT, 32},
         {4, 0, VK_FORMAT_R32G32B32A32_UINT, 48}};
-    VkPipelineVertexInputStateCreateInfo vin{VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO};
+    VkPipelineVertexInputStateCreateInfo vin{};
+    vin.sType = VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO;
     vin.vertexBindingDescriptionCount = 1; vin.pVertexBindingDescriptions = &vib;
     vin.vertexAttributeDescriptionCount = 5; vin.pVertexAttributeDescriptions = via;
 
-    VkPipelineInputAssemblyStateCreateInfo ia{VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO};
+    VkPipelineInputAssemblyStateCreateInfo ia{};
+
+    ia.sType = VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO;
     ia.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
     VkViewport vp{0, 0, float(width), float(height), 0, 1};
     VkRect2D scis{{0, 0}, {width, height}};
-    VkPipelineViewportStateCreateInfo vps{VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO};
+    VkPipelineViewportStateCreateInfo vps{};
+    vps.sType = VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO;
     vps.viewportCount = 1; vps.pViewports = &vp; vps.scissorCount = 1; vps.pScissors = &scis;
-    VkPipelineRasterizationStateCreateInfo rs{VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO};
+    VkPipelineRasterizationStateCreateInfo rs{};
+    rs.sType = VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO;
     rs.polygonMode = VK_POLYGON_MODE_FILL; rs.cullMode = VK_CULL_MODE_NONE;
     rs.frontFace = VK_FRONT_FACE_COUNTER_CLOCKWISE; rs.lineWidth = 1.0f;
-    VkPipelineMultisampleStateCreateInfo ms{VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO};
+    VkPipelineMultisampleStateCreateInfo ms{};
+    ms.sType = VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO;
     ms.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
-    VkPipelineDepthStencilStateCreateInfo ds{VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO};
+    VkPipelineDepthStencilStateCreateInfo ds{};
+    ds.sType = VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO;
     ds.depthTestEnable = VK_TRUE; ds.depthWriteEnable = VK_TRUE; ds.depthCompareOp = VK_COMPARE_OP_LESS;
     VkPipelineColorBlendAttachmentState cba{};
     cba.colorWriteMask = VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT |
                          VK_COLOR_COMPONENT_B_BIT | VK_COLOR_COMPONENT_A_BIT;
-    VkPipelineColorBlendStateCreateInfo cb{VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO};
+    VkPipelineColorBlendStateCreateInfo cb{};
+    cb.sType = VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO;
     cb.attachmentCount = 1; cb.pAttachments = &cba;
-    VkGraphicsPipelineCreateInfo gpi{VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO};
+    VkGraphicsPipelineCreateInfo gpi{};
+    gpi.sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO;
     gpi.stageCount = 2; gpi.pStages = stages;
     gpi.pVertexInputState = &vin; gpi.pInputAssemblyState = &ia;
     gpi.pViewportState = &vps; gpi.pRasterizationState = &rs;
@@ -533,22 +556,26 @@ WindowResult render_window(const std::vector<SceneInstance>& instances,
           "vkCreateGraphicsPipelines");
     Unique<VkPipeline> pipeline(rawPipeline, [dev](VkPipeline p) { vkDestroyPipeline(dev, p, nullptr); });
 
-    VkCommandPoolCreateInfo cpi{VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO};
+    VkCommandPoolCreateInfo cpi{};
+    cpi.sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO;
     cpi.queueFamilyIndex = gfx;
     VkCommandPool rawCmdPool = VK_NULL_HANDLE;
     check(vkCreateCommandPool(dev, &cpi, nullptr, &rawCmdPool), "vkCreateCommandPool");
     Unique<VkCommandPool> cmdPool(rawCmdPool, [dev](VkCommandPool p) { vkDestroyCommandPool(dev, p, nullptr); });
 
     {
-        VkCommandBufferAllocateInfo ub{VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
+        VkCommandBufferAllocateInfo ub{};
+        ub.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
         ub.commandPool = rawCmdPool; ub.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY; ub.commandBufferCount = 1;
         VkCommandBuffer up;
         check(vkAllocateCommandBuffers(dev, &ub, &up), "vkAllocateCommandBuffers(upload)");
-        VkCommandBufferBeginInfo bbi{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+        VkCommandBufferBeginInfo bbi{};
+        bbi.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
         bbi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
         check(vkBeginCommandBuffer(up, &bbi), "vkBeginCommandBuffer(upload)");
         for (size_t i = 0; i < textures.size(); ++i) {
-            VkImageMemoryBarrier b{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
+            VkImageMemoryBarrier b{};
+            b.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
             b.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
             b.newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
             b.image = textures[i].img.get();
@@ -568,7 +595,8 @@ WindowResult render_window(const std::vector<SceneInstance>& instances,
                                  VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, 0, 0, nullptr, 0, nullptr, 1, &b);
         }
         check(vkEndCommandBuffer(up), "vkEndCommandBuffer(upload)");
-        VkSubmitInfo si{VK_STRUCTURE_TYPE_SUBMIT_INFO};
+        VkSubmitInfo si{};
+        si.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
         si.commandBufferCount = 1; si.pCommandBuffers = &up;
         check(vkQueueSubmit(queue, 1, &si, VK_NULL_HANDLE), "vkQueueSubmit(upload)");
         check(vkQueueWaitIdle(queue), "vkQueueWaitIdle(upload)");
@@ -577,7 +605,8 @@ WindowResult render_window(const std::vector<SceneInstance>& instances,
 
     std::vector<VkCommandBuffer> cmds(nimg, VK_NULL_HANDLE);
     {
-        VkCommandBufferAllocateInfo cbi{VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
+        VkCommandBufferAllocateInfo cbi{};
+        cbi.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
         cbi.commandPool = rawCmdPool; cbi.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
         cbi.commandBufferCount = nimg;
         check(vkAllocateCommandBuffers(dev, &cbi, cmds.data()), "vkAllocateCommandBuffers");
@@ -586,9 +615,11 @@ WindowResult render_window(const std::vector<SceneInstance>& instances,
     clears[0].color = {{0.06f, 0.07f, 0.09f, 1.0f}};
     clears[1].depthStencil = {1.0f, 0};
     for (uint32_t i = 0; i < nimg; ++i) {
-        VkCommandBufferBeginInfo bbi{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+        VkCommandBufferBeginInfo bbi{};
+        bbi.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
         check(vkBeginCommandBuffer(cmds[i], &bbi), "vkBeginCommandBuffer");
-        VkRenderPassBeginInfo rbi{VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO};
+        VkRenderPassBeginInfo rbi{};
+        rbi.sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO;
         rbi.renderPass = rawPass; rbi.framebuffer = framebuffers[i].get();
         rbi.renderArea = {{0, 0}, {width, height}};
         rbi.clearValueCount = 2; rbi.pClearValues = clears;
@@ -623,13 +654,15 @@ WindowResult render_window(const std::vector<SceneInstance>& instances,
     std::vector<Unique<VkSemaphore>> acquireSem(frames), submitSem(frames);
     std::vector<Unique<VkFence>> fences(frames);
     for (uint32_t f = 0; f < frames; ++f) {
-        VkSemaphoreCreateInfo si{VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO};
+        VkSemaphoreCreateInfo si{};
+        si.sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO;
         VkSemaphore a = VK_NULL_HANDLE, b = VK_NULL_HANDLE;
         check(vkCreateSemaphore(dev, &si, nullptr, &a), "vkCreateSemaphore(acquire)");
         acquireSem[f] = Unique<VkSemaphore>(a, [dev](VkSemaphore s) { vkDestroySemaphore(dev, s, nullptr); });
         check(vkCreateSemaphore(dev, &si, nullptr, &b), "vkCreateSemaphore(submit)");
         submitSem[f] = Unique<VkSemaphore>(b, [dev](VkSemaphore s) { vkDestroySemaphore(dev, s, nullptr); });
-        VkFenceCreateInfo fi{VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
+        VkFenceCreateInfo fi{};
+        fi.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO;
         VkFence fence = VK_NULL_HANDLE;
         check(vkCreateFence(dev, &fi, nullptr, &fence), "vkCreateFence");
         fences[f] = Unique<VkFence>(fence, [dev](VkFence x) { vkDestroyFence(dev, x, nullptr); });
@@ -666,13 +699,16 @@ WindowResult render_window(const std::vector<SceneInstance>& instances,
         VkPipelineStageFlags wait_stage = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
         VkSemaphore waitSem = acquireSem[f].get();
         VkSemaphore sigSem = submitSem[f].get();
-        VkSubmitInfo si{VK_STRUCTURE_TYPE_SUBMIT_INFO};
+        VkSubmitInfo si{};
+        si.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
         si.waitSemaphoreCount = 1; si.pWaitSemaphores = &waitSem; si.pWaitDstStageMask = &wait_stage;
         si.commandBufferCount = 1; si.pCommandBuffers = &cmds[idx];
         si.signalSemaphoreCount = 1; si.pSignalSemaphores = &sigSem;
         check(vkQueueSubmit(queue, 1, &si, fences[f].get()), "vkQueueSubmit");
 
-        VkPresentInfoKHR ppi{VK_STRUCTURE_TYPE_PRESENT_INFO_KHR};
+        VkPresentInfoKHR ppi{};
+
+        ppi.sType = VK_STRUCTURE_TYPE_PRESENT_INFO_KHR;
         ppi.waitSemaphoreCount = 1; ppi.pWaitSemaphores = &sigSem;
         ppi.swapchainCount = 1; ppi.pSwapchains = &rawSwap; ppi.pImageIndices = &idx;
         VkResult pr = vkQueuePresentKHR(queue, &ppi);

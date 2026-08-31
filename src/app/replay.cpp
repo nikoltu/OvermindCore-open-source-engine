@@ -6,6 +6,47 @@
 
 namespace sc2::app {
 
+void apply_timed_order(sim::World& w, const TimedOrder& t) {
+    switch (record_kind(t)) {
+        case RecordKind::Stop:
+            w.stop(t.unit_id);
+            return;
+        case RecordKind::Order:
+            w.issue(t.unit_id, t.order, t.queued);
+            return;
+        case RecordKind::Command:
+            break;
+    }
+    const sim::Command& c = t.command;
+    switch (c.kind) {
+        case sim::CommandKind::Train:
+            w.queue_train(t.unit_id, c.proto, c.mineral_cost, c.gas_cost, c.build_time, c.count);
+            return;
+        case sim::CommandKind::TrainAt:
+            w.queue_train_at(t.unit_id, c.proto, c.mineral_cost, c.gas_cost, c.build_time, c.x, c.y,
+                             c.count);
+            return;
+        case sim::CommandKind::TrainLarva:
+            w.train_larva(t.unit_id, c.proto, c.build_time, c.mineral_cost, c.gas_cost);
+            return;
+        case sim::CommandKind::WorkerBuild:
+            w.issue_worker_build(t.unit_id, c.x, c.y, c.proto, c.mineral_cost, c.gas_cost,
+                                 c.build_time, c.arrive, c.verb);
+            return;
+        case sim::CommandKind::Addon:
+            w.build_addon(t.unit_id, c.addon_kind, c.build_time);
+            return;
+        case sim::CommandKind::RallySet:
+            w.set_rally(t.unit_id, c.x, c.y);
+            return;
+        case sim::CommandKind::RallyClear:
+            w.clear_rally(t.unit_id);
+            return;
+        case sim::CommandKind::Research:
+            return;
+    }
+}
+
 ReplayTrace replay(const OrderLog& log) {
     sim::World w(log.seed);
     for (const sim::Unit& u : log.initial_units) w.add_unit(u);
@@ -15,13 +56,8 @@ ReplayTrace replay(const OrderLog& log) {
 
     size_t oi = 0;
     for (int t = 0; t < log.total_ticks; ++t) {
-        while (oi < log.orders.size() && log.orders[oi].tick == t) {
-            const TimedOrder& to = log.orders[oi++];
-            if (to.is_stop)
-                w.stop(to.unit_id);
-            else
-                w.issue(to.unit_id, to.order, to.queued);
-        }
+        while (oi < log.orders.size() && log.orders[oi].tick == t)
+            apply_timed_order(w, log.orders[oi++]);
         w.step();
         trace.hashes.push_back(w.state_hash());
     }
@@ -166,8 +202,15 @@ void put_unit(std::vector<uint8_t>& o, const sim::Unit& u) {
     put_u8(o, u.gathers_gas ? 1 : 0);
     put_u32(o, uint32_t(u.orders.size()));
     for (const sim::Order& r : u.orders) put_order(o, r);
+    put_u8(o, u.requires_creep ? 1 : 0);
+    put_i32(o, u.spawner_proto);
+    put_u32(o, uint32_t(u.footprint_offsets.size()));
+    for (const std::pair<int16_t, int16_t>& f : u.footprint_offsets) {
+        put_i32(o, f.first);
+        put_i32(o, f.second);
+    }
 }
-sim::Unit get_unit(Reader& r) {
+sim::Unit get_unit(Reader& r, uint32_t version) {
     sim::Unit u;
     u.id = r.u32();
     u.player = r.i32();
@@ -233,7 +276,48 @@ sim::Unit get_unit(Reader& r) {
     u.gathers_gas = r.u8() != 0;
     uint32_t no = r.u32();
     for (uint32_t i = 0; i < no && r.ok; ++i) u.orders.push_back(get_order(r));
+    if (version >= 3) {
+        u.requires_creep = r.u8() != 0;
+        u.spawner_proto = r.i32();
+        uint32_t nf = r.u32();
+        for (uint32_t i = 0; i < nf && r.ok; ++i) {
+            const int32_t fx = r.i32();
+            const int32_t fy = r.i32();
+            u.footprint_offsets.push_back({int16_t(fx), int16_t(fy)});
+        }
+    }
     return u;
+}
+
+void put_command(std::vector<uint8_t>& o, const sim::Command& c) {
+    put_u8(o, uint8_t(c.kind));
+    put_unit(o, c.proto);
+    put_fx(o, c.x);
+    put_fx(o, c.y);
+    put_fx(o, c.build_time);
+    put_fx(o, c.arrive);
+    put_i32(o, c.mineral_cost);
+    put_i32(o, c.gas_cost);
+    put_i32(o, c.count);
+    put_i32(o, c.addon_kind);
+    put_u8(o, uint8_t(c.verb));
+    put_str(o, c.research_id);
+}
+sim::Command get_command(Reader& r, uint32_t version) {
+    sim::Command c;
+    c.kind = sim::CommandKind(r.u8());
+    c.proto = get_unit(r, version);
+    c.x = r.fx();
+    c.y = r.fx();
+    c.build_time = r.fx();
+    c.arrive = r.fx();
+    c.mineral_cost = r.i32();
+    c.gas_cost = r.i32();
+    c.count = r.i32();
+    c.addon_kind = r.i32();
+    c.verb = sim::BuildVerb(r.u8());
+    c.research_id = r.str();
+    return c;
 }
 
 }
@@ -254,7 +338,9 @@ void write_order_log(const OrderLog& log, std::vector<uint8_t>& out) {
         put_u32(out, t.unit_id);
         put_u8(out, t.queued ? 1 : 0);
         put_u8(out, t.is_stop ? 1 : 0);
+        put_u8(out, t.is_command ? 1 : 0);
         put_order(out, t.order);
+        if (t.is_command) put_command(out, t.command);
     }
     return;
 }
@@ -263,7 +349,7 @@ bool read_order_log(const uint8_t* data, size_t len, OrderLog& out) {
     if (len < 12 || std::memcmp(data, kOrderLogMagic, 8) != 0) return false;
     Reader r{data + 8, data + len};
     uint32_t version = r.u32();
-    if (version != 1 && version != kOrderLogVersion) return false;
+    if (version < 1 || version > kOrderLogVersion) return false;
     OrderLog log;
     log.seed = r.u64();
     if (version >= 2) {
@@ -273,7 +359,7 @@ bool read_order_log(const uint8_t* data, size_t len, OrderLog& out) {
     }
     log.total_ticks = r.i32();
     uint32_t nu = r.u32();
-    for (uint32_t i = 0; i < nu && r.ok; ++i) log.initial_units.push_back(get_unit(r));
+    for (uint32_t i = 0; i < nu && r.ok; ++i) log.initial_units.push_back(get_unit(r, version));
     uint32_t no = r.u32();
     for (uint32_t i = 0; i < no && r.ok; ++i) {
         TimedOrder t;
@@ -281,7 +367,9 @@ bool read_order_log(const uint8_t* data, size_t len, OrderLog& out) {
         t.unit_id = r.u32();
         t.queued = r.u8() != 0;
         t.is_stop = r.u8() != 0;
+        if (version >= 3) t.is_command = r.u8() != 0;
         t.order = get_order(r);
+        if (t.is_command) t.command = get_command(r, version);
         log.orders.push_back(t);
     }
     if (!r.ok) return false;

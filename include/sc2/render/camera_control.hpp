@@ -23,7 +23,7 @@ struct CameraControl {
 
     float fovy = 0.654498f;
     float znear = 0.1f;
-    float zfar = 1000.0f;
+    float zfar = 20000.0f;
     Vec3 world_up{0, 0, 1};
     bool mirror_x = false;
 

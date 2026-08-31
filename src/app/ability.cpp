@@ -138,20 +138,6 @@ static void bind_cast_times(const data::Catalog& cat, const std::string& abil_id
     b.cast_outro_time = cabil_cast_phase(cat, abil_id, "CastOutroTime");
 }
 
-static std::string cabil_effect(const data::Catalog& cat, const std::string& id) {
-    std::string eff;
-    for (const core::XmlNode& c : cat.resolved("CAbil", id)) {
-        if (c.name == "Effect") {
-            std::string v = c.attr_or("value", "");
-            if (!v.empty()) eff = v;
-        }
-    }
-    if (auto s = cat.scalar("CAbil", id, "Effect")) {
-        if (!s->empty()) eff = *s;
-    }
-    return eff;
-}
-
 double weapon_upgrade_bonus(const data::Catalog& cat, const data::UpgradeCatalog& up,
                             const std::string& weapon_id,
                             const std::vector<std::string>& researched) {
@@ -258,17 +244,26 @@ void apply_unit_upgrades(const data::Catalog& cat, const data::UpgradeCatalog& u
                          sim::Unit& u) {
     if (researched.empty()) return;
     std::vector<std::string> weapons;
-    for (const std::string& w : cat.array_links("CUnit", unit_name, "WeaponArray"))
-        if (!w.empty() && cat.weapon_damage(w)) weapons.push_back(w);
+    for (const std::string& w : cat.equipped_weapons(unit_name))
+        if (cat.weapon_damage(w)) weapons.push_back(w);
+
+    auto fold_weapon = [&](const std::string& w, Fixed& dst) {
+        auto eff = cat.weapon_damage_effect_id(w);
+        if (!eff) return;
+        const int h = cat.weapon_hit_count(w).value_or(1);
+        const double per_hit = dst.to_double() / (h > 0 ? h : 1);
+        dst = Fixed::from_double(fold_field(up, researched, "Effect", *eff, "Amount", per_hit) *
+                                 (h > 0 ? h : 1));
+    };
+    if (!weapons.empty()) fold_weapon(weapons[0], u.wpn_damage);
+    if (weapons.size() >= 2) fold_weapon(weapons[1], u.wpn2_damage);
 
     if (!weapons.empty())
-        if (auto eff = cat.weapon_damage_effect_id(weapons[0]))
-            u.wpn_damage = Fixed::from_double(
-                fold_field(up, researched, "Effect", *eff, "Amount", u.wpn_damage.to_double()));
+        weapon_attribute_bonus(cat, weapons[0], u.wpn_bonus_attr, u.wpn_bonus_amount, &up,
+                               &researched);
     if (weapons.size() >= 2)
-        if (auto eff = cat.weapon_damage_effect_id(weapons[1]))
-            u.wpn2_damage = Fixed::from_double(
-                fold_field(up, researched, "Effect", *eff, "Amount", u.wpn2_damage.to_double()));
+        weapon_attribute_bonus(cat, weapons[1], u.wpn2_bonus_attr, u.wpn2_bonus_amount, &up,
+                               &researched);
 
     u.armor = Fixed::from_double(fold_field(up, researched, "Unit", unit_name, "LifeArmor",
                                             u.armor.to_double()));
@@ -507,8 +502,7 @@ std::optional<AbilityBuild> make_ability(const data::Catalog& cat, const std::st
         return b;
     }
 
-    std::string eff = cabil_effect(cat, abil_id);
-    if (eff.empty()) eff = abil_id;
+    const std::string eff = cat.cabil_effect_link(abil_id);
 
     if (auto rc = cat.recall_spec(abil_id)) {
         AbilityBuild b;

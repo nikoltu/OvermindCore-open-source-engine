@@ -4,6 +4,7 @@
 
 #include "sc2/casc/storage.hpp"
 #include "sc2/core/xml.hpp"
+#include "sc2/data/melee_mods.hpp"
 
 namespace sc2::data {
 
@@ -186,12 +187,9 @@ const std::vector<UpgradeEffect>& UpgradeCatalog::resolve(const std::string& id)
     return resolved_cache_[id] = std::move(merged);
 }
 
-static const char* kMeleeMods[] = {"core",       "liberty",   "libertymulti",
-                                   "swarm",      "swarmmulti", "void",
-                                   "voidmulti"};
-
 void UpgradeCatalog::load_files(const casc::Storage& store,
                                 const std::vector<std::string>& basenames) {
+    load_skips_.clear();
     for (const char* mod : kMeleeMods) {
         for (const std::string& file : basenames) {
             std::string name =
@@ -199,6 +197,7 @@ void UpgradeCatalog::load_files(const casc::Storage& store,
             try {
                 ingest(store.read_by_name(name));
             } catch (const std::exception&) {
+                load_skips_.push_back(name);
             }
         }
     }

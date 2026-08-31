@@ -22,7 +22,7 @@ struct CascMap {
     std::string name;
     Kind kind;
     std::uint32_t width = 0, height = 0;
-    std::string tileset;
+    std::string tileset{};
     bool described = false;
 };
 

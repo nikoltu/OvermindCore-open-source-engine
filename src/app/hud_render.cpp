@@ -23,25 +23,6 @@ int panel_height(std::uint32_t out_h) {
     return h;
 }
 
-struct FRect { double x0, y0, x1, y1; };
-
-struct RaceWells { FRect minimap, unit, card; };
-constexpr RaceWells kRaceWells[3] = {
-      {{0.01484, 0.50860, 0.16953, 0.97543},
-                     {0.21094, 0.63636, 0.67969, 0.97297},
-                     {0.77969, 0.58231, 0.98750, 0.97297}},
-      {{0.01484, 0.50860, 0.16953, 0.97543},
-                     {0.21094, 0.63636, 0.67969, 0.97297},
-                     {0.77969, 0.58231, 0.98750, 0.97297}},
-      {{0.01484, 0.50860, 0.16953, 0.97543},
-                     {0.21094, 0.63636, 0.67969, 0.97297},
-                     {0.77969, 0.58231, 0.98750, 0.97297}},
-};
-const RaceWells& wells_for(const ConsolePanel* c) {
-    const int r = (c && c->race >= 0 && c->race < 3) ? c->race : 0;
-    return kRaceWells[r];
-}
-
 struct ConsoleGeom {
     bool active = false;
     int x0 = 0, y0 = 0, w = 0, h = 0;
@@ -59,17 +40,6 @@ ConsoleGeom console_geom(std::uint32_t out_w, std::uint32_t out_h, const Console
     g.y0 = int(out_h) - dst_h;
     g.h = dst_h;
     return g;
-}
-
-HudRect well_to_screen(const ConsoleGeom& g, const FRect& f, int inset) {
-    HudRect r;
-    r.x0 = g.x0 + int(f.x0 * g.w + 0.5) + inset;
-    r.y0 = g.y0 + int(f.y0 * g.h + 0.5) + inset;
-    r.x1 = g.x0 + int(f.x1 * g.w + 0.5) - inset;
-    r.y1 = g.y0 + int(f.y1 * g.h + 0.5) - inset;
-    if (r.x1 <= r.x0) r.x1 = r.x0 + 1;
-    if (r.y1 <= r.y0) r.y1 = r.y0 + 1;
-    return r;
 }
 
 void blend(std::vector<std::uint8_t>& img, std::uint32_t w, std::uint32_t h, int x, int y,
@@ -203,10 +173,28 @@ int hud_panel_height(std::uint32_t out_w, std::uint32_t out_h, const ConsolePane
     return panel_height(out_h);
 }
 
+bool hud_covers_point(std::uint32_t out_w, std::uint32_t out_h, const ConsolePanel* console,
+                      float x, float y) {
+    if (out_w == 0 || out_h == 0) return false;
+    const ConsoleGeom g = console_geom(out_w, out_h, console);
+    if (!g.active)
+        return y >= float(int(out_h) - panel_height(out_h));
+    if (x < float(g.x0) || x >= float(g.x0 + g.w) || y < float(g.y0) || y >= float(g.y0 + g.h))
+        return false;
+    int sx = int((x - float(g.x0)) * float(console->tw) / float(g.w));
+    int sy = int((y - float(g.y0)) * float(console->th) / float(g.h));
+    if (sx < 0) sx = 0;
+    if (sy < 0) sy = 0;
+    if (sx >= console->tw) sx = console->tw - 1;
+    if (sy >= console->th) sy = console->th - 1;
+    const std::size_t i = (std::size_t(sy) * std::size_t(console->tw) + std::size_t(sx)) * 4 + 3;
+    return i < console->rgba->size() && (*console->rgba)[i] != 0;
+}
+
 bool authored_rect(const ConsolePanel* c, const HudAuthoredRects::R& pr, std::uint32_t out_h,
                    HudRect& out) {
     if (!c || !c->authored || !c->authored->ok || !pr.ok() || out_h == 0) return false;
-    const double s = double(out_h) / 1200.0;
+    const double s = double(out_h) / double(kRefHeight);
     out.x0 = int(pr.x0 * s + 0.5);
     out.y0 = int(pr.y0 * s + 0.5);
     out.x1 = int(pr.x1 * s + 0.5);
@@ -220,10 +208,6 @@ HudRect hud_minimap_rect(std::uint32_t out_w, std::uint32_t out_h, const Console
     if (HudRect a; console && console->authored &&
                    authored_rect(console, console->authored->minimap, out_h, a))
         return a;
-    const ConsoleGeom g = console_geom(out_w, out_h, console);
-    if (g.active) {
-        return well_to_screen(g, wells_for(console).minimap, std::max(2, g.w / 400));
-    }
     (void)out_w;
     const int ph = panel_height(out_h);
     int side = ph - 2 * kPad;
@@ -240,8 +224,6 @@ HudRect hud_unit_panel_rect(std::uint32_t out_w, std::uint32_t out_h, const Cons
     if (HudRect a; console && console->authored &&
                    authored_rect(console, console->authored->info, out_h, a))
         return a;
-    const ConsoleGeom g = console_geom(out_w, out_h, console);
-    if (g.active) return well_to_screen(g, wells_for(console).unit, std::max(2, g.w / 400));
     const HudRect mm = hud_minimap_rect(out_w, out_h, nullptr);
     const int ph = panel_height(out_h);
     HudRect r;
@@ -262,14 +244,8 @@ HudRect hud_command_cell(std::uint32_t out_w, std::uint32_t out_h, int index,
         if (HudRect a; authored_rect(console, console->authored->buttons[index], out_h, a))
             return a;
     }
-    HudRect agrid;
-    const bool have_authored = console && console->authored &&
-                               authored_rect(console, console->authored->command, out_h, agrid);
-    const ConsoleGeom g = console_geom(out_w, out_h, console);
-    if (g.active || have_authored) {
-        const HudRect grid = have_authored
-                                 ? agrid
-                                 : well_to_screen(g, wells_for(console).card, std::max(1, g.w / 640));
+    HudRect grid;
+    if (console && console->authored && authored_rect(console, console->authored->command, out_h, grid)) {
         const int cw = grid.w() / kCommandCols;
         const int ch = grid.h() / kCommandRows;
         const int gap = std::max(1, cw / 14);
@@ -326,7 +302,6 @@ std::vector<std::uint8_t> HudRender::render(const HudContent& content, const sim
     if (console && console->authored &&
         authored_rect(console, console->authored->resource, out_h, rp)) {
         const int tx0 = std::max(rp.x0, rp.x1 - res_w - 12);
-        fill_rect(img, out_w, out_h, tx0, rp.y0, rp.x1, rp.y1, 14, 16, 22, 0.55f);
         const int ty = rp.y0 + std::max(0, (rp.h() - ui::kFontH * 2) / 2);
         draw_text(img, out_w, out_h, tx0 + 6, ty, res, 2, 235, 236, 210, tx0, rp.y0, rp.x1,
                   rp.y1);
@@ -426,10 +401,16 @@ std::vector<std::uint8_t> HudRender::render(const HudContent& content, const sim
         }
     }
 
-    const int info_x = mm.x1 + kPad * 2;
-    const int info_y = mm.y0;
-    draw_text(img, out_w, out_h, info_x, info_y, content.selection_summary, 2, 220, 224, 232,
-              info_x, mm.y0, W, H);
+    HudRect ip;
+    if (console && console->authored &&
+        authored_rect(console, console->authored->info, out_h, ip)) {
+        draw_text(img, out_w, out_h, ip.x0 + kPad * 2, ip.y0 + kPad * 2,
+                  content.selection_summary, 2, 220, 224, 232, ip.x0, ip.y0, ip.x1, ip.y1);
+    } else {
+        const int info_x = mm.x1 + kPad * 2;
+        draw_text(img, out_w, out_h, info_x, mm.y0, content.selection_summary, 2, 220, 224, 232,
+                  info_x, mm.y0, W, H);
+    }
 
     {
         int err_y = panel_y0 - ui::kFontH * 2 - 8;

@@ -98,9 +98,12 @@ inline WsiDevice create_wsi_device(HINSTANCE hinst, HWND hwnd, const char* ctx,
         want_ext.push_back(VK_EXT_DEBUG_UTILS_EXTENSION_NAME);
     }
 
-    VkApplicationInfo app{VK_STRUCTURE_TYPE_APPLICATION_INFO};
+    VkApplicationInfo app{};
+
+    app.sType = VK_STRUCTURE_TYPE_APPLICATION_INFO;
     app.apiVersion = VK_API_VERSION_1_1;
-    VkInstanceCreateInfo ici{VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO};
+    VkInstanceCreateInfo ici{};
+    ici.sType = VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO;
     ici.pApplicationInfo = &app;
     ici.enabledExtensionCount = uint32_t(want_ext.size());
     ici.ppEnabledExtensionNames = want_ext.data();
@@ -116,8 +119,9 @@ inline WsiDevice create_wsi_device(HINSTANCE hinst, HWND hwnd, const char* ctx,
         auto destroy = reinterpret_cast<PFN_vkDestroyDebugUtilsMessengerEXT>(
             vkGetInstanceProcAddr(rawInst, "vkDestroyDebugUtilsMessengerEXT"));
         if (create && destroy) {
-            VkDebugUtilsMessengerCreateInfoEXT mi{
-                VK_STRUCTURE_TYPE_DEBUG_UTILS_MESSENGER_CREATE_INFO_EXT};
+            VkDebugUtilsMessengerCreateInfoEXT mi =
+                vk_init<VkDebugUtilsMessengerCreateInfoEXT>(
+                    VK_STRUCTURE_TYPE_DEBUG_UTILS_MESSENGER_CREATE_INFO_EXT);
             mi.messageSeverity = VK_DEBUG_UTILS_MESSAGE_SEVERITY_WARNING_BIT_EXT |
                                  VK_DEBUG_UTILS_MESSAGE_SEVERITY_ERROR_BIT_EXT;
             mi.messageType = VK_DEBUG_UTILS_MESSAGE_TYPE_GENERAL_BIT_EXT |
@@ -134,7 +138,8 @@ inline WsiDevice create_wsi_device(HINSTANCE hinst, HWND hwnd, const char* ctx,
         }
     }
 
-    VkWin32SurfaceCreateInfoKHR wsci{VK_STRUCTURE_TYPE_WIN32_SURFACE_CREATE_INFO_KHR};
+    VkWin32SurfaceCreateInfoKHR wsci{};
+    wsci.sType = VK_STRUCTURE_TYPE_WIN32_SURFACE_CREATE_INFO_KHR;
     wsci.hinstance = hinst;
     wsci.hwnd = hwnd;
     VkSurfaceKHR rawSurf = VK_NULL_HANDLE;
@@ -147,12 +152,14 @@ inline WsiDevice create_wsi_device(HINSTANCE hinst, HWND hwnd, const char* ctx,
         fail("no graphics+present queue family");
 
     float prio = 1.0f;
-    VkDeviceQueueCreateInfo qci{VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO};
+    VkDeviceQueueCreateInfo qci{};
+    qci.sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO;
     qci.queueFamilyIndex = w.gfx_family;
     qci.queueCount = 1;
     qci.pQueuePriorities = &prio;
     const char* devext[] = {VK_KHR_SWAPCHAIN_EXTENSION_NAME};
-    VkDeviceCreateInfo dci{VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO};
+    VkDeviceCreateInfo dci{};
+    dci.sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO;
     dci.queueCreateInfoCount = 1;
     dci.pQueueCreateInfos = &qci;
     dci.enabledExtensionCount = 1;

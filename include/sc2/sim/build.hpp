@@ -9,23 +9,36 @@ namespace sc2::sim {
 
 enum class BuildStyle { TerranStructure, ProtossWarp, ZergMorph };
 
-inline bool can_place_structure(const World& world, const TerrainMap& terrain, int cx0,
-                                int cy0, int fw, int fh, std::uint32_t builder = kNoTarget,
-                                bool requires_vespene = false) {
-    if (!terrain.can_place(cx0, cy0, fw, fh)) return false;
-    bool found_gas = false;
+inline bool footprint_clear_of_blockers(const World& world, const TerrainMap& terrain, int cx0,
+                                        int cy0, int fw, int fh,
+                                        std::uint32_t builder = kNoTarget, bool gas_exempt = false,
+                                        bool* saw_gas = nullptr) {
+    if (saw_gas) *saw_gas = false;
     for (const Unit& u : world.units()) {
         if (!u.alive) continue;
         if (u.id == builder) continue;
         int ucx, ucy;
         terrain.to_cell(u.x, u.y, ucx, ucy);
         if (!(ucx >= cx0 && ucx < cx0 + fw && ucy >= cy0 && ucy < cy0 + fh)) continue;
-        if (requires_vespene && u.is_gas && u.resource_left > 0) {
-            found_gas = true;
+        if (gas_exempt && u.is_gas && u.resource_left > 0) {
+            if (saw_gas) *saw_gas = true;
             continue;
         }
+        if (u.flying) continue;
+        if (u.speed.raw() != 0) continue;
         return false;
     }
+    return true;
+}
+
+inline bool can_place_structure(const World& world, const TerrainMap& terrain, int cx0,
+                                int cy0, int fw, int fh, std::uint32_t builder = kNoTarget,
+                                bool requires_vespene = false) {
+    if (!terrain.can_place(cx0, cy0, fw, fh)) return false;
+    bool found_gas = false;
+    if (!footprint_clear_of_blockers(world, terrain, cx0, cy0, fw, fh, builder, requires_vespene,
+                                     &found_gas))
+        return false;
     return !requires_vespene || found_gas;
 }
 

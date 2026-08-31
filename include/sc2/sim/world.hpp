@@ -13,6 +13,7 @@
 #include "sc2/sim/nav.hpp"
 #include "sc2/sim/rng.hpp"
 #include "sc2/sim/scan_sweep.hpp"
+#include "sc2/sim/terrain_map.hpp"
 
 namespace sc2::sim {
 
@@ -74,23 +75,23 @@ struct AbilityDef {
     Fixed amount;
     Fixed duration;
     Fixed range;
-    Fixed energy_fraction;
+    Fixed energy_fraction{};
     Fixed move_speed_mult = Fixed::from_int(1);
     Fixed attack_speed_mult = Fixed::from_int(1);
     bool beh_root = false;
     bool beh_stun = false;
     bool beh_lift = false;
     bool beh_control_transfer = false;
-    Fixed beh_dmg_per_tick;
-    Fixed beh_dmg_period;
-    Fixed radius;
-    Fixed period;
+    Fixed beh_dmg_per_tick{};
+    Fixed beh_dmg_period{};
+    Fixed radius{};
+    Fixed period{};
     int32_t period_count = 0;
     int32_t spawn_proto = -1;
     int32_t spawn_count = 0;
     bool spawn_snap_resource = false;
     int32_t mineral_cost = 0, gas_cost = 0;
-    Fixed morph_heal_life_frac, morph_heal_shield_frac;
+    Fixed morph_heal_life_frac{}, morph_heal_shield_frac{};
     EffectRef root = kNoEffect;
 };
 
@@ -156,10 +157,10 @@ struct EffectContext {
 
 struct Order {
     OrderType type = OrderType::Idle;
-    Fixed tx, ty;
+    Fixed tx{}, ty{};
     uint32_t target = kNoTarget;
     uint32_t ability = kNoAbility;
-    Fixed px, py;
+    Fixed px{}, py{};
 };
 
 struct BehaviorInstance {
@@ -223,6 +224,15 @@ struct ForceFieldInstance {
     std::vector<std::pair<int, int>> cells;
 };
 
+inline uint32_t type_identity(const std::string& s) {
+    uint32_t h = 2166136261u;
+    for (char c : s) {
+        h ^= uint8_t(c);
+        h *= 16777619u;
+    }
+    return h;
+}
+
 struct Unit {
     uint32_t id = 0;
     int32_t player = 0;
@@ -260,6 +270,11 @@ struct Unit {
     bool walks_cliffs = false;
     bool crushes_ff = false;
     int32_t creep_radius = 0;
+    bool has_toggle_creep = false;
+    bool creep_gen_on = false;
+    int32_t toggle_creep_radius = 0;
+    int32_t toggle_creep_period = 1;
+    int32_t creep_source_idx = -1;
     int32_t creep_grow_period = 0;
     std::vector<std::pair<int16_t, int16_t>> footprint_offsets;
     bool requires_creep = false;
@@ -332,6 +347,7 @@ struct Unit {
     Fixed windup_bamt;
     Fixed windup_ps;
     Fixed windup_ar{Fixed::from_int(1)};
+    int windup_hits = 1;
 
     Fixed crush_damage;
     Fixed crush_radius;
@@ -341,6 +357,10 @@ struct Unit {
 
     Fixed morph_timer;
     int32_t morph_proto = -1;
+
+    Fixed salvage_timer;
+    int32_t salvage_minerals = 0;
+    int32_t salvage_gas = 0;
 
     int32_t spawner_proto = -1;
     int32_t spawner_cap = 0;
@@ -407,25 +427,33 @@ struct Unit {
     bool has_burrowed_wpn = false;
     bool burrowed_wpn_on = false;
     BurrowWeapon burrowed_wpn;
-    void swap_burrow_weapon() {
-        std::swap(wpn_damage, burrowed_wpn.damage);
-        std::swap(wpn_period, burrowed_wpn.period);
-        std::swap(wpn_range, burrowed_wpn.range);
-        std::swap(wpn_min_range, burrowed_wpn.min_range);
-        std::swap(wpn_damage_point, burrowed_wpn.damage_point);
-        std::swap(wpn_projectile_speed, burrowed_wpn.projectile_speed);
-        std::swap(wpn_backswing, burrowed_wpn.backswing);
-        std::swap(wpn_bonus_amount, burrowed_wpn.bonus_amount);
-        std::swap(acquire_range, burrowed_wpn.acquire);
-        std::swap(wpn_hits, burrowed_wpn.hits);
-        std::swap(wpn_target_filter, burrowed_wpn.target_filter);
-        std::swap(wpn_bonus_attr, burrowed_wpn.bonus_attr);
-        std::swap(splash_line_count, burrowed_wpn.splash_line_count);
-        std::swap(splash_line_first, burrowed_wpn.splash_line_first);
-        std::swap(splash_line_step, burrowed_wpn.splash_line_step);
-        std::swap(splash_line_radius, burrowed_wpn.splash_line_radius);
-        std::swap(splash_line_from_source, burrowed_wpn.splash_line_from_source);
+    void swap_weapon_block(BurrowWeapon& other) {
+        std::swap(wpn_damage, other.damage);
+        std::swap(wpn_period, other.period);
+        std::swap(wpn_range, other.range);
+        std::swap(wpn_min_range, other.min_range);
+        std::swap(wpn_damage_point, other.damage_point);
+        std::swap(wpn_projectile_speed, other.projectile_speed);
+        std::swap(wpn_backswing, other.backswing);
+        std::swap(wpn_bonus_amount, other.bonus_amount);
+        std::swap(acquire_range, other.acquire);
+        std::swap(wpn_hits, other.hits);
+        std::swap(wpn_target_filter, other.target_filter);
+        std::swap(wpn_bonus_attr, other.bonus_attr);
+        std::swap(splash_line_count, other.splash_line_count);
+        std::swap(splash_line_first, other.splash_line_first);
+        std::swap(splash_line_step, other.splash_line_step);
+        std::swap(splash_line_radius, other.splash_line_radius);
+        std::swap(splash_line_from_source, other.splash_line_from_source);
     }
+
+    bool has_toggle_wpn = false;
+    bool toggle_wpn_on = false;
+    Fixed toggle_wpn_drain;
+    BurrowWeapon toggle_wpn;
+
+    void swap_burrow_weapon() { swap_weapon_block(burrowed_wpn); }
+
     int32_t attack_spawn_proto = -1;
     int32_t attack_spawn_count = 0;
 
@@ -478,6 +506,15 @@ struct Unit {
     Fixed cur_speed;
     bool moving_now = false;
     bool moved_this_tick = false;
+    Fixed move_target_x, move_target_y;
+    bool pushed_this_tick = false;
+    std::uint8_t push_release = 0;
+    Fixed push_dir_x, push_dir_y;
+    bool has_anchor = false;
+    Fixed anchor_x, anchor_y;
+    std::uint8_t air_expand = 0;
+    std::int32_t air_onset_tick = 0;
+    bool ever_ordered = false;
     std::uint32_t cast_count = 0;
     Fixed facing;
     Fixed guard_x{}, guard_y{};
@@ -521,7 +558,6 @@ struct Player {
     int32_t minerals = 50;
     int32_t gas = 0;
     int32_t team = -1;
-    std::vector<int32_t> upgrades;
 };
 
 struct VeterancyDef {
@@ -532,10 +568,36 @@ struct VeterancyDef {
     int max_level() const { return int(xp_threshold.size()) - 1; }
 };
 
+enum class CommandKind : uint8_t {
+    Train = 0,
+    TrainAt = 1,
+    TrainLarva = 2,
+    WorkerBuild = 3,
+    Addon = 4,
+    RallySet = 5,
+    RallyClear = 6,
+    Research = 7,
+};
+
+struct Command {
+    CommandKind kind = CommandKind::Train;
+    Unit proto;
+    Fixed x, y;
+    Fixed build_time;
+    Fixed arrive;
+    int32_t mineral_cost = 0;
+    int32_t gas_cost = 0;
+    int32_t count = 1;
+    int32_t addon_kind = 0;
+    BuildVerb verb = BuildVerb::Committed;
+    std::string research_id;
+};
+
 struct OrderSink {
     virtual ~OrderSink() = default;
     virtual void on_order(int tick, uint32_t id, const Order& o, bool queued) = 0;
     virtual void on_stop(int tick, uint32_t id) = 0;
+    virtual void on_command(int tick, uint32_t id, const Command& c) = 0;
 };
 
 class World {
@@ -547,6 +609,7 @@ public:
 
     uint32_t add_unit(Unit u) {
         u.id = uint32_t(units_.size());
+        u.air_onset_tick = tick_;
         if (weapon_executor_ && u.wpn_effect == kNoEffect &&
             (u.wpn_damage.raw() > 0 || u.wpn2_damage.raw() > 0))
             u.wpn_effect = ensure_weapon_effect();
@@ -576,10 +639,10 @@ public:
         if (u.creep_radius > 0) {
             const int period = u.creep_grow_period > 0 ? u.creep_grow_period : 1;
             auto mit = creep_masks_.find(u.catalog_id);
-            if (mit != creep_masks_.end() && !mit->second.empty())
-                creep_.add_source(u.x, u.y, u.creep_radius, period, mit->second);
-            else
-                creep_.add_source(u.x, u.y, u.creep_radius, period);
+            units_.back().creep_source_idx =
+                (mit != creep_masks_.end() && !mit->second.empty())
+                    ? creep_.add_source(u.x, u.y, u.creep_radius, period, mit->second)
+                    : creep_.add_source(u.x, u.y, u.creep_radius, period);
         }
         return u.id;
     }
@@ -587,13 +650,14 @@ public:
     void set_order_sink(OrderSink* s) { order_sink_ = s; }
     OrderSink* order_sink() const { return order_sink_; }
 
-    void issue(uint32_t id, const Order& o, bool queued = false) {
+    void issue(uint32_t id, const Order& o, bool queued = false, bool player_order = true) {
         if (id >= units_.size()) return;
         if (order_sink_ && !in_step_) order_sink_->on_order(tick_, id, o, queued);
         detach_builder(id);
         Unit& u = units_[id];
         if (!queued) u.orders.clear();
         u.orders.push_back(o);
+        if (player_order) u.ever_ordered = true;
     }
     void stop(uint32_t id) {
         if (id >= units_.size()) return;
@@ -612,12 +676,25 @@ public:
 
     void set_rally(uint32_t id, Fixed x, Fixed y) {
         if (id >= units_.size()) return;
+        if (reporting()) {
+            Command c;
+            c.kind = CommandKind::RallySet;
+            c.x = x;
+            c.y = y;
+            report_command(id, c);
+        }
         units_[id].has_rally = true;
         units_[id].rally_x = x;
         units_[id].rally_y = y;
     }
     void clear_rally(uint32_t id) {
-        if (id < units_.size()) units_[id].has_rally = false;
+        if (id >= units_.size()) return;
+        if (reporting()) {
+            Command c;
+            c.kind = CommandKind::RallyClear;
+            report_command(id, c);
+        }
+        units_[id].has_rally = false;
     }
 
     Order smart_order(uint32_t actor, uint32_t target, Fixed tx, Fixed ty) const;
@@ -645,7 +722,8 @@ public:
     void step_projectiles(Fixed dt);
     void step_point_defense(Fixed dt);
     void queue_projectile(std::uint32_t attacker, Fixed px, Fixed py, std::uint32_t target, Fixed speed,
-                          Fixed dmg, std::uint32_t battr, Fixed bamt, Fixed ar = Fixed::from_int(1));
+                          Fixed dmg, std::uint32_t battr, Fixed bamt, Fixed ar = Fixed::from_int(1),
+                          int hits = 1);
 
     Fixed heal_unit(uint32_t id, Fixed amount);
 
@@ -713,9 +791,6 @@ public:
     int32_t team_of(int32_t p) const;
     bool are_allied(int32_t a, int32_t b) const;
 
-    int32_t upgrade_level(int32_t player, int32_t upgrade_id) const;
-    void set_upgrade_level(int32_t player, int32_t upgrade_id, int32_t level);
-
     bool queue_train(uint32_t producer, const Unit& proto, int32_t mineral_cost,
                      int32_t gas_cost, Fixed build_time, int32_t count = 1);
     bool queue_train_at(uint32_t producer, const Unit& proto, int32_t mineral_cost,
@@ -744,6 +819,13 @@ public:
         if (!b.alive || b.constructing) return false;
         if (b.addon != kAddonNone || b.addon_building != 0) return false;
         if (kind != kAddonTechLab && kind != kAddonReactor) return false;
+        if (reporting()) {
+            Command cmd;
+            cmd.kind = CommandKind::Addon;
+            cmd.addon_kind = kind;
+            cmd.build_time = build_time;
+            report_command(building, cmd);
+        }
         if (build_time.raw() <= 0) { attach_addon(building, kind); return true; }
         b.addon_building = kind;
         b.addon_build_left = build_time;
@@ -887,12 +969,62 @@ public:
         cds.insert(pos, {slot, dur});
     }
 
+    bool begin_salvage(uint32_t structure, Fixed delay, int32_t refund_minerals, int32_t refund_gas) {
+        if (structure >= units_.size()) return false;
+        Unit& u = units_[structure];
+        if (!u.alive || u.player < 0 || u.salvage_timer.raw() > 0) return false;
+        if (refund_minerals < 0) refund_minerals = 0;
+        if (refund_gas < 0) refund_gas = 0;
+        if (delay.raw() <= 0) {
+            Player& p = player(u.player);
+            p.minerals += refund_minerals;
+            p.gas += refund_gas;
+            u.alive = false;
+            return true;
+        }
+        u.salvage_timer = delay;
+        u.salvage_minerals = refund_minerals;
+        u.salvage_gas = refund_gas;
+        return true;
+    }
+
     bool set_cloak(uint32_t id, bool engage) {
         if (id >= units_.size()) return false;
         Unit& u = units_[id];
         if (engage && u.energy.raw() <= 0) return false;
         u.cloaked = engage;
         return u.cloaked;
+    }
+
+    bool set_weapon_toggle(uint32_t id, bool engage) {
+        if (id >= units_.size()) return false;
+        Unit& u = units_[id];
+        if (!u.has_toggle_wpn) return false;
+        if (engage == u.toggle_wpn_on) return u.toggle_wpn_on;
+        if (engage && u.energy.raw() <= 0) return false;
+        u.swap_weapon_block(u.toggle_wpn);
+        u.toggle_wpn_on = engage;
+        return u.toggle_wpn_on;
+    }
+
+    bool set_creep_generation(uint32_t id, bool engage) {
+        if (id >= units_.size()) return false;
+        Unit& u = units_[id];
+        if (!u.has_toggle_creep) return false;
+        if (engage == u.creep_gen_on) return u.creep_gen_on;
+        if (engage) {
+            const int period = u.toggle_creep_period > 0 ? u.toggle_creep_period : 1;
+            auto mit = creep_masks_.find(u.catalog_id);
+            u.creep_source_idx = (mit != creep_masks_.end() && !mit->second.empty())
+                                     ? creep_.add_source(u.x, u.y, u.toggle_creep_radius, period,
+                                                         mit->second)
+                                     : creep_.add_source(u.x, u.y, u.toggle_creep_radius, period);
+        } else if (u.creep_source_idx >= 0) {
+            creep_.kill_source(u.creep_source_idx);
+            u.creep_source_idx = -1;
+        }
+        u.creep_gen_on = engage;
+        return u.creep_gen_on;
     }
 
     int32_t add_persistent(PersistentInstance p);
@@ -1069,7 +1201,20 @@ public:
         if (pl.minerals < mineral_cost || pl.gas < gas_cost) return false;
         const Fixed hx = lv.x, hy = lv.y;
         lv.alive = false;
-        return queue_train_at(hall, proto, mineral_cost, gas_cost, build_time, hx, hy);
+        if (reporting()) {
+            Command cmd;
+            cmd.kind = CommandKind::TrainLarva;
+            cmd.proto = proto;
+            cmd.build_time = build_time;
+            cmd.mineral_cost = mineral_cost;
+            cmd.gas_cost = gas_cost;
+            report_command(larva, cmd);
+        }
+        const bool was_internal = in_step_;
+        in_step_ = true;
+        const bool queued = queue_train_at(hall, proto, mineral_cost, gas_cost, build_time, hx, hy);
+        in_step_ = was_internal;
+        return queued;
     }
 
     bool warp_train(uint32_t gate, const Unit& proto, Fixed tx, Fixed ty, Fixed forming_time,
@@ -1222,6 +1367,9 @@ public:
     NavGrid& nav() { return nav_; }
     const NavGrid& nav() const { return nav_; }
 
+    TerrainMap& placement() { return placement_; }
+    const TerrainMap& placement() const { return placement_; }
+
     void set_separation(bool on) { separation_ = on; }
     bool separation() const { return separation_; }
 
@@ -1312,6 +1460,8 @@ public:
 
     void return_dead_carry();
 
+    void release_dead_creep_sources();
+
     int winner() const;
 
 private:
@@ -1379,7 +1529,7 @@ private:
         Unit proto;
         Fixed timer;
         bool has_pos = false;
-        Fixed px, py;
+        Fixed px{}, py{};
         int32_t count = 1;
         int32_t mineral_cost = 0, gas_cost = 0;
         uint32_t consumed_larva = kNoTarget;
@@ -1435,7 +1585,7 @@ private:
     bool larva_egg_morph_ = false;
     struct PendingSpawn { int32_t proto; int32_t count; Fixed x, y; int32_t owner;
                           uint32_t parent = kNoTarget; bool injected = false;
-                          uint32_t phase_link = kNoTarget; Fixed move_x, move_y;
+                          uint32_t phase_link = kNoTarget; Fixed move_x{}, move_y{};
                           uint32_t gather_node = kNoTarget, depot = kNoTarget; };
     std::vector<PendingSpawn> pending_spawns_;
     struct PendingHit {
@@ -1447,6 +1597,7 @@ private:
         Fixed bamt;
         Fixed life;
         Fixed ar{Fixed::from_int(1)};
+        int hits = 1;
     };
     std::vector<PendingHit> pending_hits_;
     std::vector<VeterancyDef> vet_defs_;
@@ -1473,10 +1624,15 @@ private:
     bool multi_hit_armor_ = false;
     bool target_priority_ = false;
     NavGrid nav_;
+    TerrainMap placement_;
     Rng rng_;
     int tick_ = 0;
     OrderSink* order_sink_ = nullptr;
     bool in_step_ = false;
+    bool reporting() const { return order_sink_ != nullptr && !in_step_; }
+    void report_command(uint32_t id, const Command& c) {
+        if (reporting()) order_sink_->on_command(tick_, id, c);
+    }
     bool separation_ = false;
     bool fog_acquire_ = false;
     bool target_sort_ = false;

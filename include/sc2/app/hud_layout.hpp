@@ -2,6 +2,8 @@
 
 #include <cstdint>
 
+#include "sc2/app/ui_canvas.hpp"
+
 namespace sc2::casc {
 class Storage;
 }
@@ -16,6 +18,9 @@ struct HudAuthoredRects {
         bool ok() const { return x1 > x0 && y1 > y0; }
     };
     R minimap;
+    R minimap_panel;
+    R control_group;
+    R alert;
     R command;
     R info;
     R portrait;

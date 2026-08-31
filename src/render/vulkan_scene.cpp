@@ -106,24 +106,29 @@ RenderResult render_scene(const std::vector<SceneInstance>& instances,
     VkDeviceSize rbytes = VkDeviceSize(width) * height * 4;
     Buffer readback = make_buffer(pd, dev, rbytes, VK_BUFFER_USAGE_TRANSFER_DST_BIT, nullptr);
 
-    VkCommandPoolCreateInfo cpi{VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO};
+    VkCommandPoolCreateInfo cpi{};
+
+    cpi.sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO;
     cpi.queueFamilyIndex = gfx;
     VkCommandPool rawCmdPool = VK_NULL_HANDLE;
     check(vkCreateCommandPool(dev, &cpi, nullptr, &rawCmdPool), "vkCreateCommandPool");
     Unique<VkCommandPool> cmdPool(rawCmdPool, [dev](VkCommandPool p) { vkDestroyCommandPool(dev, p, nullptr); });
-    VkCommandBufferAllocateInfo cbi{VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
+    VkCommandBufferAllocateInfo cbi{};
+    cbi.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
     cbi.commandPool = rawCmdPool;
     cbi.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
     cbi.commandBufferCount = 1;
     VkCommandBuffer cmd;
     check(vkAllocateCommandBuffers(dev, &cbi, &cmd), "vkAllocateCommandBuffers");
-    VkCommandBufferBeginInfo bbi{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+    VkCommandBufferBeginInfo bbi{};
+    bbi.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
     bbi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
     check(vkBeginCommandBuffer(cmd, &bbi), "vkBeginCommandBuffer");
 
     sr.record(cmd, live, cam, pverts, pgroups);
 
-    VkImageMemoryBarrier lb{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
+    VkImageMemoryBarrier lb{};
+    lb.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
     lb.oldLayout = lb.newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
     lb.srcQueueFamilyIndex = lb.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
     lb.image = sr.ldr_image();
@@ -140,11 +145,14 @@ RenderResult render_scene(const std::vector<SceneInstance>& instances,
                            readback.buf.get(), 1, &region);
     check(vkEndCommandBuffer(cmd), "vkEndCommandBuffer");
 
-    VkFenceCreateInfo fi{VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
+    VkFenceCreateInfo fi{};
+
+    fi.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO;
     VkFence rawFence = VK_NULL_HANDLE;
     check(vkCreateFence(dev, &fi, nullptr, &rawFence), "vkCreateFence");
     Unique<VkFence> fence(rawFence, [dev](VkFence f) { vkDestroyFence(dev, f, nullptr); });
-    VkSubmitInfo si{VK_STRUCTURE_TYPE_SUBMIT_INFO};
+    VkSubmitInfo si{};
+    si.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
     si.commandBufferCount = 1;
     si.pCommandBuffers = &cmd;
     check(vkQueueSubmit(queue, 1, &si, rawFence), "vkQueueSubmit");

@@ -96,11 +96,12 @@ std::vector<uint32_t> Control::box_select(const sim::World& world,
     for (const sim::Unit& u : world.units()) {
         if (!u.alive || u.player != player_) continue;
         const float ux = float(u.x.to_double()), uy = float(u.y.to_double());
+        const float fz = ground_z(ux, uy);
         float fx, fy;
-        if (!project(ux, uy, 0.0f, fx, fy)) continue;
+        if (!project(ux, uy, fz, fx, fy)) continue;
         float xlo = fx, xhi = fx, ylo = fy, yhi = fy;
         float tx, ty;
-        if (project(ux, uy, float(u.radius.to_double()) * kSelectHeightPerRadius, tx, ty)) {
+        if (project(ux, uy, fz + float(u.radius.to_double()) * kSelectHeightPerRadius, tx, ty)) {
             xlo = std::min(fx, tx); xhi = std::max(fx, tx);
             ylo = std::min(fy, ty); yhi = std::max(fy, ty);
         }
@@ -127,6 +128,60 @@ bool Control::ground_point(const sim::World&, const ScreenPoint& p, sim::Fixed& 
     if (std::fabs(dz) < 1e-9f) return false;
     float t = -nz / dz;
     if (t < 0.0f) return false;
+
+    if (ground_) {
+        const float top = ground_->max_z();
+        if (top > 0.0f) {
+            auto ray = [&](float u, float& x, float& y, float& z) {
+                x = nx + u * (fx - nx);
+                y = ny + u * (fy - ny);
+                z = nz + u * (fz - nz);
+            };
+            const float t_top = std::min((top - nz) / dz, t);
+            float t0 = std::max(0.0f, t_top);
+            if (t0 <= t) {
+                float ax, ay, az, bx, by, bz;
+                ray(t0, ax, ay, az);
+                ray(t, bx, by, bz);
+                const float span = std::sqrt((bx - ax) * (bx - ax) + (by - ay) * (by - ay));
+                int steps = int(span) + 1;
+                if (steps < 1) steps = 1;
+                if (steps > 4096) steps = 4096;
+
+                float prev_u = t0, prev_gap = az - ground_->z_at(ax, ay);
+                bool hit = false;
+                float hit_lo = t0, hit_hi = t0;
+                if (prev_gap <= 0.0f) {
+                    hit = true;
+                } else {
+                    for (int i = 1; i <= steps; ++i) {
+                        const float u = t0 + (t - t0) * (float(i) / float(steps));
+                        float sx, sy, sz;
+                        ray(u, sx, sy, sz);
+                        const float gap = sz - ground_->z_at(sx, sy);
+                        if (gap <= 0.0f) {
+                            hit = true;
+                            hit_lo = prev_u;
+                            hit_hi = u;
+                            break;
+                        }
+                        prev_u = u;
+                        prev_gap = gap;
+                    }
+                }
+                if (hit) {
+                    for (int i = 0; i < 16; ++i) {
+                        const float mid = 0.5f * (hit_lo + hit_hi);
+                        float sx, sy, sz;
+                        ray(mid, sx, sy, sz);
+                        if (sz - ground_->z_at(sx, sy) > 0.0f) hit_lo = mid;
+                        else hit_hi = mid;
+                    }
+                    t = hit_hi;
+                }
+            }
+        }
+    }
 
     wx = float_to_fixed(nx + t * (fx - nx));
     wy = float_to_fixed(ny + t * (fy - ny));
@@ -219,7 +274,7 @@ Command Control::resolve_command(const sim::World& world, const ScreenPoint& p,
 
 Command Control::issue_command(sim::World& world,
                                const std::vector<uint32_t>& selection,
-                               const ScreenPoint& p, bool attack_move) const {
+                               const ScreenPoint& p, bool attack_move, bool queued) const {
     Command cmd = resolve_command(world, p, attack_move);
     if (cmd.kind == CommandKind::None) return cmd;
 
@@ -247,7 +302,7 @@ Command Control::issue_command(sim::World& world,
                 mv.type = OrderType::Move;
                 mv.tx = world.unit(cmd.target).x;
                 mv.ty = world.unit(cmd.target).y;
-                world.issue(id, mv);
+                world.issue(id, mv, queued);
             }
         }
         return cmd;
@@ -273,7 +328,7 @@ Command Control::issue_command(sim::World& world,
         case CommandKind::None:
             return cmd;
     }
-    for (uint32_t id : selection) world.issue(id, order);
+    for (uint32_t id : selection) world.issue(id, order, queued);
     return cmd;
 }
 

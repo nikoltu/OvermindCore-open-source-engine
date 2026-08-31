@@ -157,6 +157,10 @@ void ActorDriver::observe(const sim::World& world, float dt_ms, bool sim_ticked)
                 h ^= h >> 29; h *= 0xBF58476D1CE4E5B9ull; h ^= h >> 32;
                 a.clock = float(h & 0xFFFFFFu) / float(0x1000000u) * len;
             }
+            if (u.id < spawn_facing_set.size() && spawn_facing_set[u.id]) {
+                a.facing = spawn_facing[u.id];
+                a.facing_known = true;
+            }
             s.known = true;
             s.alive = u.alive;
             s.x = u.x; s.y = u.y; s.cooldown = u.cooldown; s.cast_count = u.cast_count;

@@ -26,6 +26,8 @@ struct MeleePlayerSetup {
     std::vector<MeleePos> mineral_positions;
     sim::Unit geyser_field;
     std::vector<MeleePos> geyser_positions;
+    std::vector<sim::Unit> mineral_protos;
+    std::vector<sim::Unit> geyser_protos;
     int gas_worker_count = 0;
     sim::Unit supply_unit;
     int supply_mineral_cost = 100;
@@ -58,6 +60,7 @@ struct MeleePlayerSetup {
 struct MeleeSetup {
     std::vector<MeleePlayerSetup> players;
     std::vector<sim::Unit> neutrals;
+    std::vector<float> neutral_facing;
 };
 
 struct MeleePlayerLayout {
@@ -73,6 +76,8 @@ struct MeleePlayerLayout {
 struct MeleeLayout {
     std::vector<MeleePlayerLayout> players;
     std::vector<std::string> unit_type;
+    std::vector<float> unit_facing;
+    std::vector<char> unit_facing_set;
 };
 
 MeleeLayout build_melee(sim::World& w, const MeleeSetup& s);

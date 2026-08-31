@@ -94,6 +94,278 @@ std::string basename_of(const std::string& name) {
     return p == std::string::npos ? name : name.substr(p + 1);
 }
 
+using BzCrcTable = std::array<uint32_t, 256>;
+
+const BzCrcTable& bz_crc_table() {
+    static const BzCrcTable table = [] {
+        BzCrcTable t{};
+        for (uint32_t i = 0; i < 256; ++i) {
+            uint32_t c = i << 24;
+            for (int k = 0; k < 8; ++k)
+                c = (c & 0x80000000u) ? (c << 1) ^ 0x04C11DB7u : (c << 1);
+            t[i] = c;
+        }
+        return t;
+    }();
+    return table;
+}
+
+uint32_t bz_crc(const std::vector<uint8_t>& data) {
+    const BzCrcTable& t = bz_crc_table();
+    uint32_t c = 0xFFFFFFFFu;
+    for (uint8_t byte : data) c = (c << 8) ^ t[((c >> 24) ^ byte) & 0xFFu];
+    return ~c;
+}
+
+class BzBitReader {
+public:
+    BzBitReader(const uint8_t* data, size_t size) : data_(data), nbits_(size * 8) {}
+
+    uint32_t bits(int count) {
+        uint32_t v = 0;
+        for (int i = 0; i < count; ++i) {
+            if (pos_ >= nbits_) throw std::runtime_error("mpq: bzip2 stream truncated");
+            v = (v << 1) | ((data_[pos_ >> 3] >> (7 - (pos_ & 7))) & 1u);
+            ++pos_;
+        }
+        return v;
+    }
+
+private:
+    const uint8_t* data_;
+    size_t nbits_;
+    size_t pos_ = 0;
+};
+
+constexpr int kBzMaxCodeLen = 23;
+
+struct BzGroup {
+    std::array<int64_t, kBzMaxCodeLen + 2> limit{};
+    std::array<int64_t, kBzMaxCodeLen + 2> base{};
+    std::vector<int> perm;
+    int min_len = 0;
+    int max_len = 0;
+};
+
+BzGroup bz_build_group(const std::vector<int>& len) {
+    BzGroup g;
+    const int alpha = int(len.size());
+    g.min_len = kBzMaxCodeLen;
+    g.max_len = 0;
+    for (int l : len) {
+        if (l < g.min_len) g.min_len = l;
+        if (l > g.max_len) g.max_len = l;
+    }
+    g.perm.reserve(alpha);
+    for (int l = g.min_len; l <= g.max_len; ++l)
+        for (int s = 0; s < alpha; ++s)
+            if (len[s] == l) g.perm.push_back(s);
+    for (int s = 0; s < alpha; ++s) g.base[len[s] + 1] += 1;
+    for (int i = 1; i <= kBzMaxCodeLen + 1; ++i) g.base[i] += g.base[i - 1];
+    int64_t vec = 0;
+    for (int l = g.min_len; l <= g.max_len; ++l) {
+        vec += g.base[l + 1] - g.base[l];
+        g.limit[l] = vec - 1;
+        vec <<= 1;
+    }
+    for (int l = g.min_len + 1; l <= g.max_len; ++l)
+        g.base[l] = ((g.limit[l - 1] + 1) << 1) - g.base[l];
+    return g;
+}
+
+int bz_decode_symbol(BzBitReader& br, const BzGroup& g) {
+    int l = g.min_len;
+    int64_t v = int64_t(br.bits(l));
+    while (l <= g.max_len && v > g.limit[l]) {
+        ++l;
+        if (l > g.max_len) break;
+        v = (v << 1) | int64_t(br.bits(1));
+    }
+    if (l > g.max_len) throw std::runtime_error("mpq: bzip2 invalid Huffman code");
+    int64_t rank = v - g.base[l];
+    if (rank < 0 || rank >= int64_t(g.perm.size()))
+        throw std::runtime_error("mpq: bzip2 invalid Huffman code");
+    return g.perm[size_t(rank)];
+}
+
+std::vector<uint8_t> bzip2_decompress(const uint8_t* data, size_t size) {
+    if (size < 4 || data[0] != 'B' || data[1] != 'Z' || data[2] != 'h')
+        throw std::runtime_error("mpq: bzip2 bad stream header");
+    const int level = data[3] - '0';
+    if (level < 1 || level > 9) throw std::runtime_error("mpq: bzip2 bad block-size level");
+    const uint32_t block_max = uint32_t(level) * 100000u;
+
+    BzBitReader br(data, size);
+    br.bits(32);
+
+    std::vector<uint8_t> out;
+    uint32_t combined_crc = 0;
+    for (;;) {
+        const uint32_t magic_hi = br.bits(24);
+        const uint32_t magic_lo = br.bits(24);
+        if (magic_hi == 0x177245u && magic_lo == 0x385090u) {
+            const uint32_t stored = br.bits(32);
+            if (stored != combined_crc)
+                throw std::runtime_error("mpq: bzip2 stream CRC mismatch");
+            break;
+        }
+        if (magic_hi != 0x314159u || magic_lo != 0x265359u)
+            throw std::runtime_error("mpq: bzip2 bad block magic");
+
+        const uint32_t block_crc = br.bits(32);
+        if (br.bits(1))
+            throw std::runtime_error("mpq: bzip2 randomised block not supported");
+        const uint32_t orig_ptr = br.bits(24);
+
+        bool used[256] = {};
+        const uint32_t ranges = br.bits(16);
+        for (int i = 0; i < 16; ++i) {
+            if (!((ranges >> (15 - i)) & 1u)) continue;
+            const uint32_t m = br.bits(16);
+            for (int j = 0; j < 16; ++j)
+                if ((m >> (15 - j)) & 1u) used[i * 16 + j] = true;
+        }
+        std::vector<uint8_t> seq_to_unseq;
+        for (int i = 0; i < 256; ++i)
+            if (used[i]) seq_to_unseq.push_back(uint8_t(i));
+        if (seq_to_unseq.empty()) throw std::runtime_error("mpq: bzip2 empty symbol map");
+        const int alpha = int(seq_to_unseq.size()) + 2;
+        const int eob = alpha - 1;
+
+        const int ngroups = int(br.bits(3));
+        if (ngroups < 2 || ngroups > 6) throw std::runtime_error("mpq: bzip2 bad group count");
+        const int nselectors = int(br.bits(15));
+        if (nselectors < 1) throw std::runtime_error("mpq: bzip2 bad selector count");
+
+        std::vector<uint8_t> selector(static_cast<size_t>(nselectors));
+        {
+            std::vector<uint8_t> order(static_cast<size_t>(ngroups));
+            for (int i = 0; i < ngroups; ++i) order[size_t(i)] = uint8_t(i);
+            for (int i = 0; i < nselectors; ++i) {
+                int v = 0;
+                while (br.bits(1))
+                    if (++v >= ngroups) throw std::runtime_error("mpq: bzip2 bad selector");
+                const uint8_t sel = order[size_t(v)];
+                for (int k = v; k > 0; --k) order[size_t(k)] = order[size_t(k - 1)];
+                order[0] = sel;
+                selector[size_t(i)] = sel;
+            }
+        }
+
+        std::vector<BzGroup> groups;
+        groups.reserve(size_t(ngroups));
+        for (int g = 0; g < ngroups; ++g) {
+            std::vector<int> len(static_cast<size_t>(alpha));
+            int cur = int(br.bits(5));
+            for (int s = 0; s < alpha; ++s) {
+                for (;;) {
+                    if (cur < 1 || cur > 20)
+                        throw std::runtime_error("mpq: bzip2 bad code length");
+                    if (!br.bits(1)) break;
+                    if (br.bits(1))
+                        --cur;
+                    else
+                        ++cur;
+                }
+                len[size_t(s)] = cur;
+            }
+            groups.push_back(bz_build_group(len));
+        }
+
+        std::vector<uint32_t> tt;
+        tt.reserve(size_t(block_max));
+        std::array<uint32_t, 256> counts{};
+        std::vector<uint8_t> mtf(seq_to_unseq.size());
+        for (size_t i = 0; i < mtf.size(); ++i) mtf[i] = uint8_t(i);
+
+        int group_no = -1;
+        int group_pos = 0;
+        auto next_symbol = [&] {
+            if (group_pos == 0) {
+                if (++group_no >= nselectors)
+                    throw std::runtime_error("mpq: bzip2 selector list exhausted");
+                group_pos = 50;
+            }
+            --group_pos;
+            return bz_decode_symbol(br, groups[selector[size_t(group_no)]]);
+        };
+
+        int sym = next_symbol();
+        while (sym != eob) {
+            if (sym <= 1) {
+                uint64_t run = 0;
+                uint64_t weight = 1;
+                do {
+                    run += uint64_t(sym + 1) * weight;
+                    if (run > block_max) throw std::runtime_error("mpq: bzip2 run overflow");
+                    weight <<= 1;
+                    sym = next_symbol();
+                } while (sym <= 1);
+                const uint8_t byte = seq_to_unseq[mtf[0]];
+                if (tt.size() + run > block_max)
+                    throw std::runtime_error("mpq: bzip2 block overflow");
+                counts[byte] += uint32_t(run);
+                tt.insert(tt.end(), size_t(run), uint32_t(byte));
+                continue;
+            }
+            const size_t nn = size_t(sym - 1);
+            if (nn >= mtf.size()) throw std::runtime_error("mpq: bzip2 symbol out of range");
+            const uint8_t idx = mtf[nn];
+            for (size_t k = nn; k > 0; --k) mtf[k] = mtf[k - 1];
+            mtf[0] = idx;
+            const uint8_t byte = seq_to_unseq[idx];
+            if (tt.size() >= block_max) throw std::runtime_error("mpq: bzip2 block overflow");
+            counts[byte] += 1;
+            tt.push_back(uint32_t(byte));
+            sym = next_symbol();
+        }
+
+        const uint32_t nblock = uint32_t(tt.size());
+        if (nblock == 0 || orig_ptr >= nblock)
+            throw std::runtime_error("mpq: bzip2 bad origin pointer");
+
+        std::array<uint32_t, 257> cftab{};
+        for (int i = 0; i < 256; ++i) cftab[size_t(i) + 1] = counts[size_t(i)];
+        for (int i = 1; i <= 256; ++i) cftab[size_t(i)] += cftab[size_t(i) - 1];
+        for (uint32_t i = 0; i < nblock; ++i) {
+            const uint8_t ch = uint8_t(tt[i] & 0xFFu);
+            tt[cftab[ch]] |= (i << 8);
+            cftab[ch] += 1;
+        }
+        uint32_t tpos = tt[orig_ptr] >> 8;
+
+        std::vector<uint8_t> block;
+        block.reserve(size_t(nblock));
+        int run = 0;
+        int prev = -1;
+        for (uint32_t i = 0; i < nblock; ++i) {
+            if (tpos >= nblock) throw std::runtime_error("mpq: bzip2 broken BWT chain");
+            tpos = tt[tpos];
+            const uint8_t byte = uint8_t(tpos & 0xFFu);
+            tpos >>= 8;
+            if (run == 4) {
+                block.insert(block.end(), size_t(byte), uint8_t(prev));
+                run = 0;
+                prev = -1;
+                continue;
+            }
+            if (int(byte) == prev) {
+                ++run;
+            } else {
+                run = 1;
+                prev = int(byte);
+            }
+            block.push_back(byte);
+        }
+
+        if (bz_crc(block) != block_crc)
+            throw std::runtime_error("mpq: bzip2 block CRC mismatch");
+        combined_crc = ((combined_crc << 1) | (combined_crc >> 31)) ^ block_crc;
+        out.insert(out.end(), block.begin(), block.end());
+    }
+    return out;
+}
+
 }
 
 Mpq Mpq::open(const std::vector<uint8_t>& bytes) {
@@ -242,6 +514,11 @@ std::vector<uint8_t> Mpq::read_file(const std::string& name) const {
         size_t body_len = buf.size() - 1;
         if (method & 0x02) {
             auto d = core::zlib_inflate(body, body_len);
+            if (d.size() > out_size) d.resize(out_size);
+            return d;
+        }
+        if (method == 0x10) {
+            auto d = bzip2_decompress(body, body_len);
             if (d.size() > out_size) d.resize(out_size);
             return d;
         }

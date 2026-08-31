@@ -23,7 +23,9 @@ HudContent HudModel::build(const sim::World& world, int player,
         if (u.alive && u.player == player) ++owned;
     }
     c.selection_owned = owned;
-    c.selection_summary = std::to_string(owned) + (owned == 1 ? " unit" : " units");
+    c.selection_summary =
+        owned == 0 ? std::string()
+                   : std::to_string(owned) + (owned == 1 ? " unit" : " units");
 
     auto clamp01 = [](double v) { return v < 0 ? 0.0f : (v > 1 ? 1.0f : float(v)); };
     for (std::uint32_t id : selection) {

@@ -18,8 +18,8 @@ struct AbilitySpec {
     std::uint32_t req_attr_mask = 0;
     std::uint32_t exc_attr_mask = 0;
     bool require_energy = false;
-    std::vector<VitalGate> vital_gates;
-    Fixed life_cost;
+    std::vector<VitalGate> vital_gates{};
+    Fixed life_cost{};
 };
 
 class AbilitySystem {

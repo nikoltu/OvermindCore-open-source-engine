@@ -63,6 +63,11 @@ const char* anim_name(render::AnimState s) {
         case render::AnimState::Attack: return "Attack";
         case render::AnimState::Death: return "Death";
         case render::AnimState::Gather: return "Gather";
+        case render::AnimState::Cast: return "Cast";
+        case render::AnimState::FlyStart: return "FlyStart";
+        case render::AnimState::FlyStand: return "FlyStand";
+        case render::AnimState::FlyWalk: return "FlyWalk";
+        case render::AnimState::FlyEnd: return "FlyEnd";
     }
     return "?";
 }
@@ -77,6 +82,8 @@ const char* order_name(sim::OrderType t) {
         case sim::OrderType::Gather: return "Gather";
         case sim::OrderType::Cast: return "Cast";
         case sim::OrderType::Patrol: return "Patrol";
+        case sim::OrderType::Unload: return "Unload";
+        case sim::OrderType::Load: return "Load";
     }
     return "?";
 }
@@ -124,16 +131,12 @@ void SandboxGame::reset(Race race) {
     try { mineral = make_unit(cat_, "MineralField", -1); } catch (const std::exception&) {}
     mineral.player = -1;
     mineral.speed = Fixed();
-    mineral.radius = Fixed::from_int(1);
-    mineral.resource_left = 1500;
     ps.mineral_field = mineral;
 
     Unit geyser;
     try { geyser = make_unit(cat_, "VespeneGeyser", -1); } catch (const std::exception&) {}
     geyser.player = -1;
     geyser.speed = Fixed();
-    geyser.radius = Fixed::from_int(1);
-    geyser.resource_left = 2250;
     ps.geyser_field = geyser;
 
     for (const TestMap::Resource& res : base.resources) {

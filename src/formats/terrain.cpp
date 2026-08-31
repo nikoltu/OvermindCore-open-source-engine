@@ -59,6 +59,30 @@ TerrainQuantize parse_terrain_quantize(const std::vector<uint8_t>& t3terrain_xml
     return q;
 }
 
+TerrainUvTiling parse_terrain_uvtiling(const std::vector<uint8_t>& t3terrain_xml) {
+    TerrainUvTiling out;
+    core::XmlNode root =
+        core::xml_parse(std::string(t3terrain_xml.begin(), t3terrain_xml.end()));
+    std::vector<const core::XmlNode*> stack{&root};
+    while (!stack.empty()) {
+        const core::XmlNode* n = stack.back();
+        stack.pop_back();
+        if (n->name == "heightMap") {
+            if (const std::string* s = n->attr("uvtiling")) {
+                float u = 0, v = 0;
+                if (std::sscanf(s->c_str(), "%f %f", &u, &v) == 2 && u > 0.0f && v > 0.0f) {
+                    out.u = u;
+                    out.v = v;
+                    out.found = true;
+                }
+            }
+            break;
+        }
+        for (const core::XmlNode& c : n->children) stack.push_back(&c);
+    }
+    return out;
+}
+
 std::string parse_terrain_tileset(const std::vector<uint8_t>& t3terrain_xml) {
     core::XmlNode root =
         core::xml_parse(std::string(t3terrain_xml.begin(), t3terrain_xml.end()));
@@ -296,28 +320,21 @@ Model build_terrain_mesh(const HeightMap& hm, const std::vector<uint8_t>& data,
 
 Model build_terrain_mesh_stepped(const CliffMap& cliff,
                                  const std::vector<float>& level_height, float cell,
-                                 uint32_t max_dim, const std::vector<uint8_t>* ramp, bool with_walls) {
+                                 const std::vector<uint8_t>* ramp, bool with_walls) {
     if (cliff.empty() || cliff.width < 2 || cliff.height < 2 || level_height.empty())
         throw std::runtime_error("stepped terrain mesh: degenerate cliff grid");
 
     const uint32_t cw = cliff.width, ch = cliff.height;
-    uint32_t cap = std::max<uint32_t>(2, max_dim);
-    while (uint64_t(std::min(cw, cap)) * std::min(ch, cap) * 4ULL > 40000ULL && cap > 2)
-        cap = std::max<uint32_t>(2, cap * 3 / 4);
-    const uint32_t nx = std::min(cw, cap), ny = std::min(ch, cap);
+    const uint32_t nx = cw, ny = ch;
 
-    auto src = [](uint32_t i, uint32_t n, uint32_t dim) -> uint32_t {
-        uint32_t s = uint32_t(uint64_t(i) * dim / n);
-        return s < dim ? s : dim - 1;
-    };
     auto height_of = [&](uint32_t i, uint32_t j) -> float {
-        uint8_t L = cliff.levels[size_t(src(j, ny, ch)) * cw + src(i, nx, cw)];
+        uint8_t L = cliff.levels[size_t(j) * cw + i];
         return level_height[L < level_height.size() ? L : level_height.size() - 1];
     };
     const bool have_ramps = ramp && !ramp->empty();
     auto ramp_of = [&](uint32_t i, uint32_t j) -> bool {
         if (!have_ramps) return false;
-        size_t k = size_t(src(j, ny, ch)) * cw + src(i, nx, cw);
+        size_t k = size_t(j) * cw + i;
         return k < ramp->size() && (*ramp)[k] != 0;
     };
     auto ramp_corners = [&](uint32_t i, uint32_t j, float out[4]) {
@@ -361,17 +378,35 @@ Model build_terrain_mesh_stepped(const CliffMap& cliff,
         m.uvs.push_back(ex > 0.0f ? x / ex : 0.0f);
         m.uvs.push_back(ey > 0.0f ? y / ey : 0.0f);
     };
-    const size_t kBudget = 65000;
+    const size_t kRegionVerts = 65536;
+    uint32_t region_base = 0, region_first_index = 0;
+    auto flush_region = [&]() {
+        const uint32_t vend = uint32_t(m.positions.size() / 3);
+        const uint32_t iend = uint32_t(m.indices.size());
+        if (iend == region_first_index) return;
+        M3Region r;
+        r.first_vertex = region_base;
+        r.num_vertices = vend - region_base;
+        r.first_index = region_first_index;
+        r.num_indices = iend - region_first_index;
+        m.regions.push_back(r);
+        m.region_material.push_back(-1);
+        region_base = vend;
+        region_first_index = iend;
+    };
 
-    for (uint32_t j = 0; j < ny; ++j)
+    if (size_t(nx) * 4 > kRegionVerts)
+        throw std::runtime_error("stepped terrain mesh: cliff grid too wide to index");
+    const uint32_t rows_per_band =
+        std::max<uint32_t>(1, uint32_t(kRegionVerts / (size_t(nx) * 4 + 4)));
+    for (uint32_t j = 0; j < ny; ++j) {
+        if (j && j % rows_per_band == 0) flush_region();
         for (uint32_t i = 0; i < nx; ++i) {
             const float x0 = float(i) * cell, x1 = x0 + cell;
             const float y0 = float(j) * cell, y1 = y0 + cell;
-            const float z = height_of(i, j);
             float c[4];
             corners_of(i, j, c);
-            (void)z;
-            const uint16_t b = uint16_t(m.positions.size() / 3);
+            const uint16_t b = uint16_t(m.positions.size() / 3 - region_base);
             push_vert(x0, y0, c[0]);
             push_vert(x0, y1, c[1]);
             push_vert(x1, y0, c[2]);
@@ -380,19 +415,12 @@ Model build_terrain_mesh_stepped(const CliffMap& cliff,
                              {b, uint16_t(b + 1), uint16_t(b + 2), uint16_t(b + 2),
                               uint16_t(b + 1), uint16_t(b + 3)});
         }
-    M3Region tops;
-    tops.first_vertex = 0;
-    tops.num_vertices = uint32_t(m.positions.size() / 3);
-    tops.first_index = 0;
-    tops.num_indices = uint32_t(m.indices.size());
-    m.regions.push_back(tops);
-    m.region_material.push_back(-1);
+    }
+    flush_region();
 
-    const uint32_t wall_first_index = uint32_t(m.indices.size());
-    const uint32_t wall_first_vertex = uint32_t(m.positions.size() / 3);
     auto add_wall = [&](float ax, float ay, float bx, float by, float zlo, float zhi) {
-        if (m.positions.size() / 3 + 4 > kBudget) return;
-        const uint16_t b = uint16_t(m.positions.size() / 3 - wall_first_vertex);
+        if (m.positions.size() / 3 + 4 - region_base > kRegionVerts) flush_region();
+        const uint16_t b = uint16_t(m.positions.size() / 3 - region_base);
         push_vert(ax, ay, zlo);
         push_vert(bx, by, zlo);
         push_vert(ax, ay, zhi);
@@ -420,15 +448,7 @@ Model build_terrain_mesh_stepped(const CliffMap& cliff,
                 }
             }
         }
-    if (uint32_t(m.indices.size()) > wall_first_index) {
-        M3Region walls;
-        walls.first_vertex = wall_first_vertex;
-        walls.num_vertices = uint32_t(m.positions.size() / 3) - wall_first_vertex;
-        walls.first_index = wall_first_index;
-        walls.num_indices = uint32_t(m.indices.size()) - wall_first_index;
-        m.regions.push_back(walls);
-        m.region_material.push_back(-1);
-    }
+    flush_region();
 
     m.vertex_count = uint32_t(m.positions.size() / 3);
     return m;
@@ -496,14 +516,17 @@ TextureMask TextureMask::parse(const std::vector<uint8_t>& d) {
 }
 
 uint8_t TextureMask::layer_weight(uint32_t layer, uint32_t x, uint32_t y) const {
-    if (layer >= 8 || x >= mask_w || y >= mask_h || !planar_ok()) return 0;
+    if (layer >= 8 || x >= mask_w || !planar_ok()) return 0;
+    const uint32_t qw = quad_w(), qh = quad_h();
+    if (y >= qh * 64) return 0;
     const uint32_t bx = x >> 1;
     const uint32_t qx = bx >> 6, qy = y >> 6;
     const uint32_t tX = (bx >> 5) & 1, tY = (y >> 5) & 1;
     const uint32_t px = bx & 31, py = y & 31;
-    const uint32_t qw = mask_w / 128, qh = mask_h / 64;
     const size_t tile = ((size_t(layer) * qh + qy) * qw + qx) * 4 + tX * 2 + tY;
-    const uint8_t b = texels[tile * 1024 + py * 32 + px];
+    const size_t off = tile * 1024 + py * 32 + px;
+    if (off >= texels.size()) return 0;
+    const uint8_t b = texels[off];
     return uint8_t(((x & 1) ? (b & 0x0F) : (b >> 4)) * 17);
 }
 
@@ -544,11 +567,11 @@ SyncHeightMap SyncHeightMap::parse(const std::vector<uint8_t>& d) {
     const size_t header = d.size() - field;
     if (header < 16) throw std::runtime_error("terrain: SMAP field overruns its header");
     const size_t n = size_t(sh.width) * sh.height;
-    sh.height_u16.resize(n);
+    sh.height_i16.resize(n);
     sh.level.resize(n);
     for (size_t i = 0; i < n; ++i) {
         const size_t o = header + i * 4;
-        sh.height_u16[i] = uint16_t(uint16_t(d[o]) | uint16_t(d[o + 1]) << 8);
+        sh.height_i16[i] = int16_t(uint16_t(uint16_t(d[o]) | uint16_t(d[o + 1]) << 8));
         sh.level[i] = uint16_t(uint16_t(d[o + 2]) | uint16_t(d[o + 3]) << 8);
     }
     return sh;

@@ -4,23 +4,21 @@
 
 namespace sc2::app {
 
-inline constexpr float kRefHeightCandidate768 = 768.0f;
-inline constexpr float kRefHeightCandidate1200 = 1200.0f;
-inline constexpr float kRefHeightDefault = kRefHeightCandidate768;
+inline constexpr float kRefHeight = 1080.0f;
 
 inline constexpr float kAspectBands[] = {1.33f, 1.4f, 1.44f, 1.5f, 1.51f, 1.6f, 1.7f, 1.75f, 1.77f};
 inline constexpr int kAspectBandCount = int(sizeof(kAspectBands) / sizeof(kAspectBands[0]));
 
 struct Canvas {
     std::uint32_t phys_w = 0, phys_h = 0;
-    float ref_height = kRefHeightDefault;
+    float ref_height = kRefHeight;
     float scale = 1.0f;
     float virt_w = 0.0f, virt_h = 0.0f;
     float aspect = 1.0f;
 };
 
 inline Canvas make_canvas(std::uint32_t phys_w, std::uint32_t phys_h,
-                          float ref_height = kRefHeightDefault) {
+                          float ref_height = kRefHeight) {
     Canvas c;
     c.phys_w = phys_w;
     c.phys_h = phys_h;

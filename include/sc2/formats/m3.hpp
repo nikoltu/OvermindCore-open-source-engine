@@ -79,7 +79,7 @@ struct M3Region {
 struct M3Layer {
     std::string usage;
     std::string image_path;
-    std::vector<uint8_t> inline_rgba;
+    std::vector<uint8_t> inline_rgba{};
     uint32_t inline_w = 0, inline_h = 0;
 };
 

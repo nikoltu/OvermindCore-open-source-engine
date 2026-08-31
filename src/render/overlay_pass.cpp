@@ -44,7 +44,8 @@ Layer make_layer(VkPhysicalDevice pd, VkDevice dev, uint32_t w, uint32_t h,
 }
 
 void record_upload(VkCommandBuffer cmd, const Layer& t) {
-    VkImageMemoryBarrier b{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
+    VkImageMemoryBarrier b{};
+    b.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
     b.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
     b.newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
     b.image = t.image.img.get();
@@ -80,17 +81,22 @@ Unique<VkPipeline> make_overlay_pipeline(VkDevice dev, VkRenderPass pass,
     stages[1].module = fs;
     stages[1].pName = "main";
 
-    VkPipelineVertexInputStateCreateInfo vin{VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO};
-    VkPipelineInputAssemblyStateCreateInfo ia{VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO};
+    VkPipelineVertexInputStateCreateInfo vin{};
+    vin.sType = VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO;
+    VkPipelineInputAssemblyStateCreateInfo ia{};
+    ia.sType = VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO;
     ia.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
     VkViewport vp{0, 0, float(w), float(h), 0, 1};
     VkRect2D scis{{0, 0}, {w, h}};
-    VkPipelineViewportStateCreateInfo vps{VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO};
+    VkPipelineViewportStateCreateInfo vps{};
+    vps.sType = VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO;
     vps.viewportCount = 1; vps.pViewports = &vp; vps.scissorCount = 1; vps.pScissors = &scis;
-    VkPipelineRasterizationStateCreateInfo rs{VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO};
+    VkPipelineRasterizationStateCreateInfo rs{};
+    rs.sType = VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO;
     rs.polygonMode = VK_POLYGON_MODE_FILL; rs.cullMode = VK_CULL_MODE_NONE;
     rs.frontFace = VK_FRONT_FACE_COUNTER_CLOCKWISE; rs.lineWidth = 1.0f;
-    VkPipelineMultisampleStateCreateInfo ms{VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO};
+    VkPipelineMultisampleStateCreateInfo ms{};
+    ms.sType = VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO;
     ms.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
 
     VkPipelineColorBlendAttachmentState cba{};
@@ -103,10 +109,13 @@ Unique<VkPipeline> make_overlay_pipeline(VkDevice dev, VkRenderPass pass,
     cba.alphaBlendOp = VK_BLEND_OP_ADD;
     cba.colorWriteMask = VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT |
                          VK_COLOR_COMPONENT_B_BIT | VK_COLOR_COMPONENT_A_BIT;
-    VkPipelineColorBlendStateCreateInfo cb{VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO};
+    VkPipelineColorBlendStateCreateInfo cb{};
+    cb.sType = VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO;
     cb.attachmentCount = 1; cb.pAttachments = &cba;
 
-    VkGraphicsPipelineCreateInfo gpi{VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO};
+    VkGraphicsPipelineCreateInfo gpi{};
+
+    gpi.sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO;
     gpi.stageCount = 2; gpi.pStages = stages;
     gpi.pVertexInputState = &vin; gpi.pInputAssemblyState = &ia;
     gpi.pViewportState = &vps; gpi.pRasterizationState = &rs;
@@ -144,7 +153,8 @@ std::vector<uint8_t> composite_overlay(const std::vector<uint8_t>& base_rgba,
     Layer base = make_layer(pd, dev, width, height, base_rgba);
     Layer overlay = make_layer(pd, dev, width, height, overlay_rgba);
 
-    VkSamplerCreateInfo smi{VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO};
+    VkSamplerCreateInfo smi{};
+    smi.sType = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO;
     smi.magFilter = smi.minFilter = VK_FILTER_NEAREST;
     smi.addressModeU = smi.addressModeV = smi.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
     smi.maxLod = 0.0f;
@@ -157,7 +167,8 @@ std::vector<uint8_t> composite_overlay(const std::vector<uint8_t>& base_rgba,
     texb.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
     texb.descriptorCount = 1;
     texb.stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
-    VkDescriptorSetLayoutCreateInfo texli{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
+    VkDescriptorSetLayoutCreateInfo texli{};
+    texli.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
     texli.bindingCount = 1;
     texli.pBindings = &texb;
     VkDescriptorSetLayout rawTexLayout = VK_NULL_HANDLE;
@@ -166,7 +177,8 @@ std::vector<uint8_t> composite_overlay(const std::vector<uint8_t>& base_rgba,
         vkDestroyDescriptorSetLayout(dev, l, nullptr); });
 
     VkDescriptorPoolSize psize{VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 2};
-    VkDescriptorPoolCreateInfo dpi{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
+    VkDescriptorPoolCreateInfo dpi{};
+    dpi.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
     dpi.maxSets = 2;
     dpi.poolSizeCount = 1;
     dpi.pPoolSizes = &psize;
@@ -176,7 +188,8 @@ std::vector<uint8_t> composite_overlay(const std::vector<uint8_t>& base_rgba,
         vkDestroyDescriptorPool(dev, p, nullptr); });
 
     auto bind_layer = [&](const Layer& t) -> VkDescriptorSet {
-        VkDescriptorSetAllocateInfo dsa{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
+        VkDescriptorSetAllocateInfo dsa{};
+        dsa.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
         dsa.descriptorPool = rawPool;
         dsa.descriptorSetCount = 1;
         dsa.pSetLayouts = &rawTexLayout;
@@ -184,7 +197,8 @@ std::vector<uint8_t> composite_overlay(const std::vector<uint8_t>& base_rgba,
         check(vkAllocateDescriptorSets(dev, &dsa, &set), "vkAllocateDescriptorSets");
         VkDescriptorImageInfo dii{rawSampler, t.image.view.get(),
                                   VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL};
-        VkWriteDescriptorSet w{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
+        VkWriteDescriptorSet w{};
+        w.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
         w.dstSet = set;
         w.dstBinding = 0;
         w.descriptorCount = 1;
@@ -210,7 +224,8 @@ std::vector<uint8_t> composite_overlay(const std::vector<uint8_t>& base_rgba,
     subp.pipelineBindPoint = VK_PIPELINE_BIND_POINT_GRAPHICS;
     subp.colorAttachmentCount = 1;
     subp.pColorAttachments = &colorRef;
-    VkRenderPassCreateInfo rpi{VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO};
+    VkRenderPassCreateInfo rpi{};
+    rpi.sType = VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO;
     rpi.attachmentCount = 1; rpi.pAttachments = &att;
     rpi.subpassCount = 1; rpi.pSubpasses = &subp;
     VkRenderPass rawPass = VK_NULL_HANDLE;
@@ -218,14 +233,16 @@ std::vector<uint8_t> composite_overlay(const std::vector<uint8_t>& base_rgba,
     Unique<VkRenderPass> renderPass(rawPass, [dev](VkRenderPass p) { vkDestroyRenderPass(dev, p, nullptr); });
 
     VkImageView fbView = color.view.get();
-    VkFramebufferCreateInfo fbi{VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO};
+    VkFramebufferCreateInfo fbi{};
+    fbi.sType = VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO;
     fbi.renderPass = rawPass; fbi.attachmentCount = 1; fbi.pAttachments = &fbView;
     fbi.width = width; fbi.height = height; fbi.layers = 1;
     VkFramebuffer rawFb = VK_NULL_HANDLE;
     check(vkCreateFramebuffer(dev, &fbi, nullptr, &rawFb), "vkCreateFramebuffer");
     Unique<VkFramebuffer> framebuffer(rawFb, [dev](VkFramebuffer f) { vkDestroyFramebuffer(dev, f, nullptr); });
 
-    VkPipelineLayoutCreateInfo pli{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
+    VkPipelineLayoutCreateInfo pli{};
+    pli.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
     pli.setLayoutCount = 1;
     pli.pSetLayouts = &rawTexLayout;
     VkPipelineLayout rawLayout = VK_NULL_HANDLE;
@@ -242,16 +259,20 @@ std::vector<uint8_t> composite_overlay(const std::vector<uint8_t>& base_rgba,
     VkDeviceSize rbytes = VkDeviceSize(width) * height * 4;
     Buffer readback = make_buffer(pd, dev, rbytes, VK_BUFFER_USAGE_TRANSFER_DST_BIT, nullptr);
 
-    VkCommandPoolCreateInfo cpi{VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO};
+    VkCommandPoolCreateInfo cpi{};
+
+    cpi.sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO;
     cpi.queueFamilyIndex = gfx;
     VkCommandPool rawCmdPool = VK_NULL_HANDLE;
     check(vkCreateCommandPool(dev, &cpi, nullptr, &rawCmdPool), "vkCreateCommandPool");
     Unique<VkCommandPool> cmdPool(rawCmdPool, [dev](VkCommandPool p) { vkDestroyCommandPool(dev, p, nullptr); });
-    VkCommandBufferAllocateInfo cbi{VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
+    VkCommandBufferAllocateInfo cbi{};
+    cbi.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
     cbi.commandPool = rawCmdPool; cbi.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY; cbi.commandBufferCount = 1;
     VkCommandBuffer cmd;
     check(vkAllocateCommandBuffers(dev, &cbi, &cmd), "vkAllocateCommandBuffers");
-    VkCommandBufferBeginInfo bbi{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+    VkCommandBufferBeginInfo bbi{};
+    bbi.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
     bbi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
     check(vkBeginCommandBuffer(cmd, &bbi), "vkBeginCommandBuffer");
 
@@ -260,7 +281,8 @@ std::vector<uint8_t> composite_overlay(const std::vector<uint8_t>& base_rgba,
 
     VkClearValue clear;
     clear.color = {{0.0f, 0.0f, 0.0f, 0.0f}};
-    VkRenderPassBeginInfo rbi{VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO};
+    VkRenderPassBeginInfo rbi{};
+    rbi.sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO;
     rbi.renderPass = rawPass; rbi.framebuffer = rawFb;
     rbi.renderArea = {{0, 0}, {width, height}};
     rbi.clearValueCount = 1; rbi.pClearValues = &clear;
@@ -282,11 +304,14 @@ std::vector<uint8_t> composite_overlay(const std::vector<uint8_t>& base_rgba,
                            readback.buf.get(), 1, &region);
     check(vkEndCommandBuffer(cmd), "vkEndCommandBuffer");
 
-    VkFenceCreateInfo fi{VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
+    VkFenceCreateInfo fi{};
+
+    fi.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO;
     VkFence rawFence = VK_NULL_HANDLE;
     check(vkCreateFence(dev, &fi, nullptr, &rawFence), "vkCreateFence");
     Unique<VkFence> fence(rawFence, [dev](VkFence f) { vkDestroyFence(dev, f, nullptr); });
-    VkSubmitInfo si{VK_STRUCTURE_TYPE_SUBMIT_INFO};
+    VkSubmitInfo si{};
+    si.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
     si.commandBufferCount = 1; si.pCommandBuffers = &cmd;
     check(vkQueueSubmit(queue, 1, &si, rawFence), "vkQueueSubmit");
     check(vkWaitForFences(dev, 1, &rawFence, VK_TRUE, UINT64_MAX), "vkWaitForFences");

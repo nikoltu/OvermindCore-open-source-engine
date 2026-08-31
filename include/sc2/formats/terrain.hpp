@@ -30,6 +30,12 @@ struct TerrainQuantize {
 
 TerrainQuantize parse_terrain_quantize(const std::vector<uint8_t>& t3terrain_xml);
 
+struct TerrainUvTiling {
+    float u = 9.0f, v = 9.0f;
+    bool found = false;
+};
+TerrainUvTiling parse_terrain_uvtiling(const std::vector<uint8_t>& t3terrain_xml);
+
 std::string parse_terrain_tileset(const std::vector<uint8_t>& t3terrain_xml);
 
 std::vector<std::string> parse_terrain_textures(const std::vector<uint8_t>& t3terrain_xml);
@@ -73,14 +79,14 @@ Model build_terrain_mesh(const HeightMap& hm, const std::vector<uint8_t>& data,
 struct SyncHeightMap {
     uint32_t version = 0;
     uint32_t width = 0, height = 0;
-    std::vector<uint16_t> height_u16;
+    std::vector<int16_t> height_i16;
     std::vector<uint16_t> level;
-    bool empty() const { return width == 0 || height == 0 || height_u16.empty(); }
+    bool empty() const { return width == 0 || height == 0 || height_i16.empty(); }
     float world_at(uint32_t col, uint32_t row) const {
         if (empty()) return 0.0f;
         if (col >= width) col = width - 1;
         if (row >= height) row = height - 1;
-        return float(height_u16[size_t(row) * width + col]) / 256.0f;
+        return float(height_i16[size_t(row) * width + col]) / 256.0f;
     }
     static SyncHeightMap parse(const std::vector<uint8_t>& data);
 };
@@ -100,7 +106,6 @@ struct CliffMap;
 
 Model build_terrain_mesh_stepped(const CliffMap& cliff,
                                  const std::vector<float>& level_height, float cell = 1.0f,
-                                 uint32_t max_dim = 128,
                                  const std::vector<uint8_t>* ramp = nullptr, bool with_walls = true);
 
 struct TextureInfo {
@@ -142,10 +147,13 @@ struct TextureMask {
     uint32_t mask_w = 0, mask_h = 0;
     std::vector<uint8_t> texels;
     bool empty() const { return mask_w == 0 || mask_h == 0; }
-    bool planar_ok() const {
-        return mask_w >= 128 && mask_h >= 64 && mask_w % 128 == 0 && mask_h % 64 == 0 &&
-               texels.size() >= size_t(mask_w) * mask_h * 4;
+    uint32_t quad_w() const { return mask_w ? (mask_w + 127) / 128 : 0; }
+    uint32_t quad_h() const {
+        const uint32_t qw = quad_w();
+        if (qw == 0) return 0;
+        return uint32_t((texels.size() / 8 / 4096) / qw);
     }
+    bool planar_ok() const { return mask_w > 0 && quad_w() > 0 && quad_h() > 0; }
     uint8_t layer_weight(uint32_t layer, uint32_t x, uint32_t y) const;
     static TextureMask parse(const std::vector<uint8_t>& data);
 };

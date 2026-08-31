@@ -293,17 +293,6 @@ GroundImage composite_map_ground(const casc::Storage& store, const formats::Text
     return composite_ground_images(info, mask, imgs, uv_tiles);
 }
 
-GroundImage composite_retail_ground(const casc::Storage& store,
-                                    const std::vector<std::string>& layer_names,
-                                    const formats::TextureMask& mask, uint32_t uv_tiles) {
-    std::vector<ResolvedLayer> layers = resolve_map_layers(store, layer_names);
-    std::vector<LayerImage> imgs(layers.size());
-    for (size_t i = 0; i < layers.size(); ++i)
-        if (!layers[i].diffuse.empty())
-            decode_asset(store, layers[i].diffuse, imgs[i].w, imgs[i].h, imgs[i].rgba);
-    return composite_ground_images(formats::TextureInfo{}, mask, imgs, uv_tiles);
-}
-
 bool set_terrain_splat_gpu(formats::Model& m, const casc::Storage& store,
                            const std::vector<std::string>& layer_names,
                            const formats::TextureMask& mask, float extent_x, float extent_y) {

@@ -21,6 +21,7 @@ struct PlacedDoodad {
     float rotation = 0;
     float sx = 1, sy = 1, sz = 1;
     int variation = 0;
+    bool no_footprint = false;
 };
 
 struct PlacedPoint {
@@ -85,6 +86,9 @@ inline PlacedObjects parse_placed_objects(const std::vector<std::uint8_t>& objec
         pd.rotation = std::strtof(d->attr_or("Rotation", "0").c_str(), nullptr);
         detail::parse_vec3_or(d->attr_or("Scale", ""), pd.sx, pd.sy, pd.sz, 1.0f);
         pd.variation = std::atoi(d->attr_or("Variation", "0").c_str());
+        for (const core::XmlNode* f : d->elements("Flag"))
+            if (f->attr_or("Index", "") == "NoDoodadFootprint" && f->attr_or("Value", "") != "0")
+                pd.no_footprint = true;
         out.doodads.push_back(std::move(pd));
     }
     for (const core::XmlNode* pt : po->elements("ObjectPoint")) {

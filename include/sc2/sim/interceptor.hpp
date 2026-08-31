@@ -68,6 +68,7 @@ public:
                     }
                     ic.orders.clear();
                     ic.orders.push_back(Order{OrderType::Attack, Fixed(), Fixed(), target});
+                    ic.ever_ordered = true;
                 }
             } else {
                 for (std::uint32_t id : c.wing) {

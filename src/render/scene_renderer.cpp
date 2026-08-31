@@ -90,18 +90,21 @@ void SceneRenderer::apply_environment(Tunables& tun, const data::EnvLight& env) 
 void SceneRenderer::set_environment(const data::EnvLight& env) { apply_environment(tun_, env); }
 
 void SceneRenderer::one_time(const std::function<void(VkCommandBuffer)>& rec) {
-    VkCommandBufferAllocateInfo ab{VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
+    VkCommandBufferAllocateInfo ab{};
+    ab.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
     ab.commandPool = cmdPool_.get();
     ab.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
     ab.commandBufferCount = 1;
     VkCommandBuffer cb;
     check(vkAllocateCommandBuffers(dev_, &ab, &cb), "vkAllocateCommandBuffers(one_time)");
-    VkCommandBufferBeginInfo bi{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+    VkCommandBufferBeginInfo bi{};
+    bi.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
     bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
     check(vkBeginCommandBuffer(cb, &bi), "vkBeginCommandBuffer(one_time)");
     rec(cb);
     check(vkEndCommandBuffer(cb), "vkEndCommandBuffer(one_time)");
-    VkSubmitInfo si{VK_STRUCTURE_TYPE_SUBMIT_INFO};
+    VkSubmitInfo si{};
+    si.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
     si.commandBufferCount = 1;
     si.pCommandBuffers = &cb;
     check(vkQueueSubmit(queue_, 1, &si, VK_NULL_HANDLE), "vkQueueSubmit(one_time)");
@@ -117,7 +120,8 @@ int SceneRenderer::upload_texture(uint32_t w, uint32_t h, const std::vector<uint
     Buffer stg = make_buffer(pd_, dev_, rgba.size(), VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
                              const_cast<uint8_t*>(rgba.data()));
     one_time([&](VkCommandBuffer cb) {
-        VkImageMemoryBarrier b{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
+        VkImageMemoryBarrier b{};
+        b.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
         b.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
         b.newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
         b.image = img.img.get();
@@ -199,7 +203,8 @@ SceneRenderer::Mesh& SceneRenderer::ensure_mesh(const formats::Model& m) {
                             VK_BUFFER_USAGE_INDEX_BUFFER_BIT, tri.data());
     mesh.draw_set.assign(mesh.draws.size(), VK_NULL_HANDLE);
     for (size_t d = 0; d < mesh.draws.size(); ++d) {
-        VkDescriptorSetAllocateInfo dsa{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
+        VkDescriptorSetAllocateInfo dsa{};
+        dsa.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
         dsa.descriptorPool = matPool_.get();
         dsa.descriptorSetCount = 1;
         VkDescriptorSetLayout tl = texLayout_.get();
@@ -211,7 +216,7 @@ SceneRenderer::Mesh& SceneRenderer::ensure_mesh(const formats::Model& m) {
         for (int s = 0; s < 4; ++s) {
             dii[s] = {sampler_.get(), textures_[mesh.draw_tex[d][s]].view.get(),
                       VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL};
-            w[s] = VkWriteDescriptorSet{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
+            w[s] = vk_init<VkWriteDescriptorSet>(VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET);
             w[s].dstSet = mesh.draw_set[d];
             w[s].dstBinding = uint32_t(s);
             w[s].descriptorCount = 1;
@@ -272,7 +277,8 @@ SceneRenderer::TerrainSplat* SceneRenderer::ensure_splat(const formats::Model& m
         Buffer stg = make_buffer(pd_, dev_, len, VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
                                  const_cast<uint8_t*>(bytes));
         one_time([&](VkCommandBuffer cb) {
-            VkImageMemoryBarrier b{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
+            VkImageMemoryBarrier b{};
+            b.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
             b.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
             b.newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
             b.image = img.img.get();
@@ -301,7 +307,9 @@ SceneRenderer::TerrainSplat* SceneRenderer::ensure_splat(const formats::Model& m
                                  m.splat_weights.data(),
                                  size_t(m.splat_w) * m.splat_h * kLayers);
 
-    VkDescriptorSetAllocateInfo dsa{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
+    VkDescriptorSetAllocateInfo dsa{};
+
+    dsa.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
     dsa.descriptorPool = splatPool_.get();
     dsa.descriptorSetCount = 1;
     VkDescriptorSetLayout sl = splatLayout_.get();
@@ -312,7 +320,7 @@ SceneRenderer::TerrainSplat* SceneRenderer::ensure_splat(const formats::Model& m
         {sampler_.get(), ts.weight_arr.view.get(), VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL}};
     VkWriteDescriptorSet w[2];
     for (int s = 0; s < 2; ++s) {
-        w[s] = VkWriteDescriptorSet{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
+        w[s] = vk_init<VkWriteDescriptorSet>(VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET);
         w[s].dstSet = ts.set;
         w[s].dstBinding = uint32_t(s);
         w[s].descriptorCount = 1;
@@ -332,14 +340,16 @@ SceneRenderer::SceneRenderer(VkPhysicalDevice pd, VkDevice dev, VkQueue queue,
       texture_root_(std::move(texture_root)), tun_(tun) {
     tun_.light_dir = normalize(tun_.light_dir);
 
-    VkCommandPoolCreateInfo cpi{VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO};
+    VkCommandPoolCreateInfo cpi{};
+    cpi.sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO;
     cpi.flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
     cpi.queueFamilyIndex = gfx_family_;
     VkCommandPool rawCmdPool = VK_NULL_HANDLE;
     check(vkCreateCommandPool(dev_, &cpi, nullptr, &rawCmdPool), "vkCreateCommandPool(scene)");
     cmdPool_ = Unique<VkCommandPool>(rawCmdPool, [dev](VkCommandPool p) { vkDestroyCommandPool(dev, p, nullptr); });
 
-    VkSamplerCreateInfo smi{VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO};
+    VkSamplerCreateInfo smi{};
+    smi.sType = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO;
     smi.magFilter = smi.minFilter = VK_FILTER_LINEAR;
     smi.addressModeU = smi.addressModeV = smi.addressModeW = VK_SAMPLER_ADDRESS_MODE_REPEAT;
     smi.maxLod = 1.0f;
@@ -347,7 +357,9 @@ SceneRenderer::SceneRenderer(VkPhysicalDevice pd, VkDevice dev, VkQueue queue,
     check(vkCreateSampler(dev_, &smi, nullptr, &rawSampler), "vkCreateSampler");
     sampler_ = Unique<VkSampler>(rawSampler, [dev](VkSampler s) { vkDestroySampler(dev, s, nullptr); });
 
-    VkSamplerCreateInfo ssmi{VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO};
+    VkSamplerCreateInfo ssmi{};
+
+    ssmi.sType = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO;
     ssmi.magFilter = ssmi.minFilter = VK_FILTER_NEAREST;
     ssmi.addressModeU = ssmi.addressModeV = ssmi.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_BORDER;
     ssmi.borderColor = VK_BORDER_COLOR_FLOAT_OPAQUE_WHITE;
@@ -363,7 +375,8 @@ SceneRenderer::SceneRenderer(VkPhysicalDevice pd, VkDevice dev, VkQueue queue,
         texb[s].descriptorCount = 1;
         texb[s].stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
     }
-    VkDescriptorSetLayoutCreateInfo texli{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
+    VkDescriptorSetLayoutCreateInfo texli{};
+    texli.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
     texli.bindingCount = 4;
     texli.pBindings = texb;
     VkDescriptorSetLayout rawTexLayout = VK_NULL_HANDLE;
@@ -375,7 +388,8 @@ SceneRenderer::SceneRenderer(VkPhysicalDevice pd, VkDevice dev, VkQueue queue,
     boneb.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
     boneb.descriptorCount = 1;
     boneb.stageFlags = VK_SHADER_STAGE_VERTEX_BIT;
-    VkDescriptorSetLayoutCreateInfo boneli{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
+    VkDescriptorSetLayoutCreateInfo boneli{};
+    boneli.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
     boneli.bindingCount = 1;
     boneli.pBindings = &boneb;
     VkDescriptorSetLayout rawBoneLayout = VK_NULL_HANDLE;
@@ -391,7 +405,8 @@ SceneRenderer::SceneRenderer(VkPhysicalDevice pd, VkDevice dev, VkQueue queue,
     gb[1].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
     gb[1].descriptorCount = 1;
     gb[1].stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
-    VkDescriptorSetLayoutCreateInfo gli{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
+    VkDescriptorSetLayoutCreateInfo gli{};
+    gli.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
     gli.bindingCount = 2;
     gli.pBindings = gb;
     VkDescriptorSetLayout rawGlobalLayout = VK_NULL_HANDLE;
@@ -403,7 +418,8 @@ SceneRenderer::SceneRenderer(VkPhysicalDevice pd, VkDevice dev, VkQueue queue,
     pb.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
     pb.descriptorCount = 1;
     pb.stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
-    VkDescriptorSetLayoutCreateInfo pli2{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
+    VkDescriptorSetLayoutCreateInfo pli2{};
+    pli2.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
     pli2.bindingCount = 1;
     pli2.pBindings = &pb;
     VkDescriptorSetLayout rawPartLayout = VK_NULL_HANDLE;
@@ -415,7 +431,8 @@ SceneRenderer::SceneRenderer(VkPhysicalDevice pd, VkDevice dev, VkQueue queue,
     tmb.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
     tmb.descriptorCount = 1;
     tmb.stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
-    VkDescriptorSetLayoutCreateInfo tmli{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
+    VkDescriptorSetLayoutCreateInfo tmli{};
+    tmli.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
     tmli.bindingCount = 1;
     tmli.pBindings = &tmb;
     VkDescriptorSetLayout rawTmLayout = VK_NULL_HANDLE;
@@ -439,7 +456,8 @@ SceneRenderer::SceneRenderer(VkPhysicalDevice pd, VkDevice dev, VkQueue queue,
 
     VkDescriptorPoolSize gpsizes[2] = {{VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1},
                                        {VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1}};
-    VkDescriptorPoolCreateInfo gdpi{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
+    VkDescriptorPoolCreateInfo gdpi{};
+    gdpi.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
     gdpi.maxSets = 1;
     gdpi.poolSizeCount = 2;
     gdpi.pPoolSizes = gpsizes;
@@ -447,7 +465,8 @@ SceneRenderer::SceneRenderer(VkPhysicalDevice pd, VkDevice dev, VkQueue queue,
     check(vkCreateDescriptorPool(dev_, &gdpi, nullptr, &rawGlobalPool), "vkCreateDescriptorPool(global)");
     globalPool_ = Unique<VkDescriptorPool>(rawGlobalPool, [dev](VkDescriptorPool p) { vkDestroyDescriptorPool(dev, p, nullptr); });
     {
-        VkDescriptorSetAllocateInfo gdsa{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
+        VkDescriptorSetAllocateInfo gdsa{};
+        gdsa.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
         gdsa.descriptorPool = rawGlobalPool;
         gdsa.descriptorSetCount = 1;
         VkDescriptorSetLayout gl = globalLayout_.get();
@@ -457,13 +476,13 @@ SceneRenderer::SceneRenderer(VkPhysicalDevice pd, VkDevice dev, VkQueue queue,
         VkDescriptorImageInfo smi2{shadowSampler_.get(), shadowMap_.view.get(),
                                    VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL};
         VkWriteDescriptorSet gw[2]{};
-        gw[0] = VkWriteDescriptorSet{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
+        gw[0] = vk_init<VkWriteDescriptorSet>(VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET);
         gw[0].dstSet = global_set_;
         gw[0].dstBinding = 0;
         gw[0].descriptorCount = 1;
         gw[0].descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
         gw[0].pBufferInfo = &ubi;
-        gw[1] = VkWriteDescriptorSet{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
+        gw[1] = vk_init<VkWriteDescriptorSet>(VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET);
         gw[1].dstSet = global_set_;
         gw[1].dstBinding = 1;
         gw[1].descriptorCount = 1;
@@ -474,7 +493,8 @@ SceneRenderer::SceneRenderer(VkPhysicalDevice pd, VkDevice dev, VkQueue queue,
 
     const uint32_t kMaxMeshSets = 512, kMaxBoneSets = 4096, kMaxPartSets = 256;
     VkDescriptorPoolSize matSize{VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 4 * kMaxMeshSets};
-    VkDescriptorPoolCreateInfo matdpi{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
+    VkDescriptorPoolCreateInfo matdpi{};
+    matdpi.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
     matdpi.maxSets = kMaxMeshSets;
     matdpi.poolSizeCount = 1;
     matdpi.pPoolSizes = &matSize;
@@ -483,7 +503,8 @@ SceneRenderer::SceneRenderer(VkPhysicalDevice pd, VkDevice dev, VkQueue queue,
     matPool_ = Unique<VkDescriptorPool>(rawMatPool, [dev](VkDescriptorPool p) { vkDestroyDescriptorPool(dev, p, nullptr); });
 
     VkDescriptorPoolSize boneSize{VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, kMaxBoneSets};
-    VkDescriptorPoolCreateInfo bonedpi{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
+    VkDescriptorPoolCreateInfo bonedpi{};
+    bonedpi.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
     bonedpi.maxSets = kMaxBoneSets;
     bonedpi.poolSizeCount = 1;
     bonedpi.pPoolSizes = &boneSize;
@@ -492,7 +513,8 @@ SceneRenderer::SceneRenderer(VkPhysicalDevice pd, VkDevice dev, VkQueue queue,
     bonePool_ = Unique<VkDescriptorPool>(rawBonePool, [dev](VkDescriptorPool p) { vkDestroyDescriptorPool(dev, p, nullptr); });
 
     VkDescriptorPoolSize partSize{VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, kMaxPartSets};
-    VkDescriptorPoolCreateInfo partdpi{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
+    VkDescriptorPoolCreateInfo partdpi{};
+    partdpi.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
     partdpi.maxSets = kMaxPartSets;
     partdpi.poolSizeCount = 1;
     partdpi.pPoolSizes = &partSize;
@@ -536,7 +558,8 @@ SceneRenderer::SceneRenderer(VkPhysicalDevice pd, VkDevice dev, VkQueue queue,
     sdep.dstStageMask = VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT;
     sdep.srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
     sdep.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
-    VkRenderPassCreateInfo rpi{VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO};
+    VkRenderPassCreateInfo rpi{};
+    rpi.sType = VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO;
     rpi.attachmentCount = 2;
     rpi.pAttachments = att;
     rpi.subpassCount = 1;
@@ -548,7 +571,8 @@ SceneRenderer::SceneRenderer(VkPhysicalDevice pd, VkDevice dev, VkQueue queue,
     litPass_ = Unique<VkRenderPass>(rawPass, [dev](VkRenderPass p) { vkDestroyRenderPass(dev, p, nullptr); });
     {
         VkImageView fbViews[2] = {hdrColor_.view.get(), depth_.view.get()};
-        VkFramebufferCreateInfo fbi{VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO};
+        VkFramebufferCreateInfo fbi{};
+        fbi.sType = VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO;
         fbi.renderPass = rawPass;
         fbi.attachmentCount = 2;
         fbi.pAttachments = fbViews;
@@ -562,7 +586,8 @@ SceneRenderer::SceneRenderer(VkPhysicalDevice pd, VkDevice dev, VkQueue queue,
 
     VkPushConstantRange pcr{VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0, 80};
     VkDescriptorSetLayout set_layouts[3] = {texLayout_.get(), boneLayout_.get(), globalLayout_.get()};
-    VkPipelineLayoutCreateInfo pli{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
+    VkPipelineLayoutCreateInfo pli{};
+    pli.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
     pli.setLayoutCount = 3;
     pli.pSetLayouts = set_layouts;
     pli.pushConstantRangeCount = 1;
@@ -577,26 +602,31 @@ SceneRenderer::SceneRenderer(VkPhysicalDevice pd, VkDevice dev, VkQueue queue,
                                                 {2, 0, VK_FORMAT_R32G32_SFLOAT, 24},
                                                 {3, 0, VK_FORMAT_R32G32B32A32_SFLOAT, 32},
                                                 {4, 0, VK_FORMAT_R32G32B32A32_UINT, 48}};
-    VkPipelineVertexInputStateCreateInfo vin{VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO};
+    VkPipelineVertexInputStateCreateInfo vin{};
+    vin.sType = VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO;
     vin.vertexBindingDescriptionCount = 1;
     vin.pVertexBindingDescriptions = &vib;
     vin.vertexAttributeDescriptionCount = 5;
     vin.pVertexAttributeDescriptions = via;
-    VkPipelineInputAssemblyStateCreateInfo ia{VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO};
+    VkPipelineInputAssemblyStateCreateInfo ia{};
+    ia.sType = VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO;
     ia.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
     VkViewport vp{0, 0, float(width_), float(height_), 0, 1};
     VkRect2D scis{{0, 0}, {width_, height_}};
-    VkPipelineViewportStateCreateInfo vps{VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO};
+    VkPipelineViewportStateCreateInfo vps{};
+    vps.sType = VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO;
     vps.viewportCount = 1;
     vps.pViewports = &vp;
     vps.scissorCount = 1;
     vps.pScissors = &scis;
-    VkPipelineRasterizationStateCreateInfo rs{VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO};
+    VkPipelineRasterizationStateCreateInfo rs{};
+    rs.sType = VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO;
     rs.polygonMode = VK_POLYGON_MODE_FILL;
     rs.cullMode = VK_CULL_MODE_NONE;
     rs.frontFace = VK_FRONT_FACE_COUNTER_CLOCKWISE;
     rs.lineWidth = 1.0f;
-    VkPipelineMultisampleStateCreateInfo ms{VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO};
+    VkPipelineMultisampleStateCreateInfo ms{};
+    ms.sType = VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO;
     ms.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
 
     vs_ = make_shader(dev_, kSceneVertSpv, sizeof(kSceneVertSpv));
@@ -611,17 +641,20 @@ SceneRenderer::SceneRenderer(VkPhysicalDevice pd, VkDevice dev, VkQueue queue,
         stages[1].stage = VK_SHADER_STAGE_FRAGMENT_BIT;
         stages[1].module = fs_.get();
         stages[1].pName = "main";
-        VkPipelineDepthStencilStateCreateInfo ds{VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO};
+        VkPipelineDepthStencilStateCreateInfo ds{};
+        ds.sType = VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO;
         ds.depthTestEnable = VK_TRUE;
         ds.depthWriteEnable = VK_TRUE;
         ds.depthCompareOp = VK_COMPARE_OP_LESS;
         VkPipelineColorBlendAttachmentState cba{};
         cba.colorWriteMask = VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT |
                              VK_COLOR_COMPONENT_B_BIT | VK_COLOR_COMPONENT_A_BIT;
-        VkPipelineColorBlendStateCreateInfo cb{VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO};
+        VkPipelineColorBlendStateCreateInfo cb{};
+        cb.sType = VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO;
         cb.attachmentCount = 1;
         cb.pAttachments = &cba;
-        VkGraphicsPipelineCreateInfo gpi{VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO};
+        VkGraphicsPipelineCreateInfo gpi{};
+        gpi.sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO;
         gpi.stageCount = 2;
         gpi.pStages = stages;
         gpi.pVertexInputState = &vin;
@@ -646,7 +679,8 @@ SceneRenderer::SceneRenderer(VkPhysicalDevice pd, VkDevice dev, VkQueue queue,
             sb[s].descriptorCount = 1;
             sb[s].stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
         }
-        VkDescriptorSetLayoutCreateInfo sli{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
+        VkDescriptorSetLayoutCreateInfo sli{};
+        sli.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
         sli.bindingCount = 2;
         sli.pBindings = sb;
         VkDescriptorSetLayout rawSplat = VK_NULL_HANDLE;
@@ -654,7 +688,8 @@ SceneRenderer::SceneRenderer(VkPhysicalDevice pd, VkDevice dev, VkQueue queue,
         splatLayout_ = Unique<VkDescriptorSetLayout>(rawSplat, [dev](VkDescriptorSetLayout l) { vkDestroyDescriptorSetLayout(dev, l, nullptr); });
 
         VkDescriptorSetLayout splat_sets[3] = {splatLayout_.get(), boneLayout_.get(), globalLayout_.get()};
-        VkPipelineLayoutCreateInfo spli{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
+        VkPipelineLayoutCreateInfo spli{};
+        spli.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
         spli.setLayoutCount = 3;
         spli.pSetLayouts = splat_sets;
         spli.pushConstantRangeCount = 1;
@@ -673,17 +708,20 @@ SceneRenderer::SceneRenderer(VkPhysicalDevice pd, VkDevice dev, VkQueue queue,
         stages[1].stage = VK_SHADER_STAGE_FRAGMENT_BIT;
         stages[1].module = splatfs_.get();
         stages[1].pName = "main";
-        VkPipelineDepthStencilStateCreateInfo ds{VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO};
+        VkPipelineDepthStencilStateCreateInfo ds{};
+        ds.sType = VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO;
         ds.depthTestEnable = VK_TRUE;
         ds.depthWriteEnable = VK_TRUE;
         ds.depthCompareOp = VK_COMPARE_OP_LESS;
         VkPipelineColorBlendAttachmentState cba{};
         cba.colorWriteMask = VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT |
                              VK_COLOR_COMPONENT_B_BIT | VK_COLOR_COMPONENT_A_BIT;
-        VkPipelineColorBlendStateCreateInfo cb{VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO};
+        VkPipelineColorBlendStateCreateInfo cb{};
+        cb.sType = VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO;
         cb.attachmentCount = 1;
         cb.pAttachments = &cba;
-        VkGraphicsPipelineCreateInfo gpi{VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO};
+        VkGraphicsPipelineCreateInfo gpi{};
+        gpi.sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO;
         gpi.stageCount = 2;
         gpi.pStages = stages;
         gpi.pVertexInputState = &vin;
@@ -700,7 +738,8 @@ SceneRenderer::SceneRenderer(VkPhysicalDevice pd, VkDevice dev, VkQueue queue,
         splatPipeline_ = Unique<VkPipeline>(rawPipeline, [dev](VkPipeline p) { vkDestroyPipeline(dev, p, nullptr); });
 
         VkDescriptorPoolSize sp{VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 8};
-        VkDescriptorPoolCreateInfo spci{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
+        VkDescriptorPoolCreateInfo spci{};
+        spci.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
         spci.maxSets = 4;
         spci.poolSizeCount = 1;
         spci.pPoolSizes = &sp;
@@ -730,7 +769,8 @@ SceneRenderer::SceneRenderer(VkPhysicalDevice pd, VkDevice dev, VkQueue queue,
     ssdep.dstStageMask = VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT;
     ssdep.srcAccessMask = VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
     ssdep.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
-    VkRenderPassCreateInfo srpi{VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO};
+    VkRenderPassCreateInfo srpi{};
+    srpi.sType = VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO;
     srpi.attachmentCount = 1;
     srpi.pAttachments = &satt;
     srpi.subpassCount = 1;
@@ -742,7 +782,8 @@ SceneRenderer::SceneRenderer(VkPhysicalDevice pd, VkDevice dev, VkQueue queue,
     shadowPass_ = Unique<VkRenderPass>(rawShadowPass, [dev](VkRenderPass p) { vkDestroyRenderPass(dev, p, nullptr); });
     {
         VkImageView sfbView = shadowMap_.view.get();
-        VkFramebufferCreateInfo sfbi{VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO};
+        VkFramebufferCreateInfo sfbi{};
+        sfbi.sType = VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO;
         sfbi.renderPass = rawShadowPass;
         sfbi.attachmentCount = 1;
         sfbi.pAttachments = &sfbView;
@@ -762,12 +803,14 @@ SceneRenderer::SceneRenderer(VkPhysicalDevice pd, VkDevice dev, VkQueue queue,
         sstage.pName = "main";
         VkViewport svp{0, 0, float(tun_.shadow_dim), float(tun_.shadow_dim), 0, 1};
         VkRect2D sscis{{0, 0}, {tun_.shadow_dim, tun_.shadow_dim}};
-        VkPipelineViewportStateCreateInfo svps{VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO};
+        VkPipelineViewportStateCreateInfo svps{};
+        svps.sType = VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO;
         svps.viewportCount = 1;
         svps.pViewports = &svp;
         svps.scissorCount = 1;
         svps.pScissors = &sscis;
-        VkPipelineRasterizationStateCreateInfo srs{VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO};
+        VkPipelineRasterizationStateCreateInfo srs{};
+        srs.sType = VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO;
         srs.polygonMode = VK_POLYGON_MODE_FILL;
         srs.cullMode = VK_CULL_MODE_NONE;
         srs.frontFace = VK_FRONT_FACE_COUNTER_CLOCKWISE;
@@ -775,13 +818,16 @@ SceneRenderer::SceneRenderer(VkPhysicalDevice pd, VkDevice dev, VkQueue queue,
         srs.depthBiasEnable = VK_TRUE;
         srs.depthBiasConstantFactor = tun_.raster_const;
         srs.depthBiasSlopeFactor = tun_.raster_slope;
-        VkPipelineDepthStencilStateCreateInfo sds{VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO};
+        VkPipelineDepthStencilStateCreateInfo sds{};
+        sds.sType = VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO;
         sds.depthTestEnable = VK_TRUE;
         sds.depthWriteEnable = VK_TRUE;
         sds.depthCompareOp = VK_COMPARE_OP_LESS;
-        VkPipelineColorBlendStateCreateInfo scb{VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO};
+        VkPipelineColorBlendStateCreateInfo scb{};
+        scb.sType = VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO;
         scb.attachmentCount = 0;
-        VkGraphicsPipelineCreateInfo sgpi{VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO};
+        VkGraphicsPipelineCreateInfo sgpi{};
+        sgpi.sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO;
         sgpi.stageCount = 1;
         sgpi.pStages = &sstage;
         sgpi.pVertexInputState = &vin;
@@ -800,7 +846,8 @@ SceneRenderer::SceneRenderer(VkPhysicalDevice pd, VkDevice dev, VkQueue queue,
 
     {
         VkPushConstantRange ppcr{VK_SHADER_STAGE_VERTEX_BIT, 0, 64};
-        VkPipelineLayoutCreateInfo ppli{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
+        VkPipelineLayoutCreateInfo ppli{};
+        ppli.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
         ppli.setLayoutCount = 1;
         VkDescriptorSetLayout ppl = partLayout_.get();
         ppli.pSetLayouts = &ppl;
@@ -824,7 +871,8 @@ SceneRenderer::SceneRenderer(VkPhysicalDevice pd, VkDevice dev, VkQueue queue,
         VkVertexInputAttributeDescription pvia[3] = {{0, 0, VK_FORMAT_R32G32B32_SFLOAT, 0},
                                                      {1, 0, VK_FORMAT_R32G32_SFLOAT, 12},
                                                      {2, 0, VK_FORMAT_R32G32B32A32_SFLOAT, 20}};
-        VkPipelineVertexInputStateCreateInfo pvin{VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO};
+        VkPipelineVertexInputStateCreateInfo pvin{};
+        pvin.sType = VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO;
         pvin.vertexBindingDescriptionCount = 1;
         pvin.pVertexBindingDescriptions = &pvib;
         pvin.vertexAttributeDescriptionCount = 3;
@@ -839,14 +887,17 @@ SceneRenderer::SceneRenderer(VkPhysicalDevice pd, VkDevice dev, VkQueue queue,
         pcba.alphaBlendOp = VK_BLEND_OP_ADD;
         pcba.colorWriteMask = VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT |
                               VK_COLOR_COMPONENT_B_BIT | VK_COLOR_COMPONENT_A_BIT;
-        VkPipelineColorBlendStateCreateInfo pcb{VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO};
+        VkPipelineColorBlendStateCreateInfo pcb{};
+        pcb.sType = VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO;
         pcb.attachmentCount = 1;
         pcb.pAttachments = &pcba;
-        VkPipelineDepthStencilStateCreateInfo pds{VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO};
+        VkPipelineDepthStencilStateCreateInfo pds{};
+        pds.sType = VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO;
         pds.depthTestEnable = VK_TRUE;
         pds.depthWriteEnable = VK_FALSE;
         pds.depthCompareOp = VK_COMPARE_OP_LESS_OR_EQUAL;
-        VkGraphicsPipelineCreateInfo pgpi{VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO};
+        VkGraphicsPipelineCreateInfo pgpi{};
+        pgpi.sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO;
         pgpi.stageCount = 2;
         pgpi.pStages = pstages;
         pgpi.pVertexInputState = &pvin;
@@ -877,7 +928,8 @@ SceneRenderer::SceneRenderer(VkPhysicalDevice pd, VkDevice dev, VkQueue queue,
     tmsubp.pipelineBindPoint = VK_PIPELINE_BIND_POINT_GRAPHICS;
     tmsubp.colorAttachmentCount = 1;
     tmsubp.pColorAttachments = &tmref;
-    VkRenderPassCreateInfo tmrpi{VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO};
+    VkRenderPassCreateInfo tmrpi{};
+    tmrpi.sType = VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO;
     tmrpi.attachmentCount = 1;
     tmrpi.pAttachments = &tmatt;
     tmrpi.subpassCount = 1;
@@ -887,7 +939,8 @@ SceneRenderer::SceneRenderer(VkPhysicalDevice pd, VkDevice dev, VkQueue queue,
     tmPass_ = Unique<VkRenderPass>(rawTmPass, [dev](VkRenderPass p) { vkDestroyRenderPass(dev, p, nullptr); });
     {
         VkImageView tmView = ldrColor_.view.get();
-        VkFramebufferCreateInfo tmfbi{VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO};
+        VkFramebufferCreateInfo tmfbi{};
+        tmfbi.sType = VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO;
         tmfbi.renderPass = rawTmPass;
         tmfbi.attachmentCount = 1;
         tmfbi.pAttachments = &tmView;
@@ -900,21 +953,24 @@ SceneRenderer::SceneRenderer(VkPhysicalDevice pd, VkDevice dev, VkQueue queue,
     }
     {
         VkDescriptorPoolSize tmpsize{VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1};
-        VkDescriptorPoolCreateInfo tmdpi{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
+        VkDescriptorPoolCreateInfo tmdpi{};
+        tmdpi.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
         tmdpi.maxSets = 1;
         tmdpi.poolSizeCount = 1;
         tmdpi.pPoolSizes = &tmpsize;
         VkDescriptorPool rawTmPool = VK_NULL_HANDLE;
         check(vkCreateDescriptorPool(dev_, &tmdpi, nullptr, &rawTmPool), "vkCreateDescriptorPool(tonemap)");
         tmPool_ = Unique<VkDescriptorPool>(rawTmPool, [dev](VkDescriptorPool p) { vkDestroyDescriptorPool(dev, p, nullptr); });
-        VkDescriptorSetAllocateInfo tmdsa{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
+        VkDescriptorSetAllocateInfo tmdsa{};
+        tmdsa.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
         tmdsa.descriptorPool = rawTmPool;
         tmdsa.descriptorSetCount = 1;
         VkDescriptorSetLayout tml = tmLayout_.get();
         tmdsa.pSetLayouts = &tml;
         check(vkAllocateDescriptorSets(dev_, &tmdsa, &tm_set_), "vkAllocateDescriptorSets(tonemap)");
         VkDescriptorImageInfo dii{sampler_.get(), hdrColor_.view.get(), VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL};
-        VkWriteDescriptorSet w{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
+        VkWriteDescriptorSet w{};
+        w.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
         w.dstSet = tm_set_;
         w.dstBinding = 0;
         w.descriptorCount = 1;
@@ -924,7 +980,8 @@ SceneRenderer::SceneRenderer(VkPhysicalDevice pd, VkDevice dev, VkQueue queue,
     }
     {
         VkPushConstantRange tmpcr{VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(TonemapPC)};
-        VkPipelineLayoutCreateInfo tmpli{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
+        VkPipelineLayoutCreateInfo tmpli{};
+        tmpli.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
         tmpli.setLayoutCount = 1;
         VkDescriptorSetLayout tml = tmLayout_.get();
         tmpli.pSetLayouts = &tml;
@@ -944,14 +1001,17 @@ SceneRenderer::SceneRenderer(VkPhysicalDevice pd, VkDevice dev, VkQueue queue,
         tmstages[1].stage = VK_SHADER_STAGE_FRAGMENT_BIT;
         tmstages[1].module = tmfs_.get();
         tmstages[1].pName = "main";
-        VkPipelineVertexInputStateCreateInfo tmvin{VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO};
+        VkPipelineVertexInputStateCreateInfo tmvin{};
+        tmvin.sType = VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO;
         VkPipelineColorBlendAttachmentState tmcba{};
         tmcba.colorWriteMask = VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT |
                                VK_COLOR_COMPONENT_B_BIT | VK_COLOR_COMPONENT_A_BIT;
-        VkPipelineColorBlendStateCreateInfo tmcb{VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO};
+        VkPipelineColorBlendStateCreateInfo tmcb{};
+        tmcb.sType = VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO;
         tmcb.attachmentCount = 1;
         tmcb.pAttachments = &tmcba;
-        VkGraphicsPipelineCreateInfo tmgpi{VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO};
+        VkGraphicsPipelineCreateInfo tmgpi{};
+        tmgpi.sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO;
         tmgpi.stageCount = 2;
         tmgpi.pStages = tmstages;
         tmgpi.pVertexInputState = &tmvin;
@@ -1074,7 +1134,8 @@ void SceneRenderer::record(VkCommandBuffer cmd, const std::vector<const SceneIns
         }
         Buffer& slot = bonebufs_[bidx];
         ++bidx;
-        VkDescriptorSetAllocateInfo dsa{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
+        VkDescriptorSetAllocateInfo dsa{};
+        dsa.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
         dsa.descriptorPool = bonePool_.get();
         dsa.descriptorSetCount = 1;
         VkDescriptorSetLayout bl = boneLayout_.get();
@@ -1082,7 +1143,8 @@ void SceneRenderer::record(VkCommandBuffer cmd, const std::vector<const SceneIns
         VkDescriptorSet set = VK_NULL_HANDLE;
         check(vkAllocateDescriptorSets(dev_, &dsa, &set), "vkAllocateDescriptorSets(bone)");
         VkDescriptorBufferInfo bdi{slot.buf.get(), 0, VK_WHOLE_SIZE};
-        VkWriteDescriptorSet bw{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
+        VkWriteDescriptorSet bw{};
+        bw.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
         bw.dstSet = set;
         bw.dstBinding = 0;
         bw.descriptorCount = 1;
@@ -1122,7 +1184,8 @@ void SceneRenderer::record(VkCommandBuffer cmd, const std::vector<const SceneIns
         vkResetDescriptorPool(dev_, partPool_.get(), 0);
         part_set.assign(pgroups.size(), VK_NULL_HANDLE);
         for (size_t g = 0; g < pgroups.size(); ++g) {
-            VkDescriptorSetAllocateInfo dsa{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
+            VkDescriptorSetAllocateInfo dsa{};
+            dsa.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
             dsa.descriptorPool = partPool_.get();
             dsa.descriptorSetCount = 1;
             VkDescriptorSetLayout pl = partLayout_.get();
@@ -1131,7 +1194,8 @@ void SceneRenderer::record(VkCommandBuffer cmd, const std::vector<const SceneIns
             int ti = pgroups[g].tex;
             if (ti < 0 || ti >= int(textures_.size())) ti = kDefaultWhite;
             VkDescriptorImageInfo dii{sampler_.get(), textures_[ti].view.get(), VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL};
-            VkWriteDescriptorSet w{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
+            VkWriteDescriptorSet w{};
+            w.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
             w.dstSet = part_set[g];
             w.dstBinding = 0;
             w.descriptorCount = 1;
@@ -1143,7 +1207,8 @@ void SceneRenderer::record(VkCommandBuffer cmd, const std::vector<const SceneIns
 
     VkClearValue sclear;
     sclear.depthStencil = {1.0f, 0};
-    VkRenderPassBeginInfo srbi{VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO};
+    VkRenderPassBeginInfo srbi{};
+    srbi.sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO;
     srbi.renderPass = shadowPass_.get();
     srbi.framebuffer = shadowFb_.get();
     srbi.renderArea = {{0, 0}, {tun_.shadow_dim, tun_.shadow_dim}};
@@ -1173,7 +1238,8 @@ void SceneRenderer::record(VkCommandBuffer cmd, const std::vector<const SceneIns
     VkClearValue clears[2];
     clears[0].color = {{0.06f, 0.07f, 0.09f, 1.0f}};
     clears[1].depthStencil = {1.0f, 0};
-    VkRenderPassBeginInfo rbi{VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO};
+    VkRenderPassBeginInfo rbi{};
+    rbi.sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO;
     rbi.renderPass = litPass_.get();
     rbi.framebuffer = litFb_.get();
     rbi.renderArea = {{0, 0}, {width_, height_}};
@@ -1241,7 +1307,8 @@ void SceneRenderer::record(VkCommandBuffer cmd, const std::vector<const SceneIns
     vkCmdEndRenderPass(cmd);
 
     TonemapPC tm{tun_.exposure, tun_.curve};
-    VkRenderPassBeginInfo tmrbi{VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO};
+    VkRenderPassBeginInfo tmrbi{};
+    tmrbi.sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO;
     tmrbi.renderPass = tmPass_.get();
     tmrbi.framebuffer = tmFb_.get();
     tmrbi.renderArea = {{0, 0}, {width_, height_}};

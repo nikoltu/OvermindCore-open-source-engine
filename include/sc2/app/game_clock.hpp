@@ -34,10 +34,10 @@ public:
     }
     static double multiplier(Speed s) {
         switch (s) {
-            case Speed::Slower: return 0.5;
-            case Speed::Slow: return 0.75;
+            case Speed::Slower: return 0.6;
+            case Speed::Slow: return 0.8;
             case Speed::Normal: return 1.0;
-            case Speed::Fast: return 1.21;
+            case Speed::Fast: return 1.2;
             case Speed::Faster: return 1.4;
         }
         return 1.0;

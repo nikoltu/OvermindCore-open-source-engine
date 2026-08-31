@@ -1,17 +1,20 @@
 #pragma once
 
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <cstdlib>
 #include <functional>
 #include <map>
 #include <optional>
+#include <set>
 #include <string>
 #include <unordered_map>
 #include <utility>
 #include <vector>
 
 #include "sc2/core/xml.hpp"
+#include "sc2/data/authored.hpp"
 #include "sc2/data/strings.hpp"
 
 namespace sc2::casc {
@@ -43,6 +46,11 @@ public:
 
     void load_files(const casc::Storage& store,
                     const std::vector<std::string>& basenames);
+
+    const std::vector<std::string>& load_skips() const { return load_skips_; }
+
+    static const std::vector<std::string>& unlisted_families() { return unlisted_families_; }
+    static void clear_unlisted_families() { unlisted_families_.clear(); }
 
     void load_strings(const casc::Storage& store);
 
@@ -81,18 +89,10 @@ public:
                                          const std::string& id,
                                          const std::string& field) const;
 
-    std::vector<std::string> array_links_legacy(const std::string& family,
-                                                const std::string& id,
-                                                const std::string& field) const;
-
     int own_declaration_count(const std::string& family, const std::string& id) const {
         const Entry* e = find(family, id);
         return e ? int(e->decl_seen) : 0;
     }
-
-    std::vector<std::string> array_links_twomode(const std::string& family,
-                                                 const std::string& id,
-                                                 const std::string& field) const;
 
     static std::string family_of(const std::string& tag);
 
@@ -124,8 +124,28 @@ public:
     std::string ability_command_requirement(const std::string& abil_id,
                                             const std::string& cmd_index) const;
 
+    struct CommandCardSlot {
+        int index = -1;
+        std::string type;
+        std::string ability;
+        std::string command;
+        std::string face;
+        std::string submenu_id;
+        std::string requirements;
+        int row = -1;
+        int col = -1;
+    };
+    struct CommandCardLayout {
+        int index = -1;
+        std::string card_id;
+        std::vector<CommandCardSlot> slots;
+    };
+    std::vector<CommandCardLayout> unit_command_cards(const std::string& unit_id) const;
+
     std::vector<std::pair<std::string, std::string>>
     unit_ability_commands(const std::string& unit_id) const;
+
+    std::string cabil_effect_link(const std::string& abil_id) const;
 
     std::optional<std::string> button_icon(const std::string& button_id) const;
 
@@ -135,6 +155,7 @@ public:
         std::string face;
         int row = -1;
         int col = -1;
+        int card = 0;
     };
     std::vector<AbilityCardButton> unit_ability_card_buttons(const std::string& unit_id) const;
 
@@ -459,9 +480,15 @@ public:
         return 0.0f;
     }
 
+    std::array<float, 3> unit_render_scale(const std::string& unit_id) const;
+
     std::optional<int> cargo_size(const std::string& unit_id) const {
         if (auto v = scalar_num("CUnit", unit_id, "CargoSize")) return int(*v);
         return std::nullopt;
+    }
+
+    double watchtower_capture_range() const {
+        return scalar_num("CAbil", "TowerCapture", "Range").value_or(0.0);
     }
 
     double detector_range(const std::string& unit_id) const {
@@ -511,7 +538,7 @@ public:
 
     double creep_source_radius(const std::string& unit_id) const {
         double best = 0;
-        for (const std::string& beh : array_links_legacy("CUnit", unit_id, "BehaviorArray")) {
+        for (const std::string& beh : array_links("CUnit", unit_id, "BehaviorArray")) {
             if (beh.empty()) continue;
             const Entry* e = find("CBehavior", beh);
             if (!e || e->tag != "CBehaviorCreepSource") continue;
@@ -521,6 +548,39 @@ public:
             }
         }
         return best;
+    }
+
+    std::string unit_toggled_creep_source(const std::string& unit_id) const {
+        for (const std::string& ab : array_links("CUnit", unit_id, "AbilArray"))
+            for (const std::string& beh : array_links("CAbil", ab, "BehaviorArray")) {
+                if (beh.empty()) continue;
+                const Entry* e = find("CBehavior", beh);
+                if (e && e->tag == "CBehaviorCreepSource") return beh;
+            }
+        return {};
+    }
+
+    double toggled_creep_radius(const std::string& unit_id) const {
+        const std::string beh = unit_toggled_creep_source(unit_id);
+        if (beh.empty()) return 0;
+        auto fp = scalar("CBehavior", beh, "Grown");
+        return fp ? footprint_place_radius(*fp) : 0;
+    }
+    double toggled_creep_period(const std::string& unit_id) const {
+        const std::string beh = unit_toggled_creep_source(unit_id);
+        if (beh.empty()) return 0;
+        return scalar_num("CBehavior", beh, "Period").value_or(0.0);
+    }
+    std::vector<std::pair<int, int>> toggled_creep_footprint_offsets(const std::string& unit_id) const {
+        const std::string beh = unit_toggled_creep_source(unit_id);
+        if (beh.empty()) return {};
+        auto fp = scalar("CBehavior", beh, "Grown");
+        return fp ? footprint_place_offsets(*fp) : std::vector<std::pair<int, int>>{};
+    }
+
+    static int footprint_row_y(int miny, int maxy, int r) {
+        const int h = maxy - miny;
+        return h > 0 ? miny + (h - 1 - r) : miny + r;
     }
 
     std::vector<std::pair<int, int>> footprint_place_offsets(const std::string& fp_id) const {
@@ -542,7 +602,7 @@ public:
                 for (std::size_t col = 0; col < bits.size(); ++col) {
                     const char ch = bits[col];
                     if (ch == '.' || ch == ' ' || ch == '\t' || ch == '\r' || ch == '\n') continue;
-                    cells.emplace_back(minx + int(col), miny + r);
+                    cells.emplace_back(minx + int(col), footprint_row_y(miny, maxy, r));
                 }
                 ++seq;
             }
@@ -552,7 +612,7 @@ public:
     }
 
     std::vector<std::pair<int, int>> creep_source_footprint_offsets(const std::string& unit_id) const {
-        for (const std::string& beh : array_links_legacy("CUnit", unit_id, "BehaviorArray")) {
+        for (const std::string& beh : array_links("CUnit", unit_id, "BehaviorArray")) {
             if (beh.empty()) continue;
             const Entry* e = find("CBehavior", beh);
             if (!e || e->tag != "CBehaviorCreepSource") continue;
@@ -567,6 +627,283 @@ public:
     std::vector<std::pair<int, int>> unit_pathing_footprint_offsets(const std::string& unit_id) const {
         auto fp = scalar("CUnit", unit_id, "Footprint");
         if (!fp) return {};
+        return pathing_footprint_offsets(*fp);
+    }
+
+    std::vector<std::pair<int, int>> doodad_pathing_footprint_offsets(const std::string& doodad_type) const {
+        auto fp = scalar("CActorDoodad", doodad_type, "Footprint");
+        if (!fp) return {};
+        if (footprint_has_layer(*fp, "Pathing")) return pathing_footprint_offsets(*fp, "Pathing");
+        return pathing_footprint_offsets(*fp);
+    }
+
+    bool footprint_has_layer(const std::string& fp_id, const char* layer_name) const {
+        for (const core::XmlNode& L : resolved("CFootprint", fp_id))
+            if (L.name == "Layers" && L.attr_or("index", "") == layer_name) return true;
+        return false;
+    }
+
+    std::vector<std::vector<std::pair<double, double>>> footprint_shape_rings(
+        const std::string& fp_id, std::vector<int>* border_weights_out = nullptr,
+        double* shape_radius_out = nullptr) const {
+        if (border_weights_out) border_weights_out->clear();
+        if (shape_radius_out) *shape_radius_out = 0;
+        std::vector<std::pair<double, double>> verts;
+        std::string borders;
+        for (const core::XmlNode& n : resolved("CFootprint", fp_id)) {
+            if (n.name != "Shape") continue;
+            for (const core::XmlNode& c : n.children) {
+                const std::string* v = c.attr("value");
+                const std::string& s = v ? *v : c.text;
+                if (s.empty()) continue;
+                if (c.name == "Radius") {
+                    if (shape_radius_out) *shape_radius_out = std::strtod(s.c_str(), nullptr);
+                } else if (c.name == "Offsets") {
+                    std::vector<std::pair<double, double>> vs;
+                    const char* p = s.c_str();
+                    while (*p) {
+                        char* end = nullptr;
+                        const double x = std::strtod(p, &end);
+                        if (end == p) break;
+                        p = end;
+                        while (*p == ',' || *p == ' ') ++p;
+                        const double y = std::strtod(p, &end);
+                        if (end == p) break;
+                        p = end;
+                        vs.emplace_back(x, y);
+                        while (*p == ';' || *p == ' ') ++p;
+                    }
+                    if (!vs.empty()) verts = std::move(vs);
+                } else if (c.name == "Borders") {
+                    borders = s;
+                }
+            }
+        }
+        std::vector<int> next(verts.size(), -1);
+        if (!borders.empty()) {
+            const char* p = borders.c_str();
+            while (*p) {
+                char* end = nullptr;
+                const long a = std::strtol(p, &end, 10);
+                if (end == p) break;
+                p = end;
+                while (*p == ',' || *p == ' ') ++p;
+                const long b = std::strtol(p, &end, 10);
+                if (end == p) break;
+                p = end;
+                while (*p == ',' || *p == ' ') ++p;
+                const long w = std::strtol(p, &end, 10);
+                if (end != p) {
+                    p = end;
+                    if (border_weights_out) border_weights_out->push_back(int(w));
+                }
+                while (*p && *p != ';') ++p;
+                while (*p == ';' || *p == ' ') ++p;
+                if (a >= 0 && a < long(verts.size()) && b >= 0 && b < long(verts.size()))
+                    next[std::size_t(a)] = int(b);
+            }
+        }
+        if (verts.size() < 3) return {};
+        std::vector<std::vector<std::pair<double, double>>> rings;
+        const bool have_edges =
+            std::find_if(next.begin(), next.end(), [](int n) { return n >= 0; }) != next.end();
+        if (!have_edges) {
+            rings.push_back(verts);
+            return rings;
+        }
+        std::vector<char> seen(verts.size(), 0);
+        for (std::size_t start = 0; start < verts.size(); ++start) {
+            if (seen[start] || next[start] < 0) continue;
+            std::vector<std::pair<double, double>> ring;
+            std::size_t cur = start;
+            for (std::size_t guard = 0; guard <= verts.size(); ++guard) {
+                if (seen[cur]) break;
+                seen[cur] = 1;
+                ring.push_back(verts[cur]);
+                const int nx = next[cur];
+                if (nx < 0) break;
+                cur = std::size_t(nx);
+            }
+            if (ring.size() >= 3) rings.push_back(std::move(ring));
+        }
+        return rings;
+    }
+
+    bool footprint_has_shape(const std::string& fp_id) const {
+        return !footprint_shape_rings(fp_id).empty();
+    }
+
+    double footprint_shape_radius(const std::string& fp_id) const {
+        double r = 0;
+        footprint_shape_rings(fp_id, nullptr, &r);
+        return r;
+    }
+
+    double unit_body_radius(const std::string& unit_id, double authored_radius) const {
+        const std::optional<std::string> fp = scalar("CUnit", unit_id, "Footprint");
+        if (!fp) return authored_radius;
+        const double contour = footprint_shape_radius(*fp);
+        if (contour <= 0) return authored_radius;
+        const double quantised = std::ceil(contour * 16.0 - 1e-9) / 16.0;
+        return quantised > authored_radius ? quantised : authored_radius;
+    }
+
+    int footprint_min_border_weight(const std::string& fp_id) const {
+        std::vector<int> w;
+        footprint_shape_rings(fp_id, &w);
+        if (w.empty()) return -1;
+        return *std::min_element(w.begin(), w.end());
+    }
+
+    void footprint_grid_phase(const std::string& fp_id, double minx, double miny, double maxx,
+                              double maxy, double& fx, double& fy) const {
+        auto wrap = [](double f) {
+            f -= std::floor(f);
+            return f;
+        };
+        for (const char* layer_name : {"Place", "Pathing", "Check"}) {
+            bool have = false, have_area = false;
+            int bx = 0, by = 0, maxcols = 0, nrows = 0;
+            for (const core::XmlNode& layer : resolved("CFootprint", fp_id)) {
+                if (layer.name != "Layers" || layer.attr_or("index", "") != layer_name) continue;
+                int seq = 0, maxrow = -1;
+                for (const core::XmlNode& row : layer.children) {
+                    if (row.name != "Rows") continue;
+                    const std::string* v = row.attr("value");
+                    const std::string& bits = v ? *v : row.text;
+                    if (int(bits.size()) > maxcols) maxcols = int(bits.size());
+                    const std::string* ri = row.attr("index");
+                    const int r = ri ? std::atoi(ri->c_str()) : seq;
+                    if (r > maxrow) maxrow = r;
+                    ++seq;
+                }
+                if (seq == 0) continue;
+                have = true;
+                if (maxrow + 1 > nrows) nrows = maxrow + 1;
+                int ax, ay, aw, ah;
+                const std::string* area = layer.attr("Area");
+                if (!have_area && area &&
+                    std::sscanf(area->c_str(), "%d,%d,%d,%d", &ax, &ay, &aw, &ah) == 4) {
+                    have_area = true;
+                    bx = ax;
+                    by = ay;
+                }
+            }
+            if (!have || maxcols == 0) continue;
+            if (!have_area) {
+                bx = -(maxcols / 2);
+                by = -(nrows / 2);
+            }
+            fx = wrap(0.5 - double(bx) - double(maxcols) / 2.0);
+            fy = wrap(0.5 - double(by) - double(nrows) / 2.0);
+            return;
+        }
+        auto bbox_phase = [&](double m) {
+            const double fr = m - std::floor(m);
+            return std::fabs(fr - 0.5) < 1e-6 ? 0.0 : 0.5;
+        };
+        (void)maxx;
+        (void)maxy;
+        fx = bbox_phase(minx);
+        fy = bbox_phase(miny);
+    }
+
+    std::vector<std::pair<int, int>> footprint_shape_offsets(const std::string& fp_id) const {
+        const auto rings = footprint_shape_rings(fp_id);
+        if (rings.empty()) return {};
+        double minx = 1e30, miny = 1e30, maxx = -1e30, maxy = -1e30;
+        for (const auto& ring : rings)
+            for (const auto& v : ring) {
+                minx = std::min(minx, v.first);
+                maxx = std::max(maxx, v.first);
+                miny = std::min(miny, v.second);
+                maxy = std::max(maxy, v.second);
+            }
+        double fx = 0.5, fy = 0.5;
+        footprint_grid_phase(fp_id, minx, miny, maxx, maxy, fx, fy);
+        auto inside = [&](double px, double py) {
+            bool in = false;
+            for (const auto& ring : rings)
+                for (std::size_t i = 0, j = ring.size() - 1; i < ring.size(); j = i++) {
+                    const double xi = ring[i].first, yi = ring[i].second;
+                    const double xj = ring[j].first, yj = ring[j].second;
+                    const double cross = (xj - xi) * (py - yi) - (yj - yi) * (px - xi);
+                    if (std::fabs(cross) < 1e-9 && px >= std::min(xi, xj) - 1e-9 &&
+                        px <= std::max(xi, xj) + 1e-9 && py >= std::min(yi, yj) - 1e-9 &&
+                        py <= std::max(yi, yj) + 1e-9)
+                        return true;
+                    if ((yi > py) != (yj > py) && px < (xj - xi) * (py - yi) / (yj - yi) + xi) in = !in;
+                }
+            return in;
+        };
+        std::vector<std::pair<int, int>> cells;
+        const int y0 = int(std::floor(miny - fy)), y1 = int(std::ceil(maxy - fy));
+        const int x0 = int(std::floor(minx - fx)), x1 = int(std::ceil(maxx - fx));
+        for (int dy = y0; dy <= y1; ++dy)
+            for (int dx = x0; dx <= x1; ++dx)
+                if (inside(double(dx) + fx, double(dy) + fy)) cells.emplace_back(dx, dy);
+
+        return cells;
+    }
+
+    bool footprint_shape_bitmap_disjoint(const std::string& fp_id) const {
+        const std::vector<std::pair<int, int>> poly = footprint_shape_offsets(fp_id);
+        const std::vector<std::pair<int, int>> bmp = pathing_footprint_offsets(fp_id);
+        if (poly.empty() || bmp.empty()) return false;
+        for (const std::pair<int, int>& c : poly)
+            if (std::find(bmp.begin(), bmp.end(), c) != bmp.end()) return false;
+        return true;
+    }
+
+    std::vector<std::pair<int, int>> footprint_shape_occupancy(const std::string& fp_id) const {
+        const std::vector<std::pair<int, int>> poly = footprint_shape_offsets(fp_id);
+        const std::vector<std::pair<int, int>> bmp = pathing_footprint_offsets(fp_id);
+        if (bmp.empty() || poly.empty()) return poly;
+        std::vector<std::pair<int, int>> clamped;
+        clamped.reserve(poly.size());
+        for (const std::pair<int, int>& c : poly)
+            if (std::find(bmp.begin(), bmp.end(), c) != bmp.end()) clamped.push_back(c);
+        if (clamped.empty()) return bmp;
+        return clamped;
+    }
+
+    std::vector<std::pair<int, int>> doodad_shape_footprint_offsets(
+        const std::string& doodad_type) const {
+        auto fp = scalar("CActorDoodad", doodad_type, "Footprint");
+        if (!fp) return {};
+        return footprint_body_offsets(*fp,  false);
+    }
+
+    std::vector<std::pair<int, int>> doodad_nav_footprint_offsets(const std::string& doodad_type) const {
+        auto fp = scalar("CActorDoodad", doodad_type, "Footprint");
+        if (!fp) return {};
+        return footprint_body_offsets(*fp,  true);
+    }
+
+    std::vector<std::pair<int, int>> footprint_body_offsets(const std::string& fp_id, bool nav) const {
+        if (footprint_has_layer(fp_id, "Pathing")) return pathing_footprint_offsets(fp_id, "Pathing");
+        if (footprint_has_shape(fp_id))
+            return nav ? footprint_shape_offsets(fp_id) : footprint_shape_occupancy(fp_id);
+        return pathing_footprint_offsets(fp_id);
+    }
+
+    std::vector<std::pair<int, int>> unit_shape_footprint_offsets(const std::string& unit_id) const {
+        auto fp = scalar("CUnit", unit_id, "Footprint");
+        if (!fp) return {};
+        if (footprint_min_border_weight(*fp) == 1) return {};
+        return footprint_body_offsets(*fp,  false);
+    }
+
+    std::vector<std::pair<int, int>> unit_nav_footprint_offsets(const std::string& unit_id) const {
+        auto fp = scalar("CUnit", unit_id, "Footprint");
+        if (!fp) return {};
+        if (footprint_min_border_weight(*fp) == 1) return {};
+        return footprint_body_offsets(*fp,  true);
+    }
+
+    std::vector<std::pair<int, int>> pathing_footprint_offsets(const std::string& footprint_id,
+                                                              const char* layer_name = "Place") const {
+        const std::string* fp = &footprint_id;
         std::vector<std::pair<int, int>> result;
         auto has = [&](int x, int y) {
             for (const auto& c : result)
@@ -575,14 +912,14 @@ public:
         };
         std::string aux;
         for (const core::XmlNode& layer : resolved("CFootprint", *fp)) {
-            if (layer.name != "Layers" || layer.attr_or("index", "") != "Place") continue;
+            if (layer.name != "Layers" || layer.attr_or("index", "") != layer_name) continue;
             for (const core::XmlNode& s : layer.children)
                 if (s.name == "Sets")
                     if (const std::string* c = s.attr("Character"); c && !c->empty())
                         if (aux.find((*c)[0]) == std::string::npos) aux.push_back((*c)[0]);
         }
         for (const core::XmlNode& layer : resolved("CFootprint", *fp)) {
-            if (layer.name != "Layers" || layer.attr_or("index", "") != "Place") continue;
+            if (layer.name != "Layers" || layer.attr_or("index", "") != layer_name) continue;
             std::vector<std::pair<std::string, int>> rows;
             int seq = 0, maxcols = 0;
             for (const core::XmlNode& row : layer.children) {
@@ -596,21 +933,23 @@ public:
                 ++seq;
             }
             if (rows.empty()) continue;
-            int minx, miny, mx, my, mw, mh;
+            int minx, miny, maxy, mx, my, mw, mh;
             const std::string* area = layer.attr("Area");
             if (area && std::sscanf(area->c_str(), "%d,%d,%d,%d", &mx, &my, &mw, &mh) == 4) {
                 minx = mx;
                 miny = my;
+                maxy = mh;
             } else {
                 minx = -(maxcols / 2);
                 miny = -(seq / 2);
+                maxy = miny + seq;
             }
             for (const auto& [bits, r] : rows)
                 for (std::size_t col = 0; col < bits.size(); ++col) {
                     const char ch = bits[col];
                     if (ch == '.' || ch == ' ' || ch == '\t' || ch == '\r' || ch == '\n') continue;
                     if (aux.find(ch) != std::string::npos) continue;
-                    const int x = minx + int(col), y = miny + r;
+                    const int x = minx + int(col), y = footprint_row_y(miny, maxy, r);
                     if (!has(x, y)) result.emplace_back(x, y);
                 }
         }
@@ -890,6 +1229,40 @@ public:
                 return true;
         return false;
     }
+    bool weapon_hidden(const std::string& id) const {
+        bool set = false;
+        for (const core::XmlNode& c : resolved("CWeapon", id))
+            if (c.name == "Options" && c.attr_or("index", "") == "Hidden")
+                set = c.attr_or("value", "0") != "0";
+        return set;
+    }
+
+    std::vector<std::string> equipped_weapons(const std::string& unit_id,
+                                              bool include_disabled = false) const {
+        std::vector<std::string> out;
+        for (const std::string& w : array_links("CUnit", unit_id, "WeaponArray"))
+            if (!w.empty() && !weapon_hidden(w) && (include_disabled || !weapon_disabled(w)))
+                out.push_back(w);
+        return out;
+    }
+
+    std::string unit_toggled_weapon(const std::string& unit_id) const {
+        for (const std::string& ab : array_links("CUnit", unit_id, "AbilArray"))
+            for (const std::string& beh : array_links("CAbil", ab, "BehaviorArray")) {
+                const std::string w = behavior_weapon_enable(beh);
+                if (!w.empty() && weapon_disabled(w)) return w;
+            }
+        return {};
+    }
+
+    bool weapon_disabled(const std::string& id) const {
+        bool set = false;
+        for (const core::XmlNode& c : resolved("CWeapon", id))
+            if (c.name == "Options" && c.attr_or("index", "") == "Disabled")
+                set = c.attr_or("value", "0") != "0";
+        return set;
+    }
+
     bool behavior_has_state(const std::string& beh, const char* name) const {
         for (const core::XmlNode& m : resolved("CBehavior", beh)) {
             if (m.name != "Modification") continue;
@@ -956,8 +1329,7 @@ public:
     };
     RevelationInfo reveal_ability(const std::string& abil_id) const {
         if (abil_id.empty() || !find("CAbil", abil_id)) return {};
-        std::string root = scalar("CAbil", abil_id, "Effect").value_or("");
-        if (root.empty() && find("CEffect", abil_id)) root = abil_id;
+        const std::string root = cabil_effect_link(abil_id);
         if (root.empty()) return {};
         {
             double area_radius = 0, reveal_radius = 0, reveal_dur = 0;
@@ -984,7 +1356,7 @@ public:
                     }
                     if (auto s = scalar("CEffect", cur, "InitialEffect"); s && !s->empty()) stack.push_back(*s);
                 } else if (e->tag == "CEffectSet") {
-                    for (const std::string& c : array_links_legacy("CEffect", cur, "EffectArray"))
+                    for (const std::string& c : array_links("CEffect", cur, "EffectArray"))
                         if (!c.empty()) stack.push_back(c);
                 } else if (e->tag == "CEffectEnumArea") {
                     std::string applied;
@@ -1450,6 +1822,28 @@ public:
         return {};
     }
 
+    struct AbilInfoRow {
+        std::string index;
+        std::string unit;
+        bool unit_written = false;
+        std::string upgrade;
+        bool upgrade_written = false;
+        bool upgrade_named = false;
+        double time = 0;
+        int minerals = 0;
+        int gas = 0;
+        std::string requirement;
+        bool requirement_written = false;
+        int unit_count = 1;
+        double warp_charge = 0;
+        bool is_gas = false;
+        bool requires_techlab = false;
+        bool self_macro = false;
+    };
+    std::vector<AbilInfoRow> ability_info_rows(const std::string& abil_id) const;
+    std::optional<AbilInfoRow> ability_info_row(const std::string& abil_id,
+                                                const std::string& index) const;
+
     struct TrainProduct {
         std::string unit;
         std::string ability;
@@ -1465,33 +1859,17 @@ public:
             const Entry* e = find("CAbil", b.ability);
             if (!e || e->tag != "CAbilTrain") continue;
             if (b.command.empty()) continue;
+            const auto row = ability_info_row(b.ability, b.command);
+            if (!row || row->unit.empty()) continue;
             TrainProduct p;
             p.ability = b.ability;
             p.command = b.command;
             p.face = b.face;
             p.row = b.row;
             p.col = b.col;
-            for (const core::XmlNode& info : resolved("CAbil", b.ability)) {
-                if (info.name != "InfoArray") continue;
-                if (info.attr_or("index", "") != b.command) continue;
-                std::string unit = info.attr_or("Unit", "");
-                if (const std::string t = info.attr_or("Time", ""); !t.empty()) p.time = std::atof(t.c_str());
-                for (const core::XmlNode& ch : info.children) {
-                    if (ch.name == "Unit") {
-                        if (const std::string* v = ch.attr("value")) unit = *v;
-                    } else if (ch.name == "Time") {
-                        if (const std::string* v = ch.attr("value")) p.time = std::atof(v->c_str());
-                    } else if (ch.name == "Button") {
-                        const std::string req = ch.attr_or("Requirements", "");
-                        if (req.find("Attached") != std::string::npos &&
-                            req.find("TechLab") != std::string::npos)
-                            p.requires_techlab = true;
-                    }
-                }
-                p.unit = std::move(unit);
-                break;
-            }
-            if (p.unit.empty()) continue;
+            p.unit = row->unit;
+            p.time = row->time;
+            p.requires_techlab = row->requires_techlab;
             out.push_back(std::move(p));
         }
         return out;
@@ -1512,30 +1890,17 @@ public:
             const Entry* e = find("CAbil", b.ability);
             if (!e || e->tag != "CAbilBuild") continue;
             if (b.command.empty()) continue;
+            const auto row = ability_info_row(b.ability, b.command);
+            if (!row || !row->unit_written || row->unit.empty()) continue;
             BuildProduct p;
             p.ability = b.ability;
             p.command = b.command;
             p.face = b.face;
             p.row = b.row;
             p.col = b.col;
-            bool unit_set = false;
-            for (const core::XmlNode& info : resolved("CAbil", b.ability)) {
-                if (info.name != "InfoArray") continue;
-                if (info.attr_or("index", "") != b.command) continue;
-                if (const std::string* u = info.attr("Unit")) { p.unit = *u; unit_set = true; }
-                if (const std::string t = info.attr_or("Time", ""); !t.empty()) p.time = std::atof(t.c_str());
-                for (const core::XmlNode& ch : info.children) {
-                    if (ch.name == "Unit") {
-                        if (const std::string* v = ch.attr("value")) { p.unit = *v; unit_set = true; }
-                    } else if (ch.name == "Time") {
-                        if (const std::string* v = ch.attr("value")) p.time = std::atof(v->c_str());
-                    } else if (ch.name == "ValidatorArray") {
-                        const std::string v = ch.attr_or("value", "");
-                        if (v.find("Vespene") != std::string::npos) p.is_gas = true;
-                    }
-                }
-            }
-            if (!unit_set || p.unit.empty()) continue;
+            p.unit = row->unit;
+            p.time = row->time;
+            p.is_gas = row->is_gas;
             out.push_back(std::move(p));
         }
         return out;
@@ -1547,42 +1912,82 @@ public:
         int gas = 0;
         double time = 0;
     };
+    std::vector<std::string> research_slots(const std::string& abil_id) const {
+        const Entry* e = find("CAbil", abil_id);
+        if (!e || e->tag != "CAbilResearch") return {};
+        std::vector<std::string> out;
+        for (const AbilInfoRow& r : ability_info_rows(abil_id))
+            if (!r.upgrade.empty()) out.push_back(r.index);
+        return out;
+    }
+    std::string research_slot_upgrade(const std::string& abil_id, const std::string& index) const {
+        if (auto r = ability_info_row(abil_id, index)) return r->upgrade;
+        return {};
+    }
+    double research_slot_time(const std::string& abil_id, const std::string& index) const {
+        if (auto r = ability_info_row(abil_id, index)) return r->time;
+        return 0;
+    }
+
     ResearchInfo research_info(const std::string& upgrade_id) const {
+        struct Candidate { std::string ability; std::string index; };
+        std::vector<Candidate> candidates;
+        std::vector<Candidate> carded;
+        for (const std::string& ab : ids("CAbil")) {
+            const Entry* e = find("CAbil", ab);
+            if (!e || e->tag != "CAbilResearch") continue;
+            for (const AbilInfoRow& r : ability_info_rows(ab)) {
+                if (upgrade_id.empty() || r.upgrade != upgrade_id) continue;
+                candidates.push_back(Candidate{ab, r.index});
+                if (carded_ability_commands().count(ab + "," + r.index))
+                    carded.push_back(Candidate{ab, r.index});
+            }
+        }
+        const Candidate* pick = nullptr;
+        if (carded.size() == 1) pick = &carded[0];
+        else if (!candidates.empty()) pick = &candidates[0];
+        if (pick) {
+            const auto row = ability_info_row(pick->ability, pick->index);
+            ResearchInfo out;
+            out.found = true;
+            out.minerals = row->minerals;
+            out.gas = row->gas;
+            out.time = row->time;
+            return out;
+        }
         for (const std::string& ab : ids("CAbil")) {
             const Entry* e = find("CAbil", ab);
             if (!e || e->tag != "CAbilResearch") continue;
             for (const core::XmlNode& info : resolved("CAbil", ab)) {
                 if (info.name != "InfoArray") continue;
-                std::string up = info.attr_or("Upgrade", "");
-                if (up.empty())
-                    for (const core::XmlNode& ch : info.children)
-                        if (ch.name == "Upgrade") {
-                            if (const std::string* v = ch.attr("value")) up = *v;
-                            break;
-                        }
-                if (up != upgrade_id) continue;
-                ResearchInfo r;
-                r.found = true;
-                if (const std::string t = info.attr_or("Time", ""); !t.empty())
-                    r.time = std::atof(t.c_str());
-                for (const core::XmlNode& ch : info.children) {
-                    if (ch.name == "Time") {
-                        if (const std::string* v = ch.attr("value")) r.time = std::atof(v->c_str());
-                    } else if (ch.name == "Resource") {
-                        const std::string idx = ch.attr_or("index", "");
-                        const std::string val = ch.attr_or("value", "");
-                        if (idx == "Minerals") r.minerals = std::atoi(val.c_str());
-                        else if (idx == "Vespene") r.gas = std::atoi(val.c_str());
-                    }
+                if (info.attr_or("Upgrade", "") == upgrade_id) {
+                    ResearchInfo r;
+                    r.found = true;
+                    return r;
                 }
-                return r;
+                for (const core::XmlNode& ch : info.children)
+                    if (ch.name == "Upgrade" && ch.attr_or("value", "") == upgrade_id) {
+                        ResearchInfo r;
+                        r.found = true;
+                        return r;
+                    }
             }
         }
         return {};
     }
 
+    const std::set<std::string>& carded_ability_commands() const {
+        if (!carded_cmds_built_) {
+            carded_cmds_built_ = true;
+            for (const std::string& unit : ids("CUnit"))
+                for (const AbilityCardButton& b : unit_ability_card_buttons(unit))
+                    carded_cmds_.insert(b.ability + "," + b.command);
+        }
+        return carded_cmds_;
+    }
+
     int resource_harvest_amount(const std::string& unit_id) const {
-        for (const std::string& beh : array_links_legacy("CUnit", unit_id, "BehaviorArray")) {
+        for (const std::string& beh : array_links("CUnit", unit_id, "BehaviorArray")) {
             if (beh.empty()) continue;
             const Entry* e = find("CBehavior", beh);
             if (!e || e->tag != "CBehaviorResource") continue;
@@ -1593,7 +1998,7 @@ public:
     }
 
     std::optional<double> resource_harvest_time(const std::string& unit_id) const {
-        for (const std::string& beh : array_links_legacy("CUnit", unit_id, "BehaviorArray")) {
+        for (const std::string& beh : array_links("CUnit", unit_id, "BehaviorArray")) {
             if (beh.empty()) continue;
             const Entry* e = find("CBehavior", beh);
             if (!e || e->tag != "CBehaviorResource") continue;
@@ -1603,7 +2008,7 @@ public:
     }
 
     int resource_content(const std::string& unit_id) const {
-        for (const std::string& beh : array_links_legacy("CUnit", unit_id, "BehaviorArray")) {
+        for (const std::string& beh : array_links("CUnit", unit_id, "BehaviorArray")) {
             if (beh.empty()) continue;
             const Entry* e = find("CBehavior", beh);
             if (!e || e->tag != "CBehaviorResource") continue;
@@ -1673,7 +2078,7 @@ public:
     }
 
     double creep_source_period(const std::string& unit_id) const {
-        for (const std::string& beh : array_links_legacy("CUnit", unit_id, "BehaviorArray")) {
+        for (const std::string& beh : array_links("CUnit", unit_id, "BehaviorArray")) {
             if (beh.empty()) continue;
             const Entry* e = find("CBehavior", beh);
             if (!e || e->tag != "CBehaviorCreepSource") continue;
@@ -1704,6 +2109,33 @@ public:
         return s;
     }
 
+    struct SalvageSpec {
+        bool found = false;
+        double delay = 0;
+        double mineral_frac = 0;
+        double gas_frac = 0;
+    };
+    SalvageSpec salvage_spec(const std::string& abil_id) const {
+        SalvageSpec s;
+        for (const std::string& beh : array_links("CAbil", abil_id, "BehaviorArray")) {
+            if (auto bb = behavior_buff(beh)) s.delay = bb->duration;
+            s.found = true;
+            break;
+        }
+        if (!s.found) return s;
+        for (const core::XmlNode& c : resolved("CEffect", "SalvageShared")) {
+            if (c.name != "SalvageFactor") continue;
+            for (const core::XmlNode& r : c.children) {
+                if (r.name != "Resource") continue;
+                const std::string idx = r.attr_or("index", "");
+                const double v = std::atof(r.attr_or("value", "0").c_str());
+                if (idx == "Minerals") s.mineral_frac = v < 0 ? -v : v;
+                else if (idx == "Vespene") s.gas_frac = v < 0 ? -v : v;
+            }
+        }
+        return s;
+    }
+
     std::optional<double> cloak_drain(const std::string& behavior_id) const {
         for (const core::XmlNode& n : resolved("CBehavior", behavior_id)) {
             if (n.name != "Modification") continue;
@@ -1715,6 +2147,16 @@ public:
                     }
         }
         return std::nullopt;
+    }
+
+    std::string behavior_weapon_enable(const std::string& behavior_id) const {
+        for (const core::XmlNode& n : resolved("CBehavior", behavior_id)) {
+            if (n.name != "Modification") continue;
+            for (const core::XmlNode& v : n.children)
+                if (v.name == "WeaponEnableArray")
+                    if (const std::string* val = v.attr("value"); val && !val->empty()) return *val;
+        }
+        return {};
     }
 
     std::vector<std::pair<double, double>> weapon_splash(const std::string& weapon_id) const;
@@ -1737,16 +2179,35 @@ private:
     struct TwoSlot { std::string link; bool present = false; bool dead = false; };
     std::vector<TwoSlot> resolve_array_slots(const std::string& family,
                                              const std::string& id,
-                                             const std::string& field) const;
+                                             const std::string& field,
+                                             const std::string& expand_as = std::string()) const;
 
+    struct SlotWrite {
+        const core::XmlNode* node;
+        std::string self;
+    };
+    struct NodeSlot { std::vector<SlotWrite> writes; bool dead = false; };
+    std::vector<NodeSlot> resolve_node_slots(const std::string& family,
+                                             const std::string& id,
+                                             const std::string& field,
+                                             const std::string& expand_as = std::string()) const;
+
+    std::vector<std::string> load_skips_;
+    static std::vector<std::string> unlisted_families_;
     using IdMap = std::unordered_map<std::string, Entry>;
     std::unordered_map<std::string, IdMap> families_;
+    std::unordered_map<std::string, std::vector<std::string>> family_order_;
     std::unordered_map<std::string, std::string> consts_;
     std::unordered_map<std::string, std::vector<core::XmlNode>> singletons_;
     std::unordered_map<std::string, std::vector<core::XmlNode>> tag_defaults_;
     StringTable strings_;
 
     mutable std::unordered_map<std::string, std::vector<core::XmlNode>> resolved_cache_;
+
+    mutable std::unordered_map<std::string, std::string> actor_by_unit_;
+    mutable bool actor_by_unit_built_ = false;
+    mutable std::set<std::string> carded_cmds_;
+    mutable bool carded_cmds_built_ = false;
 
     template <class T, class Extract>
     std::optional<T> walk_effect_first(
@@ -1773,23 +2234,22 @@ private:
     std::optional<T> walk_damage_tree(
         const std::string& effect_id, int depth,
         const std::function<std::optional<T>(const std::string&)>& at_damage,
-        const std::function<T(T, const std::string&)>& periodic,
-        const std::string& prefer = {}) const {
+        const std::function<T(T, const std::string&)>& periodic) const {
         if (depth > 32) return std::nullopt;
         const Entry* e = find("CEffect", effect_id);
         if (!e) return std::nullopt;
         const std::string& tag = e->tag;
-        if (tag == "CEffectDamage")
-            return (prefer.empty() || effect_id == prefer) ? at_damage(effect_id) : std::nullopt;
+        if (tag == "CEffectDamage") return at_damage(effect_id);
         auto follow = [&](const char* f) -> std::optional<T> {
             if (auto link = scalar("CEffect", effect_id, f); link && !link->empty())
-                return walk_damage_tree<T>(*link, depth + 1, at_damage, periodic, prefer);
+                return walk_damage_tree<T>(*link, depth + 1, at_damage, periodic);
             return std::nullopt;
         };
         auto follow_array = [&](const char* f) -> std::optional<T> {
             for (const std::string& link : array_links("CEffect", effect_id, f))
                 if (!link.empty())
-                    if (auto d = walk_damage_tree<T>(link, depth + 1, at_damage, periodic, prefer)) return d;
+                    if (auto d = walk_damage_tree<T>(link, depth + 1, at_damage, periodic))
+                        return d;
             return std::nullopt;
         };
         if (tag == "CEffectLaunchMissile") {
@@ -1801,7 +2261,8 @@ private:
             if (auto d = follow_array("EffectArray")) return d;
         } else if (tag == "CEffectSwitch") {
             for (const std::string& ce : switch_effects(effect_id))
-                if (auto d = walk_damage_tree<T>(ce, depth + 1, at_damage, periodic, prefer)) return d;
+                if (auto d = walk_damage_tree<T>(ce, depth + 1, at_damage, periodic))
+                    return d;
         }
         for (const char* f : {"ImpactEffect", "InitialEffect", "FinalEffect", "ExpireEffect"})
             if (auto d = follow(f)) return d;
@@ -1810,12 +2271,7 @@ private:
         return std::nullopt;
     }
 
-    std::optional<int> effect_damage(const std::string& effect_id,
-                                     int depth,
-                                     const std::string& prefer = {}) const;
-    std::optional<int> effect_hit_count(const std::string& effect_id,
-                                        int depth,
-                                        const std::string& prefer = {}) const;
+    std::optional<int> effect_damage(const std::string& effect_id, int depth) const;
     std::optional<double> effect_life_change(const std::string& effect_id, int depth) const;
     std::optional<double> effect_energy_fraction(const std::string& effect_id, int depth) const;
     std::optional<std::string> effect_apply_behavior(const std::string& effect_id, int depth) const;

@@ -34,17 +34,37 @@ static uint32_t attribute_bit(const std::string& name) {
     return 0;
 }
 
-static void weapon_attribute_bonus(const data::Catalog& cat, const std::string& weapon_id,
-                                   uint32_t& bits, Fixed& amount) {
+static double fold_attribute_bonus(const data::UpgradeCatalog& up,
+                                   const std::vector<std::string>& researched,
+                                   const std::string& effect, const std::string& attribute,
+                                   double base) {
+    double v = base;
+    for (const std::string& upg : researched) {
+        if (!up.contains(upg)) continue;
+        for (const data::UpgradeEffect& e : up.resolve(upg))
+            if (e.catalog == "Effect" && e.entry == effect && e.field == "AttributeBonus" &&
+                e.field_index == attribute)
+                v = e.apply(v);
+    }
+    return v;
+}
+
+void weapon_attribute_bonus(const data::Catalog& cat, const std::string& weapon_id, uint32_t& bits,
+                            Fixed& amount, const data::UpgradeCatalog* up,
+                            const std::vector<std::string>* researched) {
     bits = 0;
     amount = Fixed();
-    int best = 0;
+    const auto eff = cat.weapon_damage_effect_id(weapon_id);
+    double best = 0.0;
     for (const auto& [name, val] : cat.weapon_attribute_bonus(weapon_id)) {
         const uint32_t b = attribute_bit(name);
-        if (b == 0 || val <= best) continue;
-        best = val;
+        if (b == 0) continue;
+        double v = double(val);
+        if (up && researched && eff) v = fold_attribute_bonus(*up, *researched, *eff, name, v);
+        if (v <= best) continue;
+        best = v;
         bits = b;
-        amount = Fixed::from_int(val);
+        amount = Fixed::from_double(v);
     }
 }
 
@@ -82,9 +102,10 @@ static void read_attributes(const data::Catalog& cat, const std::string& unit_id
         const std::string* idx = n.attr("index");
         if (!idx) continue;
         const std::string& val = n.attr_or("value", "1");
-        if (!truthy(val)) continue;
-        if (*idx == "Heroic") { u.heroic = true; continue; }
-        u.attributes |= attribute_bit(*idx);
+        const bool set = truthy(val);
+        if (*idx == "Heroic") { u.heroic = set; continue; }
+        if (set) u.attributes |= attribute_bit(*idx);
+        else u.attributes &= ~attribute_bit(*idx);
     }
 }
 
@@ -167,6 +188,7 @@ sim::Unit make_unit(const data::Catalog& cat, const std::string& unit_id,
     u.decel = field(cat, "CUnit", unit_id, "Deceleration", u.accel);
     u.lateral_accel = field(cat, "CUnit", unit_id, "LateralAcceleration");
     u.radius = field(cat, "CUnit", unit_id, "Radius", Fixed::from_ratio(1, 2));
+    u.radius = Fixed::from_double(cat.unit_body_radius(unit_id, u.radius.to_double()));
     u.cargo_size = int(field(cat, "CUnit", unit_id, "CargoSize").round());
     u.cargo_space = cat.transport_capacity(unit_id);
 
@@ -191,9 +213,11 @@ sim::Unit make_unit(const data::Catalog& cat, const std::string& unit_id,
     u.supply_provides = data::supply_provided(cat, unit_id);
     u.supply_uses = data::unit_cost(cat, unit_id).supply;
 
+    u.build_progress = Fixed::from_int(1);
+
     int filled = 0;
-    for (const std::string& w : cat.array_links("CUnit", unit_id, "WeaponArray")) {
-        if (w.empty()) continue;
+    const std::string toggled_w = cat.unit_toggled_weapon(unit_id);
+    for (const std::string& w : cat.equipped_weapons(unit_id,  !toggled_w.empty())) {
         auto dmg = cat.weapon_damage(w);
         if (!dmg) continue;
         const Fixed damage = Fixed::from_int(*dmg);
@@ -290,6 +314,16 @@ sim::Unit make_unit(const data::Catalog& cat, const std::string& unit_id,
         if (++filled == 2) break;
     }
 
+    if (!toggled_w.empty() && filled == 1 && u.wpn2_damage.raw() == 0) {
+        u.has_toggle_wpn = true;
+        u.swap_weapon_block(u.toggle_wpn);
+        for (const std::string& ab : cat.array_links("CUnit", unit_id, "AbilArray"))
+            for (const std::string& beh : cat.array_links("CAbil", ab, "BehaviorArray"))
+                if (cat.behavior_weapon_enable(beh) == toggled_w)
+                    if (auto d = cat.cloak_drain(beh))
+                        u.toggle_wpn_drain = Fixed::from_double(*d);
+    }
+
     if (auto pd = cat.point_defense_of(unit_id)) {
         u.point_defense_radius = Fixed::from_double(pd->radius);
         u.point_defense_max = pd->max;
@@ -335,6 +369,13 @@ sim::Unit make_unit(const data::Catalog& cat, const std::string& unit_id,
         u.creep_grow_period =
             period_s > 0 ? int(period_s * sim::World::kTicksPerSecond + 0.5) : 1;
     }
+    if (const double tcr = cat.toggled_creep_radius(unit_id); tcr > 0) {
+        u.has_toggle_creep = true;
+        u.toggle_creep_radius = int(tcr);
+        const double tp = cat.toggled_creep_period(unit_id);
+        u.toggle_creep_period = tp > 0 ? int(tp * sim::World::kTicksPerSecond + 0.5) : 1;
+    }
+
     if (auto offs = cat.unit_pathing_footprint_offsets(unit_id); !offs.empty()) {
         u.footprint_offsets.reserve(offs.size());
         for (const auto& [dx, dy] : offs)

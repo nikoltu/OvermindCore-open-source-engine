@@ -27,6 +27,9 @@ int hud_panel_height(std::uint32_t out_h);
 
 int hud_panel_height(std::uint32_t out_w, std::uint32_t out_h, const ConsolePanel* console);
 
+bool hud_covers_point(std::uint32_t out_w, std::uint32_t out_h, const ConsolePanel* console,
+                      float x, float y);
+
 constexpr int kCommandCols = 5;
 constexpr int kCommandRows = 3;
 HudRect hud_command_cell(std::uint32_t out_w, std::uint32_t out_h, int index,

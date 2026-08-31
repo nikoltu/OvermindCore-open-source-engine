@@ -14,7 +14,17 @@ struct TimedOrder {
     sim::Order order;
     bool queued = false;
     bool is_stop = false;
+    bool is_command = false;
+    sim::Command command;
 };
+
+enum class RecordKind : uint8_t { Order, Stop, Command };
+inline RecordKind record_kind(const TimedOrder& t) {
+    if (t.is_command) return RecordKind::Command;
+    return t.is_stop ? RecordKind::Stop : RecordKind::Order;
+}
+
+void apply_timed_order(sim::World& w, const TimedOrder& t);
 
 struct OrderLog {
     uint64_t seed = 1;
@@ -36,7 +46,12 @@ struct ReplayTrace {
 
 inline void record_order(OrderLog& log, const sim::World& w, uint32_t id,
                          const sim::Order& o, bool queued = false) {
-    log.orders.push_back(TimedOrder{w.tick(), id, o, queued});
+    TimedOrder t;
+    t.tick = w.tick();
+    t.unit_id = id;
+    t.order = o;
+    t.queued = queued;
+    log.orders.push_back(t);
 }
 
 class Recorder {
@@ -80,7 +95,12 @@ class LogRecorder : public sim::OrderSink {
 public:
     explicit LogRecorder(OrderLog& log) : log_(log) {}
     void on_order(int tick, uint32_t id, const sim::Order& o, bool queued) override {
-        log_.orders.push_back(TimedOrder{tick, id, o, queued, false});
+        TimedOrder t;
+        t.tick = tick;
+        t.unit_id = id;
+        t.order = o;
+        t.queued = queued;
+        log_.orders.push_back(t);
     }
     void on_stop(int tick, uint32_t id) override {
         TimedOrder t;
@@ -89,13 +109,21 @@ public:
         t.is_stop = true;
         log_.orders.push_back(t);
     }
+    void on_command(int tick, uint32_t id, const sim::Command& c) override {
+        TimedOrder t;
+        t.tick = tick;
+        t.unit_id = id;
+        t.is_command = true;
+        t.command = c;
+        log_.orders.push_back(t);
+    }
 
 private:
     OrderLog& log_;
 };
 
 inline constexpr char kOrderLogMagic[8] = {'S', 'C', '2', 'R', 'L', 'O', 'G', '\0'};
-inline constexpr uint32_t kOrderLogVersion = 2;
+inline constexpr uint32_t kOrderLogVersion = 3;
 
 void write_order_log(const OrderLog& log, std::vector<uint8_t>& out);
 bool read_order_log(const uint8_t* data, size_t len, OrderLog& out);

@@ -49,10 +49,6 @@ GroundImage composite_ground_images(const formats::TextureInfo& info,
                                     const formats::TextureMask& mask,
                                     const std::vector<LayerImage>& images, uint32_t uv_tiles = 9);
 
-GroundImage composite_retail_ground(const casc::Storage& store,
-                                    const std::vector<std::string>& layer_names,
-                                    const formats::TextureMask& mask, uint32_t uv_tiles);
-
 GroundImage composite_map_ground(const casc::Storage& store, const formats::TextureInfo& info,
                                  const formats::TextureMask& mask,
                                  const std::vector<ResolvedLayer>& layers, uint32_t uv_tiles = 9);

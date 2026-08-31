@@ -1,13 +1,17 @@
 #pragma once
 
+#include <cstdlib>
 #include <string>
 #include <unordered_map>
 #include <vector>
 
 #include "sc2/data/catalog.hpp"
 #include "sc2/data/requirements.hpp"
+#include "sc2/sim/fixed.hpp"
 
 namespace sc2::data {
+
+#include "sc2/data/authored.hpp"
 
 struct ProductInfo {
     std::string ability;

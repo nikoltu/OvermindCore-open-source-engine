@@ -5,6 +5,7 @@
 #include <functional>
 
 #include "sc2/casc/storage.hpp"
+#include "sc2/data/melee_mods.hpp"
 
 namespace sc2::data {
 
@@ -22,8 +23,14 @@ std::string Catalog::family_of(const std::string& tag) {
     if (tag.rfind("CMover", 0) == 0) return "CMover";
     if (tag.rfind("CFootprint", 0) == 0) return "CFootprint";
     if (tag.rfind("CButton", 0) == 0) return "CButton";
+    if (tag.rfind("C", 0) == 0 &&
+        std::find(unlisted_families_.begin(), unlisted_families_.end(), tag) ==
+            unlisted_families_.end())
+        unlisted_families_.push_back(tag);
     return tag;
 }
+
+std::vector<std::string> Catalog::unlisted_families_;
 
 std::string Catalog::expand_id(std::string v, const std::string& id) {
     for (size_t p; (p = v.find("##id##")) != std::string::npos;)
@@ -55,7 +62,9 @@ void Catalog::ingest(const std::vector<uint8_t>& xml) {
             }
             continue;
         }
-        Entry& entry = families_[family][*id];
+        IdMap& fam = families_[family];
+        if (fam.find(*id) == fam.end()) family_order_[family].push_back(*id);
+        Entry& entry = fam[*id];
         entry.id = *id;
         entry.tag = e.name;
         if (const std::string* p = e.attr("parent")) entry.parent = *p;
@@ -108,12 +117,9 @@ const Catalog::Entry* Catalog::find(const std::string& family,
 }
 
 std::vector<std::string> Catalog::ids(const std::string& family) const {
-    std::vector<std::string> out;
-    auto fit = families_.find(family);
-    if (fit == families_.end()) return out;
-    out.reserve(fit->second.size());
-    for (const auto& [id, entry] : fit->second) out.push_back(id);
-    return out;
+    auto oit = family_order_.find(family);
+    if (oit == family_order_.end()) return {};
+    return oit->second;
 }
 
 const std::vector<XmlNode>& Catalog::resolved(const std::string& family,
@@ -166,75 +172,56 @@ std::vector<std::string> Catalog::array_links(const std::string& family,
     return out;
 }
 
-std::vector<std::string> Catalog::array_links_legacy(const std::string& family,
-                                                     const std::string& id,
-                                                     const std::string& field) const {
-    const auto& children = resolved(family, id);
-    std::vector<std::string> slots;
-    std::unordered_map<std::string, size_t> byidx;
-    long counter = 0;
-    for (const XmlNode& c : children) {
-        if (c.name != field) continue;
-        const std::string* v = c.attr("Link");
-        if (!v) v = c.attr("value");
-        std::string val = v ? expand_id(*v, id) : std::string{};
-        if (const std::string* rm = c.attr("removed"); rm && *rm != "0" && !rm->empty()) val.clear();
-        std::string idx;
-        if (const std::string* ix = c.attr("index")) {
-            idx = *ix;
-            char* end = nullptr;
-            long n = std::strtol(idx.c_str(), &end, 10);
-            if (end != idx.c_str()) counter = n + 1;
-        } else {
-            idx = std::to_string(counter++);
-        }
-        auto it = byidx.find(idx);
-        if (it != byidx.end()) {
-            slots[it->second] = val;
-        } else {
-            if (!val.empty()) {
-                bool dup = false;
-                for (const std::string& s : slots) if (s == val) { dup = true; break; }
-                if (dup) continue;
+std::vector<Catalog::TwoSlot> Catalog::resolve_array_slots(const std::string& family,
+                                                           const std::string& id,
+                                                           const std::string& field,
+                                                           const std::string& expand_as) const {
+    std::vector<TwoSlot> out;
+    for (const NodeSlot& s : resolve_node_slots(family, id, field, expand_as)) {
+        TwoSlot t;
+        t.dead = s.dead;
+        for (const SlotWrite& w : s.writes) {
+            const std::string* lv = w.node->attr("Link");
+            if (!lv) lv = w.node->attr("value");
+            if (lv) {
+                t.link = expand_id(*lv, w.self);
+                t.present = true;
             }
-            byidx[idx] = slots.size();
-            slots.push_back(val);
         }
+        out.push_back(std::move(t));
     }
-    std::vector<std::string> out;
-    for (const std::string& s : slots) if (!s.empty()) out.push_back(s);
     return out;
 }
 
-std::vector<Catalog::TwoSlot> Catalog::resolve_array_slots(const std::string& family,
+std::vector<Catalog::NodeSlot> Catalog::resolve_node_slots(const std::string& family,
                                                            const std::string& id,
-                                                           const std::string& field) const {
+                                                           const std::string& field,
+                                                           const std::string& expand_as) const {
+    const std::string& self = expand_as.empty() ? id : expand_as;
     const Entry* e = find(family, id);
     if (!e) return {};
 
-    std::vector<TwoSlot> base;
-    if (!e->parent.empty() && e->parent != id) base = resolve_array_slots(family, e->parent, field);
+    std::vector<NodeSlot> base;
+    if (!e->parent.empty() && e->parent != id)
+        base = resolve_node_slots(family, e->parent, field, self);
 
-    struct Own { long key; bool is_pos; std::string link; bool present; bool dead; };
+    struct Own { long key; bool is_pos; std::vector<SlotWrite> writes; bool dead; };
     std::vector<Own> own;
     std::unordered_map<long, size_t> own_at;
     long counter = 0;
+    long next_append = 0;
     long cur_decl = -1;
     for (size_t k = 0; k < e->own.size(); ++k) {
         if (e->own[k].name != field) {
             if (k < e->own_decl.size() && long(e->own_decl[k]) != cur_decl) {
-                cur_decl = long(e->own_decl[k]); counter = 0;
+                cur_decl = long(e->own_decl[k]); counter = next_append;
             }
             continue;
         }
         if (k < e->own_decl.size() && long(e->own_decl[k]) != cur_decl) {
-            cur_decl = long(e->own_decl[k]); counter = 0;
+            cur_decl = long(e->own_decl[k]); counter = next_append;
         }
         const XmlNode& c = e->own[k];
-        const std::string* lv = c.attr("Link");
-        if (!lv) lv = c.attr("value");
-        const bool has_link = lv != nullptr;
-        std::string link = has_link ? expand_id(*lv, id) : std::string{};
         int rm_state = -1;
         if (const std::string* rm = c.attr("removed"))
             rm_state = (*rm != "0" && !rm->empty()) ? 1 : 0;
@@ -245,37 +232,33 @@ std::vector<Catalog::TwoSlot> Catalog::resolve_array_slots(const std::string& fa
         }
         long key;
         bool is_pos;
-        if (has_index) { key = index; is_pos = false; counter = index + 1; }
+        if (has_index) { key = index; is_pos = false; }
         else { key = counter; is_pos = true; ++counter; }
+        if (key + 1 > next_append) next_append = key + 1;
         auto it = own_at.find(key);
         if (it == own_at.end()) {
             own_at[key] = own.size();
-            own.push_back(Own{key, is_pos, link, has_link, rm_state == 1});
+            own.push_back(Own{key, is_pos, {SlotWrite{&c, self}}, rm_state == 1});
         } else {
             Own& o = own[it->second];
-            if (has_link) { o.link = link; o.present = true; }
+            o.writes.push_back(SlotWrite{&c, self});
             if (rm_state == 1) o.dead = true;
             else if (rm_state == 0) o.dead = false;
         }
     }
 
-    for (const Own& o : own) {
+    for (Own& o : own) {
         if (o.is_pos) {
-            base.push_back(TwoSlot{o.link, o.present, o.dead});
+            base.push_back(NodeSlot{std::move(o.writes), o.dead});
         } else {
             size_t idx = size_t(o.key < 0 ? 0 : o.key);
             if (idx >= base.size()) base.resize(idx + 1);
-            if (o.present) { base[idx].link = o.link; base[idx].present = true; }
-            if (o.dead) base[idx].dead = true;
+            NodeSlot& s = base[idx];
+            s.writes.insert(s.writes.end(), o.writes.begin(), o.writes.end());
+            if (o.dead) s.dead = true;
         }
     }
     return base;
-}
-
-std::vector<std::string> Catalog::array_links_twomode(const std::string& family,
-                                                      const std::string& id,
-                                                      const std::string& field) const {
-    return array_links(family, id, field);
 }
 
 std::vector<std::string> Catalog::switch_effects(const std::string& effect_id) const {
@@ -288,8 +271,7 @@ std::vector<std::string> Catalog::switch_effects(const std::string& effect_id) c
     return out;
 }
 
-std::optional<int> Catalog::effect_damage(const std::string& effect_id, int depth,
-                                          const std::string& prefer) const {
+std::optional<int> Catalog::effect_damage(const std::string& effect_id, int depth) const {
     return walk_damage_tree<int>(
         effect_id, depth,
         [this](const std::string& id) -> std::optional<int> {
@@ -299,8 +281,7 @@ std::optional<int> Catalog::effect_damage(const std::string& effect_id, int dept
         [this](int sub, const std::string& id) -> int {
             const int pc = int(scalar_num("CEffect", id, "PeriodCount").value_or(0));
             return sub * (pc > 0 ? pc : 1);
-        },
-        prefer);
+        });
 }
 
 std::optional<double> Catalog::effect_life_change(const std::string& effect_id, int depth) const {
@@ -657,18 +638,23 @@ std::optional<Catalog::InterceptorMagSpec> Catalog::interceptor_magazine_of(
         if (ae && ae->tag == "CAbilArmMagazine") { mag = a; break; }
     }
     if (mag.empty()) return std::nullopt;
+    const auto& nodes = resolved("CAbil", mag);
+    std::string slot;
+    for (const XmlNode& info : nodes) {
+        if (info.name != "InfoArray") continue;
+        const std::string* u = info.attr("Unit");
+        if (u && !u->empty()) { slot = info.attr_or("index", ""); break; }
+    }
+    if (slot.empty()) return std::nullopt;
     std::string escort;
     int count = 0;
     double build_time = 0;
-    for (const XmlNode& info : resolved("CAbil", mag)) {
-        if (info.name != "InfoArray") continue;
-        const std::string* u = info.attr("Unit");
-        if (!u || u->empty()) continue;
-        escort = *u;
+    for (const XmlNode& info : nodes) {
+        if (info.name != "InfoArray" || info.attr_or("index", "") != slot) continue;
+        if (const std::string* u = info.attr("Unit"); u && !u->empty()) escort = *u;
         if (const std::string* c = info.attr("CountStart"); c && !c->empty()) count = std::atoi(c->c_str());
         if (const std::string* t = info.attr("Time"); t && !t->empty())
             build_time = std::strtod(t->c_str(), nullptr);
-        break;
     }
     if (escort.empty()) return std::nullopt;
     InterceptorMagSpec s;
@@ -870,39 +856,16 @@ std::optional<double> Catalog::weapon_radius_split_no_splash(const std::string& 
 std::optional<int> Catalog::weapon_damage(const std::string& weapon_id) const {
     const Entry* w = find("CWeapon", weapon_id);
     if (!w) return std::nullopt;
-    const std::string eff = weapon_effect_id(weapon_id);
-    const std::string disp = scalar("CWeapon", weapon_id, "DisplayEffect").value_or("");
-    if (!disp.empty())
-        if (auto d = effect_damage(eff, 0, disp)) return d;
-    if (auto d = effect_damage(eff, 0)) return d;
-    if (!disp.empty())
-        return effect_damage(disp, 0);
+    const int hits = weapon_hit_count(weapon_id).value_or(1);
+    if (auto leaf = weapon_damage_effect_id(weapon_id))
+        if (auto amount = scalar_num("CEffect", *leaf, "Amount")) return int(*amount) * hits;
     return std::nullopt;
-}
-
-std::optional<int> Catalog::effect_hit_count(const std::string& effect_id, int depth,
-                                             const std::string& prefer) const {
-    return walk_damage_tree<int>(
-        effect_id, depth,
-        [](const std::string&) -> std::optional<int> { return 1; },
-        [this](int sub, const std::string& id) -> int {
-            const int pc = int(scalar_num("CEffect", id, "PeriodCount").value_or(0));
-            return sub * (pc > 0 ? pc : 1);
-        },
-        prefer);
 }
 
 std::optional<int> Catalog::weapon_hit_count(const std::string& weapon_id) const {
-    const Entry* w = find("CWeapon", weapon_id);
-    if (!w) return std::nullopt;
-    const std::string eff = weapon_effect_id(weapon_id);
-    const std::string disp = scalar("CWeapon", weapon_id, "DisplayEffect").value_or("");
-    if (!disp.empty())
-        if (auto c = effect_hit_count(eff, 0, disp)) return c;
-    if (auto c = effect_hit_count(eff, 0)) return c;
-    if (!disp.empty())
-        return effect_hit_count(disp, 0);
-    return std::nullopt;
+    if (!find("CWeapon", weapon_id)) return std::nullopt;
+    if (auto d = scalar_num("CWeapon", weapon_id, "DisplayAttackCount"); d && *d > 0) return int(*d);
+    return 1;
 }
 
 std::vector<std::pair<double, double>>
@@ -982,27 +945,206 @@ std::string Catalog::ability_command_requirement(const std::string& abil_id,
     return req;
 }
 
+std::vector<Catalog::AbilInfoRow> Catalog::ability_info_rows(const std::string& abil_id) const {
+    const Entry* e = find("CAbil", abil_id);
+    if (!e) return {};
+    const bool is_merge = e->tag == "CAbilMerge";
+    const bool is_warp = e->tag == "CAbilWarpTrain";
+    std::vector<AbilInfoRow> out;
+    std::unordered_map<std::string, std::size_t> at;
+    for (const core::XmlNode& info : resolved("CAbil", abil_id)) {
+        if (info.name != "InfoArray" && !(is_merge && info.name == "Info")) continue;
+        const std::string index = info.attr_or("index", "");
+        auto it = at.find(index);
+        if (it == at.end()) {
+            at[index] = out.size();
+            out.push_back(AbilInfoRow{});
+            out.back().index = index;
+            it = at.find(index);
+        }
+        AbilInfoRow& r = out[it->second];
+
+        if (const std::string* u = info.attr("Unit")) {
+            r.unit = *u;
+            r.unit_written = true;
+            r.unit_count = 1;
+        } else {
+            int n = 0;
+            std::string first;
+            bool any = false;
+            for (const core::XmlNode& ch : info.children) {
+                if (ch.name != "Unit") continue;
+                any = true;
+                const std::string v = ch.attr_or("value", "");
+                if (v.empty()) continue;
+                if (first.empty()) first = v;
+                ++n;
+            }
+            if (any) {
+                r.unit = first;
+                r.unit_written = true;
+                r.unit_count = n > 1 ? n : 1;
+            }
+        }
+        if (const std::string* u = info.attr("Upgrade")) {
+            r.upgrade = *u;
+            r.upgrade_written = true;
+            if (!u->empty()) r.upgrade_named = true;
+        } else {
+            for (const core::XmlNode& ch : info.children) {
+                if (ch.name != "Upgrade") continue;
+                r.upgrade = ch.attr_or("value", "");
+                r.upgrade_written = true;
+                if (!r.upgrade.empty()) r.upgrade_named = true;
+                break;
+            }
+        }
+        if (const std::string t = info.attr_or("Time", ""); !t.empty()) r.time = authored_seconds(t.c_str());
+        for (const core::XmlNode& ch : info.children) {
+            if (ch.name == "Time") {
+                if (const std::string* v = ch.attr("value")) r.time = authored_seconds(v->c_str());
+            } else if (ch.name == "Resource") {
+                const std::string idx = ch.attr_or("index", "");
+                const std::string val = ch.attr_or("value", "");
+                if (idx == "Minerals") r.minerals = std::atoi(val.c_str());
+                else if (idx == "Vespene") r.gas = std::atoi(val.c_str());
+            } else if (ch.name == "ValidatorArray") {
+                if (ch.attr_or("value", "").find("Vespene") != std::string::npos) r.is_gas = true;
+            } else if (ch.name == "Button") {
+                if (const std::string* req = ch.attr("Requirements")) {
+                    r.requirement = *req;
+                    r.requirement_written = true;
+                    r.requires_techlab = req->find("Attached") != std::string::npos &&
+                                         req->find("TechLab") != std::string::npos;
+                }
+            } else if (is_warp && ch.name == "Charge") {
+                std::string v = ch.attr_or("TimeUse", "");
+                if (v.empty())
+                    for (const core::XmlNode& tu : ch.children)
+                        if (tu.name == "TimeUse") { v = tu.text.empty() ? tu.attr_or("value", "") : tu.text; break; }
+                if (!v.empty()) r.warp_charge = std::strtod(v.c_str(), nullptr);
+            }
+        }
+        r.self_macro = r.unit.find("##") != std::string::npos;
+    }
+    return out;
+}
+
+std::optional<Catalog::AbilInfoRow> Catalog::ability_info_row(const std::string& abil_id,
+                                                              const std::string& index) const {
+    for (AbilInfoRow& r : ability_info_rows(abil_id))
+        if (r.index == index) return r;
+    return std::nullopt;
+}
+
+std::vector<Catalog::CommandCardLayout>
+Catalog::unit_command_cards(const std::string& unit_id) const {
+    auto parse_int = [](const std::string& s) -> int {
+        if (s.empty()) return -1;
+        char* end = nullptr;
+        long v = std::strtol(s.c_str(), &end, 10);
+        return (end != s.c_str() && *end == '\0') ? static_cast<int>(v) : -1;
+    };
+    auto merge_attr = [](const core::XmlNode& n, const char* key, std::string& dst) {
+        if (const std::string* v = n.attr(key)) dst = *v;
+    };
+
+    std::vector<CommandCardLayout> out;
+    const std::vector<NodeSlot> cards = resolve_node_slots("CUnit", unit_id, "CardLayouts");
+    for (std::size_t ci = 0; ci < cards.size(); ++ci) {
+        const NodeSlot& card = cards[ci];
+        if (card.dead) continue;
+        CommandCardLayout layout;
+        layout.index = int(ci);
+        struct Slot {
+            std::vector<const core::XmlNode*> writes;
+            bool dead = false;
+        };
+        std::vector<Slot> slots;
+        long next_append = 0;
+        for (const SlotWrite& w : card.writes) {
+            merge_attr(*w.node, "CardId", layout.card_id);
+            long counter = next_append;
+            for (const core::XmlNode& b : w.node->children) {
+                if (b.name != "LayoutButtons") continue;
+                long key;
+                bool has_index = false;
+                long index = 0;
+                if (const std::string* ix = b.attr("index")) {
+                    char* end = nullptr;
+                    long n = std::strtol(ix->c_str(), &end, 10);
+                    if (end != ix->c_str() && *end == '\0') { has_index = true; index = n; }
+                }
+                if (has_index) key = index;
+                else key = counter++;
+                if (key < 0) key = 0;
+                if (key + 1 > next_append) next_append = key + 1;
+                if (std::size_t(key) >= slots.size()) slots.resize(std::size_t(key) + 1);
+                Slot& s = slots[std::size_t(key)];
+                s.writes.push_back(&b);
+                if (const std::string* rm = b.attr("removed"))
+                    s.dead = (*rm != "0" && !rm->empty());
+            }
+        }
+        for (std::size_t si = 0; si < slots.size(); ++si) {
+            if (slots[si].dead || slots[si].writes.empty()) continue;
+            CommandCardSlot cs;
+            cs.index = int(si);
+            std::string abil_cmd;
+            std::string row, col;
+            for (const core::XmlNode* b : slots[si].writes) {
+                merge_attr(*b, "Type", cs.type);
+                merge_attr(*b, "AbilCmd", abil_cmd);
+                merge_attr(*b, "Face", cs.face);
+                merge_attr(*b, "SubmenuCardId", cs.submenu_id);
+                merge_attr(*b, "Requirements", cs.requirements);
+                merge_attr(*b, "Row", row);
+                merge_attr(*b, "Column", col);
+            }
+            cs.row = parse_int(row);
+            cs.col = parse_int(col);
+            if (!abil_cmd.empty()) {
+                const std::size_t comma = abil_cmd.find(',');
+                cs.ability = comma == std::string::npos ? abil_cmd : abil_cmd.substr(0, comma);
+                cs.command = comma == std::string::npos ? std::string() : abil_cmd.substr(comma + 1);
+            }
+            layout.slots.push_back(std::move(cs));
+        }
+        out.push_back(std::move(layout));
+    }
+    return out;
+}
+
 std::vector<std::pair<std::string, std::string>>
 Catalog::unit_ability_commands(const std::string& unit_id) const {
     std::vector<std::pair<std::string, std::string>> out;
-    for (const core::XmlNode& n : resolved("CUnit", unit_id)) {
-        if (n.name != "CardLayouts") continue;
-        for (const core::XmlNode& b : n.children) {
-            if (b.name != "LayoutButtons") continue;
-            if (b.attr_or("Type", "") != "AbilCmd") continue;
-            const std::string ac = b.attr_or("AbilCmd", "");
-            if (ac.empty()) continue;
-            const std::size_t comma = ac.find(',');
-            std::string abil = comma == std::string::npos ? ac : ac.substr(0, comma);
-            std::string cmd = comma == std::string::npos ? std::string() : ac.substr(comma + 1);
-            if (abil.empty()) continue;
+    for (const CommandCardLayout& card : unit_command_cards(unit_id))
+        for (const CommandCardSlot& s : card.slots) {
+            if (s.type != "AbilCmd" || s.ability.empty()) continue;
             bool dup = false;
             for (const auto& p : out)
-                if (p.first == abil && p.second == cmd) { dup = true; break; }
-            if (!dup) out.emplace_back(std::move(abil), std::move(cmd));
+                if (p.first == s.ability && p.second == s.command) { dup = true; break; }
+            if (!dup) out.emplace_back(s.ability, s.command);
         }
-    }
     return out;
+}
+
+std::string Catalog::cabil_effect_link(const std::string& abil_id) const {
+    std::string eff;
+    for (const core::XmlNode& c : resolved("CAbil", abil_id))
+        if (c.name == "Effect") {
+            const std::string v = c.attr_or("value", "");
+            if (!v.empty()) eff = v;
+        }
+    if (auto s = scalar("CAbil", abil_id, "Effect"); s && !s->empty()) eff = *s;
+    if (!eff.empty()) return eff;
+
+    const Entry* e = find("CAbil", abil_id);
+    if (!e || (e->tag != "CAbilEffectTarget" && e->tag != "CAbilEffectInstant")) return {};
+    const auto def = tag_default_scalar("CAbilEffect", "Effect");
+    if (!def || def->empty()) return {};
+    const std::string link = expand_id(*def, abil_id);
+    return (!link.empty() && find("CEffect", link)) ? link : std::string{};
 }
 
 std::optional<std::string> Catalog::button_icon(const std::string& button_id) const {
@@ -1017,45 +1159,23 @@ std::optional<std::string> Catalog::button_icon(const std::string& button_id) co
 
 std::vector<Catalog::AbilityCardButton>
 Catalog::unit_ability_card_buttons(const std::string& unit_id) const {
-    auto parse_int = [](const std::string& s) -> int {
-        if (s.empty()) return -1;
-        char* end = nullptr;
-        long v = std::strtol(s.c_str(), &end, 10);
-        return (end != s.c_str() && *end == '\0') ? static_cast<int>(v) : -1;
-    };
     std::vector<AbilityCardButton> out;
-    for (const core::XmlNode& n : resolved("CUnit", unit_id)) {
-        if (n.name != "CardLayouts") continue;
-        for (const core::XmlNode& b : n.children) {
-            if (b.name != "LayoutButtons") continue;
-            if (b.attr_or("Type", "") != "AbilCmd") continue;
-            const std::string ac = b.attr_or("AbilCmd", "");
-            if (ac.empty()) continue;
-            const std::size_t comma = ac.find(',');
-            std::string abil = comma == std::string::npos ? ac : ac.substr(0, comma);
-            std::string cmd = comma == std::string::npos ? std::string() : ac.substr(comma + 1);
-            if (abil.empty()) continue;
-            const std::string face = b.attr_or("Face", "");
-            const int row = parse_int(b.attr_or("Row", ""));
-            const int col = parse_int(b.attr_or("Column", ""));
-            AbilityCardButton* found = nullptr;
-            for (AbilityCardButton& e : out)
-                if (e.ability == abil && e.command == cmd) { found = &e; break; }
-            if (found) {
-                if (!face.empty()) found->face = face;
-                if (row >= 0) found->row = row;
-                if (col >= 0) found->col = col;
-            } else {
-                AbilityCardButton e;
-                e.ability = std::move(abil);
-                e.command = std::move(cmd);
-                e.face = face;
-                e.row = row;
-                e.col = col;
-                out.push_back(std::move(e));
-            }
+    for (const CommandCardLayout& card : unit_command_cards(unit_id))
+        for (const CommandCardSlot& s : card.slots) {
+            if (s.type != "AbilCmd" || s.ability.empty()) continue;
+            bool dup = false;
+            for (const AbilityCardButton& e : out)
+                if (e.ability == s.ability && e.command == s.command) { dup = true; break; }
+            if (dup) continue;
+            AbilityCardButton e;
+            e.ability = s.ability;
+            e.command = s.command;
+            e.face = s.face;
+            e.row = s.row;
+            e.col = s.col;
+            e.card = card.index;
+            out.push_back(std::move(e));
         }
-    }
     return out;
 }
 
@@ -1085,6 +1205,7 @@ Catalog::UnitStats Catalog::unit_stats(const std::string& unit_id) const {
     s.speed = scalar_num("CUnit", unit_id, "Speed").value_or(0);
     s.radius = scalar_num("CUnit", unit_id, "Radius");
     if (!s.radius && find("CUnit", unit_id)) s.radius = 0.5;
+    if (s.radius) s.radius = unit_body_radius(unit_id, *s.radius);
     bool primary_weapon = true;
     for (const std::string& wl : array_links("CUnit", unit_id, "WeaponArray"))
         if (!wl.empty()) {
@@ -1098,12 +1219,9 @@ Catalog::UnitStats Catalog::unit_stats(const std::string& unit_id) const {
     return s;
 }
 
-static const char* kMeleeMods[] = {"core",       "liberty", "libertymulti",
-                                   "swarm",      "swarmmulti", "void",
-                                   "voidmulti"};
-
 void Catalog::load_files(const casc::Storage& store,
                          const std::vector<std::string>& basenames) {
+    load_skips_.clear();
     for (const char* mod : kMeleeMods) {
         for (const std::string& file : basenames) {
             std::string name =
@@ -1111,6 +1229,7 @@ void Catalog::load_files(const casc::Storage& store,
             try {
                 ingest(store.read_by_name(name));
             } catch (const std::exception&) {
+                load_skips_.push_back(name);
             }
         }
     }
@@ -1140,6 +1259,7 @@ void Catalog::load_root_files(const casc::Storage& store,
             try {
                 ingest(store.read_by_name(name));
             } catch (const std::exception&) {
+                load_skips_.push_back(name);
             }
         }
     }
@@ -1353,6 +1473,42 @@ std::optional<double> Catalog::effect_vital_fraction(const std::string& effect_i
                     return std::atof(v->c_str());
     }
     return std::nullopt;
+}
+
+std::array<float, 3> Catalog::unit_render_scale(const std::string& unit_id) const {
+    const std::array<float, 3> kIdentity{1.0f, 1.0f, 1.0f};
+    if (unit_id.empty()) return kIdentity;
+
+    if (!actor_by_unit_built_) {
+        actor_by_unit_built_ = true;
+        for (const std::string& aid : ids("CActorUnit")) {
+            const Entry* e = find("CActorUnit", aid);
+            if (!e) continue;
+            const std::string* un = e->attr("unitName");
+            const std::string& key = (un && !un->empty()) ? *un : aid;
+            actor_by_unit_.emplace(key, aid);
+        }
+    }
+    auto it = actor_by_unit_.find(unit_id);
+    if (it == actor_by_unit_.end()) return kIdentity;
+
+    std::optional<std::string> raw = scalar("CActorUnit", it->second, "Scale");
+    if (!raw || raw->empty()) return kIdentity;
+
+    std::array<float, 3> out = kIdentity;
+    std::size_t comps = 0;
+    const char* p = raw->c_str();
+    while (*p && comps < 3) {
+        char* end = nullptr;
+        const double v = std::strtod(p, &end);
+        if (end == p) break;
+        out[comps++] = float(v);
+        p = end;
+        while (*p == ',' || *p == ' ') ++p;
+    }
+    if (comps == 0) return kIdentity;
+    if (comps == 1) out[1] = out[2] = out[0];
+    return out;
 }
 
 }

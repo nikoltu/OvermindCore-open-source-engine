@@ -37,6 +37,8 @@ public:
     void load_files(const casc::Storage& store,
                     const std::vector<std::string>& basenames);
 
+    const std::vector<std::string>& load_skips() const { return load_skips_; }
+
     void ingest(const std::vector<uint8_t>& xml);
 
     std::size_t size() const { return upgrades_.size(); }
@@ -46,6 +48,8 @@ public:
     const std::vector<UpgradeEffect>& resolve(const std::string& id) const;
 
 private:
+    std::vector<std::string> load_skips_;
+
     struct Slot {
         std::string key;
         bool alive = true;

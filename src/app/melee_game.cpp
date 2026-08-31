@@ -3,6 +3,7 @@
 #include "sc2/formats/placed_objects.hpp"
 
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <cstdio>
 #include <set>
@@ -30,6 +31,7 @@
 #include "sc2/data/catalog.hpp"
 #include "sc2/formats/m3.hpp"
 #include "sc2/render/mat4.hpp"
+#include "sc2/sim/weapon.hpp"
 #include "sc2/sim/transport.hpp"
 #include "sc2/render/prim.hpp"
 #include "sc2/ui/font.hpp"
@@ -517,7 +519,8 @@ MeleeCommandContext MeleeGame::command_context() {
         }
     ctx.producer_built = human_producer_ != sim::kNoTarget;
     const int bank = world_.player(cfg_.human_player).minerals;
-    ctx.can_afford_producer = bank >= human_build_.producer_cost;
+    ctx.can_afford_producer = bank >= human_build_.producer_cost &&
+                              world_.player(cfg_.human_player).gas >= human_build_.producer_gas;
     ctx.can_afford_supply = bank >= human_build_.supply_cost;
     if (ctx.worker_selected && !ctx.town_hall_selected && cat_ &&
         size_t(cfg_.human_player) < layout_.players.size()) {
@@ -711,10 +714,16 @@ std::uint32_t MeleeGame::selected_addon_producer() const {
 
 void MeleeGame::setup(const MeleeSetup& setup, MeleeModels* models,
                       const formats::Model* ground, float map_w, float map_h,
-                      const sim::NavGrid* nav) {
+                      const sim::NavGrid* nav, const sim::TerrainMap* placement,
+                      float playable_x0, float playable_y0, float playable_x1,
+                      float playable_y1) {
     ground_ = ground;
     map_w_ = map_w;
     map_h_ = map_h;
+    playable_x0_ = playable_x0;
+    playable_y0_ = playable_y0;
+    playable_x1_ = playable_x1;
+    playable_y1_ = playable_y1;
     if (map_w > 0.0f && map_h > 0.0f)
         world_.creep().configure(int(map_w) + 1, int(map_h) + 1, sim::Fixed::from_int(1),
                                  sim::Fixed(), sim::Fixed());
@@ -723,6 +732,7 @@ void MeleeGame::setup(const MeleeSetup& setup, MeleeModels* models,
         if (u.alive && u.catalog_id == "XelNagaTower")
             world_.register_watchtower(u.id, sim::Fixed::from_double(2.5));
     if (nav) world_.nav() = *nav;
+    if (placement) world_.placement() = *placement;
     if (world_.nav().configured())
         for (const sim::Unit& u : world_.units()) {
             if (!u.alive || u.catalog_id.find("Destructible") == std::string::npos) continue;
@@ -792,6 +802,8 @@ void MeleeGame::setup(const MeleeSetup& setup, MeleeModels* models,
             if (!m) m = models->model_for(layout_.unit_type[id]);
         }
         driver_.set_model(id, m);
+        if (id < layout_.unit_facing_set.size() && layout_.unit_facing_set[id])
+            driver_.set_spawn_facing(id, layout_.unit_facing[id]);
     }
     producer_model_ = models ? models->model_for("Barracks") : nullptr;
     carry_model_ = models ? models->model_for("MineralField") : nullptr;
@@ -816,6 +828,7 @@ void MeleeGame::setup(const MeleeSetup& setup, MeleeModels* models,
     if (cfg_.human_player >= 0 && size_t(cfg_.human_player) < setup.players.size()) {
         const MeleePlayerSetup& hp = setup.players[size_t(cfg_.human_player)];
         human_build_.producer_cost = hp.producer_mineral_cost;
+        human_build_.producer_gas = hp.producer_gas_cost;
         human_build_.army_cost = hp.army_mineral_cost;
         human_build_.worker_proto = hp.worker;
         human_build_.worker_cost = hp.worker_mineral_cost;
@@ -830,7 +843,10 @@ void MeleeGame::setup(const MeleeSetup& setup, MeleeModels* models,
 
     if (cfg_.human_player >= 0 && size_t(cfg_.human_player) < setup.players.size()) {
         const MeleePos& st = setup.players[size_t(cfg_.human_player)].start;
-        camctl_.focus = {float(st.x.to_double()), float(st.y.to_double()), 0.0f};
+        {
+            const float fx = float(st.x.to_double()), fy = float(st.y.to_double());
+            camctl_.focus = {fx, fy, ground_z_at(fx, fy)};
+        }
         framed_ = true;
     } else {
         render::Vec3 c{0, 0, 0};
@@ -841,7 +857,8 @@ void MeleeGame::setup(const MeleeSetup& setup, MeleeModels* models,
             ++n;
         }
         if (n) {
-            camctl_.focus = {c.x / float(n), c.y / float(n), 0};
+            const float fx = c.x / float(n), fy = c.y / float(n);
+            camctl_.focus = {fx, fy, ground_z_at(fx, fy)};
             camctl_.distance = 40.0f;
         }
     }
@@ -863,13 +880,8 @@ void MeleeGame::begin_replay(const OrderLog& log) {
 
 void MeleeGame::inject_replay_orders(int tick) {
     while (replay_cursor_ < replay_source_.orders.size() &&
-           replay_source_.orders[replay_cursor_].tick <= tick) {
-        const TimedOrder& to = replay_source_.orders[replay_cursor_++];
-        if (to.is_stop)
-            world_.stop(to.unit_id);
-        else
-            world_.issue(to.unit_id, to.order, to.queued);
-    }
+           replay_source_.orders[replay_cursor_].tick <= tick)
+        apply_timed_order(world_, replay_source_.orders[replay_cursor_++]);
 }
 
 ReplayTrace MeleeGame::run_replay_to_end() {
@@ -899,6 +911,7 @@ void MeleeGame::enable_research(const data::Catalog& cat, const data::UpgradeCat
 void MeleeGame::register_creep_masks(const data::Catalog& cat) {
     for (const std::string& id : cat.ids("CUnit")) {
         auto mask = cat.creep_source_footprint_offsets(id);
+        if (mask.empty()) mask = cat.toggled_creep_footprint_offsets(id);
         if (!mask.empty()) world_.register_creep_mask(id, std::move(mask));
     }
 }
@@ -1158,8 +1171,13 @@ std::vector<AbilityCardEntry> MeleeGame::merge_selection_abilities(CommandCard& 
 }
 
 std::vector<AbilityCardEntry> MeleeGame::selection_card_abilities() {
-    CommandCard card = build_melee_command_card(command_context());
-    return merge_selection_abilities(card);
+    return command_card_layout().abilities;
+}
+
+MeleeGame::CardLayout MeleeGame::command_card_layout() {
+    CardLayout l;
+    l.card = compose_command_card(l.builds, l.abilities, l.trains);
+    return l;
 }
 
 CommandCard MeleeGame::compose_command_card(std::vector<BuildCardEntry>& builds,
@@ -1309,9 +1327,7 @@ std::vector<MeleeGame::TrainCardEntry> MeleeGame::merge_selection_train(CommandC
 }
 
 std::vector<MeleeGame::TrainCardEntry> MeleeGame::selection_train_card() {
-    CommandCard card = build_melee_command_card(command_context());
-    merge_selection_abilities(card);
-    return merge_selection_train(card);
+    return command_card_layout().trains;
 }
 
 bool MeleeGame::human_train(std::uint32_t producer, const std::string& unit_id) {
@@ -1403,11 +1419,7 @@ std::vector<MeleeGame::BuildCardEntry> MeleeGame::merge_selection_build(CommandC
 }
 
 std::vector<MeleeGame::BuildCardEntry> MeleeGame::selection_build_card() {
-    CommandCard card = build_melee_command_card(command_context());
-    std::vector<BuildCardEntry> out = merge_selection_build(card);
-    merge_selection_abilities(card);
-    merge_selection_train(card);
-    return out;
+    return command_card_layout().builds;
 }
 
 bool MeleeGame::human_build(std::uint32_t worker, const std::string& structure_unit_id) {
@@ -1438,6 +1450,7 @@ bool MeleeGame::human_build(std::uint32_t worker, const std::string& structure_u
     build_proto_ = make_unit(*cat_, structure_unit_id, cfg_.human_player);
     build_proto_.speed = sim::Fixed();
     build_cost_ = data::unit_cost(*cat_, structure_unit_id).minerals;
+    build_gas_cost_ = data::unit_cost(*cat_, structure_unit_id).gas;
     build_time_ = time;
     return true;
 }
@@ -1458,6 +1471,116 @@ bool MeleeGame::human_morph(std::uint32_t caster, const std::string& morph_abil)
     hp.minerals -= delta.first;
     hp.gas -= delta.second;
     return true;
+}
+
+bool MeleeGame::human_toggle_cloak(const std::string& abil_id, const std::string& command) {
+    if (!cat_) return false;
+    bool is_cloak = false;
+    for (const std::string& beh : cat_->array_links("CAbil", abil_id, "BehaviorArray"))
+        if (cat_->cloak_drain(beh)) {
+            is_cloak = true;
+            break;
+        }
+    if (!is_cloak) return false;
+
+    const bool engage = command != "Off";
+    const sim::Fixed cost = ability_energy_cost(*cat_, abil_id);
+
+    bool any = false;
+    if (cfg_.human_player < 0) return false;
+    for (std::uint32_t id : selection_) {
+        if (id >= world_.units().size()) continue;
+        sim::Unit& u = world_.unit(id);
+        if (!u.alive || u.player != cfg_.human_player || u.cloak_drain.raw() <= 0) continue;
+        if (engage) {
+            if (u.cloaked) continue;
+            if (u.energy < cost) continue;
+            if (!world_.set_cloak(id, true)) continue;
+            u.energy = u.energy - cost;
+        } else {
+            if (!u.cloaked) continue;
+            world_.set_cloak(id, false);
+        }
+        any = true;
+    }
+    return any;
+}
+
+bool MeleeGame::human_toggle_weapon(const std::string& abil_id, const std::string& command) {
+    if (!cat_ || cfg_.human_player < 0) return false;
+    bool enables_weapon = false;
+    for (const std::string& beh : cat_->array_links("CAbil", abil_id, "BehaviorArray"))
+        if (!cat_->behavior_weapon_enable(beh).empty()) {
+            enables_weapon = true;
+            break;
+        }
+    if (!enables_weapon) return false;
+
+    const bool engage = command != "Off";
+    const sim::Fixed cost = ability_energy_cost(*cat_, abil_id);
+
+    bool any = false;
+    for (std::uint32_t id : selection_) {
+        if (id >= world_.units().size()) continue;
+        sim::Unit& u = world_.unit(id);
+        if (!u.alive || u.player != cfg_.human_player || !u.has_toggle_wpn) continue;
+        if (engage) {
+            if (u.toggle_wpn_on) continue;
+            if (u.energy < cost) continue;
+            if (!world_.set_weapon_toggle(id, true)) continue;
+            u.energy = u.energy - cost;
+        } else {
+            if (!u.toggle_wpn_on) continue;
+            world_.set_weapon_toggle(id, false);
+        }
+        any = true;
+    }
+    return any;
+}
+
+bool MeleeGame::human_toggle_creep(const std::string& abil_id, const std::string& command) {
+    if (!cat_ || cfg_.human_player < 0) return false;
+    bool is_creep_toggle = false;
+    for (const std::string& beh : cat_->array_links("CAbil", abil_id, "BehaviorArray")) {
+        if (beh.empty()) continue;
+        if (cat_->scalar("CBehavior", beh, "Grown")) {
+            is_creep_toggle = true;
+            break;
+        }
+    }
+    if (!is_creep_toggle) return false;
+
+    const bool engage = command != "Off";
+    bool any = false;
+    for (std::uint32_t id : selection_) {
+        if (id >= world_.units().size()) continue;
+        const sim::Unit& u = world_.units()[id];
+        if (!u.alive || u.player != cfg_.human_player || !u.has_toggle_creep) continue;
+        if (engage == u.creep_gen_on) continue;
+        if (world_.set_creep_generation(id, engage)) any = true;
+        else if (!engage) any = true;
+    }
+    return any;
+}
+
+bool MeleeGame::human_salvage(const std::string& abil_id) {
+    if (!cat_ || cfg_.human_player < 0) return false;
+    const data::Catalog::SalvageSpec sp = cat_->salvage_spec(abil_id);
+    if (!sp.found || (sp.mineral_frac <= 0 && sp.gas_frac <= 0)) return false;
+
+    bool any = false;
+    for (std::uint32_t id : selection_) {
+        if (id >= world_.units().size()) continue;
+        sim::Unit& u = world_.unit(id);
+        if (!u.alive || u.player != cfg_.human_player || u.constructing) continue;
+        if (u.salvage_timer.raw() > 0) continue;
+        if (world_.cargo_used(id) > 0) continue;
+        const data::UnitCost c = data::unit_cost(*cat_, u.catalog_id);
+        const int32_t rm = int32_t(double(c.minerals) * sp.mineral_frac);
+        const int32_t rg = int32_t(double(c.gas) * sp.gas_frac);
+        if (world_.begin_salvage(id, sim::Fixed::from_double(sp.delay), rm, rg)) any = true;
+    }
+    return any;
 }
 
 bool MeleeGame::human_merge() {
@@ -1495,6 +1618,22 @@ bool MeleeGame::human_siege_defender(std::uint32_t caster, sim::Fixed cx, sim::F
     return true;
 }
 
+float MeleeGame::GroundZ::max_z() const {
+    float top = 0.0f;
+    for (float z : game->tier_heights_) top = z > top ? z : top;
+    return top;
+}
+
+float MeleeGame::ground_z_at(float wx, float wy) const {
+    if (tier_heights_.empty()) return 0.0f;
+    const sim::NavGrid& nav = world_.nav();
+    if (!nav.configured()) return 0.0f;
+    int cx = 0, cy = 0;
+    nav.to_cell(sim::Fixed::from_double(double(wx)), sim::Fixed::from_double(double(wy)), cx, cy);
+    const std::size_t L = std::size_t(nav.level_cell(cx, cy));
+    return tier_heights_[L < tier_heights_.size() ? L : tier_heights_.size() - 1];
+}
+
 void MeleeGame::update_camera(const render::InputState& in, float dt_s) {
     if (in.wheel != 0.0f) {
         const int dir = in.wheel > 0.0f ? 1 : -1;
@@ -1508,16 +1647,20 @@ void MeleeGame::update_camera(const render::InputState& in, float dt_s) {
     if (in.view_w && in.view_h) {
         refresh_hud_layout(in.view_w, in.view_h);
         const ConsolePanel console = console_view();
-        const float bar_top =
-            float(int(in.view_h) - hud_panel_height(in.view_w, in.view_h, &console));
-        const bool over_bar = in.mouse_y >= bar_top;
+        const bool over_bar =
+            hud_covers_point(in.view_w, in.view_h, &console, in.mouse_x, in.mouse_y);
         if (in.mouse_x <= cfg_.edge_margin) px -= 1;
         else if (in.mouse_x >= float(in.view_w) - cfg_.edge_margin) px += 1;
         if (in.mouse_y <= cfg_.edge_margin) py += 1;
         else if (in.mouse_y >= float(in.view_h) - cfg_.edge_margin && !over_bar) py -= 1;
     }
-    if (px != 0.0f || py != 0.0f)
+    if (px != 0.0f || py != 0.0f) {
         camctl_.pan(px * cfg_.pan_speed * dt_s, py * cfg_.pan_speed * dt_s);
+        if (playable_x1_ > playable_x0_ && playable_y1_ > playable_y0_) {
+            camctl_.focus.x = std::clamp(camctl_.focus.x, playable_x0_, playable_x1_);
+            camctl_.focus.y = std::clamp(camctl_.focus.y, playable_y0_, playable_y1_);
+        }
+    }
     float o = 0;
     if (in.key_orbit_left) o += 1;
     if (in.key_orbit_right) o -= 1;
@@ -1526,10 +1669,34 @@ void MeleeGame::update_camera(const render::InputState& in, float dt_s) {
         camctl_.orbit(-in.mouse_dx * cfg_.orbit_mouse, -in.mouse_dy * cfg_.orbit_mouse);
 }
 
+bool MeleeGame::consume_modal_target(sim::Fixed wx, sim::Fixed wy) {
+    if (!(pending_attack_ || pending_patrol_) || selection_.empty()) return false;
+    for (std::uint32_t id : selection_) {
+        if (id >= world_.units().size()) continue;
+        sim::Order o;
+        if (pending_attack_) {
+            o.type = sim::OrderType::AttackMove;
+            o.tx = wx;
+            o.ty = wy;
+        } else {
+            const Unit& u = world_.unit(id);
+            o.type = sim::OrderType::Patrol;
+            o.tx = wx;
+            o.ty = wy;
+            o.px = u.x;
+            o.py = u.y;
+        }
+        world_.issue(id, o);
+    }
+    audio_ui_event(human_lead_caster(), data::UnitEvent::Confirm, 0.9f);
+    pending_attack_ = pending_patrol_ = false;
+    return true;
+}
+
 void MeleeGame::handle_commands(const render::InputState& in, float aspect) {
     if (cfg_.human_player < 0 || !in.view_w || !in.view_h) return;
     render::Mat4 mvp = camctl_.view_proj(aspect);
-    Control ctrl(mvp, in.view_w, in.view_h, cfg_.human_player);
+    Control ctrl = make_control(mvp, in.view_w, in.view_h, cfg_.human_player);
 
     ensure_console_texture();
     refresh_hud_layout(in.view_w, in.view_h);
@@ -1539,7 +1706,7 @@ void MeleeGame::handle_commands(const render::InputState& in, float aspect) {
     const bool over_minimap = in.mouse_x >= float(mm.x0) && in.mouse_x < float(mm.x1) &&
                               in.mouse_y >= float(mm.y0) && in.mouse_y < float(mm.y1);
     const bool over_bar =
-        in.mouse_y >= float(int(in.view_h) - hud_panel_height(in.view_w, in.view_h, &console));
+        hud_covers_point(in.view_w, in.view_h, &console, in.mouse_x, in.mouse_y);
     auto minimap_world = [&](float& wx, float& wy) {
         float fx = (in.mouse_x - float(mm.x0)) / float(std::max(mm.w() - 1, 1));
         float fy = (in.mouse_y - float(mm.y0)) / float(std::max(mm.h() - 1, 1));
@@ -1598,7 +1765,23 @@ void MeleeGame::handle_commands(const render::InputState& in, float aspect) {
             if (clear && build_proto_.needs_power &&
                 !world_.powered_at(wx, wy, cfg_.human_player))
                 clear = false;
-            build_valid_ = clear && world_.player(cfg_.human_player).minerals >= build_cost_;
+            if (clear && world_.placement().configured()) {
+                int gcx = 0, gcy = 0;
+                world_.placement().to_cell(wx, wy, gcx, gcy);
+                int gminx = 0, gmaxx = 0, gminy = 0, gmaxy = 0;
+                for (const std::pair<std::int16_t, std::int16_t>& o : build_proto_.footprint_offsets) {
+                    if (o.first < gminx) gminx = o.first;
+                    if (o.first > gmaxx) gmaxx = o.first;
+                    if (o.second < gminy) gminy = o.second;
+                    if (o.second > gmaxy) gmaxy = o.second;
+                }
+                if (!world_.placement().can_place(gcx + gminx, gcy + gminy, gmaxx - gminx + 1,
+                                                  gmaxy - gminy + 1))
+                    clear = false;
+            }
+            build_valid_ = clear &&
+                           world_.player(cfg_.human_player).minerals >= build_cost_ &&
+                           world_.player(cfg_.human_player).gas >= build_gas_cost_;
         } else {
             build_valid_ = false;
         }
@@ -1607,24 +1790,27 @@ void MeleeGame::handle_commands(const render::InputState& in, float aspect) {
     if (over_minimap && map_w_ > 0.0f && map_h_ > 0.0f) {
         if (in.left_pressed) {
             float wx, wy; minimap_world(wx, wy);
-            camctl_.focus = {wx, wy, 0.0f};
+            const bool spent = consume_modal_target(
+                sim::Fixed::from_ratio(int(std::lround(double(wx) * 4096.0)), 4096),
+                sim::Fixed::from_ratio(int(std::lround(double(wy) * 4096.0)), 4096));
+            if (!spent) camctl_.focus = {wx, wy, ground_z_at(wx, wy)};
             dragging_ = false;
         }
         if (in.right_pressed && !selection_.empty()) {
             float wx, wy; minimap_world(wx, wy);
             sim::Order o;
-            o.type = in.shift ? sim::OrderType::AttackMove : sim::OrderType::Move;
+            o.type = sim::OrderType::Move;
             o.tx = sim::Fixed::from_ratio(int(std::lround(double(wx) * 64.0)), 64);
             o.ty = sim::Fixed::from_ratio(int(std::lround(double(wy) * 64.0)), 64);
-            for (std::uint32_t id : selection_) world_.issue(id, o);
+            for (std::uint32_t id : selection_) world_.issue(id, o, in.shift);
             audio_ui_event(human_lead_caster(), data::UnitEvent::Confirm, 0.9f);
         }
         return;
     }
 
     if (in.right_pressed && over_bar && cast_policy_ && cat_ && !selection_.empty()) {
-        CommandCard rc = build_melee_command_card(command_context());
-        const std::vector<AbilityCardEntry> rc_abils = merge_selection_abilities(rc);
+        const CardLayout rc_layout = command_card_layout();
+        const std::vector<AbilityCardEntry>& rc_abils = rc_layout.abilities;
         for (int i = 0; i < kCommandCols * kCommandRows && i < CommandCard::kSlots; ++i) {
             const HudRect c = hud_command_cell(in.view_w, in.view_h, i, &console);
             if (in.mouse_x < float(c.x0) || in.mouse_x >= float(c.x1) ||
@@ -1650,12 +1836,12 @@ void MeleeGame::handle_commands(const render::InputState& in, float aspect) {
     if (in.left_pressed) {
         if (over_bar) {
             dragging_ = false;
-            CommandCard card = build_melee_command_card(command_context());
-            const std::vector<BuildCardEntry> build_abils = merge_selection_build(card);
-            const std::vector<AbilityCardEntry> card_abils = merge_selection_abilities(card);
-            const std::vector<TrainCardEntry> train_abils = merge_selection_train(card);
+            CardLayout layout = command_card_layout();
+            CommandCard& card = layout.card;
+            const std::vector<BuildCardEntry>& build_abils = layout.builds;
+            const std::vector<AbilityCardEntry>& card_abils = layout.abilities;
+            const std::vector<TrainCardEntry>& train_abils = layout.trains;
             const std::uint32_t cancel_building = selected_constructing_building();
-            if (cancel_building != sim::kNoTarget) card.set_cancel();
             for (int i = 0; i < kCommandCols * kCommandRows && i < CommandCard::kSlots; ++i) {
                 const HudRect c = hud_command_cell(in.view_w, in.view_h, i, &console);
                 if (in.mouse_x >= float(c.x0) && in.mouse_x < float(c.x1) &&
@@ -1677,7 +1863,12 @@ void MeleeGame::handle_commands(const render::InputState& in, float aspect) {
                             if (ab.requirement_met && cat_) {
                                 pending_attack_ = pending_patrol_ = false;
                                 cancel_ability_cast();
-                                if (const auto ms = cat_->morph_spec(ab.ability); ms && !ms->target.empty()) {
+                                if (human_toggle_cloak(ab.ability, ab.command)) {
+                                } else if (human_toggle_weapon(ab.ability, ab.command)) {
+                                } else if (human_toggle_creep(ab.ability, ab.command)) {
+                                } else if (human_salvage(ab.ability)) {
+                                } else if (const auto ms = cat_->morph_spec(ab.ability);
+                                           ms && !ms->target.empty()) {
                                     human_morph(human_lead_caster(), ab.ability);
                                 } else {
                                     const AbilTargetMode m = ability_target_mode(*cat_, ab.ability);
@@ -1820,7 +2011,8 @@ void MeleeGame::handle_commands(const render::InputState& in, float aspect) {
                 if (clear && build_proto_.needs_power && !world_.powered_at(wx, wy, cfg_.human_player))
                     clear = false;
                 if (clear) {
-                    build_queue_.push_back({bw, wx, wy, build_proto_, build_cost_, build_time_,
+                    build_queue_.push_back({bw, wx, wy, build_proto_, build_cost_, build_gas_cost_,
+                                            build_time_,
                                             build_proto_.supply_provides.raw() == 0});
                     placed = true;
                 }
@@ -1899,22 +2091,12 @@ void MeleeGame::handle_commands(const render::InputState& in, float aspect) {
         } else if ((pending_attack_ || pending_patrol_) && !selection_.empty()) {
             dragging_ = false;
             sim::Fixed wx, wy;
-            if (ctrl.ground_point(world_, ScreenPoint{in.mouse_x, in.mouse_y}, wx, wy))
-                for (std::uint32_t id : selection_) {
-                    if (id >= world_.units().size()) continue;
-                    sim::Order o;
-                    if (pending_attack_) {
-                        o.type = sim::OrderType::AttackMove;
-                        o.tx = wx; o.ty = wy;
-                    } else {
-                        const Unit& u = world_.unit(id);
-                        o.type = sim::OrderType::Patrol;
-                        o.tx = wx; o.ty = wy; o.px = u.x; o.py = u.y;
-                    }
-                    world_.issue(id, o);
-                }
-            audio_ui_event(human_lead_caster(), data::UnitEvent::Confirm, 0.9f);
-            pending_attack_ = pending_patrol_ = false;
+            if (ctrl.ground_point(world_, ScreenPoint{in.mouse_x, in.mouse_y}, wx, wy)) {
+                consume_modal_target(wx, wy);
+            } else {
+                audio_ui_event(human_lead_caster(), data::UnitEvent::Confirm, 0.9f);
+                pending_attack_ = pending_patrol_ = false;
+            }
         } else if (has_pending_ability_cast()) {
             dragging_ = false;
             if (pending_cast_mode_ == AbilTargetMode::Point) {
@@ -2043,7 +2225,8 @@ void MeleeGame::handle_commands(const render::InputState& in, float aspect) {
                 }
             }
         } else if (producers.empty()) {
-            ctrl.issue_command(world_, selection_, ScreenPoint{in.mouse_x, in.mouse_y}, in.shift);
+            ctrl.issue_command(world_, selection_, ScreenPoint{in.mouse_x, in.mouse_y},
+                                false,  in.shift);
         } else {
             std::vector<std::uint32_t> movers;
             movers.reserve(selection_.size());
@@ -2051,7 +2234,8 @@ void MeleeGame::handle_commands(const render::InputState& in, float aspect) {
                 if (std::find(producers.begin(), producers.end(), id) == producers.end())
                     movers.push_back(id);
             if (!movers.empty())
-                ctrl.issue_command(world_, movers, ScreenPoint{in.mouse_x, in.mouse_y}, in.shift);
+                ctrl.issue_command(world_, movers, ScreenPoint{in.mouse_x, in.mouse_y},
+                                    false,  in.shift);
         }
         audio_ui_event(human_lead_caster(), data::UnitEvent::Confirm, 0.9f);
     }
@@ -2101,10 +2285,13 @@ void MeleeGame::emit_scene(std::vector<render::SceneInstance>& scene) {
         const formats::Model* m =
             (u.id < driver_.actors.size()) ? driver_.actors[u.id].model : nullptr;
         inst.model = m;
-        const float ms = 1.0f;
+        const std::array<float, 3> ms =
+            cat_ ? cat_->unit_render_scale(u.catalog_id) : std::array<float, 3>{1.0f, 1.0f, 1.0f};
+        const float footprint_scale = std::max(ms[0], ms[1]);
         const float native_span = cached_diameter(m);
         const float visual_r =
-            native_span > 1e-3f ? native_span * 0.5f : float(u.radius.to_double());
+            (native_span > 1e-3f ? native_span * 0.5f : float(u.radius.to_double())) *
+            footprint_scale;
         float wx = float(u.x.to_double()), wy = float(u.y.to_double());
         if (u.id < prev_pos_.size() && u.id < curr_pos_.size()) {
             const render::Vec3& p = prev_pos_[u.id];
@@ -2120,19 +2307,12 @@ void MeleeGame::emit_scene(std::vector<render::SceneInstance>& scene) {
                 wz = fh > 0.0f ? fh : 3.25f;
             }
         }
-        {
-            const sim::NavGrid& nav = world_.nav();
-            if (nav.configured()) {
-                int cx = 0, cy = 0;
-                nav.to_cell(sim::Fixed::from_double(double(wx)), sim::Fixed::from_double(double(wy)), cx,
-                            cy);
-                wz += float(nav.level_cell(cx, cy)) * 2.0f;
-            }
-        }
-        inst.world = render::translation(wx, wy, wz) * render::scaling(ms, ms, ms);
+        wz += ground_z_at(wx, wy);
+        inst.world = render::translation(wx, wy, wz) * render::scaling(ms[0], ms[1], ms[2]);
         if (u.id < driver_.actors.size() && m) {
             render::ActorInstance& a = driver_.actors[u.id];
-            inst.world = render::translation(wx, wy, wz) * a.orient() * render::scaling(ms, ms, ms);
+            inst.world =
+                render::translation(wx, wy, wz) * a.orient() * render::scaling(ms[0], ms[1], ms[2]);
             inst.seq = a.sequence_of(a.current());
             inst.time_ms = a.clock;
         }
@@ -2177,8 +2357,11 @@ void MeleeGame::emit_scene(std::vector<render::SceneInstance>& scene) {
                 ring_cache.emplace_back(key, render::make_ring_model(inner));
                 rm = &ring_cache.back().second;
             }
-            std::array<float, 4> rc = team_colour(u.player, false);
-            if (rc[3] < 0.0f) rc = {0.9f, 0.85f, 0.30f, 1.0f};
+            constexpr std::array<float, 3> kSelectedRingRgb = {0.0f, 168.0f / 255.0f, 90.0f / 255.0f};
+            std::array<float, 4> rc = u.player >= 0
+                                          ? std::array<float, 4>{kSelectedRingRgb[0], kSelectedRingRgb[1],
+                                                                 kSelectedRingRgb[2], 1.0f}
+                                          : std::array<float, 4>{0.9f, 0.85f, 0.30f, 1.0f};
             rc[3] = 2.0f;
             render::SceneInstance ring;
             ring.model = rm;
@@ -2370,6 +2553,7 @@ bool MeleeGame::step(const render::InputState& in, float dt_ms,
             pending_build_ = true;
             build_proto_ = human_build_.producer_proto;
             build_cost_ = human_build_.producer_cost;
+            build_gas_cost_ = human_build_.producer_gas;
             build_time_ = human_build_.producer_build_time;
             pending_attack_ = pending_patrol_ = false;
         }
@@ -2381,16 +2565,18 @@ bool MeleeGame::step(const render::InputState& in, float dt_ms,
                                  au.build_time);
         }
 
-        if (ui_buildtechlab_ || ui_buildreactor_) {
+        if ((ui_buildtechlab_ || ui_buildreactor_) && cat_) {
             const std::uint32_t prod = selected_addon_producer();
             auto& hp = world_.player(cfg_.human_player);
-            if (prod != sim::kNoTarget && hp.minerals >= 50 && hp.gas >= 25) {
+            const data::UnitCost cost =
+                data::unit_cost(*cat_, ui_buildreactor_ ? "Reactor" : "TechLab");
+            if (prod != sim::kNoTarget && hp.minerals >= cost.minerals && hp.gas >= cost.gas) {
                 const int32_t kind =
                     ui_buildreactor_ ? sim::World::kAddonReactor : sim::World::kAddonTechLab;
                 const sim::Fixed btime = sim::Fixed::from_int(ui_buildreactor_ ? 50 : 25);
                 if (world_.build_addon(prod, kind, btime)) {
-                    hp.minerals -= 50;
-                    hp.gas -= 25;
+                    hp.minerals -= cost.minerals;
+                    hp.gas -= cost.gas;
                 }
             }
         }
@@ -2403,11 +2589,12 @@ bool MeleeGame::step(const render::InputState& in, float dt_ms,
                 !world_.worker_committed(q.worker) &&
                 std::find(issued_this_frame.begin(), issued_this_frame.end(), q.worker) ==
                     issued_this_frame.end();
-            if (!worker_free || world_.player(cfg_.human_player).minerals < q.cost) {
+            if (!worker_free || world_.player(cfg_.human_player).minerals < q.cost ||
+                world_.player(cfg_.human_player).gas < q.gas) {
                 ++i;
                 continue;
             }
-            if (world_.issue_worker_build(q.worker, q.x, q.y, q.proto, q.cost, 0, q.time,
+            if (world_.issue_worker_build(q.worker, q.x, q.y, q.proto, q.cost, q.gas, q.time,
                                           sim::Fixed::from_int(2), human_build_verb_) &&
                 q.is_producer)
                 human_producer_pending_ = true;
@@ -2492,6 +2679,8 @@ bool MeleeGame::step(const render::InputState& in, float dt_ms,
             (size_t(u.player) < tbl->size() && (*tbl)[size_t(u.player)]) ? (*tbl)[size_t(u.player)]
                                                                          : fallback;
         driver_.set_model(std::uint32_t(id), m);
+        if (u.speed.raw() == 0 && (u.attributes & sim::kAttrStructure) != 0)
+            driver_.set_spawn_facing(std::uint32_t(id), kPlacedStructureFacing);
     }
     bound_count_ = world_.units().size();
     if (models_ && ui_store_) {
@@ -2622,7 +2811,8 @@ void MeleeGame::update_minimap_fog(int viewed) {
     const sim::Bounds bounds{sim::Fixed(), sim::Fixed(),
                              sim::Fixed::from_double(map_w_), sim::Fixed::from_double(map_h_)};
     vision_.compute(world_, viewed,   sim::Fixed::from_int(10),
-                      sim::Fixed::from_int(2), bounds);
+                      sim::Fixed::from_int(2), bounds,
+                    world_.placement().configured() ? &world_.placement() : nullptr);
     const int fw = vision_.width(), fh = vision_.height();
     if (fw <= 0 || fh <= 0) { minimap_fog_.clear(); minimap_fw_ = minimap_fh_ = 0; return; }
     minimap_fw_ = fw;
@@ -2714,7 +2904,7 @@ void MeleeGame::build_overlay(std::uint32_t view_w, std::uint32_t view_h,
 
     CameraFootprint cam;
     if (map_w_ > 0.0f && map_h_ > 0.0f) {
-        Control ctrl(camctl_.view_proj(aspect), view_w, view_h, viewed);
+        Control ctrl = make_control(camctl_.view_proj(aspect), view_w, view_h, viewed);
         const float cxs[4] = {0.0f, float(view_w), float(view_w), 0.0f};
         const float cys[4] = {0.0f, 0.0f, float(view_h), float(view_h)};
         cam.valid = true;
@@ -2755,7 +2945,7 @@ void MeleeGame::build_overlay(std::uint32_t view_w, std::uint32_t view_h,
     out.assign(std::size_t(view_w) * view_h * 4, 0);
 
     if (cfg_.human_player >= 0 && map_w_ > 0.0f && map_h_ > 0.0f && !minimap_fog_.empty()) {
-        Control fctrl(camctl_.view_proj(aspect), view_w, view_h, viewed);
+        Control fctrl = make_control(camctl_.view_proj(aspect), view_w, view_h, viewed);
         constexpr int kStep = 6;
         for (int by = 0; by < int(view_h); by += kStep) {
             for (int bx = 0; bx < int(view_w); bx += kStep) {

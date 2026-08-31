@@ -30,9 +30,17 @@ struct Buffer {
     Unique<VkDeviceMemory> mem;
 };
 
+template <class T>
+inline T vk_init(VkStructureType type) {
+    T s{};
+    s.sType = type;
+    return s;
+}
+
 inline Buffer make_buffer(VkPhysicalDevice pd, VkDevice dev, VkDeviceSize size, VkBufferUsageFlags usage,
                           const void* src) {
-    VkBufferCreateInfo bi{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
+    VkBufferCreateInfo bi{};
+    bi.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
     bi.size = size ? size : 4;
     bi.usage = usage;
     bi.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
@@ -42,7 +50,8 @@ inline Buffer make_buffer(VkPhysicalDevice pd, VkDevice dev, VkDeviceSize size, 
     out.buf = Unique<VkBuffer>(raw, [dev](VkBuffer b) { vkDestroyBuffer(dev, b, nullptr); });
     VkMemoryRequirements req;
     vkGetBufferMemoryRequirements(dev, raw, &req);
-    VkMemoryAllocateInfo ai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
+    VkMemoryAllocateInfo ai{};
+    ai.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
     ai.allocationSize = req.size;
     ai.memoryTypeIndex = find_memory(
         pd, req.memoryTypeBits,
@@ -68,7 +77,8 @@ struct Image {
 
 inline Image make_image(VkPhysicalDevice pd, VkDevice dev, VkFormat fmt, VkImageUsageFlags usage,
                         VkImageAspectFlags aspect, uint32_t w, uint32_t h) {
-    VkImageCreateInfo ii{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
+    VkImageCreateInfo ii{};
+    ii.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
     ii.imageType = VK_IMAGE_TYPE_2D;
     ii.format = fmt;
     ii.extent = {w, h, 1};
@@ -84,14 +94,16 @@ inline Image make_image(VkPhysicalDevice pd, VkDevice dev, VkFormat fmt, VkImage
     out.img = Unique<VkImage>(raw, [dev](VkImage i) { vkDestroyImage(dev, i, nullptr); });
     VkMemoryRequirements req;
     vkGetImageMemoryRequirements(dev, raw, &req);
-    VkMemoryAllocateInfo ai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
+    VkMemoryAllocateInfo ai{};
+    ai.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
     ai.allocationSize = req.size;
     ai.memoryTypeIndex = find_memory(pd, req.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
     VkDeviceMemory rawmem = VK_NULL_HANDLE;
     check(vkAllocateMemory(dev, &ai, nullptr, &rawmem), "vkAllocateMemory(image)");
     out.mem = Unique<VkDeviceMemory>(rawmem, [dev](VkDeviceMemory m) { vkFreeMemory(dev, m, nullptr); });
     check(vkBindImageMemory(dev, raw, rawmem, 0), "vkBindImageMemory");
-    VkImageViewCreateInfo vi{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
+    VkImageViewCreateInfo vi{};
+    vi.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
     vi.image = raw;
     vi.viewType = VK_IMAGE_VIEW_TYPE_2D;
     vi.format = fmt;
@@ -104,7 +116,8 @@ inline Image make_image(VkPhysicalDevice pd, VkDevice dev, VkFormat fmt, VkImage
 
 inline Image make_image_array(VkPhysicalDevice pd, VkDevice dev, VkFormat fmt,
                               VkImageUsageFlags usage, uint32_t w, uint32_t h, uint32_t layers) {
-    VkImageCreateInfo ii{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
+    VkImageCreateInfo ii{};
+    ii.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
     ii.imageType = VK_IMAGE_TYPE_2D;
     ii.format = fmt;
     ii.extent = {w, h, 1};
@@ -120,14 +133,16 @@ inline Image make_image_array(VkPhysicalDevice pd, VkDevice dev, VkFormat fmt,
     out.img = Unique<VkImage>(raw, [dev](VkImage i) { vkDestroyImage(dev, i, nullptr); });
     VkMemoryRequirements req;
     vkGetImageMemoryRequirements(dev, raw, &req);
-    VkMemoryAllocateInfo ai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
+    VkMemoryAllocateInfo ai{};
+    ai.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
     ai.allocationSize = req.size;
     ai.memoryTypeIndex = find_memory(pd, req.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
     VkDeviceMemory rawmem = VK_NULL_HANDLE;
     check(vkAllocateMemory(dev, &ai, nullptr, &rawmem), "vkAllocateMemory(image array)");
     out.mem = Unique<VkDeviceMemory>(rawmem, [dev](VkDeviceMemory m) { vkFreeMemory(dev, m, nullptr); });
     check(vkBindImageMemory(dev, raw, rawmem, 0), "vkBindImageMemory(array)");
-    VkImageViewCreateInfo vi{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
+    VkImageViewCreateInfo vi{};
+    vi.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
     vi.image = raw;
     vi.viewType = VK_IMAGE_VIEW_TYPE_2D_ARRAY;
     vi.format = fmt;
@@ -176,7 +191,8 @@ inline bool pick_present_device(VkInstance inst, VkSurfaceKHR surface, VkPhysica
 }
 
 inline Unique<VkShaderModule> make_shader(VkDevice dev, const uint32_t* code, size_t bytes) {
-    VkShaderModuleCreateInfo ci{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
+    VkShaderModuleCreateInfo ci{};
+    ci.sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO;
     ci.codeSize = bytes;
     ci.pCode = code;
     VkShaderModule sm = VK_NULL_HANDLE;

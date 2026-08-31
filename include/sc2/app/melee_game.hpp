@@ -16,6 +16,7 @@
 #include "sc2/app/ability_card.hpp"
 #include "sc2/app/alerts.hpp"
 #include "sc2/app/command_bind.hpp"
+#include "sc2/app/control.hpp"
 #include "sc2/app/console_panel.hpp"
 #include "sc2/app/hud_layout.hpp"
 #include "sc2/app/game_clock.hpp"
@@ -139,12 +140,32 @@ public:
 
     void setup(const MeleeSetup& setup, MeleeModels* models,
                const formats::Model* ground, float map_w, float map_h,
-               const sim::NavGrid* nav = nullptr);
+               const sim::NavGrid* nav = nullptr,
+               const sim::TerrainMap* placement = nullptr, float playable_x0 = -1.0f,
+               float playable_y0 = -1.0f, float playable_x1 = -1.0f, float playable_y1 = -1.0f);
 
     void set_ui_storage(casc::Storage* store) { ui_store_ = store; }
 
     void set_doodads(const std::vector<formats::PlacedDoodad>* d) { doodads_ = d; }
     void set_cliffs(const std::vector<render::SceneInstance>* c) { cliffs_ = c; }
+
+    void set_tier_heights(std::vector<float> th) { tier_heights_ = std::move(th); }
+
+    float ground_z_at(float wx, float wy) const;
+
+    struct GroundZ : GroundHeight {
+        explicit GroundZ(const MeleeGame* g) : game(g) {}
+        const MeleeGame* game = nullptr;
+        float z_at(float wx, float wy) const override { return game->ground_z_at(wx, wy); }
+        float max_z() const override;
+    };
+
+    Control make_control(const render::Mat4& mvp, std::uint32_t view_w, std::uint32_t view_h,
+                         std::int32_t player) const {
+        Control c(mvp, view_w, view_h, player);
+        c.set_ground_height(&ground_height_);
+        return c;
+    }
 
     void set_spawn_models(int player, const formats::Model* worker, const formats::Model* army,
                           const formats::Model* producer);
@@ -223,8 +244,22 @@ public:
     bool human_build(std::uint32_t worker, const std::string& structure_unit_id);
     std::vector<BuildCardEntry> selection_build_card();
 
+    struct CardLayout {
+        CommandCard card;
+        std::vector<BuildCardEntry> builds;
+        std::vector<AbilityCardEntry> abilities;
+        std::vector<TrainCardEntry> trains;
+    };
+    CardLayout command_card_layout();
+
     bool human_morph(std::uint32_t caster, const std::string& morph_abil);
     bool human_merge();
+
+    bool human_toggle_cloak(const std::string& abil_id, const std::string& command);
+    bool human_toggle_weapon(const std::string& abil_id, const std::string& command);
+    bool human_toggle_creep(const std::string& abil_id, const std::string& command);
+
+    bool human_salvage(const std::string& abil_id);
     bool human_research();
     bool human_siege_defender(std::uint32_t caster, sim::Fixed cx, sim::Fixed cy);
 
@@ -293,6 +328,7 @@ public:
     bool paused() const { return clock_.paused(); }
     bool pause_menu_open() const { return pause_menu_open_; }
     const MeleeLayout& layout() const { return layout_; }
+    const render::ActorDriver& actors() const { return driver_; }
     const std::vector<uint32_t>& selection() const { return selection_; }
     void set_selection(std::vector<uint32_t> sel) { selection_ = std::move(sel); }
     const MessageLog& messages() const { return messages_; }
@@ -302,6 +338,10 @@ public:
     const render::ActorDriver& driver() const { return driver_; }
     float map_w() const { return map_w_; }
     float map_h() const { return map_h_; }
+    const std::vector<std::uint8_t>& minimap_fog() const { return minimap_fog_; }
+    const sim::VisionGrid& vision() const { return vision_; }
+    int minimap_fog_w() const { return minimap_fw_; }
+    int minimap_fog_h() const { return minimap_fh_; }
 
     std::uint32_t spawn(sim::Unit proto, const std::string& token,
                         const formats::Model* model, sim::Fixed x, sim::Fixed y);
@@ -405,6 +445,8 @@ private:
     casc::Storage* ui_store_ = nullptr;
     const std::vector<formats::PlacedDoodad>* doodads_ = nullptr;
     const std::vector<render::SceneInstance>* cliffs_ = nullptr;
+    std::vector<float> tier_heights_;
+    GroundZ ground_height_{this};
     std::unique_ptr<MeleeAudio> audio_;
     render::AudioSink audio_sink_;
     void ensure_audio();
@@ -429,6 +471,7 @@ private:
     std::vector<std::string> bound_cat_;
 
     float map_w_ = 0, map_h_ = 0;
+    float playable_x0_ = -1.0f, playable_y0_ = -1.0f, playable_x1_ = -1.0f, playable_y1_ = -1.0f;
     float fps_smooth_ = 0.0f;
     sim::VisionGrid vision_;
     render::FogOverlay fog_;
@@ -459,6 +502,7 @@ private:
         int worker_cost = 50;
         int supply_cost = 100;
         int producer_cost = 150;
+        int producer_gas = 0;
         int army_cost = 50;
         sim::Fixed worker_build_time = sim::Fixed::from_int(12);
         sim::Fixed supply_build_time = sim::Fixed::from_int(21);
@@ -469,6 +513,7 @@ private:
     bool ui_buildreactor_ = false;
     bool pending_attack_ = false;
     bool pending_patrol_ = false;
+    bool consume_modal_target(sim::Fixed wx, sim::Fixed wy);
     bool pending_defender_ = false;
     std::uint32_t pending_liberator_ = sim::kNoTarget;
     bool pending_land_ = false;
@@ -479,6 +524,7 @@ private:
     bool pending_refinery_ = false;
     sim::Unit build_proto_;
     int build_cost_ = 0;
+    int build_gas_cost_ = 0;
     sim::Fixed build_time_;
     bool build_valid_ = false;
     sim::Fixed build_px_, build_py_;
@@ -487,6 +533,7 @@ private:
         sim::Fixed x, y;
         sim::Unit proto;
         int cost;
+        int gas;
         sim::Fixed time;
         bool is_producer;
     };

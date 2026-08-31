@@ -18,10 +18,12 @@ public:
     static Device create_headless(const char* app_name) {
         Device d;
         VkInstance rawInst = VK_NULL_HANDLE;
-        VkApplicationInfo app{VK_STRUCTURE_TYPE_APPLICATION_INFO};
+        VkApplicationInfo app{};
+        app.sType = VK_STRUCTURE_TYPE_APPLICATION_INFO;
         app.pApplicationName = app_name;
         app.apiVersion = VK_API_VERSION_1_1;
-        VkInstanceCreateInfo ici{VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO};
+        VkInstanceCreateInfo ici{};
+        ici.sType = VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO;
         ici.pApplicationInfo = &app;
         check(vkCreateInstance(&ici, nullptr, &rawInst), "vkCreateInstance");
         d.instance_ = Unique<VkInstance>(rawInst, [](VkInstance i) { vkDestroyInstance(i, nullptr); });
@@ -46,11 +48,13 @@ public:
         if (d.gfx_family_ == UINT32_MAX) throw std::runtime_error("render device: no graphics queue");
 
         float prio = 1.0f;
-        VkDeviceQueueCreateInfo qci{VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO};
+        VkDeviceQueueCreateInfo qci{};
+        qci.sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO;
         qci.queueFamilyIndex = d.gfx_family_;
         qci.queueCount = 1;
         qci.pQueuePriorities = &prio;
-        VkDeviceCreateInfo dci{VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO};
+        VkDeviceCreateInfo dci{};
+        dci.sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO;
         dci.queueCreateInfoCount = 1;
         dci.pQueueCreateInfos = &qci;
         VkDevice dev = VK_NULL_HANDLE;

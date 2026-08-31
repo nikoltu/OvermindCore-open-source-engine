@@ -75,6 +75,16 @@ struct ActorDriver {
         if (unit_id >= rules.size()) rules.resize(unit_id + 1, nullptr);
         rules[unit_id] = r;
     }
+    void set_spawn_facing(uint32_t unit_id, float yaw) {
+        if (unit_id >= spawn_facing.size()) {
+            spawn_facing.resize(unit_id + 1, 0.0f);
+            spawn_facing_set.resize(unit_id + 1, 0);
+        }
+        spawn_facing[unit_id] = yaw;
+        spawn_facing_set[unit_id] = 1;
+    }
+    std::vector<float> spawn_facing;
+    std::vector<char> spawn_facing_set;
     void observe(const sim::World& world, float dt_ms, bool sim_ticked = true);
 };
 

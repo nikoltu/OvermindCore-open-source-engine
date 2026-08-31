@@ -4,6 +4,7 @@
 
 #include "sc2/app/map_melee_setup.hpp"
 #include "sc2/app/sandbox_game.hpp"
+#include "sc2/sim/weapon.hpp"
 
 namespace sc2::app {
 
@@ -43,14 +44,10 @@ inline MeleeProtos race_protos(const data::Catalog& cat, Race r) {
     pr.mineral = make_unit(cat, "MineralField", -1);
     pr.mineral.player = -1;
     pr.mineral.speed = Fixed();
-    pr.mineral.radius = Fixed::from_int(1);
-    pr.mineral.resource_left = 1500;
     pr.geyser = make_unit(cat, "VespeneGeyser", -1);
     pr.geyser.player = -1;
     pr.geyser.speed = Fixed();
     pr.geyser.is_gas = true;
-    pr.geyser.radius = Fixed::from_int(1);
-    pr.geyser.resource_left = 2250;
     return pr;
 }
 
@@ -131,21 +128,50 @@ inline void apply_race_costs(MeleePlayerSetup& p, const data::Catalog& cat, Race
     }
 }
 
-inline void snap_base_to_real_resources(const formats::LoadedMap& map, int sx, int sy,
-                                        MeleePlayerSetup& p, double radius = 14.0) {
+inline void snap_base_to_real_resources(const formats::LoadedMap& map, const data::Catalog& cat,
+                                        int sx, int sy, MeleePlayerSetup& p,
+                                        std::vector<char>& consumed, double radius = 14.0) {
     using sim::Fixed;
     std::remove_reference_t<decltype(p.mineral_positions)> mins, gas;
-    for (const auto& u : map.objects.units) {
+    std::vector<sim::Unit> min_protos, gas_protos;
+    std::vector<std::size_t> min_idx, gas_idx;
+    for (std::size_t i = 0; i < map.objects.units.size(); ++i) {
+        const auto& u = map.objects.units[i];
         const double dx = u.x - sx, dy = u.y - sy;
         if (dx * dx + dy * dy > radius * radius) continue;
         const bool is_gas = u.unit_type.find("Geyser") != std::string::npos ||
                             u.unit_type.find("Vespene") != std::string::npos;
         const bool is_min = !is_gas && u.unit_type.find("Mineral") != std::string::npos;
-        if (is_gas) gas.push_back({Fixed::from_double(u.x), Fixed::from_double(u.y)});
-        else if (is_min) mins.push_back({Fixed::from_double(u.x), Fixed::from_double(u.y)});
+        if (!is_gas && !is_min) continue;
+        sim::Unit proto;
+        try {
+            proto = make_unit(cat, u.unit_type, -1);
+        } catch (const std::exception&) {
+            proto = is_gas ? p.geyser_field : p.mineral_field;
+        }
+        proto.player = -1;
+        proto.speed = Fixed();
+        proto.is_gas = is_gas;
+        if (is_gas) {
+            gas.push_back({Fixed::from_double(u.x), Fixed::from_double(u.y)});
+            gas_protos.push_back(std::move(proto));
+            gas_idx.push_back(i);
+        } else {
+            mins.push_back({Fixed::from_double(u.x), Fixed::from_double(u.y)});
+            min_protos.push_back(std::move(proto));
+            min_idx.push_back(i);
+        }
     }
-    if (mins.size() >= 4) p.mineral_positions = std::move(mins);
-    if (!gas.empty()) p.geyser_positions = std::move(gas);
+    if (mins.size() >= 4) {
+        p.mineral_positions = std::move(mins);
+        p.mineral_protos = std::move(min_protos);
+        for (std::size_t i : min_idx) consumed[i] = 1;
+    }
+    if (!gas.empty()) {
+        p.geyser_positions = std::move(gas);
+        p.geyser_protos = std::move(gas_protos);
+        for (std::size_t i : gas_idx) consumed[i] = 1;
+    }
 }
 
 inline MeleeSetup melee_setup_for_map(const formats::LoadedMap& map, const data::Catalog& cat,
@@ -156,12 +182,13 @@ inline MeleeSetup melee_setup_for_map(const formats::LoadedMap& map, const data:
 
     MeleeSetup s;
     const Race races[2] = {r0, r1};
+    std::vector<char> consumed(map.objects.units.size(), 0);
     for (int side = 0; side < 2; ++side) {
         const Race r = races[side];
         const MeleeProtos pr = race_protos(cat, r);
         const int sx = side ? st.s1x : st.s0x, sy = side ? st.s1y : st.s0y;
         MeleePlayerSetup p = map_melee_player(pr, sx, sy, st.cx, st.cy, worker_count, patches);
-        snap_base_to_real_resources(map, sx, sy, p);
+        snap_base_to_real_resources(map, cat, sx, sy, p, consumed);
         apply_race_costs(p, cat, r, prod);
         s.players.push_back(p);
     }
@@ -169,18 +196,21 @@ inline MeleeSetup melee_setup_for_map(const formats::LoadedMap& map, const data:
     {
         using sim::Fixed;
         const MeleeProtos npr = race_protos(cat, r0);
-        for (const auto& u : map.objects.units) {
-            const double d0 = (u.x - st.s0x) * (u.x - st.s0x) + (u.y - st.s0y) * (u.y - st.s0y);
-            const double d1 = (u.x - st.s1x) * (u.x - st.s1x) + (u.y - st.s1y) * (u.y - st.s1y);
-            if (d0 <= 196.0 || d1 <= 196.0) continue;
+        for (std::size_t ui = 0; ui < map.objects.units.size(); ++ui) {
+            const auto& u = map.objects.units[ui];
+            if (consumed[ui]) continue;
             const bool gas = u.unit_type.find("Geyser") != std::string::npos ||
                              u.unit_type.find("Vespene") != std::string::npos;
             const bool min = !gas && u.unit_type.find("Mineral") != std::string::npos;
             sim::Unit n;
-            if (gas) {
-                n = npr.geyser;
-            } else if (min) {
-                n = npr.mineral;
+            if (gas || min) {
+                try {
+                    n = make_unit(cat, u.unit_type, -1);
+                } catch (const std::exception&) {
+                    n = gas ? npr.geyser : npr.mineral;
+                }
+                n.is_gas = gas;
+                n.speed = Fixed();
             } else {
                 try {
                     n = make_unit(cat, u.unit_type, -1);
@@ -191,8 +221,11 @@ inline MeleeSetup melee_setup_for_map(const formats::LoadedMap& map, const data:
             }
             n.x = Fixed::from_double(u.x);
             n.y = Fixed::from_double(u.y);
-            n.player = -1;
+            n.player = u.player > 0 ? u.player - 1 : -1;
             n.alive = true;
+            s.neutral_facing.push_back(placed_facing(
+                (n.attributes & sim::kAttrStructure) != 0, gas || min || n.resource_left > 0,
+                u.rotation));
             s.neutrals.push_back(std::move(n));
         }
     }

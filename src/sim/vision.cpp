@@ -66,7 +66,11 @@ void VisionGrid::compute(const World& world, int32_t player, Fixed sight_radius,
                 Fixed centre_x = bounds_.min_x + cell_ * Fixed::from_int(cx) + half;
                 int64_t dx = int64_t((centre_x - u.x).raw());
                 if (dx * dx + dy * dy > r2) continue;
-                if (terrain && !terrain->vision_reaches(viewer_level, cx, cy)) continue;
+                if (terrain) {
+                    int tx, ty;
+                    terrain->to_cell(centre_x, centre_y, tx, ty);
+                    if (!terrain->vision_reaches(viewer_level, tx, ty)) continue;
+                }
                 cells_[size_t(cy) * size_t(w_) + size_t(cx)] = Visibility::Visible;
             }
         }

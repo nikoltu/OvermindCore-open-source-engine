@@ -9,8 +9,11 @@
 #include <windows.h>
 
 #include <shlobj.h>
+#include <winsock2.h>
+#include <ws2tcpip.h>
 
 #include <algorithm>
+#include <cstdio>
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
@@ -249,6 +252,116 @@ void LoadingScreen::close() {
         ::DestroyWindow(impl_->hwnd);
         impl_->hwnd = nullptr;
     }
+}
+
+bool attach_parent_console() {
+    const HANDLE existing = ::GetStdHandle(STD_OUTPUT_HANDLE);
+    if (existing && existing != INVALID_HANDLE_VALUE) return true;
+    if (!::AttachConsole(ATTACH_PARENT_PROCESS)) return false;
+    const bool out = std::freopen("CONOUT$", "w", stdout) != nullptr;
+    std::freopen("CONOUT$", "w", stderr);
+    return out;
+}
+
+namespace {
+
+bool winsock_ready() {
+    static const bool ok = [] {
+        WSADATA wsa{};
+        return ::WSAStartup(MAKEWORD(2, 2), &wsa) == 0;
+    }();
+    return ok;
+}
+
+class WinConnection final : public Connection {
+public:
+    explicit WinConnection(SOCKET s) : s_(s) {}
+    ~WinConnection() override { close(); }
+
+    int recv(void* buf, int len) override {
+        if (s_ == INVALID_SOCKET) return -1;
+        return ::recv(s_, static_cast<char*>(buf), len, 0);
+    }
+    bool send_all(const void* buf, int len) override {
+        if (s_ == INVALID_SOCKET) return false;
+        const char* p = static_cast<const char*>(buf);
+        while (len > 0) {
+            const int n = ::send(s_, p, len, 0);
+            if (n <= 0) return false;
+            p += n;
+            len -= n;
+        }
+        return true;
+    }
+    void close() override {
+        if (s_ != INVALID_SOCKET) {
+            ::shutdown(s_, SD_BOTH);
+            ::closesocket(s_);
+            s_ = INVALID_SOCKET;
+        }
+    }
+
+private:
+    SOCKET s_ = INVALID_SOCKET;
+};
+
+class WinListener final : public Listener {
+public:
+    explicit WinListener(SOCKET s) : s_(s) {}
+    ~WinListener() override { close(); }
+
+    std::unique_ptr<Connection> accept() override {
+        if (s_ == INVALID_SOCKET) return nullptr;
+        const SOCKET c = ::accept(s_, nullptr, nullptr);
+        if (c == INVALID_SOCKET) return nullptr;
+        BOOL one = TRUE;
+        ::setsockopt(c, IPPROTO_TCP, TCP_NODELAY, reinterpret_cast<const char*>(&one), sizeof one);
+        return std::make_unique<WinConnection>(c);
+    }
+    void close() override {
+        if (s_ != INVALID_SOCKET) {
+            ::closesocket(s_);
+            s_ = INVALID_SOCKET;
+        }
+    }
+
+private:
+    SOCKET s_ = INVALID_SOCKET;
+};
+
+}
+
+std::unique_ptr<Listener> listen_tcp(int port, std::string& error) {
+    if (!winsock_ready()) {
+        error = "WSAStartup failed: no Winsock 2.2 on this system";
+        return nullptr;
+    }
+    const SOCKET s = ::socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+    if (s == INVALID_SOCKET) {
+        error = "socket() failed with WSA error " + std::to_string(::WSAGetLastError());
+        return nullptr;
+    }
+    sockaddr_in addr{};
+    addr.sin_family = AF_INET;
+    addr.sin_port = ::htons(static_cast<unsigned short>(port));
+    addr.sin_addr.s_addr = ::htonl(INADDR_LOOPBACK);
+    if (::bind(s, reinterpret_cast<const sockaddr*>(&addr), sizeof addr) == SOCKET_ERROR) {
+        const int e = ::WSAGetLastError();
+        ::closesocket(s);
+        error = "bind to 127.0.0.1:" + std::to_string(port) + " failed with WSA error " +
+                std::to_string(e) +
+                (e == WSAEADDRINUSE ? " (that port is already in use - another client is listening"
+                                      " on it; pass --api-port N)"
+                                    : "");
+        return nullptr;
+    }
+    if (::listen(s, 1) == SOCKET_ERROR) {
+        const int e = ::WSAGetLastError();
+        ::closesocket(s);
+        error = "listen() failed with WSA error " + std::to_string(e);
+        return nullptr;
+    }
+    return std::make_unique<WinListener>(s);
 }
 
 }

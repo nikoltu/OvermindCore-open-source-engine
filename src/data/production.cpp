@@ -4,14 +4,6 @@
 
 namespace sc2::data {
 
-using core::XmlNode;
-
-static const XmlNode* find_child(const XmlNode& n, const std::string& name) {
-    for (const XmlNode& c : n.children)
-        if (c.name == name) return &c;
-    return nullptr;
-}
-
 void Production::build(const Catalog& cat) {
     edges_.clear();
     by_ability_.clear();
@@ -25,64 +17,10 @@ void Production::build(const Catalog& cat) {
             tag != "CAbilMorph" && tag != "CAbilMerge")
             continue;
 
-        std::unordered_map<std::string, ProductInfo> by_index;
-        std::vector<std::string> order;
-        for (const XmlNode& c : cat.resolved("CAbil", id)) {
-            const bool merge_info = (tag == "CAbilMerge" && c.name == "Info");
-            if (c.name != "InfoArray" && !merge_info) continue;
-            std::string index = c.attr_or("index", "");
-            std::string product = c.attr_or("Unit", "");
-            int unit_count = 1;
-            if (product.empty()) {
-                int n = 0;
-                for (const XmlNode& ch : c.children)
-                    if (ch.name == "Unit") {
-                        std::string v = ch.attr_or("value", "");
-                        if (v.empty()) continue;
-                        if (product.empty()) product = v;
-                        ++n;
-                    }
-                if (n > 1) unit_count = n;
-            }
-            bool req_present = false;
-            std::string req;
-            if (const XmlNode* b = find_child(c, "Button"))
-                if (const std::string* r = b->attr("Requirements")) {
-                    req = *r;
-                    req_present = true;
-                }
-            double warp_charge = 0;
-            if (tag == "CAbilWarpTrain") {
-                if (const XmlNode* ch = find_child(c, "Charge")) {
-                    std::string v = ch->attr_or("TimeUse", "");
-                    if (v.empty())
-                        if (const XmlNode* tu = find_child(*ch, "TimeUse"))
-                            v = tu->text.empty() ? tu->attr_or("value", "") : tu->text;
-                    if (!v.empty()) warp_charge = std::strtod(v.c_str(), nullptr);
-                }
-            }
-            if (product.find("##") != std::string::npos) continue;
-            if (product.empty()) {
-                auto it = by_index.find(index);
-                if (it != by_index.end()) {
-                    if (warp_charge > 0) it->second.warp_charge = warp_charge;
-                    if (req_present) it->second.requirement = req;
-                }
-                continue;
-            }
-            double time = std::strtod(c.attr_or("Time", "0").c_str(), nullptr);
-            if (warp_charge == 0) {
-                auto it = by_index.find(index);
-                if (it != by_index.end()) warp_charge = it->second.warp_charge;
-            }
-            if (!req_present)
-                if (auto it = by_index.find(index); it != by_index.end()) req = it->second.requirement;
-            if (by_index.find(index) == by_index.end()) order.push_back(index);
-            by_index[index] =
-                ProductInfo{id, index, product, req, time, unit_count, warp_charge, tag == "CAbilMorph"};
-        }
-        for (const std::string& idx : order) {
-            const ProductInfo& pi = by_index[idx];
+        for (const Catalog::AbilInfoRow& r : cat.ability_info_rows(id)) {
+            if (r.self_macro || r.unit.empty()) continue;
+            const ProductInfo pi{id,           r.index,      r.unit,        r.requirement,
+                                 r.time,       r.unit_count, r.warp_charge, tag == "CAbilMorph"};
             edges_.push_back(pi);
             by_ability_[id].push_back(pi);
             by_product_[pi.product].push_back(pi);

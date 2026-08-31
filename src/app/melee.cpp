@@ -2,6 +2,8 @@
 
 #include <utility>
 
+#include "sc2/app/spawn.hpp"
+
 namespace sc2::app {
 
 using sim::Fixed;
@@ -29,6 +31,14 @@ MeleeLayout build_melee(sim::World& w, const MeleeSetup& s) {
         layout.unit_type[id] = type;
         return id;
     };
+    auto face = [&](uint32_t id, float yaw) {
+        if (layout.unit_facing.size() <= id) {
+            layout.unit_facing.resize(id + 1, 0.0f);
+            layout.unit_facing_set.resize(id + 1, 0);
+        }
+        layout.unit_facing[id] = yaw;
+        layout.unit_facing_set[id] = 1;
+    };
 
     for (size_t p = 0; p < nplayers; ++p) {
         const MeleePlayerSetup& ps = s.players[p];
@@ -41,23 +51,30 @@ MeleeLayout build_melee(sim::World& w, const MeleeSetup& s) {
         hall.y = ps.start.y;
         hall.speed = Fixed();
         out.town_hall = add(std::move(hall), "CommandCenter");
+        face(out.town_hall, kPlacedStructureFacing);
 
-        for (const MeleePos& mp : ps.mineral_positions) {
-            Unit field = ps.mineral_field;
+        for (std::size_t i = 0; i < ps.mineral_positions.size(); ++i) {
+            const MeleePos& mp = ps.mineral_positions[i];
+            Unit field = i < ps.mineral_protos.size() ? ps.mineral_protos[i] : ps.mineral_field;
             field.player = -1;
             field.x = mp.x;
             field.y = mp.y;
             field.speed = Fixed();
-            out.minerals.push_back(add(std::move(field), "MineralField"));
+            const uint32_t id = add(std::move(field), "MineralField");
+            face(id, 0.0f);
+            out.minerals.push_back(id);
         }
 
-        for (const MeleePos& gp : ps.geyser_positions) {
-            Unit gy = ps.geyser_field;
+        for (std::size_t i = 0; i < ps.geyser_positions.size(); ++i) {
+            const MeleePos& gp = ps.geyser_positions[i];
+            Unit gy = i < ps.geyser_protos.size() ? ps.geyser_protos[i] : ps.geyser_field;
             gy.player = -1;
             gy.x = gp.x;
             gy.y = gp.y;
             gy.speed = Fixed();
-            out.geysers.push_back(add(std::move(gy), "VespeneGeyser"));
+            const uint32_t id = add(std::move(gy), "VespeneGeyser");
+            face(id, 0.0f);
+            out.geysers.push_back(id);
         }
 
         const uint32_t gather =
@@ -168,7 +185,10 @@ MeleeLayout build_melee(sim::World& w, const MeleeSetup& s) {
         layout.players.push_back(std::move(out));
     }
 
-    for (const Unit& n : s.neutrals) add(n, n.catalog_id.c_str());
+    for (std::size_t i = 0; i < s.neutrals.size(); ++i) {
+        const uint32_t id = add(s.neutrals[i], s.neutrals[i].catalog_id.c_str());
+        if (i < s.neutral_facing.size()) face(id, s.neutral_facing[i]);
+    }
 
     if (layout.unit_type.size() < w.units().size())
         layout.unit_type.resize(w.units().size());

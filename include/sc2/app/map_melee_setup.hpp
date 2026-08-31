@@ -145,7 +145,6 @@ inline MeleePlayerSetup map_melee_player(const MeleeProtos& pr, int sx, int sy, 
     p.geyser_field = pr.geyser;
     p.geyser_positions.push_back({cell(sx + dirx * 2), cell(sy - diry * 2)});
     p.geyser_positions.push_back({cell(sx + dirx * 4), cell(sy - diry * 2)});
-    p.gas_worker_count = 3;
     p.producer = pr.producer;
     p.army_unit = pr.army;
     p.supply_unit = pr.supply;
@@ -171,8 +170,8 @@ inline MeleeSetup melee_setup_for_map(const formats::LoadedMap& map, int worker_
     pr.worker.supply_uses = Fixed::from_int(1);
     pr.worker.is_worker = true;
 
-    pr.mineral.resource_left = 1500;
-    pr.mineral.radius = Fixed::from_ratio(1, 1);
+    pr.mineral.resource_left = 1600;
+    pr.mineral.radius = Fixed::from_ratio(3, 4);
 
     pr.producer.hp = pr.producer.hp_max = Fixed::from_int(1000);
     pr.producer.radius = Fixed::from_ratio(3, 2);
@@ -182,8 +181,8 @@ inline MeleeSetup melee_setup_for_map(const formats::LoadedMap& map, int worker_
     pr.supply.radius = Fixed::from_ratio(5, 4);
 
     pr.geyser.is_gas = true;
-    pr.geyser.resource_left = 2250;
-    pr.geyser.radius = Fixed::from_int(1);
+    pr.geyser.resource_left = 2000;
+    pr.geyser.radius = Fixed::from_ratio(3, 2);
 
     pr.army.hp = pr.army.hp_max = Fixed::from_int(45);
     pr.army.wpn_damage = Fixed::from_int(6);
@@ -215,8 +214,6 @@ inline MeleeSetup melee_setup_for_map(const formats::LoadedMap& map, const data:
     pr.mineral = make_unit(cat, "MineralField", -1);
     pr.mineral.player = -1;
     pr.mineral.speed = Fixed();
-    pr.mineral.radius = Fixed::from_int(1);
-    pr.mineral.resource_left = 1500;
     pr.producer = make_unit(cat, "Barracks", 0);
     pr.producer.speed = Fixed();
     pr.supply = make_unit(cat, "SupplyDepot", 0);
@@ -225,8 +222,6 @@ inline MeleeSetup melee_setup_for_map(const formats::LoadedMap& map, const data:
     pr.geyser.player = -1;
     pr.geyser.speed = Fixed();
     pr.geyser.is_gas = true;
-    pr.geyser.resource_left = 2250;
-    pr.geyser.radius = Fixed::from_int(1);
     pr.army = make_unit(cat, "Marine", 0);
     const data::UnitCost mcost = data::unit_cost(cat, "Marine");
     const data::UnitCost scost = data::unit_cost(cat, "SCV");

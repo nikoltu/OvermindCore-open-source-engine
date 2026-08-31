@@ -1,5 +1,10 @@
 cmake_minimum_required(VERSION 3.16)
-project(sc2engine LANGUAGES CXX)
+project(sc2engine VERSION 0.0.1 LANGUAGES CXX)
+
+set(SC2_ENGINE_BUILD "106")
+set(SC2_ENGINE_STAGE "pre-alfa")
+configure_file(include/sc2/core/version.hpp.in
+               ${CMAKE_BINARY_DIR}/generated/sc2/core/version.hpp @ONLY)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -11,6 +16,12 @@ endif()
 
 add_compile_options(-Wall -Wextra)
 
+option(SC2_WARNINGS_AS_ERRORS
+       "Treat every -Wall -Wextra warning as an error (R91's regression gate)" ON)
+if(SC2_WARNINGS_AS_ERRORS)
+  add_compile_options(-Werror)
+endif()
+
 if(MINGW)
   add_link_options(-static -static-libgcc -static-libstdc++)
 endif()
@@ -21,6 +32,7 @@ add_library(sc2core STATIC
   src/formats/m3.cpp
   src/formats/dds.cpp
   src/formats/mpq.cpp
+  src/formats/replay_events.cpp
   src/formats/sc2map.cpp
   src/formats/terrain.cpp
   src/formats/terrain_grid.cpp
@@ -64,6 +76,7 @@ add_library(sc2core STATIC
   src/app/melee_commands.cpp
   src/app/match_result.cpp
   src/app/replay.cpp
+  src/app/replay_orders.cpp
   src/app/control.cpp
   src/app/game.cpp
   src/app/melee.cpp
@@ -73,8 +86,12 @@ add_library(sc2core STATIC
   src/app/shipping_wiring.cpp
   src/app/hud.cpp
   src/app/hud_render.cpp
+  src/app/hud_layout.cpp
+  src/app/ui_layout_source.cpp
   src/app/console_panel.cpp
   src/app/menu.cpp
+  src/app/glue_screen.cpp
+  src/app/screen_router.cpp
   src/app/control_groups.cpp
   src/render/anim.cpp
   src/render/actor.cpp
@@ -92,7 +109,7 @@ add_library(sc2core STATIC
   src/audio/wasapi.cpp
   src/platform/file_desktop.cpp
 )
-target_include_directories(sc2core PUBLIC include)
+target_include_directories(sc2core PUBLIC include ${CMAKE_BINARY_DIR}/generated)
 if(WIN32)
   target_link_libraries(sc2core PUBLIC ole32)
 endif()
@@ -102,6 +119,12 @@ target_link_libraries(sc2casc PRIVATE sc2core)
 
 add_executable(sc2probe tools/sc2probe.cpp)
 target_link_libraries(sc2probe PRIVATE sc2core)
+
+add_executable(sc2sepsim tools/sc2sepsim.cpp)
+target_link_libraries(sc2sepsim PRIVATE sc2core)
+
+add_executable(sc2navmap tools/sc2navmap.cpp)
+target_link_libraries(sc2navmap PRIVATE sc2core)
 
 add_executable(sc2oracle_dump tools/sc2oracle_dump.cpp)
 target_link_libraries(sc2oracle_dump PRIVATE sc2core)
@@ -113,7 +136,7 @@ find_package(Vulkan COMPONENTS glslc QUIET)
 if(Vulkan_FOUND AND Vulkan_GLSLC_EXECUTABLE)
   set(SHADER_OUT ${CMAKE_BINARY_DIR}/shaders)
   file(MAKE_DIRECTORY ${SHADER_OUT})
-  foreach(shader mesh.vert mesh.frag scene.vert scene.frag shadow.vert particle.vert particle.frag overlay.vert overlay.frag tonemap.frag)
+  foreach(shader mesh.vert mesh.frag scene.vert scene.frag terrain_splat.frag shadow.vert particle.vert particle.frag overlay.vert overlay.frag tonemap.frag)
     add_custom_command(
       OUTPUT ${SHADER_OUT}/${shader}.spv.h
       COMMAND ${Vulkan_GLSLC_EXECUTABLE} ${CMAKE_SOURCE_DIR}/shaders/${shader}
@@ -135,6 +158,7 @@ if(Vulkan_FOUND AND Vulkan_GLSLC_EXECUTABLE)
     ${SHADER_OUT}/mesh.frag.spv.h
     ${SHADER_OUT}/scene.vert.spv.h
     ${SHADER_OUT}/scene.frag.spv.h
+    ${SHADER_OUT}/terrain_splat.frag.spv.h
     ${SHADER_OUT}/shadow.vert.spv.h
     ${SHADER_OUT}/particle.vert.spv.h
     ${SHADER_OUT}/particle.frag.spv.h
@@ -143,8 +167,6 @@ if(Vulkan_FOUND AND Vulkan_GLSLC_EXECUTABLE)
     ${SHADER_OUT}/tonemap.frag.spv.h)
   target_include_directories(sc2render PUBLIC include PRIVATE ${SHADER_OUT} src/render)
   target_link_libraries(sc2render PUBLIC sc2core Vulkan::Vulkan)
-  target_compile_options(sc2render PRIVATE -Wno-missing-field-initializers)
-
   add_executable(sc2view tools/sc2view.cpp)
   target_link_libraries(sc2view PRIVATE sc2render sc2core)
 
@@ -184,7 +206,32 @@ if(Vulkan_FOUND AND Vulkan_GLSLC_EXECUTABLE)
   add_executable(crafter-sc ${CRAFTER_SC_SOURCES})
   target_link_libraries(crafter-sc PRIVATE sc2render sc2core ole32 shell32)
   target_link_options(crafter-sc PRIVATE -mwindows)
+  set_target_properties(crafter-sc PROPERTIES
+    OUTPUT_NAME "crafter-sc_v${PROJECT_VERSION}.${SC2_ENGINE_BUILD}-${SC2_ENGINE_STAGE}")
+  add_custom_command(TARGET crafter-sc POST_BUILD
+    COMMAND ${CMAKE_COMMAND}
+            -DKEEP=$<TARGET_FILE_NAME:crafter-sc>
+            -DDIR=$<TARGET_FILE_DIR:crafter-sc>
+            -P ${CMAKE_SOURCE_DIR}/cmake/prune_stale_clients.cmake
+    VERBATIM)
   set(SC2_HAVE_VULKAN ON)
+endif()
+
+add_subdirectory(third_party)
+add_library(sc2api STATIC
+  src/api/transport/ws.cpp
+  src/api/server.cpp
+  src/api/dispatch.cpp
+  src/api/truth_pack.cpp
+  src/api/bridge/game_info.cpp
+  src/api/bridge/observation.cpp
+  src/api/bridge/orders.cpp
+  src/api/bridge/data.cpp
+)
+target_include_directories(sc2api PUBLIC include ${CMAKE_BINARY_DIR}/generated)
+target_link_libraries(sc2api PUBLIC sc2core sc2proto)
+if(TARGET crafter-sc)
+  target_link_libraries(crafter-sc PRIVATE sc2api ws2_32)
 endif()
 
 enable_testing()

@@ -8,47 +8,13 @@
 #include <utility>
 #include <vector>
 
+#include "sc2/app/ui_layout_source.hpp"
 #include "sc2/casc/storage.hpp"
 #include "sc2/ui/layout.hpp"
 
 namespace sc2::app {
 
 namespace {
-
-struct SetCache {
-    bool tried = false;
-    std::unique_ptr<ui::LayoutSet> set;
-};
-
-constexpr const char* kUiRoot = "mods/core.sc2mod/base.sc2data/";
-
-ui::LayoutSet* layout_set_for(casc::Storage& store) {
-    static std::map<const casc::Storage*, SetCache> cache;
-    SetCache& c = cache[&store];
-    if (c.tried) return c.set.get();
-    c.tried = true;
-    try {
-        auto read = [&](const std::string& p) {
-            auto b = store.read_by_name(p);
-            return std::string(b.begin(), b.end());
-        };
-        std::vector<std::string> incs =
-            ui::LayoutSet::parse_includes(read(std::string(kUiRoot) + "UI/Layout/DescIndex.SC2Layout"));
-        if (incs.empty()) return nullptr;
-        auto set = std::make_unique<ui::LayoutSet>();
-        for (const std::string& inc : incs) {
-            try {
-                set->add_xml(inc, read(std::string(kUiRoot) + inc));
-            } catch (const std::exception&) {
-            }
-        }
-        if (set->doc_count() == 0) return nullptr;
-        c.set = std::move(set);
-    } catch (const std::exception&) {
-        return nullptr;
-    }
-    return c.set.get();
-}
 
 HudAuthoredRects::R find_rect(const std::vector<ui::SolvedFrame>& solved,
                               const std::string& type, float cw, float ch) {
@@ -65,26 +31,37 @@ HudAuthoredRects::R find_rect(const std::vector<ui::SolvedFrame>& solved,
 
 const HudAuthoredRects* hud_authored_rects(casc::Storage& store, float aspect) {
     if (!(aspect > 0.1f) || aspect > 10.0f) return nullptr;
-    const int akey = int(std::lround(aspect * 64.0f));
+    constexpr float kAspectSteps = 4096.0f;
+    const int akey = int(std::lround(aspect * kAspectSteps));
     static std::map<std::pair<const casc::Storage*, int>, std::unique_ptr<HudAuthoredRects>> cache;
     auto key = std::make_pair(static_cast<const casc::Storage*>(&store), akey);
     auto it = cache.find(key);
     if (it != cache.end()) return it->second && it->second->ok ? it->second.get() : nullptr;
 
     auto& slot = cache[key];
-    ui::LayoutSet* set = layout_set_for(store);
+    const ui::LayoutSet* set = layout_namespace(store);
     if (!set) return nullptr;
     const ui::Frame* gui = set->find_template("GameUI/GameUI");
     if (!gui) return nullptr;
     try {
-        const float ch = 1200.0f;
-        const float cw = ch * (float(akey) / 64.0f);
+        const float ch = kRefHeight;
+        const float cw = ch * (float(akey) / kAspectSteps);
         ui::Frame inst = set->instantiate(*gui);
-        std::vector<ui::SolvedFrame> solved = ui::solve_layout(inst, ui::Rect{0, 0, cw, ch});
+        static const char* const kMeleeCollapsed[] = {"CashPanel", "TeamResourceButton"};
+        auto melee_collapsed = [](const ui::Frame& f) {
+            for (const char* n : kMeleeCollapsed)
+                if (f.name == n) return true;
+            return false;
+        };
+        std::vector<ui::SolvedFrame> solved =
+            ui::solve_layout(inst, ui::Rect{0, 0, cw, ch}, ui::TextResolver{}, melee_collapsed);
         auto r = std::make_unique<HudAuthoredRects>();
         r->canvas_w = cw;
         r->minimap = find_rect(solved, "Minimap", cw, ch);
-        if (!r->minimap.ok()) r->minimap = find_rect(solved, "MinimapPanel", cw, ch);
+        r->minimap_panel = find_rect(solved, "MinimapPanel", cw, ch);
+        if (!r->minimap.ok()) r->minimap = r->minimap_panel;
+        r->control_group = find_rect(solved, "ControlGroupPanel", cw, ch);
+        r->alert = find_rect(solved, "AlertPanel", cw, ch);
         r->command = find_rect(solved, "CommandPanel", cw, ch);
         r->info = find_rect(solved, "InfoPanel", cw, ch);
         r->portrait = find_rect(solved, "PortraitPanel", cw, ch);

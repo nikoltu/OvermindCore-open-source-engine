@@ -1,0 +1,10 @@
+upstream: s2client-proto
+commit: 7212ae512d15aa93a708e025d3ab9af4a9c4138f
+commit-date: 2026-07-16T22:34:26Z
+retrieved: 2026-08-29
+protocol: proto2, package SC2APIProtocol
+licence: MIT (see LICENSE, kept verbatim)
+files: s2clientprotocol/{common,data,debug,error,query,raw,sc2api,score,spatial,ui}.proto
+status: VENDORED VERBATIM. Never edited, never reformatted. A schema update replaces these
+        files, updates this file and MANIFEST.sha256, and rebuilds; tests/api_schema_pin.py
+        fails on any hash that moves without the manifest moving with it.
