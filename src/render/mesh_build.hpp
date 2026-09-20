@@ -26,14 +26,19 @@ inline std::vector<uint32_t> resolve_indices(const formats::Model& m,
                                              std::vector<Draw>& draws) {
     std::vector<uint32_t> out;
     out.reserve(m.indices.size());
+    const bool from_m3 = !m.material_refs.empty() && m.region_material.size() == m.regions.size();
     for (size_t ri = 0; ri < m.regions.size(); ++ri) {
         const formats::M3Region& r = m.regions[ri];
         uint32_t start = uint32_t(out.size());
-        uint32_t end = r.first_index + r.num_indices;
-        for (uint32_t k = r.first_index; k < end && k < m.indices.size(); ++k)
-            out.push_back(m.indices[k] + r.first_vertex);
         int mat = ri < m.region_material.size() ? m.region_material[ri] : -1;
-        draws.push_back({start, uint32_t(out.size()) - start, mat});
+        const bool untextured_by_design = mat == formats::kUntexturedRegion;
+        const bool suppress = from_m3 && mat < 0 && !untextured_by_design;
+        if (!suppress) {
+            uint32_t end = r.first_index + r.num_indices;
+            for (uint32_t k = r.first_index; k < end && k < m.indices.size(); ++k)
+                out.push_back(m.indices[k] + r.first_vertex);
+        }
+        draws.push_back({start, uint32_t(out.size()) - start, untextured_by_design ? -1 : mat});
     }
     if (m.regions.empty()) {
         for (uint16_t i : m.indices) out.push_back(i);
@@ -45,9 +50,11 @@ inline std::vector<uint32_t> resolve_indices(const formats::Model& m,
 inline std::vector<Vertex> build_vertices(const formats::Model& m,
                                           const std::vector<uint32_t>& tri) {
     std::vector<Vertex> v(m.vertex_count);
+    const uint32_t n_pos = uint32_t(m.positions.size() / 3) < m.vertex_count ? uint32_t(m.positions.size() / 3) : m.vertex_count;
     bool uv = m.uvs.size() >= size_t(m.vertex_count) * 2;
     bool skin = !m.bones.empty() &&
-                m.vertex_bone_weights.size() >= size_t(m.vertex_count) * 4;
+                m.vertex_bone_weights.size() >= size_t(m.vertex_count) * 4 &&
+                m.vertex_bone_indices.size() >= size_t(m.vertex_count) * 4;
     std::vector<uint32_t> vregion(m.vertex_count, 0);
     for (size_t ri = 0; ri < m.regions.size(); ++ri) {
         const auto& r = m.regions[ri];
@@ -55,7 +62,7 @@ inline std::vector<Vertex> build_vertices(const formats::Model& m,
              x < r.first_vertex + r.num_vertices && x < m.vertex_count; ++x)
             vregion[x] = uint32_t(ri);
     }
-    for (uint32_t i = 0; i < m.vertex_count; ++i) {
+    for (uint32_t i = 0; i < n_pos; ++i) {
         v[i] = {};
         v[i].pos[0] = m.positions[i * 3];
         v[i].pos[1] = m.positions[i * 3 + 1];
@@ -77,6 +84,14 @@ inline std::vector<Vertex> build_vertices(const formats::Model& m,
             if (wsum > 0)
                 for (int k = 0; k < 4; ++k) v[i].weight[k] /= wsum;
         }
+    }
+    const bool authored = m.normals.size() >= size_t(m.vertex_count) * 3;
+    if (authored) {
+        for (uint32_t i = 0; i < m.vertex_count; ++i) {
+            Vec3 n = normalize({m.normals[i * 3], m.normals[i * 3 + 1], m.normals[i * 3 + 2]});
+            v[i].nrm[0] = n.x; v[i].nrm[1] = n.y; v[i].nrm[2] = n.z;
+        }
+        return v;
     }
     for (size_t t = 0; t + 2 < tri.size(); t += 3) {
         uint32_t a = tri[t], b = tri[t + 1], c = tri[t + 2];

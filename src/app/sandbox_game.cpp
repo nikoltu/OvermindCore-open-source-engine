@@ -84,6 +84,7 @@ const char* order_name(sim::OrderType t) {
         case sim::OrderType::Patrol: return "Patrol";
         case sim::OrderType::Unload: return "Unload";
         case sim::OrderType::Load: return "Load";
+        case sim::OrderType::Repair: return "Repair";
     }
     return "?";
 }

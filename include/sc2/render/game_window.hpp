@@ -5,6 +5,7 @@
 #include <vector>
 
 #include "sc2/data/environment.hpp"
+#include "sc2/render/fog_field.hpp"
 #include "sc2/render/input.hpp"
 #include "sc2/render/scene.hpp"
 #include "sc2/render/window.hpp"
@@ -24,6 +25,8 @@ WindowResult run_game_window(const GameFrameFn& frame,
                              uint32_t width = 1280, uint32_t height = 720,
                              const std::string& texture_root = "",
                              uint32_t max_frames = 0,
-                             const std::function<data::EnvLight()>& env_provider = {});
+                             const std::function<data::EnvLight()>& env_provider = {},
+                             float shadow_clip = 0.0f,
+                             const std::function<const FogField*()>& fog_provider = {});
 
 }

@@ -1,5 +1,6 @@
 #pragma once
 
+#include <algorithm>
 #include <vector>
 
 #include "sc2/app/hud_messages.hpp"
@@ -8,16 +9,31 @@
 
 namespace sc2::app {
 
+enum class AlertKind { AttackUnit, AttackTown, UpgradeComplete, BuildComplete, ResourceExhausted };
+struct AlertFired {
+    AlertKind kind = AlertKind::AttackUnit;
+    float x = 0.0f, y = 0.0f;
+};
+
 class AlertWatcher {
 public:
     explicit AlertWatcher(int player = 0) : player_(player) {}
+    const std::vector<AlertFired>& fired() const { return fired_; }
 
     void set_player(int p) { player_ = p; }
-    void set_region_size(sim::Fixed r) { region_ = r; }
-    void set_cooldown(float seconds) { cooldown_ = seconds; }
+
+    struct Overlap {
+        float duration = 15.0f, local_radius = 15.0f, life = 15.0f;
+        int local_count = 1, global_count = 2;
+    };
+    void set_overlap(const Overlap& o) { overlap_ = o; }
 
     void observe(const sim::World& world, MessageLog& log, float dt) {
-        for (RegionCD& r : regions_) r.cd -= dt;
+        fired_.clear();
+        for (Active& a : active_) a.age += dt;
+        active_.erase(std::remove_if(active_.begin(), active_.end(),
+                                     [&](const Active& a) { return a.age >= overlap_.duration; }),
+                      active_.end());
 
         const std::vector<sim::Unit>& units = world.units();
         if (shadows_.size() < units.size()) shadows_.resize(units.size());
@@ -26,23 +42,19 @@ public:
             const sim::Unit& u = units[i];
             Shadow& s = shadows_[i];
             if (u.player != player_ || !s.known) {
-                s = Shadow{true, u.alive, u.hp, u.x, u.y};
+                s = Shadow{true, u.alive, u.hp, u.shields, u.x, u.y};
                 continue;
             }
-            if (u.alive && u.hp < s.hp) {
-                const int cx = (u.x / region_).floor();
-                const int cy = (u.y / region_).floor();
-                if (region_ready(cx, cy)) {
-                    log.emit(MsgZone::Alert, "Your forces are under attack", 6.0f, true,
-                             float(u.x.to_double()), float(u.y.to_double()));
-                    arm_region(cx, cy);
+            if (u.alive && (u.hp < s.hp || u.shields < s.shields)) {
+                const AlertKind kind = u.speed.raw() == 0 ? AlertKind::AttackTown : AlertKind::AttackUnit;
+                const float x = float(u.x.to_double()), y = float(u.y.to_double());
+                if (admit(kind, x, y)) {
+                    log.emit(MsgZone::Alert, "Your forces are under attack", overlap_.life, true, x, y);
+                    active_.push_back({kind, x, y, 0.0f});
+                    fired_.push_back({kind, x, y});
                 }
             }
-            if (s.alive && !u.alive)
-                log.emit(MsgZone::Alert, "Unit lost", 5.0f, true,
-                         float(s.x.to_double()), float(s.y.to_double()));
-
-            s = Shadow{true, u.alive, u.hp, u.x, u.y};
+            s = Shadow{true, u.alive, u.hp, u.shields, u.x, u.y};
         }
     }
 
@@ -50,32 +62,29 @@ private:
     struct Shadow {
         bool known = false;
         bool alive = true;
-        sim::Fixed hp, x, y;
+        sim::Fixed hp, shields, x, y;
     };
-    struct RegionCD {
-        int cx, cy;
-        float cd;
+    struct Active {
+        AlertKind kind;
+        float x, y, age;
     };
+    std::vector<AlertFired> fired_;
 
-    bool region_ready(int cx, int cy) const {
-        for (const RegionCD& r : regions_)
-            if (r.cx == cx && r.cy == cy) return r.cd <= 0.0f;
-        return true;
-    }
-    void arm_region(int cx, int cy) {
-        for (RegionCD& r : regions_)
-            if (r.cx == cx && r.cy == cy) {
-                r.cd = cooldown_;
-                return;
-            }
-        regions_.push_back({cx, cy, cooldown_});
+    bool admit(AlertKind kind, float x, float y) const {
+        int local = 0, global = 0;
+        const float r2 = overlap_.local_radius * overlap_.local_radius;
+        for (const Active& a : active_) {
+            if (a.kind != kind) continue;
+            ++global;
+            if ((a.x - x) * (a.x - x) + (a.y - y) * (a.y - y) <= r2) ++local;
+        }
+        return local < overlap_.local_count && global < overlap_.global_count;
     }
 
     int player_;
     std::vector<Shadow> shadows_;
-    std::vector<RegionCD> regions_;
-    float cooldown_ = 5.0f;
-    sim::Fixed region_ = sim::Fixed::from_int(10);
+    std::vector<Active> active_;
+    Overlap overlap_;
 };
 
 }

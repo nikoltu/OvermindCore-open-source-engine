@@ -3,6 +3,7 @@ layout(set = 0, binding = 0) uniform sampler2D hdrTex;
 layout(push_constant) uniform PC {
     float exposure;
     int   curve;
+    int   keepAlpha;
 } pc;
 layout(location = 0) in vec2 vUV;
 layout(location = 0) out vec4 outColor;
@@ -25,5 +26,5 @@ void main() {
     if (pc.curve == 1) mapped = reinhard(hdr);
     else if (pc.curve == 2) mapped = clamp(hdr, 0.0, 1.0);
     else mapped = aces(hdr);
-    outColor = vec4(to_srgb(clamp(mapped, 0.0, 1.0)), 1.0);
+    outColor = vec4(to_srgb(clamp(mapped, 0.0, 1.0)), pc.keepAlpha != 0 ? texture(hdrTex, vUV).a : 1.0);
 }

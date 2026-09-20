@@ -13,6 +13,10 @@ struct DdsInfo {
     std::string fourcc;
     uint32_t dxgi_format = 0;
     size_t data_offset = 128;
+    uint32_t pf_flags = 0;
+    uint32_t rgb_bit_count = 0;
+    uint32_t r_mask = 0, g_mask = 0, b_mask = 0, a_mask = 0;
+    bool uncompressed() const { return fourcc.empty() && rgb_bit_count != 0; }
 };
 
 DdsInfo dds_parse(const std::vector<uint8_t>& data);

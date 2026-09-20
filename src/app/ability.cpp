@@ -229,14 +229,7 @@ double armor_upgrade_bonus(const data::UpgradeCatalog& up, const std::string& un
 
 static double fold_field(const data::UpgradeCatalog& up, const std::vector<std::string>& researched,
                          const char* catalog, const std::string& entry, const char* field, double base) {
-    double v = base;
-    for (const std::string& upg : researched) {
-        if (!up.contains(upg)) continue;
-        for (const data::UpgradeEffect& e : up.resolve(upg))
-            if (e.catalog == catalog && e.entry == entry && e.field == field)
-                v = e.apply(v);
-    }
-    return v;
+    return data::fold_upgrade_field(up, researched, catalog, entry, field, base);
 }
 
 void apply_unit_upgrades(const data::Catalog& cat, const data::UpgradeCatalog& up,
@@ -282,12 +275,27 @@ void apply_unit_upgrades(const data::Catalog& cat, const data::UpgradeCatalog& u
                                                  u.energy_max.to_double()));
     u.energy     = Fixed::from_double(fold_field(up, researched, "Unit", unit_name, "Energy",
                                                  u.energy.to_double()));
+    const double base_shields_max = u.shields_max.to_double();
+    const double new_shields_max = fold_field(up, researched, "Unit", unit_name, "ShieldsMax", base_shields_max);
+    if (new_shields_max != base_shields_max) {
+        u.shields_max = Fixed::from_double(new_shields_max);
+        u.shields = u.shields + Fixed::from_double(new_shields_max - base_shields_max);
+    }
+    u.speed_mult_creep = Fixed::from_double(fold_field(up, researched, "Unit", unit_name, "SpeedMultiplierCreep",
+                                                       u.speed_mult_creep.to_double()));
     if (!weapons.empty())
         u.wpn_range = Fixed::from_double(fold_field(up, researched, "Weapon", weapons[0], "Range",
                                                     u.wpn_range.to_double()));
     if (weapons.size() >= 2)
         u.wpn2_range = Fixed::from_double(fold_field(up, researched, "Weapon", weapons[1], "Range",
                                                      u.wpn2_range.to_double()));
+    if (const std::string bv = cat.burrowed_variant(unit_name); !bv.empty()) {
+        u.burrow_speed = Fixed::from_double(fold_field(up, researched, "Unit", bv, "Speed", u.burrow_speed.to_double()));
+        u.can_burrow_move = u.burrow_speed.raw() > 0;
+    }
+    if (!weapons.empty())
+        u.acquire_range = Fixed::from_double(fold_field(up, researched, "Weapon", weapons[0], "MinScanRange",
+                                                        u.acquire_range.to_double()));
     double rate[2] = {0.0, 0.0};
     for (const std::string& upg : researched) {
         if (!up.contains(upg)) continue;
@@ -308,14 +316,18 @@ void apply_unit_upgrades(const data::Catalog& cat, const data::UpgradeCatalog& u
 static UpgradeRevert snapshot_revert(std::uint32_t id, const sim::Unit& u) {
     return UpgradeRevert{id, u.wpn_damage, u.wpn2_damage, u.armor, u.speed, u.shield_armor,
                          u.hp_max, u.hp, u.energy_max, u.energy, u.wpn_range, u.wpn2_range,
-                         u.wpn_period, u.wpn2_period};
+                         u.wpn_period, u.wpn2_period, u.wpn_bonus_amount, u.shields_max, u.shields,
+                         u.acquire_range, u.speed_mult_creep, u.burrow_speed, u.wpn_bonus_attr};
 }
 static bool revert_differs(const UpgradeRevert& r, const sim::Unit& u) {
     return r.wpn_damage != u.wpn_damage || r.wpn2_damage != u.wpn2_damage || r.armor != u.armor ||
            r.speed != u.speed || r.shield_armor != u.shield_armor || r.hp_max != u.hp_max ||
            r.hp != u.hp || r.energy_max != u.energy_max || r.energy != u.energy ||
            r.wpn_range != u.wpn_range || r.wpn2_range != u.wpn2_range ||
-           r.wpn_period != u.wpn_period || r.wpn2_period != u.wpn2_period;
+           r.wpn_period != u.wpn_period || r.wpn2_period != u.wpn2_period ||
+           r.wpn_bonus_amount != u.wpn_bonus_amount || r.wpn_bonus_attr != u.wpn_bonus_attr ||
+           r.shields_max != u.shields_max || r.shields != u.shields || r.acquire_range != u.acquire_range ||
+           r.speed_mult_creep != u.speed_mult_creep || r.burrow_speed != u.burrow_speed;
 }
 
 std::size_t apply_upgrade_to_live(sim::World& w, const data::Catalog& cat,
@@ -356,7 +368,41 @@ void revert_live_upgrade(sim::World& w, std::vector<UpgradeRevert>& revert, std:
         u.wpn2_range = r.wpn2_range;
         u.wpn_period = r.wpn_period;
         u.wpn2_period = r.wpn2_period;
+        u.wpn_bonus_amount = r.wpn_bonus_amount;
+        u.wpn_bonus_attr = r.wpn_bonus_attr;
+        u.shields_max = r.shields_max;
+        u.shields = r.shields;
+        u.acquire_range = r.acquire_range;
+        u.speed_mult_creep = r.speed_mult_creep;
+        u.burrow_speed = r.burrow_speed;
+        u.can_burrow_move = r.burrow_speed.raw() > 0;
     }
+}
+
+namespace {
+struct WhichUnitRef {
+    std::string value, effect;
+    bool on_caster() const { return value == "Caster" || value == "CasterUnit" || value == "Source"; }
+};
+}
+static WhichUnitRef which_unit(const data::Catalog& cat, const char* family, const std::string& id) {
+    WhichUnitRef w;
+    const auto& kids = cat.resolved(family, id);
+    for (auto it = kids.rbegin(); it != kids.rend(); ++it) {
+        if (it->name != "WhichUnit") continue;
+        if (const std::string* v = it->attr("Value")) w.value = *v;
+        else if (const std::string* v2 = it->attr("value")) w.value = *v2;
+        if (const std::string* e = it->attr("Effect")) w.effect = *e;
+        break;
+    }
+    return w;
+}
+
+static std::string validator_field(const data::Catalog& cat, const std::string& vid, const std::string& tag,
+                                   const char* field, const char* fallback) {
+    if (auto v = cat.scalar("CValidator", vid, field)) return *v;
+    if (auto d = cat.tag_default_scalar(tag, field); d && !d->empty()) return *d;
+    return fallback;
 }
 
 static std::optional<sim::VitalGate> parse_vital_validator(const data::Catalog& cat,
@@ -369,7 +415,7 @@ static std::optional<sim::VitalGate> parse_vital_validator(const data::Catalog& 
     g.vital = vital == "Energy" ? sim::VitalGate::Energy
               : vital == "Shields" ? sim::VitalGate::Shields
                                    : sim::VitalGate::Life;
-    const std::string cmp = cat.scalar("CValidator", vid, "Compare").value_or("LT");
+    const std::string cmp = validator_field(cat, vid, ve->tag, "Compare", "LT");
     g.cmp = cmp == "LE"   ? sim::VitalGate::LE
             : cmp == "GT" ? sim::VitalGate::GT
             : cmp == "GE" ? sim::VitalGate::GE
@@ -389,11 +435,53 @@ static std::vector<sim::VitalGate> parse_effect_vital_gates(const data::Catalog&
         if (auto g = parse_vital_validator(cat, vid)) gates.push_back(*g);
     return gates;
 }
+static void parse_autocast_validators(const data::Catalog& cat, const std::string& vid, AbilityBuild& b,
+                                      int depth = 0) {
+    if (vid.empty() || depth > 4) return;
+    const data::Catalog::Entry* ve = cat.find("CValidator", vid);
+    if (!ve) return;
+    if (ve->tag == "CValidatorCombine") {
+        const bool all = validator_field(cat, vid, ve->tag, "Type", "Or") == "And";
+        AbilityBuild one;
+        int modelled = 0;
+        for (const std::string& c : cat.array_links("CValidator", vid, "CombineArray")) {
+            AbilityBuild& into = all ? b : one;
+            const std::size_t g = into.autocast_caster_gates.size(), n = into.autocast_not_behaviors.size();
+            parse_autocast_validators(cat, c, into, depth + 1);
+            modelled += into.autocast_caster_gates.size() != g || into.autocast_not_behaviors.size() != n;
+        }
+        if (!all && modelled == 1) {
+            b.autocast_caster_gates.insert(b.autocast_caster_gates.end(), one.autocast_caster_gates.begin(),
+                                           one.autocast_caster_gates.end());
+            b.autocast_not_behaviors.insert(b.autocast_not_behaviors.end(), one.autocast_not_behaviors.begin(),
+                                            one.autocast_not_behaviors.end());
+        }
+        return;
+    }
+    const bool caster = which_unit(cat, "CValidator", vid).on_caster();
+    if (ve->tag == "CValidatorUnitCompareVital" && caster) {
+        if (auto g = parse_vital_validator(cat, vid)) b.autocast_caster_gates.push_back(*g);
+        return;
+    }
+    if (ve->tag == "CValidatorUnitCompareBehaviorCount" && caster) {
+        const std::string beh = cat.scalar("CValidator", vid, "Behavior").value_or("");
+        const std::string cmp = validator_field(cat, vid, ve->tag, "Compare", "EQ");
+        const std::string val = validator_field(cat, vid, ve->tag, "Value", "0");
+        if (!beh.empty() && cmp == "EQ" && val == "0") b.autocast_not_behaviors.push_back(behavior_id_hash(beh));
+    }
+}
+
 static void parse_ability_validators(const data::Catalog& cat, const std::string& eff,
                                      AbilityBuild& b) {
     auto gates = parse_effect_vital_gates(cat, eff);
     b.vital_gates.insert(b.vital_gates.end(), gates.begin(), gates.end());
 }
+void parse_ability_autocast_validators(const data::Catalog& cat, const std::string& abil_id, AbilityBuild& b) {
+    for (const std::string& vid : cat.array_links("CAbil", abil_id, "AutoCastValidatorArray"))
+        parse_autocast_validators(cat, vid, b);
+}
+
+namespace { struct cat_persist_tmp { double radius = 0, period = 0; int count = 0; }; }
 
 std::optional<AbilityBuild> make_ability(const data::Catalog& cat, const std::string& abil_id) {
     if (auto m = cat.morph_spec(abil_id)) {
@@ -428,6 +516,25 @@ std::optional<AbilityBuild> make_ability(const data::Catalog& cat, const std::st
         return b;
     }
 
+    if (auto ob = cat.placed_obstacle_spec(abil_id)) {
+        if (ob->ok()) {
+            AbilityBuild b;
+            b.def.kind = sim::EffectKind::CreateUnit;
+            b.def.spawn_count = 1;
+            b.spawn_unit = ob->unit;
+            b.def.spawn_blocks_ground = true;
+            b.def.radius = Fixed::from_double(ob->radius);
+            b.def.duration = Fixed::from_double(ob->duration);
+            if (auto r = cat.scalar("CAbil", abil_id, "Range"); r && !r->empty()) b.def.range = Fixed::parse(*r);
+            b.energy_cost = Fixed::from_double(ob->energy);
+            b.life_cost = cabil_life(cat, abil_id);
+            parse_ability_filters(cat, abil_id, b);
+            b.cooldown = cabil_cooldown(cat, abil_id);
+            bind_cast_times(cat, abil_id, b);
+            return b;
+        }
+    }
+
     if (auto bs = cat.build_spec(abil_id)) {
         AbilityBuild b;
         b.def.kind = sim::EffectKind::CreateUnit;
@@ -445,6 +552,11 @@ std::optional<AbilityBuild> make_ability(const data::Catalog& cat, const std::st
         b.def.kind = sim::EffectKind::PhaseShift;
         b.def.duration = Fixed::from_double(ps.duration);
         b.def.spawn_count = 1;
+        if (!ps.caster_behavior.empty()) {
+            b.def.behavior_tag = behavior_id_hash(ps.caster_behavior);
+            b.def.period = Fixed::from_double(ps.caster_duration);
+        }
+        if (!ps.cancel_behavior.empty()) b.def.phase_cancel_tag = behavior_id_hash(ps.cancel_behavior);
         b.spawn_unit = ps.shade;
         if (auto r = cat.scalar("CAbil", abil_id, "Range"); r && !r->empty())
             b.def.range = Fixed::parse(*r);
@@ -542,6 +654,7 @@ std::optional<AbilityBuild> make_ability(const data::Catalog& cat, const std::st
             bind_cast_times(cat, abil_id, b);
             parse_ability_filters(cat, abil_id, b);
             parse_ability_validators(cat, eff, b);
+            parse_ability_autocast_validators(cat, abil_id, b);
             return b;
         }
     }
@@ -577,6 +690,23 @@ std::optional<AbilityBuild> make_ability(const data::Catalog& cat, const std::st
             return area;
         }
     }
+    if (cat.effect_subclass(eff) == "Teleport") {
+        AbilityBuild tp;
+        if (build_effect(cat, eff, tp) >= 0) {
+            tp.def.kind = tp.tree[tp.tree_root].kind;
+            if (auto r = cat.scalar_num("CEffect", eff, "Range"); r && *r > 0)
+                tp.def.range = Fixed::from_double(*r);
+            else if (auto ar = cat.scalar("CAbil", abil_id, "Range"); ar && !ar->empty())
+                tp.def.range = Fixed::parse(*ar);
+            tp.energy_cost = cabil_energy(cat, abil_id);
+            tp.life_cost = cabil_life(cat, abil_id);
+            tp.cooldown = cabil_cooldown(cat, abil_id);
+            bind_cast_times(cat, abil_id, tp);
+            parse_ability_filters(cat, abil_id, tp);
+            parse_ability_validators(cat, eff, tp);
+            return tp;
+        }
+    }
     if (cat.effect_subclass(eff) == "CreateHealer") {
         AbilityBuild heal;
         if (build_effect(cat, eff, heal) >= 0) {
@@ -588,6 +718,7 @@ std::optional<AbilityBuild> make_ability(const data::Catalog& cat, const std::st
             heal.cooldown = cabil_cooldown(cat, abil_id);
             bind_cast_times(cat, abil_id, heal);
             parse_ability_filters(cat, abil_id, heal);
+            parse_ability_autocast_validators(cat, abil_id, heal);
             return heal;
         }
     }
@@ -627,6 +758,51 @@ std::optional<AbilityBuild> make_ability(const data::Catalog& cat, const std::st
         return yank;
     }
 
+    if (cat.effect_subclass(eff) == "CreatePersistent" && !cat.effect_damage(eff)) {
+        if (auto beh = cat.effect_apply_behavior(eff)) {
+            const auto dr = cat.behavior_damage_response(*beh);
+            const auto bb = cat.behavior_buff(*beh);
+            cat_persist_tmp per_v;
+            per_v.count = int(cat.scalar_num("CEffect", eff, "PeriodCount").value_or(0));
+            if (auto pp = cat.array_links("CEffect", eff, "PeriodicPeriodArray"); !pp.empty() && !pp[0].empty())
+                per_v.period = std::strtod(pp[0].c_str(), nullptr);
+            for (const std::string& pe : cat.array_links("CEffect", eff, "PeriodicEffectArray")) {
+                for (const core::XmlNode& n : cat.resolved("CEffect", pe))
+                    if (n.name == "AreaArray")
+                        if (const std::string* r = n.attr("Radius"); r && !r->empty()) per_v.radius = std::strtod(r->c_str(), nullptr);
+                if (per_v.radius > 0) break;
+            }
+            const cat_persist_tmp* per = &per_v;
+            if (dr.present && dr.modify_amount < 0 && bb && per->radius > 0 && per->period > 0 && per->count > 0) {
+                AbilityBuild g;
+                sim::EffectNode apply;
+                apply.kind = sim::EffectKind::ApplyBehavior;
+                apply.duration = Fixed::from_double(bb->duration);
+                apply.beh_resp_amount = Fixed::from_double(dr.modify_amount);
+                apply.beh_resp_kinds = dr.kinds;
+                sim::EffectNode field;
+                field.kind = sim::EffectKind::CreatePersistent;
+                field.radius = Fixed::from_double(per->radius);
+                field.period = Fixed::from_double(per->period);
+                field.period_count = per->count;
+                field.periodic = 0;
+                field.persist_allies = true;
+                field.persist_follow_source = true;
+                g.tree = {apply, field};
+                g.tree_root = 1;
+                g.def.kind = sim::EffectKind::CreatePersistent;
+                g.def.radius = field.radius;
+                g.def.period = field.period;
+                g.def.period_count = field.period_count;
+                g.energy_cost = cabil_energy(cat, abil_id);
+                g.life_cost = cabil_life(cat, abil_id);
+                g.cooldown = cabil_cooldown(cat, abil_id);
+                bind_cast_times(cat, abil_id, g);
+                return g;
+            }
+        }
+    }
+
     AbilityBuild b;
     if (auto per = cat.effect_persistent(eff)) {
         b.def.kind = sim::EffectKind::CreatePersistent;
@@ -634,6 +810,8 @@ std::optional<AbilityBuild> make_ability(const data::Catalog& cat, const std::st
         b.def.radius = Fixed::from_double(per->radius);
         b.def.period = Fixed::from_double(per->period);
         b.def.period_count = per->count;
+        b.def.persist_affiliation = per->affiliation;
+        b.def.persist_excludes_structure = per->excludes_structure;
         if (b.def.amount.raw() > 0) {
             sim::EffectNode dmg;
             dmg.kind = sim::EffectKind::Damage;
@@ -644,13 +822,18 @@ std::optional<AbilityBuild> make_ability(const data::Catalog& cat, const std::st
             pers.radius = b.def.radius;
             pers.period = b.def.period;
             pers.period_count = b.def.period_count;
+            pers.persist_affiliation = b.def.persist_affiliation;
+            pers.persist_excludes_structure = b.def.persist_excludes_structure;
+            pers.persist_src = behavior_id_hash(eff);
             pers.periodic = 0;
             b.tree = {dmg, pers};
             b.tree_root = 1;
         }
     } else if (auto dmg = cat.effect_damage(eff)) {
         b.def.kind = sim::EffectKind::Damage;
-        b.def.amount = Fixed::from_int(*dmg);
+        b.def.amount = cat.effect_subclass(eff) == "Damage"
+                           ? Fixed::from_double(cat.effect_amount(eff).value_or(double(*dmg)))
+                           : Fixed::from_int(*dmg);
     } else if (auto frac = cat.effect_energy_fraction(eff); frac && *frac > 0) {
         b.def.kind = sim::EffectKind::ModifyEnergy;
         b.def.energy_fraction = Fixed::from_double(*frac);
@@ -661,12 +844,20 @@ std::optional<AbilityBuild> make_ability(const data::Catalog& cat, const std::st
         auto bb = cat.behavior_buff(*beh);
         if (!bb) return std::nullopt;
         b.def.kind = sim::EffectKind::ApplyBehavior;
-        b.def.duration = Fixed::from_double(bb->duration);
+        b.def.behavior_tag = behavior_id_hash(*beh);
+        b.def.duration = Fixed::from_double(cat.effect_apply_duration(eff).value_or(bb->duration));
         b.def.move_speed_mult = Fixed::from_double(bb->move_speed_mult);
         b.def.attack_speed_mult = Fixed::from_double(bb->attack_speed_mult);
         b.def.beh_root = bb->root;
         b.def.beh_stun = bb->stun;
+        b.def.beh_suppress_attack = bb->suppress_attack;
+        b.def.beh_invulnerable = bb->invulnerable;
+        b.def.beh_uncommandable = bb->uncommandable;
+        b.def.beh_untargetable = bb->untargetable;
+        b.def.beh_life_armor = sim::Fixed::from_double(bb->life_armor_bonus);
+        b.def.beh_shield_armor = sim::Fixed::from_double(bb->shield_armor_bonus);
         b.def.beh_dmg_per_tick = Fixed::from_double(bb->dmg_per_tick);
+        b.def.beh_rate_mult = Fixed::from_double(bb->rate_mult);
         b.def.beh_dmg_period = Fixed::from_double(bb->dmg_period);
         if (bb->move_speed_mult == 1.0)
             if (auto slow = cat.effect_movement_slow_behavior(eff))
@@ -675,11 +866,15 @@ std::optional<AbilityBuild> make_ability(const data::Catalog& cat, const std::st
     } else if (auto cu = cat.effect_create_unit(eff)) {
         b.def.kind = sim::EffectKind::CreateUnit;
         b.def.spawn_count = cu->count;
+        b.def.spawn_range = sim::Fixed::from_double(cu->spawn_range);
         b.spawn_unit = cu->unit;
-        if (!cu->spawn_effect.empty())
-            if (auto beh = cat.effect_apply_behavior(cu->spawn_effect))
-                if (auto bb = cat.behavior_buff(*beh))
-                    b.spawn_life = Fixed::from_double(bb->duration);
+        for (const std::string& beh : cat.effect_apply_behaviors(cu->spawn_effect)) {
+            if (auto bb = cat.behavior_buff(beh); bb && bb->duration > 0 && b.spawn_life.raw() == 0)
+                b.spawn_life = Fixed::from_double(bb->duration);
+            if (const double f = cat.behavior_damage_response(beh).fraction; f > 0 && f != 1.0)
+                b.spawn_dmg_fraction = Fixed::from_double(f);
+            if (cat.behavior_no_damage_dealt(beh)) b.spawn_no_damage = true;
+        }
     } else {
         return std::nullopt;
     }
@@ -704,17 +899,102 @@ bool local_is_point(const AbilityBuild& b, int32_t idx) {
     return false;
 }
 
-uint32_t behavior_id_hash(const std::string& id) {
-    uint32_t h = 2166136261u;
-    for (unsigned char c : id) {
-        h ^= c;
-        h *= 16777619u;
+int compile_validator(const data::Catalog& cat, const std::string& vid, std::vector<sim::ValidatorOp>& ops,
+                      int depth, bool inverted, bool strict = false) {
+    if (vid.empty() || depth > 8) return -1;
+    const data::Catalog::Entry* ve = cat.find("CValidator", vid);
+    if (!ve) return -1;
+    sim::ValidatorOp op;
+    op.negate = cat.scalar("CValidator", vid, "Negate").value_or("0") == "1";
+    op.on_caster = which_unit(cat, "CValidator", vid).on_caster();
+    const std::string& tag = ve->tag;
+    if (tag == "CValidatorCombine") {
+        op.kind = validator_field(cat, vid, tag, "Type", "Or") == "And" ? sim::ValidatorOp::And
+                                                                         : sim::ValidatorOp::Or;
+        const bool inv = inverted != op.negate;
+        const bool may_drop = (op.kind == sim::ValidatorOp::And) != inv;
+        for (const std::string& c : cat.array_links("CValidator", vid, "CombineArray")) {
+            const int k = compile_validator(cat, c, ops, depth + 1, inv, strict);
+            if (k < 0 && (strict || !may_drop)) return -1;
+            if (k >= 0) op.kids.push_back(std::uint16_t(k));
+        }
+        if (op.kids.empty()) return -1;
+    } else if (tag == "CValidatorUnitCompareVital") {
+        auto g = parse_vital_validator(cat, vid);
+        if (!g) return -1;
+        op.kind = sim::ValidatorOp::Vital;
+        op.vital = *g;
+    } else if (tag == "CValidatorUnitType") {
+        op.kind = sim::ValidatorOp::UnitType;
+        op.unit_type = cat.scalar("CValidator", vid, "Value").value_or("");
+        if (op.unit_type.empty()) return -1;
+        if (cat.scalar("CValidator", vid, "Find").value_or("1") == "0") op.negate = !op.negate;
+    } else if (tag == "CValidatorUnitCompareBehaviorCount") {
+        const std::string beh = cat.scalar("CValidator", vid, "Behavior").value_or("");
+        const std::string cmp = validator_field(cat, vid, tag, "Compare", "EQ");
+        const std::string val = validator_field(cat, vid, tag, "Value", "0");
+        const bool none = (cmp == "EQ" && val == "0") || (cmp == "LT" && val == "1") || (cmp == "LE" && val == "0");
+        if (beh.empty() || !none || strict || (inverted != op.negate)) return -1;
+        op.kind = sim::ValidatorOp::NoBehavior;
+        op.behavior = behavior_id_hash(beh);
+    } else if (tag == "CValidatorUnitFilters") {
+        op.kind = sim::ValidatorOp::Filters;
+        const std::string f = cat.scalar("CValidator", vid, "Filters").value_or("");
+        const std::size_t semi = f.find(';');
+        const std::string req = f.substr(0, semi), exc = semi == std::string::npos ? "" : f.substr(semi + 1);
+        bool modelled = false, whole = true;
+        auto each = [](const std::string& list, auto&& fn) {
+            std::size_t s = 0;
+            while (s < list.size()) {
+                std::size_t c = list.find(',', s);
+                if (c == std::string::npos) c = list.size();
+                if (c > s) fn(list.substr(s, c - s));
+                s = c + 1;
+            }
+        };
+        each(req, [&](const std::string& t) {
+            if (t == "Ground") { op.req_plane |= 1; modelled = true; }
+            else if (t == "Air") { op.req_plane |= 2; modelled = true; }
+            else if (const std::uint32_t bit = filter_attr_bit(t)) { op.req_attr |= bit; modelled = true; }
+            else whole = false;
+        });
+        each(exc, [&](const std::string& t) {
+            const std::uint8_t rel = t == "Self" ? 1 : t == "Player" ? 2 : t == "Ally" ? 4 : t == "Enemy" ? 8
+                                   : t == "Neutral" ? 16 : 0;
+            if (rel) { op.exc_rel |= rel; modelled = true; }
+            else if (t == "Ground") { op.exc_plane |= 1; modelled = true; }
+            else if (t == "Air") { op.exc_plane |= 2; modelled = true; }
+            else if (t == "Invulnerable") { op.exc_invulnerable = true; modelled = true; }
+            else if (const std::uint32_t bit = filter_attr_bit(t)) { op.exc_attr |= bit; modelled = true; }
+            else whole = false;
+        });
+        if (!modelled || (!whole && (strict || inverted != op.negate))) return -1;
+    } else {
+        return -1;
     }
-    return h;
+    ops.push_back(std::move(op));
+    return int(ops.size()) - 1;
 }
 
-int32_t build_effect_rec(const data::Catalog& cat, const std::string& eff, AbilityBuild& b,
-                         int depth) {
+void attach_validators(const data::Catalog& cat, const std::string& eff, sim::EffectNode& n) {
+    for (const std::string& vid : cat.array_links("CEffect", eff, "ValidatorArray")) {
+        const data::Catalog::Entry* ve = cat.find("CValidator", vid);
+        if (ve && ve->tag == "CValidatorUnitCompareVital" && !n.gates.empty()) continue;
+        const int r = compile_validator(cat, vid, n.validators, 0, false);
+        if (r >= 0) n.validator_roots.push_back(std::uint16_t(r));
+    }
+}
+
+int32_t build_effect_node(const data::Catalog& cat, const std::string& eff, AbilityBuild& b, int depth);
+
+int32_t build_effect_rec(const data::Catalog& cat, const std::string& eff, AbilityBuild& b, int depth) {
+    const int32_t idx = build_effect_node(cat, eff, b, depth);
+    if (idx >= 0) attach_validators(cat, eff, b.tree[std::size_t(idx)]);
+    return idx;
+}
+
+int32_t build_effect_node(const data::Catalog& cat, const std::string& eff, AbilityBuild& b,
+                          int depth) {
     if (depth > 32 || eff.empty()) return -1;
     const std::string sub = cat.effect_subclass(eff);
 
@@ -730,8 +1010,43 @@ int32_t build_effect_rec(const data::Catalog& cat, const std::string& eff, Abili
         sim::EffectNode n;
         n.kind = sim::EffectKind::EnumArea;
         n.radius = sim::Fixed::from_double(ea->radius);
+        n.search_max_count = ea->max_count;
         n.search_affiliation = cat.effect_search_affiliation(eff);
         n.children = {child};
+        b.tree.push_back(std::move(n));
+        return int32_t(b.tree.size()) - 1;
+    }
+    if (sub == "CreatePersistent") {
+        auto per = cat.effect_persistent(eff);
+        if (!per) return -1;
+        sim::EffectNode n;
+        n.kind = sim::EffectKind::CreatePersistent;
+        n.radius = sim::Fixed::from_double(per->radius);
+        n.period = sim::Fixed::from_double(per->period);
+        n.period_count = per->count;
+        n.amount = sim::Fixed::from_double(per->amount);
+        n.persist_affiliation = per->affiliation;
+        n.persist_excludes_structure = per->excludes_structure;
+        for (const std::string& pe : cat.array_links("CEffect", eff, "PeriodicEffectArray")) {
+            if (pe.empty()) continue;
+            std::string leaf = pe;
+            if (auto ea = cat.effect_enum_area(pe)) leaf = ea->child;
+            const int32_t k = build_effect_rec(cat, leaf, b, depth + 1);
+            if (k < 0) return -1;
+            n.periodic = k;
+            break;
+        }
+        auto edge = [&](const char* field, sim::EffectRef& slot) -> bool {
+            const std::string id = cat.scalar("CEffect", eff, field).value_or("");
+            if (id.empty()) return true;
+            const int32_t k = build_effect_rec(cat, id, b, depth + 1);
+            if (k < 0) return false;
+            slot = k;
+            return true;
+        };
+        if (!edge("InitialEffect", n.initial) || !edge("ExpireEffect", n.expire) || !edge("FinalEffect", n.final_effect))
+            return -1;
+        n.persist_src = behavior_id_hash(eff);
         b.tree.push_back(std::move(n));
         return int32_t(b.tree.size()) - 1;
     }
@@ -755,7 +1070,8 @@ int32_t build_effect_rec(const data::Catalog& cat, const std::string& eff, Abili
     }
     if (sub == "Switch") {
         std::vector<int32_t> case_kids;
-        std::vector<sim::VitalGate> case_gates;
+        std::vector<sim::ValidatorOp> case_ops;
+        std::vector<std::uint16_t> case_roots;
         int32_t uncond = -1;
         for (const core::XmlNode& node : cat.resolved("CEffect", eff)) {
             if (node.name != "CaseArray") continue;
@@ -767,12 +1083,12 @@ int32_t build_effect_rec(const data::Catalog& cat, const std::string& eff, Abili
                 if (uncond < 0) return -1;
                 break;
             }
-            auto g = parse_vital_validator(cat, *vid);
-            if (!g) continue;
+            const int r = compile_validator(cat, *vid, case_ops, 0, false, true);
+            if (r < 0) continue;
             const int32_t k = build_effect_rec(cat, *cef, b, depth + 1);
             if (k < 0) continue;
             case_kids.push_back(k);
-            case_gates.push_back(*g);
+            case_roots.push_back(std::uint16_t(r));
         }
         int32_t dk = uncond;
         if (dk < 0) {
@@ -785,7 +1101,27 @@ int32_t build_effect_rec(const data::Catalog& cat, const std::string& eff, Abili
         n.kind = sim::EffectKind::Switch;
         n.children = case_kids;
         n.children.push_back(dk);
-        n.switch_case_gates = case_gates;
+        n.switch_ops = std::move(case_ops);
+        n.switch_case_roots = std::move(case_roots);
+        b.tree.push_back(std::move(n));
+        return int32_t(b.tree.size()) - 1;
+    }
+    if (sub == "Teleport") {
+        auto cap_value = [&](const char* field) -> std::string {
+            const auto& kids = cat.resolved("CEffect", eff);
+            for (auto it = kids.rbegin(); it != kids.rend(); ++it) {
+                if (it->name != field) continue;
+                if (const std::string* v = it->attr("Value")) return *v;
+                if (const std::string* v = it->attr("value")) return *v;
+                return {};
+            }
+            return {};
+        };
+        const WhichUnitRef which = which_unit(cat, "CEffect", eff);
+        if (!which.value.empty() && !which.on_caster()) return -1;
+        sim::EffectNode n;
+        n.kind = sim::EffectKind::Teleport;
+        n.teleport_to_source = (cap_value("TargetLocation") == "SourcePoint");
         b.tree.push_back(std::move(n));
         return int32_t(b.tree.size()) - 1;
     }
@@ -818,17 +1154,11 @@ int32_t build_effect_rec(const data::Catalog& cat, const std::string& eff, Abili
         sim::EffectNode n;
         n.kind = sim::EffectKind::IssueOrder;
         n.issue_order = ord;
-        const std::string wu = [&]() -> std::string {
-            const auto& kids = cat.resolved("CEffect", eff);
-            for (auto it = kids.rbegin(); it != kids.rend(); ++it) {
-                if (it->name != "WhichUnit") continue;
-                if (const std::string* v = it->attr("Value")) return *v;
-                if (const std::string* v = it->attr("value")) return *v;
-                return {};
-            }
-            return {};
-        }();
-        if (wu == "Caster" || wu == "CasterUnit" || wu == "Source") n.beh_on_caster = true;
+        n.beh_on_caster = which_unit(cat, "CEffect", eff).on_caster();
+        for (const core::XmlNode& f : cat.resolved("CEffect", eff)) {
+            if (f.name != "CmdFlags") continue;
+            if (f.attr_or("index", "") == "Queued") n.issue_queued = f.attr_or("value", "1") != "0";
+        }
         b.tree.push_back(std::move(n));
         return int32_t(b.tree.size()) - 1;
     }
@@ -840,6 +1170,12 @@ int32_t build_effect_rec(const data::Catalog& cat, const std::string& eff, Abili
         n.amount = sim::Fixed::from_double(*rate);
         n.heal_drain_factor =
             sim::Fixed::from_double(cat.scalar_num("CEffect", eff, "DrainVitalCostFactor").value_or(0.0));
+        if (cat.scalar("CEffect", eff, "RechargeVital").value_or("") == "Shields")
+            n.heal_vital = sim::HealVital::Shields;
+        if (const auto ie = cat.scalar("CEffect", eff, "InitialEffect"); ie && !ie->empty()) {
+            const int32_t child = build_effect_rec(cat, *ie, b, depth + 1);
+            if (child >= 0) n.children = {child};
+        }
         b.tree.push_back(std::move(n));
         return int32_t(b.tree.size()) - 1;
     }
@@ -849,7 +1185,7 @@ int32_t build_effect_rec(const data::Catalog& cat, const std::string& eff, Abili
         if (!d && sb <= 0.0) return -1;
         sim::EffectNode n;
         n.kind = sim::EffectKind::Damage;
-        n.amount = sim::Fixed::from_int(d.value_or(0));
+        n.amount = sim::Fixed::from_double(cat.effect_amount(eff).value_or(double(d.value_or(0))));
         if (sb > 0.0) n.shield_bonus = sim::Fixed::from_double(sb);
         n.armor_reduction = sim::Fixed::from_double(cat.effect_armor_reduction(eff));
         n.gates = parse_effect_vital_gates(cat, eff);
@@ -863,16 +1199,96 @@ int32_t build_effect_rec(const data::Catalog& cat, const std::string& eff, Abili
         if (!bb) return -1;
         sim::EffectNode n;
         n.kind = sim::EffectKind::ApplyBehavior;
-        n.duration = sim::Fixed::from_double(bb->duration);
+        n.duration = sim::Fixed::from_double(cat.effect_apply_duration(eff).value_or(bb->duration));
         n.move_speed_mult = sim::Fixed::from_double(bb->move_speed_mult);
         n.attack_speed_mult = sim::Fixed::from_double(bb->attack_speed_mult);
         n.beh_root = bb->root;
         n.beh_stun = bb->stun;
+        n.beh_suppress_attack = bb->suppress_attack;
+        n.beh_invulnerable = bb->invulnerable;
+        n.beh_uncommandable = bb->uncommandable;
+        n.beh_untargetable = bb->untargetable;
+        n.beh_life_armor = sim::Fixed::from_double(bb->life_armor_bonus);
+        n.beh_shield_armor = sim::Fixed::from_double(bb->shield_armor_bonus);
+        n.beh_max_stack = bb->max_stack;
+        n.beh_apply_count = std::max(1, int(cat.scalar_num("CEffect", eff, "Count").value_or(1)));
         n.beh_control_transfer = bb->control_transfer;
         n.beh_dmg_per_tick = sim::Fixed::from_double(bb->dmg_per_tick);
+        n.beh_rate_mult = sim::Fixed::from_double(bb->rate_mult);
         n.beh_dmg_period = sim::Fixed::from_double(bb->dmg_period);
         n.behavior_tag = behavior_id_hash(*beh);
         n.gates = parse_effect_vital_gates(cat, eff);
+        if (!bb->initial_effect.empty()) n.initial = build_effect_rec(cat, bb->initial_effect, b, depth + 1);
+        if (!bb->periodic_effect.empty() && bb->dmg_per_tick <= 0.0 && bb->dmg_period > 0.0) {
+            n.periodic = build_effect_rec(cat, bb->periodic_effect, b, depth + 1);
+            n.period = sim::Fixed::from_double(bb->dmg_period);
+        }
+        if (!bb->final_effect.empty()) n.final_effect = build_effect_rec(cat, bb->final_effect, b, depth + 1);
+        if (which_unit(cat, "CEffect", eff).on_caster()) n.beh_on_caster = true;
+        b.tree.push_back(std::move(n));
+        return int32_t(b.tree.size()) - 1;
+    }
+    if (sub == "DestroyPersistent") {
+        auto cap = [&](const char* field) -> std::string {
+            const auto& kids = cat.resolved("CEffect", eff);
+            for (auto it = kids.rbegin(); it != kids.rend(); ++it) {
+                if (it->name != field) continue;
+                if (const std::string* v = it->attr("Value")) return *v;
+                if (const std::string* v = it->attr("value")) return *v;
+                return {};
+            }
+            return {};
+        };
+        sim::EffectNode n;
+        n.kind = sim::EffectKind::DestroyPersistent;
+        const std::string which = cat.scalar("CEffect", eff, "Effect").value_or("");
+        n.destroy_src = which.empty() ? 0u : behavior_id_hash(which);
+        n.destroy_count = int32_t(cat.scalar_num("CEffect", eff, "Count").value_or(0));
+        n.radius = sim::Fixed::from_double(cat.scalar_num("CEffect", eff, "Radius").value_or(0));
+        const std::string loc = cap("WhichLocation");
+        n.destroy_at_source = loc == "SourcePoint" || loc == "CasterPoint" || loc == "SourceUnit" || loc == "CasterUnit";
+        n.destroy_own_only = cap("OwningPlayer") == "Source";
+        b.tree.push_back(std::move(n));
+        return int32_t(b.tree.size()) - 1;
+    }
+    if (sub == "CancelOrder") {
+        sim::EffectNode n;
+        n.kind = sim::EffectKind::CancelOrder;
+        const std::string cmd = cat.scalar("CEffect", eff, "AbilCmd").value_or("");
+        n.cancel_kind = cmd.rfind("attack", 0) == 0 ? 1 : 0;
+        n.cancel_active = true;
+        for (const core::XmlNode& f : cat.resolved("CEffect", eff)) {
+            if (f.name != "Flags") continue;
+            const std::string idx = f.attr_or("index", "");
+            const bool on = f.attr_or("value", "1") != "0";
+            if (idx == "Active") n.cancel_active = on;
+            else if (idx == "Queued") n.cancel_queued = on;
+        }
+        n.remove_count = int32_t(cat.scalar_num("CEffect", eff, "Count").value_or(0));
+        n.beh_on_caster = which_unit(cat, "CEffect", eff).on_caster();
+        b.tree.push_back(std::move(n));
+        return int32_t(b.tree.size()) - 1;
+    }
+    if (sub == "TransferBehavior") {
+        auto bl = cat.scalar("CEffect", eff, "Behavior");
+        if (!bl || bl->empty()) return -1;
+        auto ref = [&](const char* field) -> std::string {
+            const auto& kids = cat.resolved("CEffect", eff);
+            for (auto it = kids.rbegin(); it != kids.rend(); ++it) {
+                if (it->name != field) continue;
+                if (const std::string* v = it->attr("Value")) return *v;
+                if (const std::string* v = it->attr("value")) return *v;
+                return {};
+            }
+            return {};
+        };
+        auto is_caster = [](const std::string& v) { return v == "Caster" || v == "CasterUnit" || v == "Source" || v == "SourceUnit"; };
+        sim::EffectNode n;
+        n.kind = sim::EffectKind::TransferBehavior;
+        n.behavior_tag = behavior_id_hash(*bl);
+        n.transfer_from_caster = is_caster(ref("LaunchUnit"));
+        n.transfer_to_caster = is_caster(ref("ImpactUnit"));
+        n.transfer_copy = cat.scalar("CEffect", eff, "Copy").value_or("0") == "1";
         b.tree.push_back(std::move(n));
         return int32_t(b.tree.size()) - 1;
     }
@@ -882,17 +1298,8 @@ int32_t build_effect_rec(const data::Catalog& cat, const std::string& eff, Abili
         sim::EffectNode n;
         n.kind = sim::EffectKind::RemoveBehavior;
         n.behavior_tag = behavior_id_hash(*bl);
-        const std::string wu = [&]() -> std::string {
-            const auto& kids = cat.resolved("CEffect", eff);
-            for (auto it = kids.rbegin(); it != kids.rend(); ++it) {
-                if (it->name != "WhichUnit") continue;
-                if (const std::string* v = it->attr("Value")) return *v;
-                if (const std::string* v = it->attr("value")) return *v;
-                return {};
-            }
-            return {};
-        }();
-        if (wu == "Caster" || wu == "CasterUnit" || wu == "Source") n.beh_on_caster = true;
+        n.beh_on_caster = which_unit(cat, "CEffect", eff).on_caster();
+        n.remove_count = int32_t(cat.scalar_num("CEffect", eff, "Count").value_or(0));
         b.tree.push_back(std::move(n));
         return int32_t(b.tree.size()) - 1;
     }
@@ -917,6 +1324,20 @@ int32_t build_effect_rec(const data::Catalog& cat, const std::string& eff, Abili
             sim::EffectNode n;
             n.kind = sim::EffectKind::DrainEnergy;
             n.amount = sim::Fixed::from_double(-*ec);
+            n.gates = parse_effect_vital_gates(cat, eff);
+            b.tree.push_back(std::move(n));
+            return int32_t(b.tree.size()) - 1;
+        }
+        if (const auto vc = cat.effect_vital_change(eff); vc.any) {
+            sim::EffectNode n;
+            n.kind = sim::EffectKind::ModifyVitals;
+            n.vit_life = sim::Fixed::from_double(vc.life);
+            n.vit_life_frac = sim::Fixed::from_double(vc.life_frac);
+            n.vit_shields = sim::Fixed::from_double(vc.shields);
+            n.vit_shields_frac = sim::Fixed::from_double(vc.shields_frac);
+            n.vit_energy = sim::Fixed::from_double(vc.energy);
+            n.vit_energy_frac = sim::Fixed::from_double(vc.energy_frac);
+            n.beh_on_caster = which_unit(cat, "CEffect", eff).on_caster();
             n.gates = parse_effect_vital_gates(cat, eff);
             b.tree.push_back(std::move(n));
             return int32_t(b.tree.size()) - 1;
@@ -948,6 +1369,7 @@ int32_t register_ability(sim::World& world, const AbilityBuild& b) {
         to_global(node.periodic);
         to_global(node.expire);
         to_global(node.impact);
+        to_global(node.final_effect);
         remap[i] = world.add_effect(std::move(node));
     }
     return world.add_ability_with_root(b.def, remap[b.tree_root]);
@@ -966,31 +1388,6 @@ sim::Unit make_unit_upgraded(const data::Catalog& cat, const data::UpgradeCatalo
     sim::Unit u = make_unit(cat, unit_id, player);
     apply_unit_upgrades(cat, up, unit_id, researched, u);
     return u;
-}
-
-bool order_repair(const data::Catalog& cat, sim::World& world, sim::RepairSystem& repairs,
-                  std::uint32_t repairer, std::uint32_t target, const std::string& target_unit_id) {
-    using sim::Fixed;
-    const auto& us = world.units();
-    if (repairer >= us.size() || target >= us.size() || repairer == target) return false;
-    const sim::Unit& r = us[repairer];
-    const sim::Unit& t = us[target];
-    if (!r.alive || !t.alive) return false;
-    if (!r.is_worker) return false;
-    if (!world.are_allied(r.player, t.player)) return false;
-    if (!(t.attributes & sim::kAttrMechanical)) return false;
-    if (t.constructing) return false;
-    if (t.hp >= t.hp_max) return false;
-    const auto rt = cat.repair_time(target_unit_id);
-    if (!rt || *rt <= 0.0) return false;
-    const double hpmax = t.hp_max.to_double();
-    if (hpmax <= 0.0) return false;
-    const data::UnitCost cost = data::unit_cost(cat, target_unit_id);
-    const Fixed rate = Fixed::from_double(hpmax / *rt);
-    const Fixed min_per_hp = Fixed::from_double(double(cost.minerals) / hpmax);
-    const Fixed gas_per_hp = Fixed::from_double(double(cost.gas) / hpmax);
-    repairs.assign(repairer, target, rate, min_per_hp, gas_per_hp);
-    return true;
 }
 
 int add_sensor_tower(const data::Catalog& cat, sim::SensorTowerSystem& towers, std::int32_t owner,
@@ -1044,6 +1441,58 @@ bool cast_abduct(sim::World& world, std::uint32_t caster, std::uint32_t target) 
     world.unit(caster).energy = world.unit(caster).energy - cost;
     world.unit(target).x = us[caster].x;
     world.unit(target).y = us[caster].y;
+    return true;
+}
+
+bool is_resource_drop_off(const data::Catalog& cat, const std::string& unit_id,
+                          const std::string& resource) {
+    if (unit_id.empty() || resource.empty()) return false;
+    bool declared = false, set = false;
+    for (const core::XmlNode& n : cat.resolved("CUnit", unit_id)) {
+        if (n.name != "ResourceDropOff") continue;
+        const std::string* idx = n.attr("index");
+        if (!idx || *idx != resource) continue;
+        declared = true;
+        const std::string& v = n.attr_or("value", "1");
+        set = !(v.empty() || v == "0" || v == "false");
+    }
+    return declared && set;
+}
+
+std::uint32_t nearest_drop_off(const data::Catalog& cat, const sim::World& world,
+                               std::uint32_t worker) {
+    const std::vector<sim::Unit>& us = world.units();
+    if (worker >= us.size() || !us[worker].alive) return sim::kNoTarget;
+    const sim::Unit& u = us[worker];
+    const std::string resource = u.gathers_gas ? "Vespene" : "Minerals";
+    std::uint32_t best = sim::kNoTarget;
+    Fixed bd;
+    for (const sim::Unit& o : us) {
+        if (!o.alive || o.id == worker) continue;
+        if (o.player != u.player) continue;
+        if (o.constructing) continue;
+        if (o.catalog_id.empty()) continue;
+        if (!is_resource_drop_off(cat, o.catalog_id, resource)) continue;
+        const Fixed dx = o.x - u.x, dy = o.y - u.y;
+        const Fixed d = dx * dx + dy * dy;
+        if (best == sim::kNoTarget || d < bd) {
+            best = o.id;
+            bd = d;
+        }
+    }
+    return best;
+}
+
+bool order_return_cargo(const data::Catalog& cat, sim::World& world, std::uint32_t worker) {
+    const std::vector<sim::Unit>& us = world.units();
+    if (worker >= us.size()) return false;
+    const sim::Unit& u = us[worker];
+    if (!u.alive || !u.is_worker) return false;
+    if (u.carrying <= 0) return false;
+    const std::uint32_t hall = nearest_drop_off(cat, world, worker);
+    if (hall == sim::kNoTarget) return false;
+    world.unit(worker).home_depot = hall;
+    world.issue(worker, sim::Order{sim::OrderType::Gather, Fixed(), Fixed(), sim::kNoTarget});
     return true;
 }
 

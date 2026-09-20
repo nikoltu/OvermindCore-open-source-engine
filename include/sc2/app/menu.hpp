@@ -47,6 +47,11 @@ public:
 
     const ui::Rect& hit_rect(std::size_t i) const { return hits_[i]; }
 
+    void scale(float s) {
+        for (ui::SolvedFrame& b : buttons_) b.rect = {b.rect.x * s, b.rect.y * s, b.rect.w * s, b.rect.h * s};
+        for (ui::Rect& h : hits_) h = {h.x * s, h.y * s, h.w * s, h.h * s};
+    }
+
 private:
     std::vector<ui::SolvedFrame> buttons_;
     std::vector<ui::Rect> hits_;

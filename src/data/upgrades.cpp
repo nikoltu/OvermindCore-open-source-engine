@@ -89,7 +89,10 @@ static void parse_reference(const std::string& ref, UpgradeEffect& e) {
 
 UpgradeCatalog::Upgrade& UpgradeCatalog::upgrade(const std::string& id) {
     Upgrade& u = upgrades_[id];
-    if (u.id.empty()) u.id = id;
+    if (u.id.empty()) {
+        u.id = id;
+        order_.push_back(id);
+    }
     return u;
 }
 
@@ -104,55 +107,48 @@ void UpgradeCatalog::ingest(const std::vector<uint8_t>& xml) {
         if (!id) continue;
         Upgrade& u = upgrade(*id);
         if (const std::string* p = node.attr("parent")) u.parent = *p;
-
-        for (const XmlNode& f : node.children) {
-            if (f.name != "EffectArray") continue;
-
-            std::string key;
-            if (const std::string* idx = f.attr("index")) {
-                key = *idx;
-                char* end = nullptr;
-                long n = std::strtol(idx->c_str(), &end, 10);
-                if (end != idx->c_str() && *end == '\0' && n + 1 > u.next_auto)
-                    u.next_auto = static_cast<int>(n + 1);
-            } else {
-                key = std::to_string(u.next_auto++);
-            }
-
-            auto it = u.pos.find(key);
-
-            if (const std::string* rm = f.attr("removed"); rm && *rm == "1") {
-                if (it != u.pos.end()) u.slots[it->second].alive = false;
-                continue;
-            }
-
-            const std::string* ref = f.attr("Reference");
-            const std::string* val = f.attr("Value");
-            UpgradeEffect::Op op = parse_op(f.attr("Operation"));
-
-            if (it != u.pos.end()) {
-                Slot& slot = u.slots[it->second];
-                slot.alive = true;
-                if (ref) {
-                    slot.eff = UpgradeEffect{};
-                    parse_reference(*ref, slot.eff);
-                    slot.has_ref = true;
-                }
-                if (val) slot.eff.value = *val;
-                if (f.attr("Operation")) slot.eff.op = op;
-            } else if (ref) {
-                Slot slot;
-                slot.key = key;
-                slot.has_ref = true;
-                parse_reference(*ref, slot.eff);
-                if (val) slot.eff.value = *val;
-                slot.eff.op = op;
-                u.pos[key] = u.slots.size();
-                u.slots.push_back(std::move(slot));
-            }
-        }
+        const std::uint16_t decl = u.decl_seen++;
+        for (const XmlNode& f : node.children)
+            if (f.name == "EffectArray") u.writes.push_back(Write{f, decl});
     }
     resolved_cache_.clear();
+}
+
+std::vector<UpgradeCatalog::RSlot> UpgradeCatalog::resolve_slots(const std::string& id, int depth) const {
+    auto uit = upgrades_.find(id);
+    if (uit == upgrades_.end() || depth > 64) return {};
+    const Upgrade& u = uit->second;
+    std::vector<RSlot> slots;
+    if (!u.parent.empty() && u.parent != id) slots = resolve_slots(u.parent, depth + 1);
+    for (const Write& w : u.writes) {
+        const XmlNode& c = w.node;
+        RSlot* target = nullptr;
+        if (const std::string* ix = c.attr("index")) {
+            char* end = nullptr;
+            long n = std::strtol(ix->c_str(), &end, 10);
+            if (end == ix->c_str() || *end != '\0' || n < 0 || n > 65535) continue;
+            if (std::size_t(n) >= slots.size()) slots.resize(std::size_t(n) + 1);
+            target = &slots[std::size_t(n)];
+        } else {
+            slots.emplace_back();
+            target = &slots.back();
+        }
+        if (const std::string* rm = c.attr("removed")) {
+            target->dead = (*rm != "0" && !rm->empty());
+            if (target->dead) continue;
+        }
+        if (const std::string* ref = c.attr("Reference")) {
+            UpgradeEffect e;
+            parse_reference(*ref, e);
+            e.value = target->eff.value;
+            e.op = target->eff.op;
+            target->eff = e;
+            target->has_ref = true;
+        }
+        if (const std::string* val = c.attr("Value")) target->eff.value = *val;
+        if (c.attr("Operation")) target->eff.op = parse_op(c.attr("Operation"));
+    }
+    return slots;
 }
 
 bool UpgradeCatalog::contains(const std::string& id) const {
@@ -160,10 +156,7 @@ bool UpgradeCatalog::contains(const std::string& id) const {
 }
 
 std::vector<std::string> UpgradeCatalog::ids() const {
-    std::vector<std::string> out;
-    out.reserve(upgrades_.size());
-    for (const auto& [id, u] : upgrades_) out.push_back(id);
-    return out;
+    return order_;
 }
 
 const std::vector<UpgradeEffect>& UpgradeCatalog::resolve(const std::string& id) const {
@@ -176,13 +169,10 @@ const std::vector<UpgradeEffect>& UpgradeCatalog::resolve(const std::string& id)
     if (uit == upgrades_.end()) return out;
     const Upgrade& u = uit->second;
 
+    (void)u;
     std::vector<UpgradeEffect> merged;
-    if (!u.parent.empty() && u.parent != id) {
-        const auto& base = resolve(u.parent);
-        merged.insert(merged.end(), base.begin(), base.end());
-    }
-    for (const Slot& s : u.slots)
-        if (s.alive && s.has_ref) merged.push_back(s.eff);
+    for (const RSlot& s : resolve_slots(id, 0))
+        if (!s.dead && s.has_ref) merged.push_back(s.eff);
 
     return resolved_cache_[id] = std::move(merged);
 }

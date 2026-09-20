@@ -1,6 +1,10 @@
 #include "sc2/app/synth_map.hpp"
 
+#include "sc2/formats/map_archive.hpp"
+
 #include <algorithm>
+#include <fstream>
+#include <iterator>
 
 namespace sc2::app {
 
@@ -120,6 +124,29 @@ SynthMap SynthMap::generate(float width, float height, int subdiv) {
     map.nav.configure(gw, gh, sim::Fixed::from_int(1), sim::Fixed(), sim::Fixed());
 
     return map;
+}
+
+RealMap RealMap::load(const char* path) {
+    RealMap out;
+    if (!path || !*path) return out;
+    std::ifstream in(path, std::ios::binary);
+    if (!in) return out;
+    std::vector<std::uint8_t> bytes((std::istreambuf_iterator<char>(in)),
+                                    std::istreambuf_iterator<char>());
+    if (bytes.size() < 1000) return out;
+    try {
+        out.map = formats::load_map_terrain(std::move(bytes));
+    } catch (const std::exception&) {
+        return out;
+    }
+    if (out.map.width == 0 || out.map.height == 0) return out;
+    try {
+        out.ground = formats::build_map_mesh_stepped(out.map, 1.0f, 128, true);
+    } catch (const std::exception&) {
+        return out;
+    }
+    out.ok = true;
+    return out;
 }
 
 }

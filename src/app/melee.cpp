@@ -1,5 +1,7 @@
 #include "sc2/app/melee.hpp"
 
+#include <algorithm>
+
 #include <utility>
 
 #include "sc2/app/spawn.hpp"
@@ -51,7 +53,7 @@ MeleeLayout build_melee(sim::World& w, const MeleeSetup& s) {
         hall.y = ps.start.y;
         hall.speed = Fixed();
         out.town_hall = add(std::move(hall), "CommandCenter");
-        face(out.town_hall, kPlacedStructureFacing);
+        face(out.town_hall, ps.town_hall_facing);
 
         for (std::size_t i = 0; i < ps.mineral_positions.size(); ++i) {
             const MeleePos& mp = ps.mineral_positions[i];
@@ -61,7 +63,7 @@ MeleeLayout build_melee(sim::World& w, const MeleeSetup& s) {
             field.y = mp.y;
             field.speed = Fixed();
             const uint32_t id = add(std::move(field), "MineralField");
-            face(id, 0.0f);
+            face(id, kUnauthoredFacing);
             out.minerals.push_back(id);
         }
 
@@ -73,13 +75,45 @@ MeleeLayout build_melee(sim::World& w, const MeleeSetup& s) {
             gy.y = gp.y;
             gy.speed = Fixed();
             const uint32_t id = add(std::move(gy), "VespeneGeyser");
-            face(id, 0.0f);
+            face(id, kUnauthoredFacing);
             out.geysers.push_back(id);
         }
 
         const uint32_t gather =
             out.minerals.empty() ? sim::kNoTarget : out.minerals.front();
         const Fixed hall_r = ps.town_hall.radius;
+        std::int64_t mcx = 0, mcy = 0;
+        for (const MeleePos& mp : ps.mineral_positions) {
+            mcx += mp.x.raw();
+            mcy += mp.y.raw();
+        }
+        const std::int64_t n_min = std::int64_t(ps.mineral_positions.size());
+        if (n_min > 0) {
+            mcx /= n_min;
+            mcy /= n_min;
+        } else {
+            mcx = ps.start.x.raw();
+            mcy = ps.start.y.raw();
+        }
+        auto dist2_to_minerals = [&](const std::pair<int, int>& off) {
+            const std::int64_t dx = std::int64_t(ps.start.x.raw()) + std::int64_t(off.first) * Fixed::kOne - mcx;
+            const std::int64_t dy = std::int64_t(ps.start.y.raw()) + std::int64_t(off.second) * Fixed::kOne - mcy;
+            return (dx >> 6) * (dx >> 6) + (dy >> 6) * (dy >> 6);
+        };
+        const std::size_t ring = ps.worker_offsets.size();
+        const bool authored_ring = ring > 0 && std::size_t(ps.worker_count) <= ring;
+        std::size_t window = 0;
+        if (authored_ring) {
+            std::int64_t best = -1;
+            for (std::size_t k = 0; k < ring; ++k) {
+                std::int64_t sum = 0;
+                for (int i = 0; i < ps.worker_count; ++i) sum += dist2_to_minerals(ps.worker_offsets[(k + std::size_t(i)) % ring]);
+                if (best < 0 || sum < best) {
+                    best = sum;
+                    window = k;
+                }
+            }
+        }
         for (int i = 0; i < ps.worker_count; ++i) {
             Unit scv = ps.worker;
             scv.player = int32_t(p);
@@ -96,7 +130,11 @@ MeleeLayout build_melee(sim::World& w, const MeleeSetup& s) {
             const Fixed off = hall_r + Fixed::from_ratio(3, 4);
             const Fixed sx = Fixed::from_ratio(i % 3, 2) - Fixed::from_ratio(1, 2);
             const Fixed sy = Fixed::from_ratio((i / 3) % 3, 2) - Fixed::from_ratio(1, 2);
-            if (d.raw() > 0) {
+            if (authored_ring) {
+                const std::pair<int, int>& o = ps.worker_offsets[(window + std::size_t(i)) % ring];
+                scv.x = ps.start.x + Fixed::from_int(o.first);
+                scv.y = ps.start.y + Fixed::from_int(o.second);
+            } else if (d.raw() > 0) {
                 scv.x = ps.start.x + dx * off / d + sx;
                 scv.y = ps.start.y + dy * off / d + sy;
             } else {
@@ -106,7 +144,31 @@ MeleeLayout build_melee(sim::World& w, const MeleeSetup& s) {
             uint32_t id = add(std::move(scv), "SCV");
             w.unit(id).home_depot = out.town_hall;
             w.unit(id).gather_target = node;
+            if (node != sim::kNoTarget)
+                w.issue(id, sim::Order{sim::OrderType::Gather, Fixed(), Fixed(), sim::kNoTarget});
             out.workers.push_back(id);
+        }
+
+        for (const MeleePlayerSetup::StartExtra& ex : ps.start_extras) {
+            std::vector<std::size_t> order;
+            for (std::size_t k = 0; k < ex.offsets.size(); ++k) order.push_back(k);
+            std::stable_sort(order.begin(), order.end(), [&](std::size_t a, std::size_t b) {
+                return dist2_to_minerals(ex.offsets[a]) > dist2_to_minerals(ex.offsets[b]);
+            });
+            for (int c = 0; c < ex.count; ++c) {
+                Unit extra = ex.proto;
+                extra.player = int32_t(p);
+                extra.alive = true;
+                if (!order.empty()) {
+                    const std::pair<int, int>& o = ex.offsets[order[std::size_t(c) % order.size()]];
+                    extra.x = ps.start.x + Fixed::from_int(o.first);
+                    extra.y = ps.start.y + Fixed::from_int(o.second);
+                } else {
+                    extra.x = ps.start.x;
+                    extra.y = ps.start.y;
+                }
+                add(std::move(extra), ex.type.c_str());
+            }
         }
 
         if (ps.gas_worker_count > 0 && !out.geysers.empty() && !ps.geyser_positions.empty()) {
@@ -130,6 +192,8 @@ MeleeLayout build_melee(sim::World& w, const MeleeSetup& s) {
                 uint32_t id = add(std::move(scv), "SCV");
                 w.unit(id).home_depot = out.town_hall;
                 w.unit(id).gather_target = geyser;
+                if (geyser != sim::kNoTarget)
+                    w.issue(id, sim::Order{sim::OrderType::Gather, Fixed(), Fixed(), sim::kNoTarget});
                 out.workers.push_back(id);
             }
         }
@@ -141,6 +205,13 @@ MeleeLayout build_melee(sim::World& w, const MeleeSetup& s) {
             ai::BuildItem{prod_proto, ps.producer_mineral_cost, ps.producer_gas_cost,
                           ps.producer_build_time, false};
         out.config.has_producer = true;
+        if (!s.expansion_sites.empty()) {
+            Unit hall_proto = ps.town_hall;
+            hall_proto.speed = Fixed();
+            out.config.has_expansion = true;
+            out.config.expansion_unit = ai::BuildItem{hall_proto, ps.town_hall_mineral_cost, 0, ps.town_hall_build_time, false};
+            for (const MeleePos& e : s.expansion_sites) out.config.expansion_sites.push_back({e.x, e.y});
+        }
 
         if (ps.has_tech) {
             Unit tech_proto = ps.tech_unit;
@@ -164,6 +235,9 @@ MeleeLayout build_melee(sim::World& w, const MeleeSetup& s) {
             out.config.tech_chain = ps.tech_chain;
         }
         out.config.army_threshold = ps.army_threshold;
+        for (const auto& ph : ps.wave_phases)
+            out.config.wave_phases.push_back(ai::MeleeConfig::WavePhase{ph.first, ph.second});
+        out.config.stock = ps.stock;
         {
             Unit wproto = ps.worker;
             wproto.is_worker = true;

@@ -29,13 +29,10 @@ void replace_all(std::string& s, const std::string& from, const std::string& to)
 
 }
 
-std::optional<std::string> resolve_unit_model(const Catalog& cat,
-                                              const std::string& unit) {
-    std::optional<std::string> am = cat.scalar("CActorUnit", unit, "Model");
-    std::string model_id =
-        (!am || am->empty() || am->find("##unitName##") != std::string::npos) ? unit
-                                                                              : *am;
+namespace {
 
+std::optional<std::string> model_asset(const Catalog& cat, const std::string& model_id,
+                                       const std::string& unit) {
     std::optional<std::string> cm = cat.scalar("CModel", model_id, "Model");
     if (!cm || cm->empty()) return std::nullopt;
     std::string path = *cm;
@@ -51,6 +48,31 @@ std::optional<std::string> resolve_unit_model(const Catalog& cat,
     for (char& c : path)
         if (c == '\\') c = '/';
     return path;
+}
+
+}
+
+std::optional<std::string> resolve_unit_model(const Catalog& cat, const std::string& unit) {
+    std::optional<std::string> am = cat.scalar("CActorUnit", unit, "Model");
+    const std::string model_id =
+        (!am || am->empty() || am->find("##unitName##") != std::string::npos) ? unit : *am;
+    return model_asset(cat, model_id, unit);
+}
+
+std::optional<std::string> resolve_build_model(const Catalog& cat, const std::string& unit) {
+    std::optional<std::string> bm = cat.scalar("CActorUnit", unit, "BuildModel");
+    if (!bm || bm->empty()) return std::nullopt;
+
+    std::string model_id = *bm;
+    replace_all(model_id, "##unitName##", unit);
+    if (model_id.empty()) return std::nullopt;
+
+    std::optional<std::string> am = cat.scalar("CActorUnit", unit, "Model");
+    const std::string finished_id =
+        (!am || am->empty() || am->find("##unitName##") != std::string::npos) ? unit : *am;
+    if (model_id == finished_id) return std::nullopt;
+
+    return model_asset(cat, model_id, unit);
 }
 
 }

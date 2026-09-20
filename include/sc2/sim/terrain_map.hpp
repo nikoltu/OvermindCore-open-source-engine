@@ -76,26 +76,13 @@ public:
     bool is_water(int cx, int cy) const { return test(cx, cy, kWater); }
     bool is_ramp(int cx, int cy) const { return test(cx, cy, kRamp); }
 
-    void set_level_rect(int cx0, int cy0, int cx1, int cy1, std::uint8_t l) {
-        if (cx1 < cx0) { int t = cx0; cx0 = cx1; cx1 = t; }
-        if (cy1 < cy0) { int t = cy0; cy0 = cy1; cy1 = t; }
-        for (int y = cy0; y <= cy1; ++y)
-            for (int x = cx0; x <= cx1; ++x) set_level(x, y, l);
-    }
-    void set_flag_rect(int cx0, int cy0, int cx1, int cy1, TerrainFlag f) {
-        if (cx1 < cx0) { int t = cx0; cx0 = cx1; cx1 = t; }
-        if (cy1 < cy0) { int t = cy0; cy0 = cy1; cy1 = t; }
-        for (int y = cy0; y <= cy1; ++y)
-            for (int x = cx0; x <= cx1; ++x) set_flag(x, y, f);
-    }
-
-    bool can_place(int cx0, int cy0, int fw, int fh) const {
+    bool can_place(int cx0, int cy0, int fw, int fh, bool ignore_buildable = false) const {
         if (fw <= 0 || fh <= 0) return false;
         if (!in_bounds(cx0, cy0) || !in_bounds(cx0 + fw - 1, cy0 + fh - 1)) return false;
         const std::uint8_t base = level(cx0, cy0);
         for (int y = cy0; y < cy0 + fh; ++y)
             for (int x = cx0; x < cx0 + fw; ++x) {
-                if (!is_buildable(x, y)) return false;
+                if (!ignore_buildable && !is_buildable(x, y)) return false;
                 if (level(x, y) != base) return false;
             }
         return true;

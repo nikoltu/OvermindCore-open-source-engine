@@ -3,6 +3,7 @@
 #include <cstdint>
 #include <vector>
 
+#include "sc2/formats/map_archive.hpp"
 #include "sc2/formats/m3.hpp"
 #include "sc2/render/mat4.hpp"
 #include "sc2/sim/nav.hpp"
@@ -26,6 +27,14 @@ struct SynthMap {
     static SynthMap generate(float width, float height, int subdiv = 1);
 
     render::Vec3 center() const { return {width * 0.5f, height * 0.5f, 0.0f}; }
+};
+
+struct RealMap {
+    formats::LoadedMap map;
+    formats::Model ground;
+    bool ok = false;
+
+    static RealMap load(const char* path);
 };
 
 }

@@ -37,6 +37,7 @@ inline std::size_t stamp_map_doodads(const data::Catalog& cat, formats::LoadedMa
             const int x = cx + o.first, y = cy + o.second;
             if (!map.nav.in_bounds(x, y) || map.nav.is_blocked_cell(x, y)) continue;
             map.nav.set_blocked(x, y, true);
+            map.note_block(x, y, formats::LoadedMap::kBlockDoodad);
             ++stamped;
         }
     }
@@ -61,6 +62,7 @@ inline std::size_t stamp_map_units(const data::Catalog& cat, formats::LoadedMap&
             const int x = cx + o.first, y = cy + o.second;
             if (!map.nav.in_bounds(x, y) || map.nav.is_blocked_cell(x, y)) continue;
             map.nav.set_blocked(x, y, true);
+            map.note_block(x, y, formats::LoadedMap::kBlockBody);
             ++stamped;
         }
     }

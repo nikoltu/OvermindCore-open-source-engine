@@ -123,7 +123,7 @@ private:
 };
 
 inline constexpr char kOrderLogMagic[8] = {'S', 'C', '2', 'R', 'L', 'O', 'G', '\0'};
-inline constexpr uint32_t kOrderLogVersion = 3;
+inline constexpr uint32_t kOrderLogVersion = 5;
 
 void write_order_log(const OrderLog& log, std::vector<uint8_t>& out);
 bool read_order_log(const uint8_t* data, size_t len, OrderLog& out);

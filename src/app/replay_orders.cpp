@@ -22,9 +22,10 @@ const EventRow kEventTable[] = {
     {"NNet.Game.SCameraSaveEvent", EventBucket::Inert, "camera bookmark; the camera is not sim state"},
     {"NNet.Game.SCameraUpdateEvent", EventBucket::Inert, "camera motion; the camera is not sim state"},
     {"NNet.Game.SSelectionDeltaEvent", EventBucket::Inert,
-     "selection is a client concept; a command names its own units"},
+     "emits no command; maintains the user's selection, which the translator tracks as the acting units of "
+     "every later SCmdEvent (a command names no units of its own)"},
     {"NNet.Game.SControlGroupUpdateEvent", EventBucket::Inert,
-     "control groups are a client concept; a command names its own units"},
+     "emits no command; maintains the user's control groups, recalled into the selection the translator tracks"},
     {"NNet.Game.SSelectionSyncCheckEvent", EventBucket::Inert,
      "a lockstep checksum of the selection; carries no intent"},
     {"NNet.Game.SCommandManagerResetEvent", EventBucket::Inert,
@@ -211,7 +212,9 @@ bool ReplayCommand::operator==(const ReplayCommand& o) const {
            target_y == o.target_y && target_z == o.target_z && target_unit_tag == o.target_unit_tag &&
            target_unit_flags == o.target_unit_flags && target_unit_link == o.target_unit_link &&
            target_data == o.target_data && has_sequence == o.has_sequence && sequence == o.sequence &&
-           manager_state == o.manager_state;
+           manager_state == o.manager_state && actor_tags == o.actor_tags &&
+           has_other_unit == o.has_other_unit && other_unit_tag == o.other_unit_tag &&
+           has_unit_group == o.has_unit_group && unit_group == o.unit_group;
 }
 
 ReplayCommand translate_command(const formats::ReplayEvent& e) {
@@ -242,6 +245,16 @@ ReplayCommand translate_command(const formats::ReplayEvent& e) {
             c.has_sequence = true;
             c.sequence = uint32_t(int_or(seq, 0));
         }
+        const ReplayValue& ou = e.data.field("m_otherUnit");
+        if (!ou.is_null()) {
+            c.has_other_unit = true;
+            c.other_unit_tag = uint32_t(int_or(ou, 0));
+        }
+        const ReplayValue& ug = e.data.field("m_unitGroup");
+        if (!ug.is_null()) {
+            c.has_unit_group = true;
+            c.unit_group = uint32_t(int_or(ug, 0));
+        }
     } else if (e.name == "NNet.Game.SCmdUpdateTargetPointEvent") {
         c.kind = ReplayCommandKind::UpdateTargetPoint;
         c.target = ReplayTargetKind::Point;
@@ -262,14 +275,70 @@ ReplayCommand translate_command(const formats::ReplayEvent& e) {
     return c;
 }
 
+namespace {
+struct SelectionTracker {
+    std::map<uint32_t, std::array<std::vector<uint32_t>, 11>> users;
+    static void apply_mask(std::vector<uint32_t>& v, const ReplayValue& mask) {
+        if (mask.kind() != ReplayValue::Kind::Struct || mask.fields().empty()) return;
+        const std::string& arm = mask.fields().front().first;
+        const ReplayValue& body = mask.fields().front().second;
+        if (arm == "Mask") {
+            const std::string& bits = body.bytes();
+            std::vector<uint32_t> kept;
+            for (size_t i = 0; i < v.size(); ++i) {
+                const bool set = i / 8 < bits.size() && ((uint8_t(bits[i / 8]) >> (i % 8)) & 1u);
+                if (!set) kept.push_back(v[i]);
+            }
+            v.swap(kept);
+        } else if (arm == "OneIndices" || arm == "ZeroIndices") {
+            std::vector<bool> listed(v.size(), false);
+            for (const ReplayValue& it : body.items()) {
+                const int64_t idx = it.as_int();
+                if (idx >= 0 && size_t(idx) < v.size()) listed[size_t(idx)] = true;
+            }
+            std::vector<uint32_t> kept;
+            for (size_t i = 0; i < v.size(); ++i)
+                if (listed[i] == (arm == "ZeroIndices")) kept.push_back(v[i]);
+            v.swap(kept);
+        }
+    }
+    void selection_delta(const formats::ReplayEvent& e) {
+        auto& groups = users[e.user_id];
+        const int64_t cg = int_or(e.data.field("m_controlGroupId"), 10);
+        if (cg < 0 || cg > 10) return;
+        std::vector<uint32_t>& v = groups[size_t(cg)];
+        const ReplayValue& delta = e.data.field("m_delta");
+        if (delta.is_null()) return;
+        apply_mask(v, delta.field("m_removeMask"));
+        for (const ReplayValue& t : delta.field("m_addUnitTags").items()) v.push_back(uint32_t(t.as_int()));
+    }
+    void control_group_update(const formats::ReplayEvent& e) {
+        auto& groups = users[e.user_id];
+        const int64_t idx = int_or(e.data.field("m_controlGroupIndex"), -1);
+        const int64_t upd = int_or(e.data.field("m_controlGroupUpdate"), -1);
+        if (idx < 0 || idx > 9) return;
+        std::vector<uint32_t>& g = groups[size_t(idx)];
+        std::vector<uint32_t>& sel = groups[10];
+        if (upd == 0) g = sel;
+        else if (upd == 1) g.insert(g.end(), sel.begin(), sel.end());
+        else if (upd == 2) { apply_mask(g, e.data.field("m_mask")); sel = g; }
+        else if (upd == 3) g.clear();
+    }
+    const std::vector<uint32_t>& selection(uint32_t user) { return users[user][10]; }
+};
+}
+
 std::vector<ReplayCommand> translate_commands(const std::vector<formats::ReplayEvent>& events,
                                               size_t* inert_count) {
     std::vector<ReplayCommand> out;
     size_t inert = 0;
+    SelectionTracker tracker;
     for (const formats::ReplayEvent& e : events) {
         const EventBucket bucket = replay_event_bucket(e.name);
         if (bucket == EventBucket::Inert) {
             ++inert;
+            if (e.name == "NNet.Game.SSelectionDeltaEvent") tracker.selection_delta(e);
+            else if (e.name == "NNet.Game.SControlGroupUpdateEvent") tracker.control_group_update(e);
             continue;
         }
         if (bucket == EventBucket::Unlisted) {
@@ -286,6 +355,7 @@ std::vector<ReplayCommand> translate_commands(const std::vector<formats::ReplayE
         }
 
         out.push_back(translate_command(e));
+        if (out.back().kind == ReplayCommandKind::Cmd) out.back().actor_tags = tracker.selection(e.user_id);
     }
     if (inert_count != nullptr) *inert_count = inert;
     return out;
@@ -316,6 +386,12 @@ void write_replay_commands(const std::vector<ReplayCommand>& commands, std::vect
         put32(out, c.target_data);
         put32(out, c.sequence);
         put32(out, c.manager_state);
+        out.push_back(uint8_t(c.has_other_unit ? 1 : 0));
+        put32(out, c.other_unit_tag);
+        out.push_back(uint8_t(c.has_unit_group ? 1 : 0));
+        put32(out, c.unit_group);
+        put32(out, uint32_t(c.actor_tags.size()));
+        for (uint32_t t : c.actor_tags) put32(out, t);
     }
 }
 
@@ -361,6 +437,21 @@ bool read_replay_commands(const uint8_t* data, size_t len, std::vector<ReplayCom
         c.target_x = int64_t(x);
         c.target_y = int64_t(y);
         c.target_z = int64_t(z);
+        uint8_t has_ou = 0, has_ug = 0;
+        uint32_t n_actor = 0;
+        if (!r.get8(has_ou) || !r.get32(c.other_unit_tag) || !r.get8(has_ug) || !r.get32(c.unit_group) || !r.get32(n_actor) ||
+            n_actor > 4096) {
+            out.clear();
+            return false;
+        }
+        c.has_other_unit = has_ou != 0;
+        c.has_unit_group = has_ug != 0;
+        c.actor_tags.resize(n_actor);
+        for (uint32_t k = 0; k < n_actor; ++k)
+            if (!r.get32(c.actor_tags[k])) {
+                out.clear();
+                return false;
+            }
         out.push_back(c);
     }
     if (!r.at_end()) {
@@ -393,15 +484,17 @@ OrdersOutcome events_to_orders(const std::vector<ReplayCommand>& commands, Order
     OrdersOutcome result;
     result.ok = false;
     result.blockers = {
-        "order_stream_too_narrow: production, worker-build, add-on, research and rally are World "
-        "methods that carry no field in app::TimedOrder, so a log built today would drop every one "
-        "of them and replay as a game in which nothing is ever built",
-        "ability_join_unproven: the join from (m_abilLink, m_abilCmdIndex) to an ability identity, "
-        "and from that identity to a sim::OrderType, is not measured; picking one would invent it",
+        "ability_join_unproven: the join from (m_abilLink, m_abilCmdIndex) to an ability identity is "
+        "not measured; picking one would invent it. The SECOND half this blocker used to claim - "
+        "identity to a sim::OrderType - is built and shipped in api/bridge/orders.cpp, so it is no "
+        "longer a reason to refuse; what it cannot name is Gather, a worker right-click, which is why "
+        "an unmapped == 0 criterion is unreachable and must be a closed nameable/refused table instead",
         "queue_flag_unproven: which bit of m_cmdFlags means queued is not measured, so the queued "
         "flag of every produced order would be a guess",
         "unit_target_unmapped: a command's target unit is a retail tag, and the mapping from a "
-        "retail tag to a sim unit id is not built",
+        "retail tag to a sim unit id is not built. The ACTING units are now addressed (Lane 9.14: "
+        "ReplayCommand::actor_tags from the tracked selection, since SCmdEvent names no units of its "
+        "own) but they are the same retail tags, so this one map closes both halves",
         "command_latency_unproven: the loop a command is APPLIED on is measured only as "
         "delta_publish = 0 against the replay's own stamp; whether the retail sim executes on that "
         "loop or later is not separated from the observing instrument's cadence, so no offset is "

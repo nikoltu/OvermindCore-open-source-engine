@@ -1,0 +1,5 @@
+file(READ "${IN}" HEX_CONTENT HEX)
+string(LENGTH "${HEX_CONTENT}" HEX_LEN)
+math(EXPR BYTE_LEN "${HEX_LEN} / 2")
+string(REGEX REPLACE "([0-9a-f][0-9a-f])" "0x\\1," BYTES "${HEX_CONTENT}")
+file(WRITE "${OUT}" "// emitted by cmake/bin2h.cmake from ${IN} - do not edit\n#pragma once\n#include <cstddef>\nstatic const unsigned char ${NAME}[] = {${BYTES}};\nstatic const std::size_t ${NAME}_len = ${BYTE_LEN};\n")

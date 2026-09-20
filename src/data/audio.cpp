@@ -73,6 +73,32 @@ std::vector<SoundAsset> resolve_assets(const std::vector<XmlNode>& fields,
 
 }
 
+Soundtrack resolve_soundtrack(const Catalog& cat, const std::string& id) {
+    Soundtrack st;
+    st.id = id;
+    if (!cat.find("CSoundtrack", id)) return st;
+    st.found = true;
+    for (const XmlNode& c : cat.resolved("CSoundtrack", id)) {
+        if (c.name == "CueArray") {
+            for (const XmlNode& k : c.children)
+                if (k.name == "MasterLayer")
+                    if (const std::string* snd = k.attr("Sound")) st.master_sound = expand_id(*snd, id);
+        } else if (c.name == "Delay") {
+            const std::string v = c.attr_or("value", "");
+            const std::size_t comma = v.find(',');
+            st.delay_min = float(std::atof(v.c_str()));
+            st.delay_max = comma == std::string::npos ? st.delay_min : float(std::atof(v.c_str() + comma + 1));
+        } else if (c.name == "Select") {
+            st.select = c.attr_or("value", "");
+        } else if (c.name == "Next") {
+            st.next = c.attr_or("value", "");
+        } else if (c.name == "Flags") {
+            if (c.attr_or("index", "") == "Continuous") st.continuous = c.attr_or("value", "1") != "0";
+        }
+    }
+    return st;
+}
+
 void AudioCatalog::build(const Catalog& cat) {
     sounds_.clear();
 
@@ -92,7 +118,24 @@ void AudioCatalog::build(const Catalog& cat) {
         s.select = cat.scalar("CSound", id, "Select");
         s.mode = cat.scalar("CSound", id, "Mode");
         s.chance = cat.scalar("CSound", id, "Chance");
+        s.pitch = cat.scalar("CSound", id, "Pitch");
 
+        for (const XmlNode& c : fields) {
+            if (c.name == "VolumeRolloffFadeBlend") {
+                s.rolloff_blend = c.attr_or("value", "");
+                continue;
+            }
+            if (c.name != "VolumeRolloffPoints") continue;
+            const std::string* dist = c.attr("Distance");
+            if (!dist || dist->empty()) {
+                s.rolloff.clear();
+                continue;
+            }
+            Sound::RolloffPoint pt;
+            pt.distance = float(std::atof(dist->c_str()));
+            if (const std::string* vol = c.attr("Volume")) pt.volume_db = float(std::atof(vol->c_str()));
+            s.rolloff.push_back(pt);
+        }
         for (const XmlNode& c : fields) {
             if (c.name != "Flags") continue;
             std::string idx = c.attr_or("index", "");

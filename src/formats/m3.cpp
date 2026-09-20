@@ -1,6 +1,7 @@
 #include "sc2/formats/m3.hpp"
 
 #include <cmath>
+#include <cstring>
 #include <stdexcept>
 
 #include "sc2/core/byte_reader.hpp"
@@ -81,7 +82,7 @@ M3Ref M3::read_ref(size_t offset) const {
 
 std::string M3::char_ref(const M3Ref& r) const {
     const M3Section* cs = section_by_index(r.index);
-    if (!cs || r.count == 0 || cs->offset + r.count > data.size()) return {};
+    if (!cs || r.count == 0 || cs->offset > data.size() || r.count > data.size() - cs->offset) return {};
     std::string s(reinterpret_cast<const char*>(&data[cs->offset]), r.count);
     if (!s.empty() && s.back() == '\0') s.pop_back();
     return s;
@@ -136,6 +137,7 @@ Model M3::decode_model() const {
 
     m.bone_count = bones.count;
     m.particles = decode_particles();
+    m.lights = decode_lights();
 
     const M3Section* vsec = section_by_index(vertices.index);
     if (!vsec) throw std::runtime_error("m3: bad vertices ref");
@@ -144,12 +146,17 @@ Model M3::decode_model() const {
         throw std::runtime_error("m3: vertices out of range");
     const uint8_t* vbuf = &data[vsec->offset];
 
+    auto meshless = [&]() {
+        decode_materials(m);
+        decode_animation(m);
+        return m;
+    };
     const M3Section* dsec = section_by_index(divisions.index);
-    if (!dsec || divisions.count < 1) return m;
+    if (!dsec || divisions.count < 1) return meshless();
     M3Ref faces = read_ref(dsec->offset);
     M3Ref regions = read_ref(dsec->offset + 12);
     const M3Section* rsec = section_by_index(regions.index);
-    if (!rsec || regions.count == 0) return m;
+    if (!rsec || regions.count == 0) return meshless();
     if (rsec->version < 3)
         throw std::runtime_error("m3: REGN version <3 unsupported");
     uint32_t rstride = rsec->version == 5 ? 48 : rsec->version == 4 ? 40 : 36;
@@ -208,6 +215,11 @@ Model M3::decode_model() const {
             int16_t vv = int16_t(rd16(p + 26));
             m.uvs.push_back(float(u) / 2048.0f);
             m.uvs.push_back(float(vv) / 2048.0f);
+        }
+        {
+            for (int a = 0; a < 3; ++a) m.normals.push_back(float(p[20 + a]) / 255.0f * 2.0f - 1.0f);
+            m.normals_w.push_back(p[23]);
+            for (int a = 0; a < 4; ++a) m.tangents.push_back(float(p[stride - 4 + a]) / 255.0f * 2.0f - 1.0f);
         }
     }
     for (int a = 0; a < 3; ++a)
@@ -311,6 +323,13 @@ void M3::decode_materials(Model& m) const {
         if (rec + mat_rec > data.size()) break;
         M3Material mat;
         mat.name = read_char(read_ref(rec));
+        if (rec + 36 <= data.size() && mat_rec >= 36) {
+            mat.flags = rd32(&data[rec + 16]);
+            mat.blend_mode = rd32(&data[rec + 20]);
+            mat.priority = int32_t(rd32(&data[rec + 24]));
+            const uint32_t sp = rd32(&data[rec + 32]);
+            std::memcpy(&mat.specularity, &sp, 4);
+        }
         size_t block = scan_block(rec, rec + mat_rec);
         if (block) {
             for (size_t k = 0; k < L; ++k) {
@@ -320,8 +339,44 @@ void M3::decode_materials(Model& m) const {
                 if (!ls || m3_tag(ls->tag) != "LAYR") continue;
                 M3Ref img = read_ref(ls->offset + 4);
                 std::string path = read_char(img);
-                if (!path.empty())
-                    mat.layers.push_back({slots[k], path});
+                if (!path.empty()) {
+                    M3Layer layer;
+                    layer.usage = slots[k];
+                    layer.image_path = path;
+                    if (ls->offset + 48 <= data.size()) {
+                        layer.word36 = rd32(&data[ls->offset + 36]);
+                        layer.word40 = rd32(&data[ls->offset + 40]);
+                        layer.word44 = rd32(&data[ls->offset + 44]);
+                    }
+                    layer.layr_version = ls->version;
+                    {
+                        const size_t base = ls->offset;
+                        const size_t rec = ls->count ? section_bytes(lr.index).size() / ls->count : 0;
+                        auto ref = [&](size_t off, uint16_t& interp, uint16_t& flags, uint32_t& id, float* init, int n) {
+                            if (off + 8 + size_t(n) * 4 > rec || base + off + 8 + size_t(n) * 4 > data.size()) return;
+                            interp = rd16(&data[base + off]);
+                            flags = rd16(&data[base + off + 2]);
+                            id = rd32(&data[base + off + 4]);
+                            for (int i = 0; i < n; ++i) init[i] = rd_f32(&data[base + off + 8 + size_t(i) * 4]);
+                        };
+                        M3Layer::AnimRefs& a = layer.anim;
+                        if (rec >= 28 && base + 28 <= data.size())
+                            for (int i = 0; i < 4; ++i) a.color[i] = float(data[base + 24 + size_t(i)]) / 255.0f;
+                        ref(48, a.bright_mult_interp, a.bright_mult_flags, a.bright_mult_id, &a.bright_mult, 1);
+                        ref(68, a.midtone_interp, a.midtone_flags, a.midtone_id, &a.midtone_offset, 1);
+                        const size_t d = ls->version > 23 ? 8 : 0;
+                        ref(180 + d, a.uv_offset_interp, a.uv_offset_flags, a.uv_offset_id, a.uv_offset, 2);
+                        ref(208 + d, a.uv_angle_interp, a.uv_angle_flags, a.uv_angle_id, a.uv_angle, 3);
+                        ref(244 + d, a.uv_tiling_interp, a.uv_tiling_flags, a.uv_tiling_id, a.uv_tiling, 2);
+                        ref(312 + d, a.brightness_interp, a.brightness_flags, a.brightness_id, &a.brightness, 1);
+                    }
+                    {
+                        const size_t rec = ls->count ? section_bytes(lr.index).size() / ls->count : 0;
+                        if (rec && ls->offset + rec <= data.size())
+                            layer.raw_record.assign(data.begin() + ls->offset, data.begin() + ls->offset + rec);
+                    }
+                    mat.layers.push_back(std::move(layer));
+                }
             }
         }
         m.materials.push_back(std::move(mat));
@@ -388,7 +443,8 @@ void M3::decode_animation(Model& m) const {
     uint32_t iref_idx = find_tag("IREF");
     if (iref_idx != UINT32_MAX) {
         const M3Section* is = section_by_index(iref_idx);
-        uint32_t n = is->count;
+        const size_t iref_room = is->offset < data.size() ? (data.size() - is->offset) / 64 : 0;
+        uint32_t n = is->count > iref_room ? uint32_t(iref_room) : is->count;
         m.inverse_bind.reserve(size_t(n) * 16);
         for (uint32_t i = 0; i < n; ++i)
             for (int k = 0; k < 16; ++k) {
@@ -457,11 +513,40 @@ void M3::decode_animation(Model& m) const {
                             if (o + 4 <= data.size()) tr.keys.push_back(int32_t(rd32(&data[o])));
                         }
                     const M3Section* vs = section_by_index(vref.index);
-                    if (vs && comps > 0)
-                        for (uint32_t j = 0; j < vref.count * uint32_t(comps); ++j) {
-                            size_t o = vs->offset + size_t(j) * 4;
-                            if (o + 4 <= data.size()) tr.values.push_back(rd_f32(&data[o]));
+                    tr.slot = uint8_t(slot);
+                    if (vs && comps > 0) {
+                        const std::string vt = m3_tag(vs->tag);
+                        const auto rd = [&](size_t o, size_t n) { return o + n <= data.size(); };
+                        for (uint32_t j = 0; j < vref.count; ++j) {
+                            if (vt.rfind("COL", 0) == 0) {
+                                const size_t o = vs->offset + size_t(j) * 4;
+                                if (!rd(o, 4)) break;
+                                tr.values.push_back(data[o + 2] / 255.0f);
+                                tr.values.push_back(data[o + 1] / 255.0f);
+                                tr.values.push_back(data[o] / 255.0f);
+                                tr.values.push_back(data[o + 3] / 255.0f);
+                            } else if (vt == "U8__") {
+                                const size_t o = vs->offset + size_t(j);
+                                if (!rd(o, 1)) break;
+                                tr.values.push_back(float(data[o]));
+                            } else if (vt == "I16_" || vt == "U16_") {
+                                const size_t o = vs->offset + size_t(j) * 2;
+                                if (!rd(o, 2)) break;
+                                const uint16_t u = rd16(&data[o]);
+                                tr.values.push_back(vt == "I16_" ? float(int16_t(u)) : float(u));
+                            } else if (vt == "I32_" || vt == "U32_" || vt == "FLAG") {
+                                const size_t o = vs->offset + size_t(j) * 4;
+                                if (!rd(o, 4)) break;
+                                const uint32_t u = rd32(&data[o]);
+                                tr.values.push_back(vt == "I32_" ? float(int32_t(u)) : float(u));
+                            } else {
+                                for (int k = 0; k < comps; ++k) {
+                                    const size_t o = vs->offset + (size_t(j) * size_t(comps) + size_t(k)) * 4;
+                                    if (rd(o, 4)) tr.values.push_back(rd_f32(&data[o]));
+                                }
+                            }
                         }
+                    }
                     if (slot == 0 && vs && vref.count > 0) {
                         const uint32_t erec =
                             vs->version >= 2 ? 108 : (vs->version == 1 ? 104 : 100);
@@ -508,8 +593,9 @@ void M3::decode_animation(Model& m) const {
         }
         M3Ref bl = read_ref(mo + 124);
         const M3Section* bls = section_by_index(bl.index);
+        const size_t bl_room = (bls && bls->offset < data.size()) ? (data.size() - bls->offset) / 2 : 0;
         if (bls)
-            for (uint32_t i = 0; i < bl.count; ++i) {
+            for (uint32_t i = 0; i < bl.count && i < bl_room; ++i) {
                 size_t o = bls->offset + size_t(i) * 2;
                 m.bone_lookup.push_back(o + 2 <= data.size() ? rd16(&data[o]) : 0);
             }
@@ -570,6 +656,8 @@ uint32_t par_record_size(uint32_t version) {
 
 struct ParFields {
     uint32_t mat_ref, speed_init, lifetime_init, size_start, size_end, rate_init;
+    uint32_t rate_ref, max_particles, lifetime_ref;
+    uint32_t add_flags;
 };
 ParFields par_fields(uint32_t v) {
     uint32_t o = 0;
@@ -577,7 +665,8 @@ ParFields par_fields(uint32_t v) {
     ParFields f{};
     add(4);
     f.mat_ref = add(4);
-    if (v >= 17) add(4);
+    f.add_flags = 0xFFFFFFFFu;
+    if (v >= 17) f.add_flags = add(4);
     uint32_t speed = add(20);
     add(20);
     if (v < 17) add(4);
@@ -597,15 +686,83 @@ ParFields par_fields(uint32_t v) {
     add(8);
     add(4); add(4); add(4); add(4);
     if (v >= 24) add(4);
-    add(4); add(4);
+    add(4);
+    uint32_t maxp = add(4);
     uint32_t rate = add(20);
     f.speed_init = speed + 8;
     f.lifetime_init = life + 8;
     f.size_start = sizes + 8;
     f.size_end = sizes + 16;
     f.rate_init = rate + 8;
+    f.rate_ref = rate;
+    f.lifetime_ref = life;
+    f.max_particles = maxp;
     return f;
 }
+}
+
+int particle_count_at_rate(const formats::M3Particle& p, float rate) {
+    if (rate > 0.0f) {
+        long r = std::lround(double(rate) * double(p.lifetime));
+        if (r < 1) r = 1;
+        if (r > 64) r = 64;
+        return int(r);
+    }
+    return 0;
+}
+
+int particle_count(const formats::M3Particle& p) {
+    if (p.emission_rate > 0.0f) {
+        long r = std::lround(double(p.emission_rate) * double(p.lifetime));
+        if (r < 1) r = 1;
+        if (r > 64) r = 64;
+        return int(r);
+    }
+    return 0;
+}
+
+std::vector<M3Light> M3::decode_lights() const {
+    std::vector<M3Light> out;
+    for (uint32_t si = 0; si < sections.size(); ++si) {
+        if (m3_tag(sections[si].tag) != "LITE") continue;
+        const M3Section& s = sections[si];
+        if (s.count == 0) continue;
+        const size_t span = section_bytes(si).size();
+        if (span < s.count) continue;
+        uint32_t rec = s.version == 7 ? 212u : 0u;
+        if (rec == 0 || size_t(s.count) * rec > span || span - size_t(s.count) * rec >= 16)
+            rec = uint32_t((span + s.count / 2) / s.count);
+        if (rec < 164) continue;
+        auto rf = [&](size_t base, uint32_t off) -> float {
+            if (off + 4 > rec || base + off + 4 > data.size()) return 0.0f;
+            return rd_f32(&data[base + off]);
+        };
+        for (uint32_t i = 0; i < s.count; ++i) {
+            const size_t base = size_t(s.offset) + size_t(i) * rec;
+            if (base + rec > data.size()) break;
+            M3Light l;
+            l.version = s.version;
+            l.type = data[base];
+            l.bone = int16_t(uint16_t(data[base + 2]) | (uint16_t(data[base + 3]) << 8));
+            l.flags = rd32(&data[base + 4]);
+            l.color[0] = rf(base, 24);
+            l.color[1] = rf(base, 28);
+            l.color[2] = rf(base, 32);
+            l.intensity = rf(base, 60);
+            if (rec >= 64 && base + 64 <= data.size()) {
+                l.color_interp = rd16(&data[base + 16]);
+                l.color_flags = rd16(&data[base + 18]);
+                l.color_id = rd32(&data[base + 20]);
+                l.intensity_interp = rd16(&data[base + 52]);
+                l.intensity_flags = rd16(&data[base + 54]);
+                l.intensity_id = rd32(&data[base + 56]);
+            }
+            l.attenuation_far = rf(base, 136);
+            l.attenuation_near = rf(base, 160);
+            out.push_back(l);
+        }
+    }
+    return out;
 }
 
 std::vector<M3Particle> M3::decode_particles() const {
@@ -639,6 +796,20 @@ std::vector<M3Particle> M3::decode_particles() const {
             p.emission_speed = rf(base, f.speed_init);
             p.lifetime = rf(base, f.lifetime_init);
             p.emission_rate = rf(base, f.rate_init);
+            if (f.rate_ref + 8 <= rec && base + f.rate_ref + 8 <= data.size()) {
+                p.rate_interp = rd16(&data[base + f.rate_ref]);
+                p.rate_anim_flags = rd16(&data[base + f.rate_ref + 2]);
+                p.rate_anim_id = rd32(&data[base + f.rate_ref + 4]);
+                p.life_anim_flags = rd16(&data[base + f.lifetime_ref + 2]);
+                p.life_anim_id = rd32(&data[base + f.lifetime_ref + 4]);
+            }
+            if (f.max_particles + 4 <= rec && base + f.max_particles + 4 <= data.size())
+                p.max_particles = rd32(&data[base + f.max_particles]);
+            if (f.add_flags != 0xFFFFFFFFu && f.add_flags + 4 <= rec &&
+                base + f.add_flags + 4 <= data.size())
+                p.additional_flags = rd32(&data[base + f.add_flags]);
+            if (base + rec <= data.size())
+                p.raw.assign(data.begin() + long(base), data.begin() + long(base + rec));
             p.size_start = rf(base, f.size_start);
             p.size_end = rf(base, f.size_end);
             out.push_back(p);

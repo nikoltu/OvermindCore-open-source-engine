@@ -9,43 +9,9 @@ using core::XmlNode;
 
 namespace {
 
-bool ident_char(char c) {
-    return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
-           (c >= '0' && c <= '9') || c == '_';
-}
-
-std::string expand_consts(const Catalog& cat, const std::string& in) {
-    std::string out;
-    out.reserve(in.size());
-    for (size_t i = 0; i < in.size();) {
-        if (in[i] == '$') {
-            size_t j = i + 1;
-            while (j < in.size() && ident_char(in[j])) ++j;
-            if (j > i + 1) {
-                if (const std::string* v = cat.const_value(in.substr(i, j - i))) {
-                    out += *v;
-                    i = j;
-                    continue;
-                }
-            }
-        }
-        out.push_back(in[i++]);
-    }
-    return out;
-}
-
-void replace_all(std::string& s, const std::string& from, const std::string& to) {
-    if (from.empty()) return;
-    for (size_t p; (p = s.find(from)) != std::string::npos;)
-        s.replace(p, from.size(), to);
-}
-
 std::string expand(const Catalog& cat, std::string s, const std::string& unit_name,
                    const std::string& self_id) {
-    s = expand_consts(cat, s);
-    if (!unit_name.empty()) replace_all(s, "##unitName##", unit_name);
-    if (!self_id.empty()) replace_all(s, "##id##", self_id);
-    return s;
+    return cat.expand_actor_tokens(s, unit_name, self_id);
 }
 
 std::string trim(const std::string& s) {

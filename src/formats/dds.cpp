@@ -3,12 +3,20 @@
 #include <algorithm>
 #include <cmath>
 #include <stdexcept>
+#include <string>
 
 #include "sc2/core/byte_reader.hpp"
 
 namespace sc2::formats {
 
 using core::ByteReader;
+
+static void check_surface_dims(uint32_t w, uint32_t h, size_t off, size_t size) {
+    constexpr uint32_t kMaxDim = 16384;
+    if (w == 0 || h == 0 || w > kMaxDim || h > kMaxDim)
+        throw std::runtime_error("dds: bad surface dimensions " + std::to_string(w) + "x" + std::to_string(h));
+    if (off > size) throw std::runtime_error("dds: data offset past end of file");
+}
 
 DdsInfo dds_parse(const std::vector<uint8_t>& data) {
     if (data.size() < 128 || data[0] != 'D' || data[1] != 'D' || data[2] != 'S' ||
@@ -38,6 +46,14 @@ DdsInfo dds_parse(const std::vector<uint8_t>& data) {
                      char((fourcc >> 16) & 0xFF), char((fourcc >> 24) & 0xFF)};
         info.fourcc.assign(c, 4);
     }
+
+    info.pf_flags = pf_flags;
+    r.seek(0x58);
+    info.rgb_bit_count = r.u32le();
+    info.r_mask = r.u32le();
+    info.g_mask = r.u32le();
+    info.b_mask = r.u32le();
+    info.a_mask = r.u32le();
 
     info.data_offset = 128;
     if (info.fourcc == "DX10") {
@@ -95,6 +111,7 @@ std::vector<uint8_t> decode_dxt(const std::vector<uint8_t>& data, size_t off,
         throw std::runtime_error("dds: unsupported fourCC '" + fourcc +
                                  "' (decode_dxt handles only DXT1/2/3/4/5 block formats)");
     size_t blk = (dxt == 1) ? 8 : 16;
+    check_surface_dims(w, h, off, data.size());
     std::vector<uint8_t> out(size_t(w) * h * 4, 0);
     uint32_t bxn = (w + 3) / 4, byn = (h + 3) / 4;
     size_t p = off;
@@ -151,6 +168,7 @@ std::vector<uint8_t> decode_dxt(const std::vector<uint8_t>& data, size_t off,
 std::vector<uint8_t> decode_bc45(const std::vector<uint8_t>& data, size_t off, uint32_t w,
                                  uint32_t h, bool two_channel) {
     const size_t blk = two_channel ? 16 : 8;
+    check_surface_dims(w, h, off, data.size());
     std::vector<uint8_t> out(size_t(w) * h * 4, 0);
     uint32_t bxn = (w + 3) / 4, byn = (h + 3) / 4;
     size_t p = off;
@@ -183,10 +201,62 @@ std::vector<uint8_t> decode_bc45(const std::vector<uint8_t>& data, size_t off, u
     return out;
 }
 
+namespace {
+
+uint8_t expand_channel(uint32_t value, uint32_t mask) {
+    if (!mask) return 0;
+    int shift = 0;
+    while (!((mask >> shift) & 1u)) ++shift;
+    uint32_t m = mask >> shift;
+    int bits = 0;
+    while (m) { ++bits; m >>= 1; }
+    uint32_t v = (value & mask) >> shift;
+    if (bits >= 8) return uint8_t(v >> (bits - 8));
+    uint32_t out = 0;
+    for (int filled = 0; filled < 8; filled += bits) out = (out << bits) | v;
+    return uint8_t(out >> (((8 + bits - 1) / bits) * bits - 8));
+}
+
+std::vector<uint8_t> decode_uncompressed(const std::vector<uint8_t>& data, const DdsInfo& info) {
+    const uint32_t bpp = info.rgb_bit_count;
+    if (bpp != 8 && bpp != 16 && bpp != 24 && bpp != 32)
+        throw std::runtime_error("dds: unsupported uncompressed bit count " + std::to_string(bpp));
+    const size_t stride = size_t(bpp / 8);
+    check_surface_dims(info.width, info.height, info.data_offset, data.size());
+    const size_t need = size_t(info.width) * size_t(info.height) * stride;
+    if (need > data.size() - info.data_offset) throw std::runtime_error("dds: truncated surface");
+    constexpr uint32_t kAlphaPixels = 0x1, kLuminance = 0x20000;
+    std::vector<uint8_t> out(size_t(info.width) * size_t(info.height) * 4);
+    const uint8_t* src = data.data() + info.data_offset;
+    for (size_t i = 0, n = size_t(info.width) * size_t(info.height); i < n; ++i) {
+        uint32_t texel = 0;
+        for (size_t k = 0; k < stride; ++k) texel |= uint32_t(src[i * stride + k]) << (8 * k);
+        uint8_t r, g, b;
+        if (info.pf_flags & kLuminance) {
+            r = g = b = expand_channel(texel, info.r_mask);
+        } else {
+            r = expand_channel(texel, info.r_mask);
+            g = expand_channel(texel, info.g_mask);
+            b = expand_channel(texel, info.b_mask);
+        }
+        const uint8_t a = ((info.pf_flags & kAlphaPixels) && info.a_mask)
+                              ? expand_channel(texel, info.a_mask)
+                              : 255;
+        out[i * 4] = r;
+        out[i * 4 + 1] = g;
+        out[i * 4 + 2] = b;
+        out[i * 4 + 3] = a;
+    }
+    return out;
+}
+
+}
+
 std::vector<uint8_t> dds_decode_rgba(const std::vector<uint8_t>& data, DdsInfo& out) {
     out = dds_parse(data);
     const std::string& fc = out.fourcc;
     const uint32_t dx = out.dxgi_format;
+    if (out.uncompressed()) return decode_uncompressed(data, out);
     const bool is_bc4 = fc == "ATI1" || fc == "BC4U" || fc == "BC4S" ||
                         (fc == "DX10" && dx >= 79 && dx <= 81);
     const bool is_bc5 = fc == "ATI2" || fc == "BC5U" || fc == "BC5S" ||

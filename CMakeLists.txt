@@ -1,7 +1,7 @@
 cmake_minimum_required(VERSION 3.16)
 project(sc2engine VERSION 0.0.1 LANGUAGES CXX)
 
-set(SC2_ENGINE_BUILD "106")
+set(SC2_ENGINE_BUILD "408")
 set(SC2_ENGINE_STAGE "pre-alfa")
 configure_file(include/sc2/core/version.hpp.in
                ${CMAKE_BINARY_DIR}/generated/sc2/core/version.hpp @ONLY)
@@ -26,7 +26,25 @@ if(MINGW)
   add_link_options(-static -static-libgcc -static-libstdc++)
 endif()
 
+set(EMBED_OUT ${CMAKE_BINARY_DIR}/generated)
+file(MAKE_DIRECTORY ${EMBED_OUT})
+foreach(pair "emblem.dds:kEmblemDds" "emblem_sm.dds:kEmblemSmDds")
+  string(REPLACE ":" ";" pair_list "${pair}")
+  list(GET pair_list 0 embed_file)
+  list(GET pair_list 1 embed_name)
+  add_custom_command(
+    OUTPUT ${EMBED_OUT}/${embed_file}.h
+    COMMAND ${CMAKE_COMMAND} -DIN=${CMAKE_SOURCE_DIR}/assets/${embed_file} -DOUT=${EMBED_OUT}/${embed_file}.h -DNAME=${embed_name}
+            -P ${CMAKE_SOURCE_DIR}/cmake/bin2h.cmake
+    DEPENDS ${CMAKE_SOURCE_DIR}/assets/${embed_file} ${CMAKE_SOURCE_DIR}/cmake/bin2h.cmake
+    COMMENT "bin2h ${embed_file}"
+    VERBATIM)
+endforeach()
+
 add_library(sc2core STATIC
+    ${EMBED_OUT}/emblem.dds.h
+    ${EMBED_OUT}/emblem_sm.dds.h
+    src/app/shell_emblem.cpp
   src/core/inflate.cpp
   src/core/xml.cpp
   src/formats/m3.cpp
@@ -34,6 +52,7 @@ add_library(sc2core STATIC
   src/formats/mpq.cpp
   src/formats/replay_events.cpp
   src/formats/sc2map.cpp
+  src/formats/tga.cpp
   src/formats/terrain.cpp
   src/formats/terrain_grid.cpp
   src/render/fog.cpp
@@ -78,7 +97,6 @@ add_library(sc2core STATIC
   src/app/replay.cpp
   src/app/replay_orders.cpp
   src/app/control.cpp
-  src/app/game.cpp
   src/app/melee.cpp
   src/app/melee_game.cpp
   src/app/sandbox_game.cpp
@@ -95,6 +113,7 @@ add_library(sc2core STATIC
   src/app/control_groups.cpp
   src/render/anim.cpp
   src/render/actor.cpp
+  src/render/creep_layer.cpp
   src/render/actor_rules.cpp
   src/render/font_ttf.cpp
   src/render/font_cff.cpp
@@ -190,9 +209,6 @@ if(Vulkan_FOUND AND Vulkan_GLSLC_EXECUTABLE)
 
   add_executable(sc2window tools/sc2window.cpp)
   target_link_libraries(sc2window PRIVATE sc2render sc2core)
-
-  add_executable(sc2game tools/sc2game.cpp)
-  target_link_libraries(sc2game PRIVATE sc2render sc2core)
 
   add_executable(sc2melee tools/sc2melee.cpp)
   target_link_libraries(sc2melee PRIVATE sc2render sc2core)

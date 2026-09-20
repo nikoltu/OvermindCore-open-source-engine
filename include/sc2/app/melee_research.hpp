@@ -6,7 +6,6 @@
 
 #include "sc2/ai/melee_ai.hpp"
 #include "sc2/app/ability.hpp"
-#include "sc2/app/research.hpp"
 #include "sc2/data/catalog.hpp"
 #include "sc2/data/upgrades.hpp"
 #include "sc2/sim/fixed.hpp"
@@ -34,25 +33,47 @@ public:
         binds_.push_back(Bind{&ai, std::move(names)});
     }
 
-    void begin(int player, const std::string& id, Fixed delay) { rs_.begin(player, id, delay); }
+    static const std::vector<std::string>& none() {
+        static const std::vector<std::string> kNone;
+        return kNone;
+    }
+
+    void begin(int player, const std::string& id, Fixed delay) {
+        if (world_) world_->begin_research(player, id, delay);
+    }
 
     void grant(int player, const std::string& id) {
-        const bool was = rs_.has(player, id);
-        rs_.grant(player, id);
+        if (!world_) return;
+        const bool was = world_->has_upgrade(player, id);
+        world_->grant_upgrade(player, id);
         if (!was) apply(player, id);
     }
 
-    void advance(Fixed dt) {
-        for (const std::pair<int, std::string>& done : rs_.advance(dt))
-            apply(done.first, done.second);
+    void apply_completed() {
+        if (!world_) return;
+        just_completed_.clear();
+        for (const std::pair<std::int32_t, std::string>& done : world_->take_completed_research()) {
+            apply(int(done.first), done.second);
+            just_completed_.push_back(done);
+        }
     }
+    const std::vector<std::pair<std::int32_t, std::string>>& just_completed() const { return just_completed_; }
 
-    const std::vector<std::string>& researched(int player) const { return rs_.researched(player); }
-    bool has(int player, const std::string& id) const { return rs_.has(player, id); }
-    bool pending(int player, const std::string& id) const { return rs_.pending(player, id); }
-    int in_progress() const { return rs_.in_progress(); }
+    const std::vector<std::string>& researched(int player) const {
+        return world_ ? world_->researched(player) : none();
+    }
+    bool has(int player, const std::string& id) const {
+        return world_ && world_->has_upgrade(player, id);
+    }
+    bool pending(int player, const std::string& id) const {
+        return world_ && world_->research_pending(player, id);
+    }
+    int in_progress() const { return world_ ? world_->research_in_progress() : 0; }
+
+    const data::UpgradeCatalog* upgrades() const { return up_; }
 
 private:
+    std::vector<std::pair<std::int32_t, std::string>> just_completed_;
     struct Bind {
         ai::MeleeAI* ai;
         ProtoNames names;
@@ -79,7 +100,6 @@ private:
 
     const data::Catalog* cat_;
     const data::UpgradeCatalog* up_;
-    ResearchState rs_;
     std::vector<Bind> binds_;
     sim::World* world_ = nullptr;
 };

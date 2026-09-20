@@ -67,6 +67,9 @@ struct InputAccum {
     float wheel = 0;
     bool quit = false;
     bool esc = false;
+    char key_char = 0;
+    std::vector<std::string> key_tokens;
+    bool alt = false;
     bool resized = false;
     bool minimized = false;
 };
@@ -101,15 +104,45 @@ LRESULT CALLBACK game_wndproc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
             if (in) in->wheel += float(GET_WHEEL_DELTA_WPARAM(wp)) / 120.0f;
             return 0;
         case WM_KEYDOWN:
-        case WM_KEYUP: {
-            const bool down = (msg == WM_KEYDOWN);
+        case WM_KEYUP:
+        case WM_SYSKEYDOWN:
+        case WM_SYSKEYUP: {
+            const bool down = (msg == WM_KEYDOWN || msg == WM_SYSKEYDOWN);
+            if (in && down && (lp & (LPARAM(1) << 30)) == 0) {
+                const char* tok = nullptr;
+                char fbuf[4] = {};
+                if (wp >= VK_F1 && wp <= VK_F12) {
+                    const int n = int(wp - VK_F1) + 1;
+                    fbuf[0] = 'F';
+                    if (n >= 10) { fbuf[1] = '1'; fbuf[2] = char('0' + n - 10); }
+                    else fbuf[1] = char('0' + n);
+                    tok = fbuf;
+                } else switch (wp) {
+                    case VK_TAB: tok = "Tab"; break;
+                    case VK_BACK: tok = "Backspace"; break;
+                    case VK_SPACE: tok = "Space"; break;
+                    case VK_INSERT: tok = "Insert"; break;
+                    case VK_DELETE: tok = "Delete"; break;
+                    case VK_HOME: tok = "Home"; break;
+                    case VK_END: tok = "End"; break;
+                    case VK_PRIOR: tok = "PageUp"; break;
+                    case VK_NEXT: tok = "PageDown"; break;
+                    case VK_ADD: tok = "NumPadPlus"; break;
+                    case VK_SUBTRACT: tok = "NumPadMinus"; break;
+                    case VK_PAUSE: tok = "Pause"; break;
+                    default: break;
+                }
+                if (tok) in->key_tokens.emplace_back(tok);
+            }
+            if (in && wp == VK_MENU) in->alt = down;
+            if (in && down && wp >= 'A' && wp <= 'Z') in->key_char = char(wp);
             if (in) switch (wp) {
-                case 'W': case VK_UP: in->pan_up = down; break;
-                case 'S': case VK_DOWN: in->pan_down = down; break;
-                case 'A': case VK_LEFT: in->pan_left = down; break;
-                case 'D': case VK_RIGHT: in->pan_right = down; break;
-                case 'Q': in->orbit_left = down; break;
-                case 'E': in->orbit_right = down; break;
+                case VK_UP: in->pan_up = down; break;
+                case VK_DOWN: in->pan_down = down; break;
+                case VK_LEFT: in->pan_left = down; break;
+                case VK_RIGHT: in->pan_right = down; break;
+                case VK_INSERT: in->orbit_left = down; break;
+                case VK_DELETE: in->orbit_right = down; break;
                 case 'T': in->train = down; break;
                 case 'B': in->build = down; break;
                 case 'H': in->hold = down; break;
@@ -123,6 +156,7 @@ LRESULT CALLBACK game_wndproc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
                     if (wp >= '0' && wp <= '9') in->num[wp - '0'] = down;
                     break;
             }
+            if (msg == WM_SYSKEYDOWN || msg == WM_SYSKEYUP) break;
             return 0;
         }
     }
@@ -156,7 +190,7 @@ const wchar_t* game_window_class(HINSTANCE hinst) {
 WindowResult run_game_window(const GameFrameFn& frame, const casc::Storage* storage,
                              uint32_t width, uint32_t height,
                              const std::string& texture_root, uint32_t max_frames,
-                             const std::function<data::EnvLight()>& env_provider) {
+                             const std::function<data::EnvLight()>& env_provider, float shadow_clip, const std::function<const FogField*()>& fog_provider) {
     HINSTANCE hinst = GetModuleHandleW(nullptr);
     const wchar_t* cls = game_window_class(hinst);
     RECT rc{0, 0, LONG(width), LONG(height)};
@@ -207,8 +241,11 @@ WindowResult run_game_window(const GameFrameFn& frame, const casc::Storage* stor
             break;
         }
 
+    SceneRenderer::Tunables tun;
+    tun.camera_fit_shadow = true;
+    tun.shadow_clip = shadow_clip;
     SceneRenderer scene_renderer(pd, dev, queue, gfx, width, height, fmt.format, storage,
-                                 texture_root);
+                                 texture_root, tun);
 
     VkCommandPoolCreateInfo cpi{};
     cpi.sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO;
@@ -497,6 +534,21 @@ WindowResult run_game_window(const GameFrameFn& frame, const casc::Storage* stor
         }
         sc_w = extent.width;
         sc_h = extent.height;
+        if (sc_w != scene_renderer.width() || sc_h != scene_renderer.height()) {
+            scene_renderer.resize(sc_w, sc_h);
+            ovlTex = make_image(pd, dev, kTexColor, VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
+                                VK_IMAGE_ASPECT_COLOR_BIT, sc_w, sc_h);
+            ovlStaging = make_buffer(pd, dev, VkDeviceSize(sc_w) * sc_h * 4, VK_BUFFER_USAGE_TRANSFER_SRC_BIT, nullptr);
+            VkDescriptorImageInfo odii{rawSampler, ovlTex.view.get(), VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL};
+            VkWriteDescriptorSet ow{};
+            ow.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+            ow.dstSet = ovlSet;
+            ow.dstBinding = 0;
+            ow.descriptorCount = 1;
+            ow.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+            ow.pImageInfo = &odii;
+            vkUpdateDescriptorSets(dev, 1, &ow, 0, nullptr);
+        }
         return true;
     };
 
@@ -554,13 +606,13 @@ WindowResult run_game_window(const GameFrameFn& frame, const casc::Storage* stor
         float msx = 1.0f, msy = 1.0f;
         if (RECT crc; GetClientRect(window.get(), &crc)) {
             const LONG cw = crc.right - crc.left, ch = crc.bottom - crc.top;
-            if (cw > 0) msx = float(width) / float(cw);
-            if (ch > 0) msy = float(height) / float(ch);
+            if (cw > 0) msx = float(sc_w) / float(cw);
+            if (ch > 0) msy = float(sc_h) / float(ch);
         }
 
         InputState in;
-        in.view_w = width;
-        in.view_h = height;
+        in.view_w = sc_w;
+        in.view_h = sc_h;
         in.mouse_x = accum.mouse_x * msx;
         in.mouse_y = accum.mouse_y * msy;
         in.mouse_dx = (accum.mouse_x - prev.mouse_x) * msx;
@@ -588,21 +640,30 @@ WindowResult run_game_window(const GameFrameFn& frame, const casc::Storage* stor
         in.key_patrol = accum.patrol;
         in.key_ctrl = accum.ctrl;
         for (int d = 0; d < 10; ++d) in.key_num[d] = accum.num[d];
+        in.key_char = accum.key_char;
+        in.key_tokens.swap(accum.key_tokens);
+        in.key_alt = accum.alt;
         in.quit = accum.quit || accum.esc;
         prev = accum;
         accum.wheel = 0;
         accum.esc = false;
+        accum.key_char = 0;
+        accum.key_tokens.clear();
 
         scene.clear();
         overlay.clear();
         bool cont = frame(in, dt_ms, scene, cam, overlay);
         if (!cont || accum.quit) running = false;
-        const bool has_overlay = overlay.size() == size_t(width) * size_t(height) * 4;
+        const bool has_overlay = overlay.size() == size_t(sc_w) * size_t(sc_h) * 4;
 
         if (env_provider) scene_renderer.set_environment(env_provider());
 
         VkFence raw_fence = fence.get();
         vkWaitForFences(dev, 1, &raw_fence, VK_TRUE, UINT64_MAX);
+        if (fog_provider) {
+            const FogField* f = fog_provider();
+            scene_renderer.set_fog(f ? *f : FogField{});
+        }
 
         if (!running && result.frames_presented == 0 && max_frames == 0) break;
 
@@ -663,7 +724,7 @@ WindowResult run_game_window(const GameFrameFn& frame, const casc::Storage* stor
         VkImageBlit bl{};
         bl.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
         bl.srcOffsets[0] = {0, 0, 0};
-        bl.srcOffsets[1] = {int32_t(width), int32_t(height), 1};
+        bl.srcOffsets[1] = {int32_t(sc_w), int32_t(sc_h), 1};
         bl.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
         bl.dstOffsets[0] = {0, 0, 0};
         bl.dstOffsets[1] = {int32_t(sc_w), int32_t(sc_h), 1};
@@ -687,7 +748,7 @@ WindowResult run_game_window(const GameFrameFn& frame, const casc::Storage* stor
                                  0, 0, nullptr, 0, nullptr, 1, &b);
             VkBufferImageCopy rgn{};
             rgn.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
-            rgn.imageExtent = {width, height, 1};
+            rgn.imageExtent = {sc_w, sc_h, 1};
             vkCmdCopyBufferToImage(cmd, ovlStaging.buf.get(), ovlTex.img.get(),
                                    VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &rgn);
             b.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;

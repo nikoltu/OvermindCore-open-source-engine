@@ -318,9 +318,94 @@ Model build_terrain_mesh(const HeightMap& hm, const std::vector<uint8_t>& data,
     return m;
 }
 
+void graded_cell_corners(const CliffMap& cliff, const std::vector<float>& level_height,
+                         const std::vector<uint8_t>* ramp, uint32_t i, uint32_t j, float out[4],
+                         const std::vector<float>* relief) {
+    const uint32_t cw = cliff.width, nx = cliff.width, ny = cliff.height;
+    const bool have_raw = cliff.raw.size() == size_t(cliff.width) * cliff.height;
+    auto height_of = [&](uint32_t a, uint32_t b) -> float {
+        const size_t k = size_t(b) * cw + a;
+        const uint8_t L = cliff.levels[k];
+        const float base = level_height[L < level_height.size() ? L : level_height.size() - 1];
+        if (!have_raw) return base;
+        const uint8_t rem = uint8_t(cliff.raw[k] & 63);
+        if (rem == 0) return base;
+        const size_t up = size_t(L) + 1;
+        if (up >= level_height.size()) return base;
+        return base + (level_height[up] - base) * (float(rem) / 64.0f);
+    };
+    const bool have_ramps = ramp && !ramp->empty();
+    auto ramp_of = [&](uint32_t a, uint32_t b) -> bool {
+        if (!have_ramps) return false;
+        const size_t k = size_t(b) * cw + a;
+        return k < ramp->size() && (*ramp)[k] != 0;
+    };
+    const float z = height_of(i, j);
+    out[0] = out[1] = out[2] = out[3] = z;
+    if (!ramp_of(i, j)) {
+        if (relief && relief->size() == size_t(cw) * ny) {
+            const uint8_t L = cliff.levels[size_t(j) * cw + i];
+            auto rel = [&](int a, int b, float& sum, int& n) {
+                if (a < 0 || b < 0 || a >= int(cw) || b >= int(ny)) return;
+                const size_t k = size_t(b) * cw + a;
+                if (cliff.levels[k] != L || ramp_of(uint32_t(a), uint32_t(b))) return;
+                sum += (*relief)[k];
+                ++n;
+            };
+            const int cx[4] = {-1, -1, 0, 0}, cy[4] = {-1, 0, -1, 0};
+            const int ox[4] = {0, 0, 1, 1}, oy[4] = {0, 1, 0, 1};
+            for (int c = 0; c < 4; ++c) {
+                float sum = 0.0f;
+                int n = 0;
+                for (int q = 0; q < 4; ++q) rel(int(i) + ox[c] + cx[q], int(j) + oy[c] + cy[q], sum, n);
+                out[c] = z + (n ? sum / float(n) : 0.0f);
+            }
+        }
+        return;
+    }
+    auto edge = [&](bool inb, uint32_t ni, uint32_t nj) -> float {
+        if (!inb) return z;
+        const float zn = height_of(ni, nj);
+        return ramp_of(ni, nj) ? 0.5f * (z + zn) : zn;
+    };
+    const float eL = edge(i > 0, i - 1, j);
+    const float eR = edge(i + 1 < nx, i + 1, j);
+    const float eD = edge(j > 0, i, j - 1);
+    const float eU = edge(j + 1 < ny, i, j + 1);
+    const float zL = i > 0 ? height_of(i - 1, j) : z;
+    const float zR = i + 1 < nx ? height_of(i + 1, j) : z;
+    const float zD = j > 0 ? height_of(i, j - 1) : z;
+    const float zU = j + 1 < ny ? height_of(i, j + 1) : z;
+    const float lo = std::min({z, zL, zR, zD, zU});
+    const float hi = std::max({z, zL, zR, zD, zU});
+    auto corner = [&](float ex, float ey) { return std::min(hi, std::max(lo, ex + ey - z)); };
+    out[0] = corner(eL, eD);
+    out[1] = corner(eL, eU);
+    out[2] = corner(eR, eD);
+    out[3] = corner(eR, eU);
+}
+
+float graded_height_at(const CliffMap& cliff, const std::vector<float>& level_height,
+                       const std::vector<uint8_t>* ramp, float cx, float cy,
+                       const std::vector<float>* relief) {
+    if (cliff.empty() || level_height.empty()) return 0.0f;
+    if (cx < 0.0f) cx = 0.0f;
+    if (cy < 0.0f) cy = 0.0f;
+    uint32_t i = uint32_t(cx), j = uint32_t(cy);
+    if (i >= cliff.width) i = cliff.width - 1;
+    if (j >= cliff.height) j = cliff.height - 1;
+    float c[4];
+    graded_cell_corners(cliff, level_height, ramp, i, j, c, relief);
+    const float fx = cx - float(i), fy = cy - float(j);
+    const float a = c[0] + (c[2] - c[0]) * fx;
+    const float b = c[1] + (c[3] - c[1]) * fx;
+    return a + (b - a) * fy;
+}
+
 Model build_terrain_mesh_stepped(const CliffMap& cliff,
                                  const std::vector<float>& level_height, float cell,
-                                 const std::vector<uint8_t>* ramp, bool with_walls) {
+                                 const std::vector<uint8_t>* ramp, bool with_walls,
+                                 const std::vector<float>* relief) {
     if (cliff.empty() || cliff.width < 2 || cliff.height < 2 || level_height.empty())
         throw std::runtime_error("stepped terrain mesh: degenerate cliff grid");
 
@@ -337,36 +422,8 @@ Model build_terrain_mesh_stepped(const CliffMap& cliff,
         size_t k = size_t(j) * cw + i;
         return k < ramp->size() && (*ramp)[k] != 0;
     };
-    auto ramp_corners = [&](uint32_t i, uint32_t j, float out[4]) {
-        const float z = height_of(i, j);
-        auto edge = [&](bool inb, uint32_t ni, uint32_t nj) -> float {
-            if (!inb) return z;
-            const float zn = height_of(ni, nj);
-            return ramp_of(ni, nj) ? 0.5f * (z + zn) : zn;
-        };
-        const float eL = edge(i > 0, i - 1, j);
-        const float eR = edge(i + 1 < nx, i + 1, j);
-        const float eD = edge(j > 0, i, j - 1);
-        const float eU = edge(j + 1 < ny, i, j + 1);
-        const float zL = i > 0 ? height_of(i - 1, j) : z;
-        const float zR = i + 1 < nx ? height_of(i + 1, j) : z;
-        const float zD = j > 0 ? height_of(i, j - 1) : z;
-        const float zU = j + 1 < ny ? height_of(i, j + 1) : z;
-        const float lo = std::min({z, zL, zR, zD, zU});
-        const float hi = std::max({z, zL, zR, zD, zU});
-        auto corner = [&](float ex, float ey) {
-            return std::min(hi, std::max(lo, ex + ey - z));
-        };
-        out[0] = corner(eL, eD);
-        out[1] = corner(eL, eU);
-        out[2] = corner(eR, eD);
-        out[3] = corner(eR, eU);
-    };
-
     auto corners_of = [&](uint32_t i, uint32_t j, float out[4]) {
-        const float z = height_of(i, j);
-        out[0] = out[1] = out[2] = out[3] = z;
-        if (ramp_of(i, j)) ramp_corners(i, j, out);
+        graded_cell_corners(cliff, level_height, ramp, i, j, out, relief);
     };
 
     Model m;
@@ -528,6 +585,13 @@ uint8_t TextureMask::layer_weight(uint32_t layer, uint32_t x, uint32_t y) const 
     if (off >= texels.size()) return 0;
     const uint8_t b = texels[off];
     return uint8_t(((x & 1) ? (b & 0x0F) : (b >> 4)) * 17);
+}
+
+PaintedPathing PaintedPathing::parse(const std::vector<uint8_t>& d) {
+    PaintedPathing out;
+    if (d.size() != kHeader + size_t(kRows) * kStride) return out;
+    out.cells.assign(d.begin() + kHeader, d.end());
+    return out;
 }
 
 CellFlags CellFlags::parse(const std::vector<uint8_t>& d) {

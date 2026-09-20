@@ -14,6 +14,7 @@ inline constexpr std::size_t kNoFrame = static_cast<std::size_t>(-1);
 enum class WidgetState : std::uint8_t { Normal, Hover, Pressed };
 
 bool is_interactive(const SolvedFrame& f);
+bool interactive_type(const std::string& type);
 
 std::string press_action(const SolvedFrame& f);
 

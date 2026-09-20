@@ -5,9 +5,40 @@
 
 #include "sc2/asset/manager.hpp"
 #include "sc2/casc/storage.hpp"
+#include "sc2/data/catalog.hpp"
 #include "sc2/data/melee_mods.hpp"
 
 namespace sc2::app {
+
+std::vector<StartupStep> plan_startup(const std::vector<std::string>& extra_files) {
+    std::vector<StartupStep> plan;
+    plan.push_back({StartupStep::Kind::OpenStore, {}, "Opening game data"});
+    plan.push_back({StartupStep::Kind::MeleeCatalog, {}, "Loading unit catalog"});
+    for (const std::string& f : extra_files)
+        plan.push_back({StartupStep::Kind::CatalogFile, f, "Loading " + f});
+    for (const std::string& tok : MeleeModels::type_tokens())
+        plan.push_back({StartupStep::Kind::Model, tok, "Loading " + tok});
+    return plan;
+}
+
+void run_startup_step(const StartupStep& step, const std::string& data_dir, casc::Storage& store,
+                      data::Catalog& cat, MeleeModels& models) {
+    switch (step.kind) {
+        case StartupStep::Kind::OpenStore:
+            store.open(data_dir);
+            break;
+        case StartupStep::Kind::MeleeCatalog:
+            cat.load_melee(store);
+            break;
+        case StartupStep::Kind::CatalogFile:
+            cat.load_files(store, {step.arg});
+            break;
+        case StartupStep::Kind::Model:
+        default:
+            models.ensure(store, step.arg);
+            break;
+    }
+}
 
 BootResult boot(const std::string& install_root) {
     BootResult r;

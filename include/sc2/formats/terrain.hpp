@@ -102,11 +102,36 @@ struct CellFlags {
     static CellFlags parse(const std::vector<uint8_t>& data);
 };
 
+struct PaintedPathing {
+    static constexpr uint32_t kStride = 1024, kRows = 512, kHeader = 16;
+    std::vector<uint8_t> cells;
+    bool empty() const { return cells.empty(); }
+    bool cell_unpathable(uint32_t x, uint32_t y) const {
+        if (empty()) return false;
+        const uint32_t row0 = 2u * y, col0 = 4u * x;
+        if (row0 + 1 >= kRows || col0 + 3 >= kStride) return false;
+        for (uint32_t dy = 0; dy < 2; ++dy)
+            for (uint32_t dx = 0; dx < 4; ++dx)
+                if (cells[size_t(row0 + dy) * kStride + col0 + dx] != 0) return false;
+        return true;
+    }
+    static PaintedPathing parse(const std::vector<uint8_t>& data);
+};
+
 struct CliffMap;
+
+void graded_cell_corners(const CliffMap& cliff, const std::vector<float>& level_height,
+                         const std::vector<uint8_t>* ramp, uint32_t i, uint32_t j, float out[4],
+                         const std::vector<float>* relief = nullptr);
+
+float graded_height_at(const CliffMap& cliff, const std::vector<float>& level_height,
+                       const std::vector<uint8_t>* ramp, float cx, float cy,
+                       const std::vector<float>* relief = nullptr);
 
 Model build_terrain_mesh_stepped(const CliffMap& cliff,
                                  const std::vector<float>& level_height, float cell = 1.0f,
-                                 const std::vector<uint8_t>* ramp = nullptr, bool with_walls = true);
+                                 const std::vector<uint8_t>* ramp = nullptr, bool with_walls = true,
+                                 const std::vector<float>* relief = nullptr);
 
 struct TextureInfo {
     uint32_t version = 0;

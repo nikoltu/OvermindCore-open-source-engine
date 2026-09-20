@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <array>
 #include <cmath>
+#include <cstdio>
 #include <cstdlib>
 #include <functional>
 #include <map>
@@ -10,6 +11,7 @@
 #include <set>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -65,7 +67,27 @@ public:
     void load_strings_text(const std::string& text) { strings_.load_text(text); }
     const StringTable& strings() const { return strings_; }
 
+    void load_assets(const casc::Storage& store);
+    void load_assets_text(const std::string& text) { assets_.load_text(text); }
+    std::string resolve_asset(const std::string& ref) const { return assets_.resolve(ref); }
+
+    struct ConsoleSkinModels {
+        std::string minimap, info, command;
+        float minimap_pos[3] = {0, 0, 0}, info_pos[3] = {0, 0, 0}, command_pos[3] = {0, 0, 0};
+        float minimap_scale[3] = {1, 1, 1}, info_scale[3] = {1, 1, 1}, command_scale[3] = {1, 1, 1};
+        bool ok() const { return !minimap.empty() && !info.empty() && !command.empty(); }
+    };
+    std::string expand_entry_tokens(const std::string& family, const std::string& id,
+                                    std::string v) const;
+    ConsoleSkinModels console_skin_models(const std::string& skin_id) const;
+
+    std::optional<std::string> console_skin_featured_image(const std::string& skin_id) const;
+
     std::optional<std::string> button_display_name(const std::string& button_id) const;
+    std::optional<std::string> button_hotkey(const std::string& button_id) const;
+    void load_hotkeys(const casc::Storage& store, const std::vector<std::string>& roots);
+    void load_hotkeys_text(const std::string& text) { hotkeys_.load_text(text); }
+    const StringTable& hotkeys() const { return hotkeys_; }
     std::optional<std::string> unit_display_name(const std::string& unit_id) const;
     std::optional<std::string> ability_display_name(const std::string& ability_id) const;
 
@@ -74,6 +96,11 @@ public:
     const Entry* find(const std::string& family, const std::string& id) const;
 
     std::vector<std::string> ids(const std::string& family) const;
+
+    using FieldReadLog = std::set<std::pair<std::string, std::string>>;
+    void set_field_read_log(FieldReadLog* log) const { field_read_log_ = log; }
+    void set_field_touch_log(FieldReadLog* log) const { field_touch_log_ = log; }
+    FieldReadLog authored_field_pairs() const;
 
     const std::vector<core::XmlNode>& resolved(const std::string& family,
                                                const std::string& id) const;
@@ -97,6 +124,11 @@ public:
     static std::string family_of(const std::string& tag);
 
     const std::string* const_value(const std::string& id) const;
+
+    std::string expand_actor_tokens(const std::string& in, const std::string& unit_name,
+                                    const std::string& self_id) const;
+
+    std::string actor_unit_name(const std::string& actor_id, const std::string& family) const;
     const std::unordered_map<std::string, std::string>& consts() const {
         return consts_;
     }
@@ -121,8 +153,23 @@ public:
 
     std::optional<int> weapon_hit_count(const std::string& weapon_id) const;
 
+    bool ability_flag(const std::string& abil_id, const std::string& flag) const {
+        bool on = false;
+        for (const core::XmlNode& n : resolved("CAbil", abil_id))
+            if (n.name == "FlagArray" && n.attr_or("index", "") == flag)
+                on = n.attr_or("value", "") == "1";
+        return on;
+    }
+
     std::string ability_command_requirement(const std::string& abil_id,
                                             const std::string& cmd_index) const;
+
+    std::string button_requirement(const std::string& abil_id,
+                                   const std::string& cmd_index) const {
+        if (const auto row = ability_info_row(abil_id, cmd_index))
+            if (row->requirement_written) return row->requirement;
+        return ability_command_requirement(abil_id, cmd_index);
+    }
 
     struct CommandCardSlot {
         int index = -1;
@@ -188,6 +235,23 @@ public:
         return 1.0;
     }
 
+    std::pair<double, double> weapon_random_delay(const std::string& weapon_id) const {
+        const Entry* e = find("CWeapon", weapon_id);
+        auto read = [&](const char* f) {
+            if (auto v = scalar_num("CWeapon", weapon_id, f)) return *v;
+            if (e)
+                if (auto d = tag_default_scalar(e->tag, f); d && !d->empty()) return std::strtod(d->c_str(), nullptr);
+            return 0.0;
+        };
+        return {read("RandomDelayMin"), read("RandomDelayMax")};
+    }
+
+    double weapon_fire_arc_deg(const std::string& weapon_id) const {
+        const double arc = scalar_num("CWeapon", weapon_id, "Arc").value_or(0.0);
+        const double slop = scalar_num("CWeapon", weapon_id, "ArcSlop").value_or(11.25);
+        return arc * 0.5 + slop;
+    }
+
     double effect_armor_reduction(const std::string& effect_id) const {
         if (auto id = damage_effect_id(effect_id, 0))
             if (auto v = scalar_num("CEffect", *id, "ArmorReduction")) return *v;
@@ -199,7 +263,7 @@ public:
     }
 
     std::optional<double> effect_damage_f(const std::string& effect_id) const {
-        if (auto id = damage_effect_id(effect_id, 0)) return scalar_num("CEffect", *id, "Amount");
+        if (auto id = damage_effect_id(effect_id, 0)) return effect_amount(*id);
         return std::nullopt;
     }
 
@@ -214,9 +278,16 @@ public:
         return array_links("CEffect", effect_id, "EffectArray");
     }
 
+    std::optional<double> effect_amount(const std::string& effect_id) const {
+        if (auto a = scalar_num("CEffect", effect_id, "Amount")) return a;
+        if (const Entry* e = find("CEffect", effect_id))
+            if (auto d = tag_default_scalar(e->tag, "Amount"); d && !d->empty()) return std::strtod(d->c_str(), nullptr);
+        return std::nullopt;
+    }
     struct EnumAreaSpec {
         std::string child;
         double radius = 0;
+        int max_count = 0;
     };
     std::optional<EnumAreaSpec> effect_enum_area(const std::string& effect_id) const {
         std::map<long, EnumAreaSpec> slots;
@@ -240,6 +311,7 @@ public:
             if (const std::string* ef = n.attr("Effect"); ef && !ef->empty()) s.child = *ef;
             if (const std::string* r = n.attr("Radius"); r && !r->empty())
                 s.radius = std::strtod(r->c_str(), nullptr);
+            if (const std::string* mc = n.attr("MaxCount"); mc && !mc->empty()) s.max_count = std::atoi(mc->c_str());
         }
         if (auto it = slots.find(0); it != slots.end() && !it->second.child.empty())
             return it->second;
@@ -316,6 +388,56 @@ public:
         return allowed;
     }
 
+    std::uint8_t effect_search_planes(const std::string& effect_id) const {
+        auto sf = scalar("CEffect", effect_id, "SearchFilters");
+        if (!sf || sf->empty()) return 1 | 2;
+        const std::size_t semi = sf->find(';');
+        const std::string req = semi == std::string::npos ? *sf : sf->substr(0, semi);
+        const std::string exc = semi == std::string::npos ? std::string{} : sf->substr(semi + 1);
+        auto planes_of = [](const std::string& part) {
+            std::uint8_t bits = 0;
+            std::size_t i = 0;
+            while (i < part.size()) {
+                std::size_t j = part.find(',', i);
+                if (j == std::string::npos) j = part.size();
+                const std::string tok = part.substr(i, j - i);
+                if (tok == "Ground") bits |= 1;
+                else if (tok == "Air") bits |= 2;
+                i = j + 1;
+            }
+            return bits;
+        };
+        const std::uint8_t req_bits = planes_of(req), exc_bits = planes_of(exc);
+        std::uint8_t allowed = std::uint8_t((1 | 2) & ~exc_bits);
+        if (req_bits) allowed = std::uint8_t(allowed & req_bits);
+        return allowed;
+    }
+
+    struct SplashFilters {
+        std::uint8_t affiliation = 8 | 16;
+        std::uint8_t planes = 1 | 2;
+        bool excludes_structure = false;
+        bool offset_by_radius = false;
+    };
+    SplashFilters weapon_splash_filters(const std::string& weapon_id) const {
+        SplashFilters f;
+        auto did = damage_effect_id(weapon_effect_id(weapon_id), 0);
+        if (!did) return f;
+        f.affiliation = effect_search_affiliation(*did);
+        f.planes = effect_search_planes(*did);
+        f.excludes_structure = effect_search_excludes_structure(*did);
+        f.offset_by_radius = effect_search_offset_by_radius(*did);
+        return f;
+    }
+
+    bool effect_search_offset_by_radius(const std::string& effect_id) const {
+        bool on = false;
+        for (const core::XmlNode& n : resolved("CEffect", effect_id))
+            if (n.name == "SearchFlags" && n.attr_or("index", "") == "OffsetByUnitRadius")
+                on = n.attr_or("value", "1") != "0";
+        return on;
+    }
+
     bool effect_search_excludes_structure(const std::string& effect_id) const {
         auto sf = scalar("CEffect", effect_id, "SearchFilters");
         if (!sf || sf->empty()) return false;
@@ -341,16 +463,53 @@ public:
     }
 
     std::optional<double> effect_flat_energy_change(const std::string& effect_id) const;
+    struct VitalChange {
+        double life = 0, life_frac = 0, shields = 0, shields_frac = 0, energy = 0, energy_frac = 0;
+        bool any = false;
+    };
+    VitalChange effect_vital_change(const std::string& effect_id) const {
+        VitalChange v;
+        const Entry* e = find("CEffect", effect_id);
+        if (!e || e->tag != "CEffectModifyUnit") return v;
+        auto set = [&](const std::string& vital, const std::string& field, const std::string& val) {
+            if (val.empty()) return;
+            const double d = std::strtod(val.c_str(), nullptr);
+            double* flat = vital == "Life" ? &v.life : vital == "Shields" ? &v.shields : vital == "Energy" ? &v.energy : nullptr;
+            double* frac = vital == "Life" ? &v.life_frac : vital == "Shields" ? &v.shields_frac
+                         : vital == "Energy" ? &v.energy_frac : nullptr;
+            if (!flat) return;
+            if (field == "Change") *flat = d;
+            else if (field == "ChangeFraction") *frac = d;
+            else return;
+            v.any = v.any || d != 0;
+        };
+        for (const core::XmlNode& n : resolved("CEffect", effect_id)) {
+            if (n.name != "VitalArray") continue;
+            const std::string vital = n.attr_or("index", "");
+            for (const char* f : {"Change", "ChangeFraction"})
+                if (const std::string* a = n.attr(f)) set(vital, f, *a);
+            for (const core::XmlNode& c : n.children) set(vital, c.name, c.attr_or("value", ""));
+        }
+        return v;
+    }
 
     struct BehaviorBuff {
         double duration = 0;
         double move_speed_mult = 1.0;
+        double rate_mult = 1.0;
         double attack_speed_mult = 1.0;
         bool root = false;
         bool stun = false;
         double dmg_per_tick = 0;
         double dmg_period = 0;
         bool control_transfer = false;
+        bool suppress_attack = false;
+        bool invulnerable = false;
+        bool uncommandable = false;
+        bool untargetable = false;
+        double life_armor_bonus = 0.0, shield_armor_bonus = 0.0;
+        int max_stack = 1;
+        std::string initial_effect, periodic_effect, expire_effect, final_effect;
     };
     std::optional<BehaviorBuff> behavior_buff(const std::string& behavior_id) const;
 
@@ -365,9 +524,53 @@ public:
         double minimum = 0.0;
         double modify_amount = 0.0;
         bool excludes_spell = false;
+        std::uint8_t kinds = 15;
         bool present = false;
     };
     DamageResponse behavior_damage_response(const std::string& behavior_id) const;
+
+    std::vector<std::string> effect_apply_behaviors(const std::string& effect_id) const {
+        std::vector<std::string> out;
+        auto add = [&](const std::string& eff) {
+            if (auto b = effect_apply_behavior(eff); b && !b->empty() &&
+                std::find(out.begin(), out.end(), *b) == out.end())
+                out.push_back(*b);
+        };
+        const Entry* e = find("CEffect", effect_id);
+        if (e && e->tag == "CEffectSet")
+            for (const std::string& member : array_links("CEffect", effect_id, "EffectArray")) add(member);
+        else
+            add(effect_id);
+        return out;
+    }
+
+    bool behavior_no_damage_dealt(const std::string& behavior_id) const {
+        bool saw = false;
+        for (const core::XmlNode& n : resolved("CBehavior", behavior_id)) {
+            if (n.name != "Modification") continue;
+            for (const core::XmlNode& m : n.children) {
+                if (m.name != "DamageDealtMaximum") continue;
+                saw = true;
+                if (m.attr_or("value", "0") != "0") return false;
+            }
+        }
+        return saw;
+    }
+
+    std::optional<double> effect_apply_duration(const std::string& effect_id) const {
+        auto beh = effect_apply_behavior(effect_id);
+        if (!beh) return std::nullopt;
+        if (effect_subclass(effect_id) == "ApplyBehavior") {
+            bool use = false;
+            for (const core::XmlNode& n : resolved("CEffect", effect_id))
+                if (n.name == "Flags" && n.attr_or("index", "") == "UseDuration")
+                    use = n.attr_or("value", "1") != "0";
+            if (use)
+                if (auto d = scalar_num("CEffect", effect_id, "Duration")) return *d;
+        }
+        auto bb = behavior_buff(*beh);
+        return bb ? std::optional<double>(bb->duration) : std::nullopt;
+    }
 
     std::optional<std::string> effect_apply_behavior(const std::string& effect_id) const {
         return effect_apply_behavior(effect_id, 0);
@@ -375,10 +578,60 @@ public:
 
     std::optional<std::string> effect_movement_slow_behavior(const std::string& effect_id) const;
 
+    struct PlacedObstacleSpec {
+        std::string unit;
+        double radius = 0;
+        double duration = 0;
+        double energy = 0;
+        bool ok() const { return !unit.empty() && radius > 0 && duration > 0; }
+    };
+    std::optional<PlacedObstacleSpec> placed_obstacle_spec(const std::string& abil_id) const {
+        std::string placed;
+        for (const core::XmlNode& n : resolved("CAbil", abil_id))
+            if (n.name == "PlaceUnit") {
+                const std::string v = n.attr_or("value", "");
+                if (!v.empty()) placed = v;
+            }
+        if (placed.empty()) return std::nullopt;
+        auto flag_set = [&](const char* name) {
+            bool on = false;
+            for (const core::XmlNode& n : resolved("CUnit", placed))
+                if (n.name == "FlagArray" && n.attr_or("index", "") == name)
+                    on = n.attr_or("value", "") == "1";
+            return on;
+        };
+        if (!flag_set("Unselectable") || !flag_set("Untargetable") || !flag_set("Uncommandable"))
+            return std::nullopt;
+        bool ground = false;
+        for (const core::XmlNode& n : resolved("CUnit", placed))
+            if (n.name == "PlaneArray" && n.attr_or("index", "") == "Ground")
+                ground = n.attr_or("value", "") == "1";
+        if (!ground) return std::nullopt;
+
+        PlacedObstacleSpec sp;
+        sp.unit = placed;
+        sp.radius = scalar_num("CUnit", placed, "Radius").value_or(0.0);
+        if (auto cu = effect_create_unit(abil_id)) {
+            if (!cu->spawn_effect.empty())
+                if (auto beh = scalar("CEffect", cu->spawn_effect, "Behavior"))
+                    sp.duration = scalar_num("CBehavior", *beh, "Duration").value_or(0.0);
+        }
+        for (const core::XmlNode& c : resolved("CAbil", abil_id)) {
+            if (c.name != "Cost") continue;
+            for (const core::XmlNode& g : c.children)
+                if (g.name == "Vital" && g.attr_or("index", "") == "Energy") {
+                    const std::string v = g.attr_or("value", "");
+                    if (!v.empty()) sp.energy = std::atof(v.c_str());
+                }
+        }
+        return sp;
+    }
+
     struct CreateUnitSpec {
         std::string unit;
         int count = 1;
         std::string spawn_effect;
+        double spawn_range = 0;
     };
 
     std::optional<CreateUnitSpec> effect_create_unit(const std::string& effect_id) const {
@@ -422,6 +675,8 @@ public:
         double line_last = 0;
         double line_step = 0;
         bool line_from_source = false;
+        std::uint8_t affiliation = 0;
+        bool excludes_structure = false;
     };
     std::optional<PersistentSpec> effect_persistent(const std::string& effect_id) const {
         return effect_persistent(effect_id, 0);
@@ -454,6 +709,8 @@ public:
         int max_count = 0;
         double period = 0;
         int hard_cap = 0;
+        std::vector<std::pair<double, double>> offsets;
+        std::pair<double, double> center{0, 0};
     };
     std::optional<SpawnBehavior> spawn_behavior(const std::string& behavior_id) const;
 
@@ -480,10 +737,65 @@ public:
         return 0.0f;
     }
 
+    std::optional<std::string> unit_wireframe_image(const std::string& unit_id) const;
+
+    struct ActorRule {
+        std::string head, subject, sub;
+        std::vector<std::pair<std::string, std::string>> filters;
+        std::string verb;
+        std::vector<std::string> args;
+    };
+
+    std::vector<ActorRule> actor_rules(const std::string& actor_id,
+                                       const std::string& family = "CActorUnit") const;
+
+    std::optional<std::array<int, 3>> ability_rally_color(const std::string& ability_id) const {
+        if (ability_id.empty()) return std::nullopt;
+        for (const core::XmlNode& n : resolved("CAbil", ability_id)) {
+            if (n.name != "OrderArray") continue;
+            const std::string v = n.attr_or("Color", "");
+            if (v.empty()) continue;
+            int comp[4] = {255, 200, 200, 200};
+            std::size_t i = 0;
+            for (int k = 0; k < 4 && i <= v.size(); ++k) {
+                const std::size_t c = v.find(',', i);
+                try {
+                    comp[k] = std::stoi(v.substr(i, c == std::string::npos ? c : c - i));
+                } catch (...) {   }
+                if (c == std::string::npos) break;
+                i = c + 1;
+            }
+            return std::array<int, 3>{comp[1], comp[2], comp[3]};
+        }
+        return std::nullopt;
+    }
+
+    std::string unit_rally_ability(const std::string& unit_id) const {
+        if (unit_id.empty()) return {};
+        for (const std::string& ab : array_links("CUnit", unit_id, "AbilArray")) {
+            const Entry* e = find("CAbil", ab);
+            if (e && e->tag == "CAbilRally") return ab;
+        }
+        return {};
+    }
+
     std::array<float, 3> unit_render_scale(const std::string& unit_id) const;
 
     std::optional<int> cargo_size(const std::string& unit_id) const {
         if (auto v = scalar_num("CUnit", unit_id, "CargoSize")) return int(*v);
+        return std::nullopt;
+    }
+
+    std::string unit_subgroup_alias(const std::string& unit_id) const {
+        auto a = scalar("CUnit", unit_id, "SubgroupAlias");
+        return a && !a->empty() ? *a : unit_id;
+    }
+    std::string unit_select_alias(const std::string& unit_id) const {
+        auto a = scalar("CUnit", unit_id, "SelectAlias");
+        return a && !a->empty() ? *a : unit_id;
+    }
+    std::optional<int> unit_subgroup_priority(const std::string& unit_id) const {
+        if (auto v = scalar_num("CUnit", unit_id, "SubgroupPriority")) return int(*v);
         return std::nullopt;
     }
 
@@ -506,34 +818,9 @@ public:
     }
 
     double footprint_place_radius(const std::string& fp_id) const {
-        double result = 0;
-        for (const core::XmlNode& layer : resolved("CFootprint", fp_id)) {
-            if (layer.name != "Layers" || layer.attr_or("index", "") != "Place") continue;
-            const std::string* area = layer.attr("Area");
-            int minx = 0, miny = 0, maxx = 0, maxy = 0;
-            if (!area || std::sscanf(area->c_str(), "%d,%d,%d,%d", &minx, &miny, &maxx, &maxy) != 4)
-                continue;
-            double best = 0;
-            int seq = 0;
-            for (const core::XmlNode& row : layer.children) {
-                if (row.name != "Rows") continue;
-                const std::string* v = row.attr("value");
-                const std::string& bits = v ? *v : row.text;
-                const std::string* ri = row.attr("index");
-                const int r = ri ? std::atoi(ri->c_str()) : seq;
-                for (std::size_t col = 0; col < bits.size(); ++col) {
-                    const char ch = bits[col];
-                    if (ch == '.' || ch == ' ' || ch == '\t' || ch == '\r' || ch == '\n') continue;
-                    const double dx = minx + double(col);
-                    const double dy = miny + double(r);
-                    const double d = std::sqrt(dx * dx + dy * dy);
-                    if (d > best) best = d;
-                }
-                ++seq;
-            }
-            result = best;
-        }
-        return result;
+        double best = 0;
+        for (const auto& [dx, dy] : footprint_place_offsets(fp_id)) best = std::max(best, std::sqrt(double(dx * dx + dy * dy)));
+        return best;
     }
 
     double creep_source_radius(const std::string& unit_id) const {
@@ -548,6 +835,14 @@ public:
             }
         }
         return best;
+    }
+
+    std::string creep_source_footprint(const std::string& unit_id, const char* field) const {
+        for (const std::string& beh : array_links("CUnit", unit_id, "BehaviorArray")) {
+            const Entry* e = beh.empty() ? nullptr : find("CBehavior", beh);
+            if (e && e->tag == "CBehaviorCreepSource") return scalar("CBehavior", beh, field).value_or("");
+        }
+        return {};
     }
 
     std::string unit_toggled_creep_source(const std::string& unit_id) const {
@@ -902,7 +1197,8 @@ public:
     }
 
     std::vector<std::pair<int, int>> pathing_footprint_offsets(const std::string& footprint_id,
-                                                              const char* layer_name = "Place") const {
+                                                              const char* layer_name = "Place",
+                                                              bool include_aux = false) const {
         const std::string* fp = &footprint_id;
         std::vector<std::pair<int, int>> result;
         auto has = [&](int x, int y) {
@@ -948,7 +1244,7 @@ public:
                 for (std::size_t col = 0; col < bits.size(); ++col) {
                     const char ch = bits[col];
                     if (ch == '.' || ch == ' ' || ch == '\t' || ch == '\r' || ch == '\n') continue;
-                    if (aux.find(ch) != std::string::npos) continue;
+                    if (!include_aux && aux.find(ch) != std::string::npos) continue;
                     const int x = minx + int(col), y = footprint_row_y(miny, maxy, r);
                     if (!has(x, y)) result.emplace_back(x, y);
                 }
@@ -1013,6 +1309,16 @@ public:
         return {};
     }
 
+    std::string unburrow_ability(const std::string& unit_id) const {
+        for (const std::string& ab : array_links("CUnit", unit_id, "AbilArray")) {
+            if (ab.empty()) continue;
+            const Entry* e = find("CAbil", ab);
+            if (!e || e->tag != "CAbilMorph") continue;
+            if (auto k = scalar("CAbil", ab, "ActorKey"); k && *k == "BurrowUp") return ab;
+        }
+        return {};
+    }
+
     std::string burrowed_variant(const std::string& unit_id) const {
         const std::string ab = burrow_ability(unit_id);
         if (ab.empty()) return {};
@@ -1020,6 +1326,65 @@ public:
         return {};
     }
 
+    struct LiftSpec {
+        double lock = 0, rise_delay = 0, rise = 0, actor = 0;
+    };
+    std::optional<LiftSpec> liftoff_spec(const std::string& abil_id) const {
+        const Entry* e = find("CAbil", abil_id);
+        if (!e || (e->tag != "CAbilMorph" && e->tag != "CAbilMorphPlacement")) return std::nullopt;
+        LiftSpec s;
+        bool any = false;
+        for (const core::XmlNode& info : resolved("CAbil", abil_id)) {
+            if (info.name != "InfoArray") continue;
+            for (const core::XmlNode& sec : info.children) {
+                if (sec.name != "SectionArray") continue;
+                const std::string sname = sec.attr_or("index", "");
+                double delay = 0, dur = 0;
+                for (const core::XmlNode& d : sec.children) {
+                    if (d.name != "DurationArray") continue;
+                    const std::string* v = d.attr("value");
+                    const double val = v ? std::atof(v->c_str()) : 0.0;
+                    const std::string idx = d.attr_or("index", "");
+                    if (idx == "Delay") delay = val;
+                    else if (idx == "Duration") dur = val;
+                }
+                any = true;
+                if (sname == "Actor") {
+                    s.actor = delay + dur;
+                    continue;
+                }
+                if (sname == "Mover") {
+                    s.rise_delay = delay;
+                    s.rise = dur;
+                }
+                if (delay + dur > s.lock) s.lock = delay + dur;
+            }
+        }
+        if (!any) return std::nullopt;
+        return s;
+    }
+    std::optional<std::pair<float, float>> actor_host_forward(const std::string& actor_id,
+                                                              const std::string& family = "CActorModel") const {
+        for (const core::XmlNode& n : resolved(family, actor_id)) {
+            if (n.name != "HostSiteOps") continue;
+            const std::string ops = n.attr_or("Ops", "");
+            std::size_t i = 0;
+            while (i < ops.size()) {
+                while (i < ops.size() && ops[i] == ' ') ++i;
+                std::size_t j = i;
+                while (j < ops.size() && ops[j] != ' ') ++j;
+                const std::string op = ops.substr(i, j - i);
+                i = j;
+                if (op.empty() || !find("CActorSiteOpRotationExplicit", op)) continue;
+                const std::string fwd = scalar("CActorSiteOpRotationExplicit", op, "Forward").value_or("");
+                float fx = 0.0f, fy = 0.0f, fz = 0.0f;
+                if (fwd.empty() || std::sscanf(fwd.c_str(), "%f,%f,%f", &fx, &fy, &fz) < 2) continue;
+                if (fx == 0.0f && fy == 0.0f) continue;
+                return std::make_pair(fx, fy);
+            }
+        }
+        return std::nullopt;
+    }
     std::string liftoff_ability(const std::string& unit_id) const {
         for (const std::string& ab : array_links("CUnit", unit_id, "AbilArray")) {
             if (ab.empty()) continue;
@@ -1030,14 +1395,94 @@ public:
         return {};
     }
 
+    std::string liftoff_target(const std::string& unit_id) const {
+        const std::string ab = liftoff_ability(unit_id);
+        if (ab.empty()) return {};
+        for (const Entry* e = find("CAbil", ab); e;
+             e = e->parent.empty() ? nullptr : find("CAbil", e->parent))
+            if (const std::string* u = e->attr("unit"); u && !u->empty()) return *u;
+        return {};
+    }
+
+    int race_food_ceiling(const std::string& race_id) const {
+        if (auto v = scalar("CRace", race_id, "FoodCeiling")) return std::atoi(v->c_str());
+        if (auto v = tag_default_scalar("CRace", "FoodCeiling")) return std::atoi(v->c_str());
+        return 200;
+    }
+    int race_starting_resource(const std::string& race_id, const char* resource) const {
+        int value = 0;
+        for (const core::XmlNode& n : resolved("CRace", race_id))
+            if (n.name == "StartingResource" && n.attr_or("index", "") == resource)
+                value = std::atoi(n.attr_or("value", "0").c_str());
+        return value;
+    }
+    struct StartSlot {
+        std::string unit;
+        int count = 1;
+        bool resource_rally = false;
+        std::vector<std::pair<int, int>> offsets;
+    };
+    std::vector<StartSlot> race_start_roster(const std::string& race_id) const {
+        std::vector<StartSlot> slots;
+        for (const core::XmlNode& n : resolved("CRace", race_id)) {
+            if (n.name != "StartingUnitArray") continue;
+            const std::string* ix = n.attr("index");
+            std::size_t at = ix ? std::size_t(std::atoi(ix->c_str())) : slots.size();
+            if (slots.size() <= at) slots.resize(at + 1);
+            StartSlot& sl = slots[at];
+            if (const std::string* u = n.attr("Unit")) sl.unit = *u;
+            if (const std::string* c = n.attr("Count")) sl.count = std::atoi(c->c_str());
+            std::size_t next = 0;
+            for (const core::XmlNode& ch : n.children) {
+                if (ch.name == "Flags" && ch.attr_or("index", "") == "ResourceRally")
+                    sl.resource_rally = ch.attr_or("value", "0") == "1";
+                if (ch.name != "Offset") continue;
+                const std::string* oi = ch.attr("index");
+                const std::size_t k = oi ? std::size_t(std::atoi(oi->c_str())) : next;
+                next = k + 1;
+                const std::string v = ch.attr_or("value", "");
+                const std::size_t comma = v.find(',');
+                if (comma == std::string::npos) continue;
+                if (sl.offsets.size() <= k) sl.offsets.resize(k + 1);
+                sl.offsets[k] = {std::atoi(v.substr(0, comma).c_str()), std::atoi(v.substr(comma + 1).c_str())};
+            }
+        }
+        return slots;
+    }
+    int race_starting_unit_count(const std::string& race_id, const std::string& unit_id) const {
+        struct Slot { std::string unit; int count = 1; };
+        std::vector<Slot> slots;
+        for (const core::XmlNode& n : resolved("CRace", race_id)) {
+            if (n.name != "StartingUnitArray") continue;
+            const std::string* ix = n.attr("index");
+            std::size_t at = slots.size();
+            if (ix) at = std::size_t(std::atoi(ix->c_str()));
+            if (slots.size() <= at) slots.resize(at + 1);
+            if (const std::string* u = n.attr("Unit")) slots[at].unit = *u;
+            if (const std::string* c = n.attr("Count")) slots[at].count = std::atoi(c->c_str());
+        }
+        int total = 0;
+        for (const Slot& sl : slots)
+            if (sl.unit == unit_id) total += sl.count;
+        return total;
+    }
+    bool unit_flag(const std::string& unit_id, const char* name) const {
+        bool on = false;
+        for (const core::XmlNode& n : resolved("CUnit", unit_id))
+            if (n.name == "FlagArray" && n.attr_or("index", "") == name) on = n.attr_or("value", "") == "1";
+        return on;
+    }
     std::string depot_lower_ability(const std::string& unit_id) const {
+        return morph_button_ability(unit_id, "Lower");
+    }
+    std::string morph_button_ability(const std::string& unit_id, const std::string& face) const {
         for (const std::string& ab : array_links("CUnit", unit_id, "AbilArray")) {
             if (ab.empty()) continue;
             const Entry* e = find("CAbil", ab);
-            if (!e || e->tag != "CAbilMorph") continue;
+            if (!e || (e->tag != "CAbilMorph" && e->tag != "CAbilMorphPlacement")) continue;
             for (const core::XmlNode& n : resolved("CAbil", ab))
                 if (n.name == "CmdButtonArray" && n.attr_or("index", "") == "Execute" &&
-                    n.attr_or("DefaultButtonFace", "") == "Lower")
+                    n.attr_or("DefaultButtonFace", "") == face)
                     return ab;
         }
         return {};
@@ -1074,6 +1519,9 @@ public:
         bool found = false;
         std::string shade;
         double duration = 0;
+        std::string caster_behavior;
+        double caster_duration = 0;
+        std::string cancel_behavior;
     };
     PhaseShiftSpec phase_shift_spec(const std::string& abil_id) const {
         const Entry* ae = find("CAbil", abil_id);
@@ -1090,6 +1538,20 @@ public:
             }
         }
         if (shade.empty() || spawn_eff.empty()) return {};
+        PhaseShiftSpec spec;
+        spec.shade = shade;
+        for (const std::string& eid : walk_effect_set(root)) {
+            const Entry* ee = find("CEffect", eid);
+            if (!ee || ee->tag != "CEffectApplyBehavior") continue;
+            std::string who;
+            for (const core::XmlNode& k : resolved("CEffect", eid))
+                if (k.name == "WhichUnit")
+                    if (const std::string* v = k.attr("Value") ? k.attr("Value") : k.attr("value")) who = *v;
+            if (who != "Caster") continue;
+            spec.caster_behavior = scalar("CEffect", eid, "Behavior").value_or("");
+            spec.caster_duration = scalar_num("CBehavior", spec.caster_behavior, "Duration").value_or(0);
+            break;
+        }
         for (const std::string& eid : walk_effect_set(spawn_eff)) {
             const Entry* ee = find("CEffect", eid);
             if (!ee || ee->tag != "CEffectApplyBehavior") continue;
@@ -1100,7 +1562,16 @@ public:
             if (!dur || *dur <= 0 || expire.empty()) continue;
             for (const std::string& teid : walk_effect_set(expire)) {
                 const Entry* te = find("CEffect", teid);
-                if (te && te->tag == "CEffectTeleport") return {true, shade, *dur};
+                if (!te || te->tag != "CEffectTeleport") continue;
+                spec.found = true;
+                spec.duration = *dur;
+                for (const std::string& vid : array_links("CBehavior", beh, "RemoveValidatorArray")) {
+                    const Entry* ve = find("CValidator", vid);
+                    if (ve && ve->tag == "CValidatorUnitCompareBehaviorCount")
+                        spec.cancel_behavior = scalar("CValidator", vid, "Behavior").value_or("");
+                    if (!spec.cancel_behavior.empty()) break;
+                }
+                return spec;
             }
         }
         return {};
@@ -1788,40 +2259,6 @@ public:
         return {};
     }
 
-    struct TechTrain {
-        std::string unit;
-        double time = 0;
-    };
-    TechTrain techlab_train_product(const std::string& producer_id) const {
-        for (const std::string& ab : array_links("CUnit", producer_id, "AbilArray")) {
-            if (ab.empty()) continue;
-            const Entry* e = find("CAbil", ab);
-            if (!e || e->tag != "CAbilTrain") continue;
-            for (const core::XmlNode& info : resolved("CAbil", ab)) {
-                if (info.name != "InfoArray") continue;
-                std::string product = info.attr_or("Unit", "");
-                if (product.empty())
-                    for (const core::XmlNode& ch : info.children)
-                        if (ch.name == "Unit") {
-                            if (const std::string* v = ch.attr("value")) product = *v;
-                            break;
-                        }
-                if (product.empty()) continue;
-                std::string req;
-                for (const core::XmlNode& ch : info.children)
-                    if (ch.name == "Button") {
-                        req = ch.attr_or("Requirements", "");
-                        break;
-                    }
-                if (req.find("Attached") != std::string::npos && req.find("TechLab") != std::string::npos) {
-                    const std::string t = info.attr_or("Time", "");
-                    return {product, t.empty() ? 0.0 : std::atof(t.c_str())};
-                }
-            }
-        }
-        return {};
-    }
-
     struct AbilInfoRow {
         std::string index;
         std::string unit;
@@ -1837,7 +2274,6 @@ public:
         int unit_count = 1;
         double warp_charge = 0;
         bool is_gas = false;
-        bool requires_techlab = false;
         bool self_macro = false;
     };
     std::vector<AbilInfoRow> ability_info_rows(const std::string& abil_id) const;
@@ -1850,15 +2286,33 @@ public:
         std::string command;
         std::string face;
         int row = -1, col = -1;
+        int card = 0;
         double time = 0;
-        bool requires_techlab = false;
+        std::string requirement;
+        double warp_charge = 0;
     };
+    bool unit_carries_ability(const std::string& unit_id, const std::string& abil_id) const {
+        const std::vector<std::string> own = array_links("CUnit", unit_id, "AbilArray");
+        if (own.empty()) return true;
+        return std::find(own.begin(), own.end(), abil_id) != own.end();
+    }
+
+    bool trained_by_spawner(const std::string& unit_id) const {
+        if (!spawner_trained_built_) {
+            for (const std::string& id : ids("CUnit"))
+                if (unit_spawn_behavior(id))
+                    for (const TrainProduct& tp : unit_train_products(id)) spawner_trained_.insert(tp.unit);
+            spawner_trained_built_ = true;
+        }
+        return spawner_trained_.count(unit_id) != 0;
+    }
     std::vector<TrainProduct> unit_train_products(const std::string& producer_id) const {
         std::vector<TrainProduct> out;
         for (const AbilityCardButton& b : unit_ability_card_buttons(producer_id)) {
             const Entry* e = find("CAbil", b.ability);
             if (!e || e->tag != "CAbilTrain") continue;
             if (b.command.empty()) continue;
+            if (!unit_carries_ability(producer_id, b.ability)) continue;
             const auto row = ability_info_row(b.ability, b.command);
             if (!row || row->unit.empty()) continue;
             TrainProduct p;
@@ -1867,12 +2321,99 @@ public:
             p.face = b.face;
             p.row = b.row;
             p.col = b.col;
+            p.card = b.card;
             p.unit = row->unit;
             p.time = row->time;
-            p.requires_techlab = row->requires_techlab;
+            p.requirement = button_requirement(b.ability, b.command);
             out.push_back(std::move(p));
         }
         return out;
+    }
+
+    std::vector<TrainProduct> unit_warp_products(const std::string& producer_id) const {
+        std::vector<TrainProduct> out;
+        for (const AbilityCardButton& b : unit_ability_card_buttons(producer_id)) {
+            const Entry* e = find("CAbil", b.ability);
+            if (!e || e->tag != "CAbilWarpTrain") continue;
+            if (b.command.empty()) continue;
+            if (!unit_carries_ability(producer_id, b.ability)) continue;
+            const auto row = ability_info_row(b.ability, b.command);
+            if (!row || row->unit.empty()) continue;
+            TrainProduct p;
+            p.ability = b.ability;
+            p.command = b.command;
+            p.face = b.face;
+            p.row = b.row;
+            p.col = b.col;
+            p.card = b.card;
+            p.unit = row->unit;
+            p.time = row->time;
+            p.warp_charge = row->warp_charge;
+            p.requirement = button_requirement(b.ability, b.command);
+            out.push_back(std::move(p));
+        }
+        return out;
+    }
+
+    std::string morph_finish_behavior(const std::string& abil_id) const {
+        const Entry* e = find("CAbil", abil_id);
+        if (!e || e->tag != "CAbilMorph") return {};
+        std::string effect;
+        for (const core::XmlNode& info : resolved("CAbil", abil_id)) {
+            if (info.name != "InfoArray") continue;
+            for (const core::XmlNode& sec : info.children) {
+                if (sec.name != "SectionArray" || sec.attr_or("index", "") != "Abils") continue;
+                for (const core::XmlNode& ea : sec.children)
+                    if (ea.name == "EffectArray" && ea.attr_or("index", "") == "Finish")
+                        if (const std::string* v = ea.attr("value"))
+                            if (!v->empty()) effect = *v;
+            }
+        }
+        if (effect.empty()) return {};
+        if (effect_subclass(effect) != "ApplyBehavior") return {};
+        std::string beh = scalar("CEffect", effect, "Behavior").value_or("");
+        if (beh.empty()) beh = effect;
+        return find("CBehavior", beh) ? beh : std::string{};
+    }
+
+    struct MorphAbilityCost {
+        bool found = false;
+        int minerals = 0;
+        int gas = 0;
+    };
+    MorphAbilityCost morph_ability_cost(const std::string& abil_id) const {
+        MorphAbilityCost out;
+        for (const core::XmlNode& c : resolved("CAbil", abil_id)) {
+            if (c.name != "Cost") continue;
+            for (const core::XmlNode& r : c.children) {
+                if (r.name != "Resource") continue;
+                const std::string idx = r.attr_or("index", "");
+                const std::string* v = r.attr("value");
+                if (!v) continue;
+                const int n = std::atoi(v->c_str());
+                if (n < 0) continue;
+                if (idx == "Minerals") { out.minerals = n; out.found = true; }
+                else if (idx == "Vespene") { out.gas = n; out.found = true; }
+            }
+        }
+        return out;
+    }
+
+    bool behavior_is_permanent(const std::string& beh_id) const {
+        for (const core::XmlNode& n : resolved("CBehavior", beh_id))
+            if (n.name == "BehaviorFlags" && n.attr_or("index", "") == "Permanent")
+                return n.attr_or("value", "") == "1";
+        return false;
+    }
+
+    std::string warpable_power_behavior(const std::string& unit_id) const {
+        for (const std::string& ab : array_links("CUnit", unit_id, "AbilArray")) {
+            if (ab.empty()) continue;
+            const Entry* e = find("CAbil", ab);
+            if (!e || e->tag != "CAbilWarpable") continue;
+            if (auto pu = scalar("CAbil", ab, "PowerUserBehavior")) return *pu;
+        }
+        return {};
     }
 
     struct BuildProduct {
@@ -1881,8 +2422,11 @@ public:
         std::string command;
         std::string face;
         int row = -1, col = -1;
+        int card = 0;
         double time = 0;
         bool is_gas = false;
+        bool instant_placement = false;
+        std::string requirement;
     };
     std::vector<BuildProduct> unit_build_products(const std::string& worker_id) const {
         std::vector<BuildProduct> out;
@@ -1898,9 +2442,12 @@ public:
             p.face = b.face;
             p.row = b.row;
             p.col = b.col;
+            p.card = b.card;
             p.unit = row->unit;
             p.time = row->time;
             p.is_gas = row->is_gas;
+            p.instant_placement = ability_flag(b.ability, "InstantPlacement");
+            p.requirement = button_requirement(b.ability, b.command);
             out.push_back(std::move(p));
         }
         return out;
@@ -1927,6 +2474,35 @@ public:
     double research_slot_time(const std::string& abil_id, const std::string& index) const {
         if (auto r = ability_info_row(abil_id, index)) return r->time;
         return 0;
+    }
+    float unit_facing_radians(const std::string& unit_id) const {
+        constexpr double kSchemaDefaultDeg = 360.0;
+        double deg = kSchemaDefaultDeg;
+        if (auto s = scalar("CUnit", unit_id, "Facing"); s && !s->empty()) {
+            try {
+                deg = std::stod(*s);
+            } catch (const std::exception&) {
+                deg = kSchemaDefaultDeg;
+            }
+        }
+        const double rad = (deg - 90.0) * 3.14159265358979323846 / 180.0;
+        const double two_pi = 2.0 * 3.14159265358979323846;
+        double w = std::fmod(rad, two_pi);
+        if (w < 0) w += two_pi;
+        return float(w);
+    }
+
+    ResearchInfo research_slot_info(const std::string& abil_id, const std::string& index) const {
+        ResearchInfo out;
+        const Entry* e = find("CAbil", abil_id);
+        if (!e || e->tag != "CAbilResearch") return out;
+        auto r = ability_info_row(abil_id, index);
+        if (!r || r->upgrade.empty()) return out;
+        out.found = true;
+        out.minerals = r->minerals;
+        out.gas = r->gas;
+        out.time = r->time;
+        return out;
     }
 
     ResearchInfo research_info(const std::string& upgrade_id) const {
@@ -1986,6 +2562,28 @@ public:
         return carded_cmds_;
     }
 
+    std::optional<int> resource_ideal_harvesters(const std::string& unit_id) const {
+        for (const std::string& beh : array_links("CUnit", unit_id, "BehaviorArray")) {
+            if (beh.empty()) continue;
+            const Entry* e = find("CBehavior", beh);
+            if (!e || e->tag != "CBehaviorResource") continue;
+            if (auto a2 = scalar_num("CBehavior", beh, "IdealHarvesterCount")) return int(*a2);
+            return std::nullopt;
+        }
+        return std::nullopt;
+    }
+
+    std::optional<double> resource_return_delay(const std::string& unit_id) const {
+        for (const std::string& beh : array_links("CUnit", unit_id, "BehaviorArray")) {
+            if (beh.empty()) continue;
+            const Entry* e = find("CBehavior", beh);
+            if (!e || e->tag != "CBehaviorResource") continue;
+            if (auto d = scalar_num("CBehavior", beh, "ReturnDelay")) return *d;
+            return std::nullopt;
+        }
+        return std::nullopt;
+    }
+
     int resource_harvest_amount(const std::string& unit_id) const {
         for (const std::string& beh : array_links("CUnit", unit_id, "BehaviorArray")) {
             if (beh.empty()) continue;
@@ -2018,6 +2616,56 @@ public:
         return 0;
     }
 
+    std::string transport_ability(const std::string& unit_id) const {
+        for (const std::string& ab : array_links("CUnit", unit_id, "AbilArray")) {
+            if (ab.empty()) continue;
+            const Entry* e = find("CAbil", ab);
+            if (e && e->tag == "CAbilTransport") return ab;
+        }
+        return {};
+    }
+
+    bool transport_player_hold(const std::string& unit_id) const {
+        const std::string ab = transport_ability(unit_id);
+        if (ab.empty()) return false;
+        bool on = false;
+        for (const core::XmlNode& n : resolved("CAbil", ab))
+            if (n.name == "Flags" && n.attr_or("index", "") == "PlayerHold")
+                on = n.attr_or("value", "1") != "0";
+        return on;
+    }
+    double transport_load_range(const std::string& unit_id) const {
+        const std::string ab = transport_ability(unit_id);
+        if (ab.empty()) return 0.0;
+        if (auto v = scalar_num("CAbil", ab, "Range")) return *v;
+        if (auto d = tag_default_scalar("CAbilTransport", "Range"); d && !d->empty())
+            return std::strtod(d->c_str(), nullptr);
+        return 0.0;
+    }
+    struct TurretSpec {
+        double yaw_arc = 0, yaw_rate = 0, yaw_idle_rate = 0, yaw_start = 0;
+        std::string idle;
+    };
+    std::optional<TurretSpec> turret(const std::string& turret_id) const {
+        if (!find("CTurret", turret_id)) return std::nullopt;
+        auto str = [&](const char* f) -> std::string {
+            if (auto v = scalar("CTurret", turret_id, f)) return *v;
+            if (auto d = tag_default_scalar("CTurret", f)) return *d;
+            return {};
+        };
+        auto num = [&](const char* f) {
+            const std::string v = str(f);
+            return v.empty() ? 0.0 : std::strtod(v.c_str(), nullptr);
+        };
+        return TurretSpec{num("YawArc"), num("YawRate"), num("YawIdleRate"), num("YawStart"), str("Idle")};
+    }
+    std::string weapon_turret(const std::string& unit_id, const std::string& weapon_id) const {
+        std::string t;
+        for (const core::XmlNode& n : resolved("CUnit", unit_id))
+            if (n.name == "WeaponArray" && n.attr_or("Link", "") == weapon_id)
+                if (const std::string* v = n.attr("Turret")) t = *v;
+        return t;
+    }
     int transport_capacity(const std::string& unit_id) const {
         for (const std::string& ab : array_links("CUnit", unit_id, "AbilArray")) {
             if (ab.empty()) continue;
@@ -2027,6 +2675,93 @@ public:
             return 0;
         }
         return 0;
+    }
+
+    int unit_fog_visibility(const std::string& unit_id) const {
+        auto v = scalar("CUnit", unit_id, "FogVisibility");
+        if (!v || v->empty()) return 0;
+        if (*v == "Snapshot") return 1;
+        if (*v == "Dimmed") return 2;
+        return 0;
+    }
+
+    bool is_harvest_ability(const std::string& ability_id) const {
+        const Entry* e = find("CAbil", ability_id);
+        return e && e->tag == "CAbilHarvest";
+    }
+
+    struct PeonBuildMode {
+        bool consumed = false;
+        bool maintained = true;
+        bool found = false;
+    };
+    PeonBuildMode worker_build_mode(const std::string& unit_id) const {
+        PeonBuildMode m;
+        for (const std::string& ab : array_links("CUnit", unit_id, "AbilArray")) {
+            if (ab.empty()) continue;
+            const Entry* e = find("CAbil", ab);
+            if (!e || e->tag != "CAbilBuild") continue;
+            bool any_product = false;
+            for (const core::XmlNode& n : resolved("CAbil", ab))
+                if (n.name == "InfoArray") { any_product = true; break; }
+            if (!any_product) continue;
+            m.found = true;
+            for (const core::XmlNode& n : resolved("CAbil", ab)) {
+                if (n.name != "FlagArray") continue;
+                const std::string idx = n.attr_or("index", "");
+                const std::string val = n.attr_or("value", "1");
+                const bool on = !(val.empty() || val == "0" || val == "false");
+                if (idx == "PeonKillFinish") m.consumed = on;
+                else if (idx == "PeonMaintained") m.maintained = on;
+            }
+            break;
+        }
+        return m;
+    }
+
+    std::optional<std::string> train_morph_unit(const std::string& unit_id) const {
+        for (const std::string& ab : array_links("CUnit", unit_id, "AbilArray")) {
+            if (ab.empty()) continue;
+            const Entry* e = find("CAbil", ab);
+            if (!e || e->tag != "CAbilTrain") continue;
+            if (auto mu = scalar("CAbil", ab, "MorphUnit"); mu && !mu->empty()) return *mu;
+        }
+        return std::nullopt;
+    }
+
+    bool unit_commandable(const std::string& unit_id) const {
+        for (const std::string& ab : array_links("CUnit", unit_id, "AbilArray")) {
+            if (ab.empty()) continue;
+            const Entry* e = find("CAbil", ab);
+            if (!e) continue;
+            if (e->tag == "CAbilMove" || e->tag == "CAbilAttack" || e->tag == "CAbilStop")
+                return true;
+        }
+        return false;
+    }
+
+    bool footprint_layer_flag(const std::string& footprint_id, const char* layer_name, const char* sign,
+                              const char* flag) const {
+        bool on = false;
+        for (const core::XmlNode& layer : resolved("CFootprint", footprint_id)) {
+            if (layer.name != "Layers" || layer.attr_or("index", "") != layer_name) continue;
+            for (const core::XmlNode& set : layer.children) {
+                if (set.name != "Sets") continue;
+                for (const core::XmlNode& n : set.children)
+                    if (n.name == sign && n.attr_or("index", "") == flag) on = n.attr_or("value", "1") != "0";
+            }
+        }
+        return on;
+    }
+    std::vector<std::pair<int, int>> near_resources_offsets(const std::string& unit_id) const {
+        auto fp = scalar("CUnit", unit_id, "Footprint");
+        if (!fp || fp->empty() || !footprint_layer_flag(*fp, "Place", "Positive", "NearResources")) return {};
+        return pathing_footprint_offsets(*fp, "Place",  true);
+    }
+    std::vector<std::pair<int, int>> near_resources_check_offsets(const std::string& unit_id) const {
+        auto fp = scalar("CUnit", unit_id, "PlacementFootprint");
+        if (!fp || fp->empty() || !footprint_layer_flag(*fp, "Check", "Negative", "NearResources")) return {};
+        return pathing_footprint_offsets(*fp, "Check",  true);
     }
 
     bool requires_creep(const std::string& unit_id) const {
@@ -2048,6 +2783,13 @@ public:
             result = creep_here;
         }
         return result;
+    }
+
+    std::vector<std::pair<int, int>> creep_check_offsets(const std::string& unit_id) const {
+        if (!requires_creep(unit_id)) return {};
+        auto fp = scalar("CUnit", unit_id, "PlacementFootprint");
+        if (!fp || fp->empty()) return {};
+        return pathing_footprint_offsets(*fp, "Check");
     }
 
     double power_source_radius(const std::string& unit_id) const {
@@ -2075,6 +2817,48 @@ public:
                 (scalar("CBehavior", beh, "PowerLevel") ? relay : primary_field) = true;
         }
         return relay && !primary_field;
+    }
+
+    std::vector<std::string> unpowered_enabled_abilities(const std::string& unit_id) const {
+        std::vector<std::string> out;
+        for (const std::string& beh : array_links("CUnit", unit_id, "BehaviorArray")) {
+            if (beh.empty()) continue;
+            const Entry* e = find("CBehavior", beh);
+            if (!e || e->tag != "CBehaviorPowerUser") continue;
+            for (const core::XmlNode& n : resolved("CBehavior", beh)) {
+                if (n.name != "PowerStageArray") continue;
+                if (n.attr("MinPowerLevel")) continue;
+                for (const core::XmlNode& m : n.children) {
+                    if (m.name != "Modification") continue;
+                    for (const core::XmlNode& f : m.children)
+                        if (f.name == "AbilLinkEnableArray")
+                            if (const std::string* v = f.attr("value"))
+                                if (!v->empty() &&
+                                    std::find(out.begin(), out.end(), *v) == out.end())
+                                    out.push_back(*v);
+                }
+            }
+        }
+        return out;
+    }
+
+    bool disables_abils_unpowered(const std::string& unit_id) const {
+        for (const std::string& beh : array_links("CUnit", unit_id, "BehaviorArray")) {
+            if (beh.empty()) continue;
+            const Entry* e = find("CBehavior", beh);
+            if (!e || e->tag != "CBehaviorPowerUser") continue;
+            for (const core::XmlNode& n : resolved("CBehavior", beh)) {
+                if (n.name != "PowerStageArray" || n.attr("MinPowerLevel")) continue;
+                for (const core::XmlNode& m : n.children) {
+                    if (m.name != "Modification") continue;
+                    for (const core::XmlNode& f : m.children)
+                        if (f.name == "ModifyFlags" && f.attr_or("index", "") == "DisableAbils" &&
+                            f.attr_or("value", "") == "1")
+                            return true;
+                }
+            }
+        }
+        return false;
     }
 
     double creep_source_period(const std::string& unit_id) const {
@@ -2170,8 +2954,143 @@ public:
 
     std::optional<double> missile_speed(const std::string& weapon_id) const;
 
+    std::optional<std::string> weapon_missile_model_id(const std::string& weapon_id) const;
+
     const std::vector<core::XmlNode>& singleton_fields(const std::string& family) const;
 
+    const std::vector<core::XmlNode>* tag_default_nodes(const std::string& tag) const {
+        auto it = tag_defaults_.find(tag);
+        return it == tag_defaults_.end() ? nullptr : &it->second;
+    }
+    std::optional<double> refund_fraction(const std::string& abil_id, const std::string& resource) const {
+        std::optional<double> v;
+        auto scan = [&](const std::vector<core::XmlNode>& nodes) {
+            for (const core::XmlNode& rf : nodes) {
+                if (rf.name != "RefundFraction") continue;
+                for (const core::XmlNode& r : rf.children)
+                    if (r.name == "Resource" && r.attr_or("index", "") == resource)
+                        if (const std::string* s = r.attr("value")) v = std::fabs(std::strtod(s->c_str(), nullptr));
+            }
+        };
+        scan(resolved("CAbil", abil_id));
+        if (!v)
+            if (const Entry* e = find("CAbil", abil_id))
+                if (const auto* d = tag_default_nodes(e->tag)) scan(*d);
+        return v;
+    }
+    struct OffCreepDecay {
+        double period = 0, amount = 0;
+    };
+    OffCreepDecay off_creep_decay(const std::string& unit_id) const {
+        for (const std::string& b : array_links("CUnit", unit_id, "BehaviorArray")) {
+            const std::string req = b.empty() ? std::string() : scalar("CBehavior", b, "Requirements").value_or("");
+            if (req.empty() || !requires_off_creep(req)) continue;
+            const double period = scalar_num("CBehavior", b, "Period").value_or(0);
+            const std::string eff = scalar("CBehavior", b, "PeriodicEffect").value_or("");
+            const double amount = eff.empty() ? 0 : effect_amount(eff).value_or(0);
+            if (period > 0 && amount > 0) return {period, amount};
+        }
+        return {};
+    }
+    double death_off_creep_radius(const std::string& unit_id) const {
+        for (const std::string& b : array_links("CUnit", unit_id, "BehaviorArray")) {
+            const std::string eff = b.empty() ? std::string() : scalar("CBehavior", b, "PeriodicEffect").value_or("");
+            if (eff.empty()) continue;
+            bool kills = false;
+            for (const core::XmlNode& n : resolved("CEffect", eff))
+                if (n.name == "Flags" && n.attr_or("index", "") == "Kill") kills = n.attr_or("value", "") == "1";
+            if (!kills) continue;
+            for (const std::string& v : array_links("CBehavior", b, "DisableValidatorArray")) {
+                const Entry* ve = find("CValidator", v);
+                if (!ve || ve->tag != "CValidatorLocationCreep" || scalar("CValidator", v, "Find").value_or("1") != "0")
+                    continue;
+                return scalar_num("CValidator", v, "RadiusBonus").value_or(0);
+            }
+        }
+        return -1;
+    }
+    bool requires_off_creep(const std::string& req) const {
+        std::string node;
+        for (const core::XmlNode& n : resolved("CRequirement", req))
+            if (n.name == "NodeArray") node = n.attr_or("Link", "");
+        const Entry* ne = node.empty() ? nullptr : find("CRequirement", node);
+        if (!ne || ne->tag != "CRequirementNot") return false;
+        const std::vector<std::string> ops = array_links("CRequirement", node, "OperandArray");
+        const Entry* ce = ops.empty() ? nullptr : find("CRequirement", ops[0]);
+        if (!ce || ce->tag != "CRequirementCountBehavior") return false;
+        for (const core::XmlNode& c : resolved("CRequirement", ops[0]))
+            if (c.name == "Count" && c.attr_or("Link", "") == "OnCreep") return true;
+        return false;
+    }
+    int unit_race_index(const std::string& unit_id) const {
+        const auto r = scalar("CUnit", unit_id, "Race");
+        if (!r) return -1;
+        if (*r == "Prot") return 1;
+        if (*r == "Zerg") return 2;
+        if (*r == "Terr" || *r == "Neut") return 0;
+        return -1;
+    }
+    struct HarvestSpec {
+        bool found = false;
+        int amount_request = 0;
+        double time_mult = 0;
+    };
+    HarvestSpec harvest_spec(const std::string& unit_id, const std::string& resource = "Minerals") const {
+        HarvestSpec out;
+        for (const std::string& ab : array_links("CUnit", unit_id, "AbilArray")) {
+            const Entry* e = ab.empty() ? nullptr : find("CAbil", ab);
+            if (!e || e->tag != "CAbilHarvest") continue;
+            out.found = true;
+            for (const core::XmlNode& n : resolved("CAbil", ab)) {
+                if (n.attr_or("index", "") != resource) continue;
+                const std::string* v = n.attr("value");
+                if (!v) continue;
+                if (n.name == "ResourceAmountRequest") out.amount_request = std::atoi(v->c_str());
+                else if (n.name == "ResourceTimeMultiplier") out.time_mult = std::strtod(v->c_str(), nullptr);
+            }
+            break;
+        }
+        return out;
+    }
+    std::vector<std::vector<std::string>> actor_progress_stages(const std::string& id) const {
+        std::vector<std::vector<std::string>> out;
+        for (const core::XmlNode& n : resolved("CActorProgress", id)) {
+            if (n.name != "StageArray") continue;
+            const std::string* ap = n.attr("AnimProps");
+            if (!ap || ap->empty()) continue;
+            std::vector<std::string> props;
+            std::size_t s = 0;
+            while (s <= ap->size()) {
+                std::size_t c = ap->find(',', s);
+                if (c == std::string::npos) c = ap->size();
+                if (c > s) props.push_back(ap->substr(s, c - s));
+                s = c + 1;
+            }
+            if (!props.empty()) out.push_back(std::move(props));
+        }
+        return out;
+    }
+    std::string progress_actor_for_build(const std::string& build_abil) const {
+        if (build_abil.empty()) return {};
+        const std::string want = "Abil." + build_abil + ".BuiltStart";
+        std::vector<std::string> ids_ = ids("CActorProgress");
+        std::sort(ids_.begin(), ids_.end());
+        for (const std::string& id : ids_)
+            for (const core::XmlNode& n : resolved("CActorProgress", id))
+                if (n.name == "On" && n.attr_or("Terms", "") == want) return id;
+        return {};
+    }
+    std::string build_ability_of(const std::string& structure) const {
+        std::vector<std::string> ab = ids("CAbil");
+        std::sort(ab.begin(), ab.end());
+        for (const std::string& a : ab) {
+            const Entry* e = find("CAbil", a);
+            if (!e || e->tag != "CAbilBuild") continue;
+            for (const core::XmlNode& n : resolved("CAbil", a))
+                if (n.name == "InfoArray" && n.attr_or("Unit", "") == structure) return a;
+        }
+        return {};
+    }
     std::optional<std::string> tag_default_scalar(const std::string& tag,
                                                   const std::string& field) const;
 
@@ -2192,6 +3111,10 @@ private:
                                              const std::string& field,
                                              const std::string& expand_as = std::string()) const;
 
+    mutable FieldReadLog* field_read_log_ = nullptr;
+    mutable FieldReadLog* field_touch_log_ = nullptr;
+    const std::vector<core::XmlNode>& resolve_chain(const std::string& family, const std::string& id) const;
+    std::string sibling_actor_family(const std::string& family, const std::string& id) const;
     std::vector<std::string> load_skips_;
     static std::vector<std::string> unlisted_families_;
     using IdMap = std::unordered_map<std::string, Entry>;
@@ -2201,8 +3124,12 @@ private:
     std::unordered_map<std::string, std::vector<core::XmlNode>> singletons_;
     std::unordered_map<std::string, std::vector<core::XmlNode>> tag_defaults_;
     StringTable strings_;
+    StringTable hotkeys_;
+    StringTable assets_;
 
     mutable std::unordered_map<std::string, std::vector<core::XmlNode>> resolved_cache_;
+    mutable std::unordered_set<std::string> spawner_trained_;
+    mutable bool spawner_trained_built_ = false;
 
     mutable std::unordered_map<std::string, std::string> actor_by_unit_;
     mutable bool actor_by_unit_built_ = false;

@@ -17,6 +17,7 @@ struct RenderResult {
     uint32_t height = 0;
     std::vector<uint8_t> rgba;
     Mat4 mvp;
+    uint32_t lit_drawn = 0, lit_culled = 0;
 };
 
 RenderResult render_model(const formats::Model& model, uint32_t width,

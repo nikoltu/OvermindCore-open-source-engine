@@ -31,25 +31,10 @@ public:
     }
     bool is_set(int slot) const { return ok(slot) && set_[slot]; }
 
-    void set_follow(float x, float y) {
-        follow_ = {x, y, follow_.zoom};
-        following_ = true;
-    }
-    void clear_follow() { following_ = false; }
-    bool follow(CameraPose& out) const {
-        if (following_) {
-            out = follow_;
-            return true;
-        }
-        return false;
-    }
-
 private:
     static bool ok(int s) { return s >= 0 && s < kSlots; }
     CameraPose slots_[kSlots];
     bool set_[kSlots] = {};
-    CameraPose follow_;
-    bool following_ = false;
 };
 
 inline bool control_group_center(const ControlGroups& groups, int slot,

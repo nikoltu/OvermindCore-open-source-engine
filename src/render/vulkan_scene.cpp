@@ -1,3 +1,4 @@
+#include "sc2/data/environment.hpp"
 #include "sc2/render/scene.hpp"
 
 #include <vulkan/vulkan.h>
@@ -65,21 +66,25 @@ bool project(const Mat4& mvp, float x, float y, float z, uint32_t width,
 RenderResult render_scene(const std::vector<SceneInstance>& instances,
                           uint32_t width, uint32_t height, const Camera* cam_in,
                           const casc::Storage* storage,
-                          const std::string& texture_root, bool enable_particles) {
+                          const std::string& texture_root, bool enable_particles,
+                          const data::EnvLight* env, const FogField* fog, uint32_t resize_from) {
     std::vector<const SceneInstance*> live;
     for (const auto& inst : instances)
         if (inst.model && inst.model->vertex_count && !inst.model->indices.empty())
             live.push_back(&inst);
     if (live.empty()) throw std::runtime_error("render_scene: no drawable instances");
 
-    Device gpu = Device::create_headless("render_scene");
+    Device& gpu = Device::shared_headless("render_scene");
     const VkPhysicalDevice pd = gpu.physical();
     const VkDevice dev = gpu.device();
     const VkQueue queue = gpu.graphics_queue();
     const uint32_t gfx = gpu.graphics_family();
 
-    SceneRenderer sr(pd, dev, queue, gfx, width, height, VK_FORMAT_R8G8B8A8_UNORM, storage,
-                     texture_root);
+    SceneRenderer sr(pd, dev, queue, gfx, resize_from ? resize_from : width, resize_from ? resize_from : height,
+                     VK_FORMAT_R8G8B8A8_UNORM, storage, texture_root);
+    if (resize_from) sr.resize(width, height);
+    if (env) sr.set_environment(*env);
+    if (fog) sr.set_fog(*fog);
     sr.prepare(live);
 
     Camera cam;
@@ -162,6 +167,8 @@ RenderResult render_scene(const std::vector<SceneInstance>& instances,
     out.width = width;
     out.height = height;
     out.mvp = cam.view_proj(float(width) / float(height));
+    out.lit_drawn = sr.lit_drawn();
+    out.lit_culled = sr.lit_culled();
     out.rgba.resize(size_t(rbytes));
     void* mapped = nullptr;
     check(vkMapMemory(dev, readback.mem.get(), 0, rbytes, 0, &mapped), "vkMapMemory(readback)");

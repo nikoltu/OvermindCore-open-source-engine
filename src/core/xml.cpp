@@ -106,10 +106,14 @@ private:
             out.push_back('\'');
         else if (!ent.empty() && ent[0] == '#') {
             unsigned long code = 0;
-            if (ent.size() >= 2 && (ent[1] == 'x' || ent[1] == 'X'))
-                code = std::stoul(ent.substr(2), nullptr, 16);
-            else
-                code = std::stoul(ent.substr(1), nullptr, 10);
+            try {
+                if (ent.size() >= 2 && (ent[1] == 'x' || ent[1] == 'X'))
+                    code = std::stoul(ent.substr(2), nullptr, 16);
+                else
+                    code = std::stoul(ent.substr(1), nullptr, 10);
+            } catch (const std::exception&) {
+                throw std::runtime_error("xml: malformed character reference &" + ent + ";");
+            }
             append_utf8(out, code);
         } else {
             out.push_back('&');
@@ -153,6 +157,14 @@ private:
     }
 
     XmlNode parse_element() {
+        static thread_local int depth = 0;
+        struct DepthGuard {
+            int& d;
+            explicit DepthGuard(int& x) : d(x) {
+                if (++d > 256) { --d; throw std::runtime_error("xml: element nesting deeper than 256"); }
+            }
+            ~DepthGuard() { --d; }
+        } depth_guard(depth);
         ++p_;
         XmlNode node;
         node.name = parse_name();
@@ -198,10 +210,24 @@ private:
                     ++p_;
                     break;
                 }
-                if (end_ - p_ >= 2 && (p_[1] == '?' || p_[1] == '!')) {
-                    p_ += 2;
+                if (end_ - p_ >= 8 && std::string(p_, p_ + 8) == "<?token ") {
+                    p_ += 7;
+                    XmlNode tok;
+                    tok.name = "?token";
+                    for (;;) {
+                        skip_space();
+                        if (!more()) fail("unterminated <?token?>");
+                        if (*p_ == '?') break;
+                        std::string key = parse_name();
+                        skip_space();
+                        if (!more() || *p_ != '=') fail("expected '=' in <?token?> attribute");
+                        ++p_;
+                        skip_space();
+                        tok.attrs.emplace_back(std::move(key), parse_attr_value());
+                    }
                     while (more() && *p_ != '>') ++p_;
                     if (more()) ++p_;
+                    node.children.push_back(std::move(tok));
                     continue;
                 }
                 if (end_ - p_ >= 9 && std::string(p_, p_ + 9) == "<![CDATA[") {
@@ -212,6 +238,12 @@ private:
                         ++p_;
                     text.append(s, p_);
                     if (more()) p_ += 3;
+                    continue;
+                }
+                if (end_ - p_ >= 2 && (p_[1] == '?' || p_[1] == '!')) {
+                    p_ += 2;
+                    while (more() && *p_ != '>') ++p_;
+                    if (more()) ++p_;
                     continue;
                 }
                 node.children.push_back(parse_element());

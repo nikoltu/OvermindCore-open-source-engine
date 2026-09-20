@@ -19,6 +19,7 @@
 
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <string>
 #include <vector>
@@ -91,7 +92,9 @@ inline WsiDevice create_wsi_device(HINSTANCE hinst, HWND hwnd, const char* ctx,
     std::vector<const char*> want_ext = {VK_KHR_SURFACE_EXTENSION_NAME,
                                          VK_KHR_WIN32_SURFACE_EXTENSION_NAME};
     std::vector<const char*> want_layer;
-    const bool validation = wsi::has_layer(layers, "VK_LAYER_KHRONOS_validation") &&
+    const char* want_validation = std::getenv("SC2_VK_VALIDATION");
+    const bool validation = want_validation && *want_validation && *want_validation != '0' &&
+                            wsi::has_layer(layers, "VK_LAYER_KHRONOS_validation") &&
                             wsi::has_ext(iexts, VK_EXT_DEBUG_UTILS_EXTENSION_NAME);
     if (validation) {
         want_layer.push_back("VK_LAYER_KHRONOS_validation");
@@ -158,12 +161,17 @@ inline WsiDevice create_wsi_device(HINSTANCE hinst, HWND hwnd, const char* ctx,
     qci.queueCount = 1;
     qci.pQueuePriorities = &prio;
     const char* devext[] = {VK_KHR_SWAPCHAIN_EXTENSION_NAME};
+    VkPhysicalDeviceFeatures have{};
+    vkGetPhysicalDeviceFeatures(w.pd, &have);
+    VkPhysicalDeviceFeatures want{};
+    want.samplerAnisotropy = have.samplerAnisotropy;
     VkDeviceCreateInfo dci{};
     dci.sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO;
     dci.queueCreateInfoCount = 1;
     dci.pQueueCreateInfos = &qci;
     dci.enabledExtensionCount = 1;
     dci.ppEnabledExtensionNames = devext;
+    dci.pEnabledFeatures = &want;
     VkDevice dev = VK_NULL_HANDLE;
     if (vkCreateDevice(w.pd, &dci, nullptr, &dev) != VK_SUCCESS) fail("vkCreateDevice (swapchain) failed");
     w.device = Unique<VkDevice>(dev, [](VkDevice d) { vkDestroyDevice(d, nullptr); });

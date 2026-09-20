@@ -8,9 +8,18 @@ using core::XmlNode;
 
 static const XmlNode* child(const std::vector<XmlNode>& children,
                             const std::string& name) {
+    const XmlNode* last = nullptr;
     for (const XmlNode& c : children)
-        if (c.name == name) return &c;
-    return nullptr;
+        if (c.name == name) last = &c;
+    return last;
+}
+
+static std::string count_attr(const std::vector<XmlNode>& children, const char* attr, const char* def) {
+    const std::string* v = nullptr;
+    for (const XmlNode& c : children)
+        if (c.name == "Count")
+            if (const std::string* a = c.attr(attr)) v = a;
+    return v ? *v : std::string(def);
 }
 
 static bool is_int_literal(const std::string& s) {
@@ -24,11 +33,6 @@ static bool is_int_literal(const std::string& s) {
 
 static long count_units(const Catalog& cat, const std::string& link,
                         const std::string& state, const TechState& st) {
-    if (state.size() >= 6 && state.compare(state.size() - 6, 6, "AtUnit") == 0) {
-        auto it = st.at_unit.find(link);
-        return it == st.at_unit.end() ? 0 : it->second;
-    }
-    bool queued_too = state.rfind("QueuedOrBetter", 0) == 0;
 
     auto tally = [&](const std::unordered_map<std::string, int>& m) -> long {
         long total = 0;
@@ -45,8 +49,10 @@ static long count_units(const Catalog& cat, const std::string& link,
         }
         return total;
     };
-    long n = tally(st.units_complete);
-    if (queued_too) n += tally(st.units_queued);
+    const bool at = state.size() >= 6 && state.compare(state.size() - 6, 6, "AtUnit") == 0;
+    const bool pending = state.rfind("Queued", 0) == 0 || state.rfind("InProgress", 0) == 0;
+    long n = tally(at ? st.at_unit : st.units_complete);
+    if (pending) n += tally(at ? st.at_unit_queued : st.units_queued);
     return n;
 }
 
@@ -59,14 +65,11 @@ long eval_node(const Catalog& cat, const std::string& node_id, const TechState& 
     const auto& kids = cat.resolved("CRequirement", node_id);
 
     auto count_leaf = [&](const std::unordered_map<std::string, int>& m) -> long {
-        const XmlNode* c = child(kids, "Count");
-        if (!c) return 0;
-        const std::string link = c->attr_or("Link", "");
-        const std::string state = c->attr_or("State", "CompleteOnly");
-        if (state.size() >= 6 && state.compare(state.size() - 6, 6, "AtUnit") == 0) {
-            auto it = st.at_unit.find(link);
-            return it == st.at_unit.end() ? 0 : it->second;
-        }
+        if (!child(kids, "Count")) return 0;
+        const std::string link = count_attr(kids, "Link", "");
+        const std::string state = count_attr(kids, "State", "CompleteOnly");
+        if (state.size() >= 6 && state.compare(state.size() - 6, 6, "AtUnit") == 0)
+            return count_units(cat, link, state, st);
         auto it = m.find(link);
         return it == m.end() ? 0 : it->second;
     };
@@ -75,12 +78,20 @@ long eval_node(const Catalog& cat, const std::string& node_id, const TechState& 
     auto truthy = [](long v) { return v != 0; };
 
     if (tag == "CRequirementCountUnit") {
-        const XmlNode* c = child(kids, "Count");
-        if (!c) return 0;
-        return count_units(cat, c->attr_or("Link", ""),
-                           c->attr_or("State", "CompleteOnly"), st);
+        if (!child(kids, "Count")) return 0;
+        return count_units(cat, count_attr(kids, "Link", ""), count_attr(kids, "State", "CompleteOnly"), st);
     }
-    if (tag == "CRequirementCountUpgrade") return count_leaf(st.upgrades);
+    if (tag == "CRequirementCountUpgrade") {
+        long n = count_leaf(st.upgrades);
+        if (child(kids, "Count")) {
+            const std::string state = count_attr(kids, "State", "CompleteOnly");
+            if (state.rfind("QueuedOrBetter", 0) == 0 || state.rfind("InProgressOrBetter", 0) == 0) {
+                auto it = st.upgrades_queued.find(count_attr(kids, "Link", ""));
+                if (it != st.upgrades_queued.end()) n += it->second;
+            }
+        }
+        return n;
+    }
     if (tag == "CRequirementCountBehavior") return count_leaf(st.behaviors);
     if (tag == "CRequirementConst") {
         const XmlNode* v = child(kids, "Value");
@@ -122,10 +133,12 @@ long eval_node(const Catalog& cat, const std::string& node_id, const TechState& 
     return 0;
 }
 
-bool eval_requirement(const Catalog& cat, const std::string& req_id,
-                      const std::string& index, const TechState& st) {
+RequirementNodeRef requirement_node(const Catalog& cat, const std::string& req_id,
+                                    const std::string& index) {
+    RequirementNodeRef ref;
     const Catalog::Entry* e = cat.find("CRequirement", req_id);
-    if (!e) return true;
+    if (!e) return ref;
+    ref.exists = true;
     const auto& kids = cat.resolved("CRequirement", req_id);
 
     const XmlNode* chosen = nullptr;
@@ -136,8 +149,28 @@ bool eval_requirement(const Catalog& cat, const std::string& req_id,
         if (c.attr_or("index", "") == index) chosen = &c;
     }
     const XmlNode* node = chosen ? chosen : first;
-    if (!node) return true;
-    return eval_node(cat, node->attr_or("Link", ""), st) != 0;
+    if (!node) return ref;
+    ref.has_node = true;
+    ref.exact = chosen != nullptr;
+    ref.link = node->attr_or("Link", "");
+    return ref;
+}
+
+bool requirement_hidden(const Catalog& cat, const std::string& req_id, const TechState& st) {
+    if (req_id.empty()) return false;
+    const RequirementNodeRef ref = requirement_node(cat, req_id, "Show");
+    if (!ref.exists || !ref.has_node || !ref.exact) return false;
+    if (ref.link.empty()) return false;
+    return eval_node(cat, ref.link, st) == 0;
+}
+
+bool eval_requirement(const Catalog& cat, const std::string& req_id,
+                      const std::string& index, const TechState& st) {
+    const RequirementNodeRef ref = requirement_node(cat, req_id, index);
+    if (!ref.exists) return true;
+    if (!ref.has_node) return true;
+    if (ref.link.empty()) return true;
+    return eval_node(cat, ref.link, st) != 0;
 }
 
 }

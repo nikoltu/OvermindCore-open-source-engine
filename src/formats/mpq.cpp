@@ -72,6 +72,8 @@ void decrypt_block(uint32_t* words, size_t n, uint32_t key) {
 
 std::vector<uint32_t> read_u32s(const std::vector<uint8_t>& image, size_t off,
                                 size_t count) {
+    if (off > image.size() || count > (image.size() - off) / 4)
+        throw std::runtime_error("mpq: table does not fit the archive");
     ByteReader r(image);
     r.seek(off);
     std::vector<uint32_t> out(count);

@@ -3,6 +3,8 @@
 #include <algorithm>
 #include <cmath>
 
+#include "sc2/sim/weapon.hpp"
+
 namespace sc2::app {
 
 using sim::Fixed;
@@ -87,8 +89,8 @@ bool Control::project(float x, float y, float z, float& px, float& py) const {
     return true;
 }
 
-std::vector<uint32_t> Control::box_select(const sim::World& world,
-                                          const ScreenRect& rect) const {
+std::vector<uint32_t> Control::box_select(const sim::World& world, const ScreenRect& rect,
+                                          bool marquee) const {
     float minx = std::min(rect.x0, rect.x1), maxx = std::max(rect.x0, rect.x1);
     float miny = std::min(rect.y0, rect.y1), maxy = std::max(rect.y0, rect.y1);
 
@@ -106,6 +108,24 @@ std::vector<uint32_t> Control::box_select(const sim::World& world,
             ylo = std::min(fy, ty); yhi = std::max(fy, ty);
         }
         if (xhi >= minx && xlo <= maxx && yhi >= miny && ylo <= maxy) hits.push_back(u.id);
+    }
+    if (marquee) {
+        bool any_mobile = false;
+        for (std::uint32_t id : hits)
+            if (id < world.units().size() &&
+                (world.units()[id].attributes & sim::kAttrStructure) == 0) {
+                any_mobile = true;
+                break;
+            }
+        if (any_mobile) {
+            std::vector<std::uint32_t> mobile;
+            mobile.reserve(hits.size());
+            for (std::uint32_t id : hits)
+                if (id < world.units().size() &&
+                    (world.units()[id].attributes & sim::kAttrStructure) == 0)
+                    mobile.push_back(id);
+            hits.swap(mobile);
+        }
     }
     return hits;
 }
@@ -208,6 +228,21 @@ uint32_t Control::pick_target(const sim::World& world, const ScreenPoint& p) con
     return best;
 }
 
+uint32_t Control::pick_ally(const sim::World& world, const ScreenPoint& p) const {
+    Fixed gx, gy;
+    if (!ground_point(world, p, gx, gy)) return kNoTarget;
+    uint32_t best = kNoTarget;
+    Fixed best_d2;
+    for (const sim::Unit& u : world.units()) {
+        if (!u.alive || u.resource_left > 0 || !world.are_allied(u.player, player_)) continue;
+        const Fixed r = std::max(u.radius, pick_radius_);
+        const Fixed dx = u.x - gx, dy = u.y - gy, d2 = dx * dx + dy * dy;
+        if (d2 > r * r) continue;
+        if (best == kNoTarget || d2 < best_d2) { best = u.id; best_d2 = d2; }
+    }
+    return best;
+}
+
 uint32_t Control::pick_own(const sim::World& world, const ScreenPoint& p) const {
     Fixed gx, gy;
     if (!ground_point(world, p, gx, gy)) return kNoTarget;
@@ -265,11 +300,63 @@ Command Control::resolve_command(const sim::World& world, const ScreenPoint& p,
     }
     Fixed gx, gy;
     if (ground_point(world, p, gx, gy)) {
+        if (!attack_move) {
+            const uint32_t ally = pick_ally(world, p);
+            if (ally != kNoTarget) {
+                cmd.kind = CommandKind::Follow;
+                cmd.target = ally;
+                cmd.x = gx;
+                cmd.y = gy;
+                return cmd;
+            }
+        }
         cmd.kind = attack_move ? CommandKind::AttackMove : CommandKind::Move;
         cmd.x = gx;
         cmd.y = gy;
     }
     return cmd;
+}
+
+std::vector<FormationTarget> formation_targets(const sim::World& world, const std::vector<uint32_t>& selection,
+                                               sim::Fixed tx, sim::Fixed ty, float mixed_formation_diameter,
+                                               float air_formation_diameter) {
+    std::vector<FormationTarget> out;
+    std::vector<uint32_t> live;
+    Fixed minx, miny, maxx, maxy, sx, sy;
+    for (uint32_t id : selection) {
+        if (id >= world.units().size() || !world.units()[id].alive) continue;
+        const sim::Unit& u = world.units()[id];
+        if (live.empty()) { minx = maxx = u.x; miny = maxy = u.y; }
+        minx = u.x < minx ? u.x : minx;
+        maxx = u.x > maxx ? u.x : maxx;
+        miny = u.y < miny ? u.y : miny;
+        maxy = u.y > maxy ? u.y : maxy;
+        sx = sx + u.x;
+        sy = sy + u.y;
+        live.push_back(id);
+    }
+    if (live.empty()) return out;
+    const bool inside = tx >= minx && tx <= maxx && ty >= miny && ty <= maxy;
+    const Fixed cx = sx / Fixed::from_int(int32_t(live.size())), cy = sy / Fixed::from_int(int32_t(live.size()));
+    bool all_air = true;
+    Fixed max_d2;
+    for (uint32_t id : live) {
+        const sim::Unit& u = world.units()[id];
+        if (!u.flying) all_air = false;
+        const Fixed dx = u.x - cx, dy = u.y - cy, d2 = dx * dx + dy * dy;
+        if (d2 > max_d2) max_d2 = d2;
+    }
+    const Fixed half = Fixed::from_double(0.5 * double(all_air ? air_formation_diameter : mixed_formation_diameter));
+    const bool fits = max_d2 <= half * half;
+    for (uint32_t id : live) {
+        const sim::Unit& u = world.units()[id];
+        FormationTarget t;
+        t.id = id;
+        if (live.size() < 2 || inside || !fits) { t.x = tx; t.y = ty; }
+        else { t.x = tx + (u.x - cx); t.y = ty + (u.y - cy); }
+        out.push_back(t);
+    }
+    return out;
 }
 
 Command Control::issue_command(sim::World& world,
@@ -297,38 +384,25 @@ Command Control::issue_command(sim::World& world,
                     if (hall != kNoTarget) u.home_depot = hall;
                 }
                 world.issue(id, Order{OrderType::Gather, Fixed(), Fixed(), kNoTarget});
-            } else if (cmd.target < world.units().size()) {
-                Order mv;
-                mv.type = OrderType::Move;
-                mv.tx = world.unit(cmd.target).x;
-                mv.ty = world.unit(cmd.target).y;
-                world.issue(id, mv, queued);
+            } else {
+                world.issue(id, world.smart_order(id, cmd.target, cmd.x, cmd.y), queued);
             }
         }
         return cmd;
     }
 
-    Order order;
-    switch (cmd.kind) {
-        case CommandKind::Attack:
-            order.type = OrderType::Attack;
-            order.target = cmd.target;
-            break;
-        case CommandKind::Move:
-            order.type = OrderType::Move;
-            order.tx = cmd.x;
-            order.ty = cmd.y;
-            break;
-        case CommandKind::AttackMove:
-            order.type = OrderType::AttackMove;
-            order.tx = cmd.x;
-            order.ty = cmd.y;
-            break;
-        case CommandKind::Gather:
-        case CommandKind::None:
-            return cmd;
+    if (cmd.kind == CommandKind::AttackMove || cmd.kind == CommandKind::Move) {
+        for (const FormationTarget& t : formation_targets(world, selection, cmd.x, cmd.y)) {
+            Order order;
+            order.type = cmd.kind == CommandKind::AttackMove ? OrderType::AttackMove : OrderType::Move;
+            order.tx = t.x;
+            order.ty = t.y;
+            world.issue(t.id, order, queued);
+        }
+        return cmd;
     }
-    for (uint32_t id : selection) world.issue(id, order, queued);
+    for (uint32_t id : selection)
+        world.issue(id, world.smart_order(id, cmd.target, cmd.x, cmd.y), queued);
     return cmd;
 }
 

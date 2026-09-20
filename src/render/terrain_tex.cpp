@@ -1,5 +1,7 @@
 #include "sc2/render/terrain_tex.hpp"
 
+#include "sc2/render/creep_layer.hpp"
+
 #include <cmath>
 #include <exception>
 
@@ -158,6 +160,11 @@ std::string resolve_map_tileset_diffuse(const casc::Storage& store,
     return {};
 }
 
+bool decode_layer_rgba(const casc::Storage& store, const std::string& diffuse_rel, uint32_t& w,
+                       uint32_t& h, std::vector<uint8_t>& out) {
+    return decode_asset(store, diffuse_rel, w, h, out);
+}
+
 std::vector<ResolvedLayer> resolve_map_layers(const casc::Storage& store,
                                               const std::vector<std::string>& layer_names) {
     std::vector<ResolvedLayer> out;
@@ -196,24 +203,7 @@ std::vector<ResolvedLayer> resolve_map_layers(const casc::Storage& store,
 }
 
 void set_terrain_diffuse(formats::Model& m, const std::string& diffuse_path) {
-    m.materials.clear();
-    m.material_refs.clear();
-    if (diffuse_path.empty()) {
-        m.region_material.assign(m.regions.size(), -1);
-        return;
-    }
-    formats::M3Layer layer;
-    layer.usage = "Diffuse";
-    layer.image_path = diffuse_path;
-    formats::M3Material mat;
-    mat.name = "terrain";
-    mat.layers.push_back(layer);
-    m.materials.push_back(mat);
-    formats::M3MaterialRef ref;
-    ref.type = 1;
-    ref.index = 0;
-    m.material_refs.push_back(ref);
-    m.region_material.assign(m.regions.size(), 0);
+    set_model_diffuse(m, diffuse_path);
 }
 
 GroundImage composite_ground_images(const formats::TextureInfo& info,

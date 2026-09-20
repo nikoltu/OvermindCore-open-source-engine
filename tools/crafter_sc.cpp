@@ -8,6 +8,7 @@
 #include <vector>
 
 #include "sc2/api/server.hpp"
+#include "sc2/app/boot.hpp"
 #include "sc2/app/casc_maps.hpp"
 #include "sc2/app/front_end.hpp"
 #include "sc2/app/install.hpp"
@@ -290,19 +291,15 @@ int main(int argc, char** argv) {
     data::Catalog cat;
     app::MeleeModels models;
     try {
+        const std::vector<app::StartupStep> plan = app::plan_startup(
+            {"AbilData.xml", "RequirementData.xml", "RequirementNodeData.xml", "LightData.xml",
+             "TerrainData.xml"});
         platform::LoadingScreen splash("CrafterSC");
-        splash.progress(0.05f, "Opening game data...");
-        store.open(info.data_dir);
-
-        splash.progress(0.35f, "Loading unit catalog...");
-        cat.load_melee(store);
-        cat.load_files(store, {"AbilData.xml", "RequirementData.xml", "RequirementNodeData.xml",
-                               "LightData.xml", "TerrainData.xml"});
-
-        splash.progress(0.70f, "Loading models...");
-        models.load(store);
-
-        splash.progress(0.95f, "Preparing menu...");
+        for (std::size_t i = 0; i < plan.size(); ++i) {
+            splash.progress(float(i) / float(plan.size()), plan[i].label);
+            app::run_startup_step(plan[i], info.data_dir, store, cat, models);
+        }
+        splash.progress(1.0f, "Preparing menu");
     } catch (const std::exception& e) {
         platform::alert("CrafterSC", std::string("Failed to load game data:\n") + e.what());
         return 1;
@@ -310,6 +307,8 @@ int main(int argc, char** argv) {
 
     app::TestMap map = app::TestMap::generate(72.0f, 72.0f);
     app::FrontEnd fe(cat, models, store, map);
+    fe.set_config_io(platform::get_config, platform::set_config);
+    fe.set_menu_data_dir(info.data_dir);
 
     std::vector<platform::MapEntry> casc_entries;
     for (const app::CascMap& cm : app::discover_casc_maps(store)) {
@@ -341,6 +340,27 @@ int main(int argc, char** argv) {
         platform::set_config("maps_dir", d);
         fe.set_maps(with_casc(platform::list_maps(d)));
     });
+    fe.set_console_renderer([](casc::Storage& st, const data::Catalog& c, const std::string& skin, std::uint32_t w) {
+        return app::render_console_models(st, c, skin, w, app::ConsoleView{});
+    });
+    fe.set_portrait_renderer(&app::render_portrait);
+    {
+        std::string rd = platform::get_config("replays_dir");
+        if (rd.empty()) {
+            const std::string cfgp = platform::config_path();
+            const std::size_t cut = cfgp.find_last_of("/\\");
+            rd = (cut == std::string::npos ? std::string(".") : cfgp.substr(0, cut)) + "/replays";
+        }
+        fe.set_replays_dir(rd);
+        std::string sd = platform::get_config("saves_dir");
+        if (sd.empty()) {
+            const std::string cfgp = platform::config_path();
+            const std::size_t cut = cfgp.find_last_of("/\\");
+            sd = (cut == std::string::npos ? std::string(".") : cfgp.substr(0, cut)) + "/saves";
+        }
+        fe.set_saves_dir(sd);
+    }
+
     fe.set_texture_callback([&](formats::Model& ground, const formats::LoadedMap& lm) {
         const std::vector<std::string>& palette =
             lm.has_splat ? lm.texture_info.layer_names : lm.tileset_textures;
@@ -395,14 +415,25 @@ int main(int argc, char** argv) {
                      std::vector<std::uint8_t>& overlay) -> bool {
         host.set_frame_view(in.view_w, in.view_h);
         if (want_listen) server.pump(host);
-        bool cont = fe.step(in, dt_ms, scene, cam);
-        fe.build_overlay(in.view_w, in.view_h, overlay);
+        static int frame_failures = 0;
+        bool cont = true;
+        try {
+            cont = fe.step(in, dt_ms, scene, cam);
+            fe.build_overlay(in.view_w, in.view_h, overlay);
+            frame_failures = 0;
+        } catch (const std::exception& e) {
+            std::fprintf(stderr, "crafter-sc: frame error: %s\n", e.what());
+            cont = ++frame_failures < 120;
+        }
         return cont;
     };
 
+    fe.set_ground_fog(true);
     try {
         render::WindowResult r = render::run_game_window(
-            frame, &store, 1280, 720, "", 0, [&] { return fe.current_environment(); });
+            frame, &store, 1280, 720, "", 0, [&] { return fe.current_environment(); },
+            app::melee_shadow_clip(cat),
+            [&]() -> const render::FogField* { return fe.ground_fog(); });
         if (!r.created) {
             platform::alert("CrafterSC", "Could not open a display window (Vulkan/WSI unavailable).");
             return 1;

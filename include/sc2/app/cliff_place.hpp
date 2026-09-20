@@ -148,6 +148,7 @@ inline CliffField place_cliffs(casc::Storage& store, const formats::LoadedMap& m
             }
             if (m.vertex_count && !S.skin.empty())
                 for (formats::M3Material& mat : m.materials) mat.layers = S.skin;
+            m.cliff_skin_opaque = true;
             it = cf.pieces.emplace(key, std::move(m)).first;
         }
         return &it->second;
@@ -244,25 +245,46 @@ inline CliffField place_cliffs(casc::Storage& store, const formats::LoadedMap& m
             const float sgn_r[4] = {-1.0f, 1.0f, 1.0f, -1.0f};
             const float sgn_u[4] = {-1.0f, -1.0f, 1.0f, 1.0f};
             const float ramp_side = left ? 1.0f : -1.0f;
+            struct Miss { CliffField& cf; bool armed = true; ~Miss() { if (armed) ++cf.unresolved_ramp_frames; } } miss{cf};
             int lv[4];
-            std::string letters(4, ' ');
             for (int k = 0; k < 4; ++k) {
                 const float x = f.cx + sgn_r[k] * f.w * f.rx + sgn_u[k] * f.h * f.ux;
                 const float y = f.cy + sgn_r[k] * f.w * f.ry + sgn_u[k] * f.h * f.uy;
                 lv[k] = vlvl(int(std::lround(x)), int(std::lround(y)));
                 if (lv[k] < 0) return;
+            }
+            int lo = lv[0];
+            for (int k = 1; k < 4; ++k) lo = lv[k] < lo ? lv[k] : lo;
+            const int base = lo > 0 ? lo - 1 : 0;
+            std::string letters(4, ' ');
+            for (int k = 0; k < 4; ++k) {
+                const int rel = lv[k] - base;
                 if (sgn_r[k] == ramp_side) {
-                    if (lv[k] < 1 || lv[k] > 3) return;
-                    letters[std::size_t(k)] = "QRS"[lv[k] - 1];
+                    if (rel < 1 || rel > 3) return;
+                    letters[std::size_t(k)] = "QRS"[rel - 1];
                 } else {
-                    if (lv[k] > 3) return;
-                    letters[std::size_t(k)] = "ABCD"[lv[k]];
+                    if (rel > 3) return;
+                    letters[std::size_t(k)] = "ABCD"[rel];
                 }
             }
+            std::vector<std::string> cands{letters};
+            for (int mask = 1; mask < 4; ++mask) {
+                std::string c = letters;
+                bool changed = false;
+                int far = 0;
+                for (int k = 0; k < 4; ++k) {
+                    if (sgn_r[k] == ramp_side) continue;
+                    const int rel = lv[k] - base;
+                    if ((mask >> far) & 1 && rel >= 1 && rel <= 3) { c[std::size_t(k)] = "QRS"[rel - 1]; changed = true; }
+                    ++far;
+                }
+                if (changed) cands.push_back(c);
+            }
             const float want_r = 2.0f * f.w, want_u = 2.0f * f.h;
+            for (const std::string& cand : cands)
             for (int yaw = 0; yaw < 4; ++yaw) {
                 std::string code(4, ' ');
-                for (int k = 0; k < 4; ++k) code[std::size_t(k)] = letters[std::size_t((k + yaw) & 3)];
+                for (int k = 0; k < 4; ++k) code[std::size_t(k)] = cand[std::size_t((k + yaw) & 3)];
                 int use = si;
                 const formats::Model* piece = load_piece(use, code, var);
                 if (piece->vertex_count == 0) continue;
@@ -295,9 +317,9 @@ inline CliffField place_cliffs(casc::Storage& store, const formats::LoadedMap& m
                 inst.seq = -1;
                 cf.instances.push_back(inst);
                 ++cf.ramp_pieces;
+                miss.armed = false;
                 return;
             }
-            ++cf.unresolved_ramp_frames;
         };
         for (const formats::TerrainRamp& r : map.ramps) {
             emit_ramp(int(r.cid), r.left_lo, true, int(r.left_lo_var));

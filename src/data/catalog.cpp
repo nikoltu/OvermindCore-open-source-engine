@@ -23,6 +23,7 @@ std::string Catalog::family_of(const std::string& tag) {
     if (tag.rfind("CMover", 0) == 0) return "CMover";
     if (tag.rfind("CFootprint", 0) == 0) return "CFootprint";
     if (tag.rfind("CButton", 0) == 0) return "CButton";
+    if (tag.rfind("CTurret", 0) == 0) return "CTurret";
     if (tag.rfind("C", 0) == 0 &&
         std::find(unlisted_families_.begin(), unlisted_families_.end(), tag) ==
             unlisted_families_.end())
@@ -78,6 +79,17 @@ void Catalog::ingest(const std::vector<uint8_t>& xml) {
         }
         const std::uint16_t decl = entry.decl_seen++;
         for (const XmlNode& field : e.children) {
+            if (field.name == "?token") {
+                const std::string* tid = field.attr("id");
+                const std::string* tval = field.attr("value");
+                if (tid && tval && !tid->empty()) {
+                    bool found = false;
+                    for (auto& kv : entry.attrs)
+                        if (kv.first == *tid) { kv.second = *tval; found = true; break; }
+                    if (!found) entry.attrs.emplace_back(*tid, *tval);
+                }
+                continue;
+            }
             entry.own.push_back(field);
             entry.own_decl.push_back(decl);
         }
@@ -108,12 +120,28 @@ const std::string* Catalog::const_value(const std::string& id) const {
     return it == consts_.end() ? nullptr : &it->second;
 }
 
+std::string Catalog::sibling_actor_family(const std::string& family, const std::string& id) const {
+    if (family.rfind("CActor", 0) != 0) return family;
+    const std::string* best = nullptr;
+    for (const auto& [name, ids] : families_)
+        if (name != family && name.rfind("CActor", 0) == 0 && ids.count(id) && (!best || name < *best)) best = &name;
+    return best ? *best : family;
+}
+
 const Catalog::Entry* Catalog::find(const std::string& family,
                                     const std::string& id) const {
     auto fit = families_.find(family);
     if (fit == families_.end()) return nullptr;
     auto it = fit->second.find(id);
     return it == fit->second.end() ? nullptr : &it->second;
+}
+
+Catalog::FieldReadLog Catalog::authored_field_pairs() const {
+    FieldReadLog out;
+    for (const auto& [family, idmap] : families_)
+        for (const auto& [id, e] : idmap)
+            for (const XmlNode& n : e.own) out.emplace(family, n.name);
+    return out;
 }
 
 std::vector<std::string> Catalog::ids(const std::string& family) const {
@@ -124,6 +152,13 @@ std::vector<std::string> Catalog::ids(const std::string& family) const {
 
 const std::vector<XmlNode>& Catalog::resolved(const std::string& family,
                                               const std::string& id) const {
+    const std::vector<XmlNode>& r = resolve_chain(family, id);
+    if (field_touch_log_)
+        for (const XmlNode& c : r) field_touch_log_->emplace(family, c.name);
+    return r;
+}
+
+const std::vector<XmlNode>& Catalog::resolve_chain(const std::string& family, const std::string& id) const {
     std::string key = family + "\x1f" + id;
     auto cit = resolved_cache_.find(key);
     if (cit != resolved_cache_.end()) return cit->second;
@@ -133,7 +168,8 @@ const std::vector<XmlNode>& Catalog::resolved(const std::string& family,
     if (e) {
         resolved_cache_.emplace(key, std::vector<XmlNode>{});
         if (!e->parent.empty() && e->parent != id) {
-            const auto& base = resolved(family, e->parent);
+            const std::string& pf = find(family, e->parent) ? family : sibling_actor_family(family, e->parent);
+            const auto& base = resolve_chain(pf, e->parent);
             out.insert(out.end(), base.begin(), base.end());
         }
         out.insert(out.end(), e->own.begin(), e->own.end());
@@ -144,6 +180,7 @@ const std::vector<XmlNode>& Catalog::resolved(const std::string& family,
 std::optional<std::string> Catalog::scalar(const std::string& family,
                                            const std::string& id,
                                            const std::string& field) const {
+    if (field_read_log_) field_read_log_->emplace(family, field);
     const auto& children = resolved(family, id);
     for (auto it = children.rbegin(); it != children.rend(); ++it) {
         if (it->name != field) continue;
@@ -198,12 +235,17 @@ std::vector<Catalog::NodeSlot> Catalog::resolve_node_slots(const std::string& fa
                                                            const std::string& field,
                                                            const std::string& expand_as) const {
     const std::string& self = expand_as.empty() ? id : expand_as;
+    if (field_read_log_) field_read_log_->emplace(family, field);
     const Entry* e = find(family, id);
     if (!e) return {};
 
     std::vector<NodeSlot> base;
-    if (!e->parent.empty() && e->parent != id)
-        base = resolve_node_slots(family, e->parent, field, self);
+    static thread_local int parent_depth = 0;
+    if (!e->parent.empty() && e->parent != id && parent_depth < 64) {
+        ++parent_depth;
+        try { base = resolve_node_slots(family, e->parent, field, self); } catch (...) { --parent_depth; throw; }
+        --parent_depth;
+    }
 
     struct Own { long key; bool is_pos; std::vector<SlotWrite> writes; bool dead; };
     std::vector<Own> own;
@@ -252,6 +294,7 @@ std::vector<Catalog::NodeSlot> Catalog::resolve_node_slots(const std::string& fa
             base.push_back(NodeSlot{std::move(o.writes), o.dead});
         } else {
             size_t idx = size_t(o.key < 0 ? 0 : o.key);
+            if (idx > 65535) continue;
             if (idx >= base.size()) base.resize(idx + 1);
             NodeSlot& s = base[idx];
             s.writes.insert(s.writes.end(), o.writes.begin(), o.writes.end());
@@ -275,7 +318,7 @@ std::optional<int> Catalog::effect_damage(const std::string& effect_id, int dept
     return walk_damage_tree<int>(
         effect_id, depth,
         [this](const std::string& id) -> std::optional<int> {
-            if (auto a = scalar_num("CEffect", id, "Amount")) return int(*a);
+            if (auto a = effect_amount(id)) return int(*a);
             return std::nullopt;
         },
         [this](int sub, const std::string& id) -> int {
@@ -392,9 +435,14 @@ std::optional<Catalog::BehaviorBuff> Catalog::behavior_buff(const std::string& b
     BehaviorBuff bb;
     bool any = false;
     if (auto d = scalar_num("CBehavior", behavior_id, "Duration")) { bb.duration = *d; any = true; }
+    if (auto ms = scalar_num("CBehavior", behavior_id, "MaxStackCount")) bb.max_stack = int(*ms);
     if (auto p = scalar_num("CBehavior", behavior_id, "Period")) bb.dmg_period = *p;
     if (auto pe = scalar("CBehavior", behavior_id, "PeriodicEffect"); pe && !pe->empty())
         if (auto d = effect_damage_f(*pe)) { bb.dmg_per_tick = *d; any = true; }
+    bb.initial_effect = scalar("CBehavior", behavior_id, "InitialEffect").value_or("");
+    bb.periodic_effect = scalar("CBehavior", behavior_id, "PeriodicEffect").value_or("");
+    bb.expire_effect = scalar("CBehavior", behavior_id, "ExpireEffect").value_or("");
+    bb.final_effect = scalar("CBehavior", behavior_id, "FinalEffect").value_or("");
     for (const core::XmlNode& n : resolved("CBehavior", behavior_id)) {
         if (n.name != "Modification") continue;
         any = true;
@@ -402,11 +450,38 @@ std::optional<Catalog::BehaviorBuff> Catalog::behavior_buff(const std::string& b
             bb.move_speed_mult = std::strtod(v->c_str(), nullptr);
         if (const std::string* v = n.attr("AttackSpeedMultiplier"); v && !v->empty())
             bb.attack_speed_mult = std::strtod(v->c_str(), nullptr);
+        if (const std::string* v = n.attr("LifeArmorBonus"); v && !v->empty())
+            bb.life_armor_bonus = std::strtod(v->c_str(), nullptr);
+        if (const std::string* v = n.attr("ShieldArmorBonus"); v && !v->empty())
+            bb.shield_armor_bonus = std::strtod(v->c_str(), nullptr);
+        for (const core::XmlNode& g : n.children) {
+            const std::string* v = g.attr("value");
+            if (!v || v->empty()) continue;
+            if (g.name == "LifeArmorBonus") bb.life_armor_bonus = std::strtod(v->c_str(), nullptr);
+            if (g.name == "ShieldArmorBonus") bb.shield_armor_bonus = std::strtod(v->c_str(), nullptr);
+        }
+        for (const core::XmlNode& g : n.children)
+            if (g.name == "RateMultiplierArray")
+                if (const std::string* v = g.attr("value"); v && !v->empty()) {
+                    const double r = std::strtod(v->c_str(), nullptr);
+                    if (r > bb.rate_mult) bb.rate_mult = r;
+                }
         for (const core::XmlNode& g : n.children)
             if (g.name == "StateFlags") {
                 const std::string idx = g.attr_or("index", "");
                 if (idx == "CanAttack" && g.attr_or("value", "") == "0") bb.root = false;
-                if (idx == "Stunned" && g.attr_or("value", "") == "1") bb.stun = true;
+                const bool on = g.attr_or("value", "") == "1";
+                if (idx == "Stun" && on) bb.stun = true;
+                if (idx == "SuppressAttack" && on) bb.suppress_attack = true;
+                if (idx == "Invulnerable" && on) bb.invulnerable = true;
+                if (idx == "Uncommandable" && on) bb.uncommandable = true;
+                if (idx == "Untargetable" && on) bb.untargetable = true;
+            }
+        for (const core::XmlNode& g : n.children)
+            if (g.name == "AbilClassDisableArray" && g.attr_or("value", "") == "1") {
+                const std::string idx = g.attr_or("index", "");
+                if (idx == "CAbilAttack") bb.suppress_attack = true;
+                if (idx == "CAbilMove") bb.root = true;
             }
     }
     if (bb.move_speed_mult == 0.0) bb.root = true;
@@ -485,9 +560,14 @@ Catalog::DamageResponse Catalog::behavior_damage_response(const std::string& beh
                 if (auto v = field(cd, "TimeUse")) r.cooldown = *v;
             }
         }
-        for (const core::XmlNode& k : n.children)
+        for (const core::XmlNode& k : n.children) {
             if (k.name == "Kind" && k.attr_or("index", "") == "Spell" && k.attr_or("value", "") == "0")
                 r.excludes_spell = true;
+            if (k.name != "Kind") continue;
+            const std::string idx = k.attr_or("index", "");
+            const std::uint8_t bit = idx == "Spell" ? 1 : idx == "Melee" ? 2 : idx == "Ranged" ? 4 : idx == "Splash" ? 8 : 0;
+            if (bit) { if (k.attr_or("value", "1") == "0") r.kinds &= std::uint8_t(~bit); else r.kinds |= bit; }
+        }
     }
     return r;
 }
@@ -559,6 +639,7 @@ std::optional<Catalog::CreateUnitSpec> Catalog::effect_create_unit(const std::st
             if (auto c = scalar("CEffect", id, "SpawnCount"); c && !c->empty())
                 s.count = std::atoi(c->c_str());
             if (auto f = scalar("CEffect", id, "SpawnEffect"); f && !f->empty()) s.spawn_effect = *f;
+            if (auto r = scalar_num("CEffect", id, "SpawnRange"); r && *r > 0) s.spawn_range = *r;
             if (s.unit.empty()) return std::nullopt;
             return s;
         });
@@ -662,6 +743,8 @@ std::optional<Catalog::InterceptorMagSpec> Catalog::interceptor_magazine_of(
     s.count = count;
     s.count_max = int(scalar_num("CAbil", mag, "MaxCount").value_or(count));
     if (auto l = scalar_num("CAbil", mag, "Leash")) s.leash = *l;
+    else if (const Entry* me = find("CAbil", mag))
+        if (auto d = tag_default_scalar(me->tag, "Leash"); d && !d->empty()) s.leash = std::strtod(d->c_str(), nullptr);
     s.build_time = build_time;
     return s;
 }
@@ -768,6 +851,8 @@ std::optional<Catalog::PersistentSpec> Catalog::effect_persistent(const std::str
                 if (auto ar = area_damage_radius(pe, depth + 1)) {
                     s.amount = ar->first;
                     s.radius = ar->second;
+                    s.affiliation = effect_search_affiliation(pe);
+                    s.excludes_structure = effect_search_excludes_structure(pe);
                     break;
                 }
         if (s.amount == 0 && s.radius == 0)
@@ -858,7 +943,7 @@ std::optional<int> Catalog::weapon_damage(const std::string& weapon_id) const {
     if (!w) return std::nullopt;
     const int hits = weapon_hit_count(weapon_id).value_or(1);
     if (auto leaf = weapon_damage_effect_id(weapon_id))
-        if (auto amount = scalar_num("CEffect", *leaf, "Amount")) return int(*amount) * hits;
+        if (auto amount = effect_amount(*leaf)) return int(*amount) * hits;
     return std::nullopt;
 }
 
@@ -929,6 +1014,30 @@ std::optional<double> Catalog::missile_speed(const std::string& weapon_id) const
                     if (const std::string* v = c.attr("value"); v && !v->empty()) {
                         try { return std::stod(*v); } catch (...) { return std::nullopt; }
                     }
+    }
+    return std::nullopt;
+}
+
+std::optional<std::string> Catalog::weapon_missile_model_id(const std::string& weapon_id) const {
+    const std::string eff = weapon_effect_id(weapon_id);
+    if (eff.empty()) return std::nullopt;
+    const Entry* ee = find("CEffect", eff);
+    if (!ee || ee->tag != "CEffectLaunchMissile") return std::nullopt;
+    for (const std::string& act : ids("CActorAction")) {
+        std::string launch;
+        for (const Entry* e = find("CActorAction", act); e && launch.empty();
+             e = e->parent.empty() ? nullptr : find("CActorAction", e->parent))
+            if (const std::string* v = e->attr("effectLaunch")) launch = *v;
+        if (launch != eff) continue;
+        auto missile = scalar("CActorAction", act, "Missile");
+        if (!missile || missile->empty()) continue;
+        auto model = scalar("CActorMissile", *missile, "Model");
+        if (!model || model->empty()) continue;
+        std::string id = *model;
+        const std::string tok = "##unitName##";
+        for (std::size_t at = id.find(tok); at != std::string::npos; at = id.find(tok, at))
+            id.replace(at, tok.size(), actor_unit_name(*missile, "CActorMissile"));
+        if (auto path = scalar("CModel", id, "Model"); path && !path->empty()) return id;
     }
     return std::nullopt;
 }
@@ -1014,8 +1123,6 @@ std::vector<Catalog::AbilInfoRow> Catalog::ability_info_rows(const std::string& 
                 if (const std::string* req = ch.attr("Requirements")) {
                     r.requirement = *req;
                     r.requirement_written = true;
-                    r.requires_techlab = req->find("Attached") != std::string::npos &&
-                                         req->find("TechLab") != std::string::npos;
                 }
             } else if (is_warp && ch.name == "Charge") {
                 std::string v = ch.attr_or("TimeUse", "");
@@ -1046,7 +1153,12 @@ Catalog::unit_command_cards(const std::string& unit_id) const {
         return (end != s.c_str() && *end == '\0') ? static_cast<int>(v) : -1;
     };
     auto merge_attr = [](const core::XmlNode& n, const char* key, std::string& dst) {
-        if (const std::string* v = n.attr(key)) dst = *v;
+        if (const std::string* v = n.attr(key)) {
+            dst = *v;
+            return;
+        }
+        for (const core::XmlNode& ch : n.children)
+            if (ch.name == key) dst = ch.attr_or("value", dst);
     };
 
     std::vector<CommandCardLayout> out;
@@ -1078,6 +1190,7 @@ Catalog::unit_command_cards(const std::string& unit_id) const {
                 if (has_index) key = index;
                 else key = counter++;
                 if (key < 0) key = 0;
+                if (key > 65535) continue;
                 if (key + 1 > next_append) next_append = key + 1;
                 if (std::size_t(key) >= slots.size()) slots.resize(std::size_t(key) + 1);
                 Slot& s = slots[std::size_t(key)];
@@ -1240,8 +1353,17 @@ void Catalog::load_melee(const casc::Storage& store) {
                        "BehaviorData.xml", "UpgradeData.xml", "ValidatorData.xml", "MoverData.xml",
                        "FootprintData.xml", "ButtonData.xml", "RequirementData.xml",
                        "RequirementNodeData.xml", "ActorData.xml",
-                       "ModelData.xml", "SoundData.xml"});
+                       "ConsoleSkinData.xml",
+                       "ModelData.xml", "SoundData.xml",
+                       "GameData.xml", "RaceData.xml",
+                       "CameraData.xml",
+                       "AlertData.xml",
+                       "CursorData.xml",
+                       "SoundtrackData.xml",
+                       "TurretData.xml"});
     load_strings(store);
+    load_hotkeys(store, {});
+    load_assets(store);
 }
 
 static const char* const kCampaignFiles[] = {
@@ -1289,6 +1411,16 @@ void Catalog::load_campaign(const casc::Storage& store,
     }
 }
 
+void Catalog::load_assets(const casc::Storage& store) {
+    for (const char* mod : kMeleeMods) {
+        std::string name = std::string("mods/") + mod + ".sc2mod/base.sc2data/GameData/Assets.txt";
+        try {
+            assets_.load(store.read_by_name(name));
+        } catch (const std::exception&) {
+        }
+    }
+}
+
 void Catalog::load_strings(const casc::Storage& store) {
     for (const char* mod : kMeleeMods) {
         std::string name = std::string("mods/") + mod +
@@ -1298,6 +1430,105 @@ void Catalog::load_strings(const casc::Storage& store) {
         } catch (const std::exception&) {
         }
     }
+}
+
+void Catalog::load_hotkeys(const casc::Storage& store, const std::vector<std::string>& roots) {
+    (void)roots;
+    for (const char* mod : kMeleeMods) {
+        std::string name = std::string("mods/") + mod +
+                           ".sc2mod/enus.sc2data/LocalizedData/GameHotkeys.txt";
+        try {
+            hotkeys_.load(store.read_by_name(name));
+        } catch (const std::exception&) {
+        }
+    }
+}
+
+static std::optional<std::string> button_hotkey_walk(const Catalog& cat, const StringTable& hk,
+                                                     const std::string& face,
+                                                     std::vector<std::string>& seen) {
+    if (face.empty()) return std::nullopt;
+    for (const std::string& s2 : seen)
+        if (s2 == face) return std::nullopt;
+    seen.push_back(face);
+    const Catalog::Entry* e = cat.find("CButton", face);
+    if (auto ref = cat.scalar("CButton", face, "Hotkey"); ref && !ref->empty())
+        if (const std::string* v = hk.find(*ref)) return *v;
+    if (const std::string* v = hk.find("Button/Hotkey/" + face)) return *v;
+    if (e && !e->parent.empty()) return button_hotkey_walk(cat, hk, e->parent, seen);
+    return std::nullopt;
+}
+
+std::optional<std::string> Catalog::button_hotkey(const std::string& button_id) const {
+    if (button_id.empty() || hotkeys_.empty()) return std::nullopt;
+    std::vector<std::string> seen;
+    return button_hotkey_walk(*this, hotkeys_, button_id, seen);
+}
+
+std::string Catalog::expand_entry_tokens(const std::string& family, const std::string& id,
+                                         std::string v) const {
+    if (v.find("##") == std::string::npos) return v;
+    std::vector<std::pair<std::string, std::string>> tokens;
+    std::string cur = id;
+    for (int depth = 0; depth < 32 && !cur.empty(); ++depth) {
+        const Entry* e = find(family, cur);
+        if (!e) break;
+        for (const auto& kv : e->attrs) {
+            bool have = false;
+            for (const auto& t : tokens)
+                if (t.first == kv.first) { have = true; break; }
+            if (!have) tokens.push_back(kv);
+        }
+        cur = e->parent;
+    }
+    for (const auto& t : tokens) {
+        const std::string needle = "##" + t.first + "##";
+        for (std::size_t p; (p = v.find(needle)) != std::string::npos;)
+            v.replace(p, needle.size(), t.second);
+    }
+    return expand_id(std::move(v), id);
+}
+
+Catalog::ConsoleSkinModels Catalog::console_skin_models(const std::string& skin_id) const {
+    ConsoleSkinModels m;
+    auto triple = [](const std::string& v, float (&out)[3]) {
+        if (v.empty()) return;
+        std::size_t i = 0;
+        for (int k = 0; k < 3 && i <= v.size(); ++k) {
+            const std::size_t c = v.find(',', i);
+            const std::string field = v.substr(i, c == std::string::npos ? c : c - i);
+            try {
+                out[k] = std::stof(field);
+            } catch (...) {
+            }
+            if (c == std::string::npos) break;
+            i = c + 1;
+        }
+    };
+    auto take = [&](const core::XmlNode& n, std::string& path, float (&pos)[3], float (&scl)[3]) {
+        const std::string model = n.attr_or("Model", "");
+        if (model.empty()) return;
+        path = resolve_asset(expand_entry_tokens("CConsoleSkin", skin_id, model));
+        triple(n.attr_or("Position", ""), pos);
+        triple(n.attr_or("Scale", ""), scl);
+    };
+    for (const core::XmlNode& n : resolved("CConsoleSkin", skin_id)) {
+        if (n.name == "MinimapPanelModel") take(n, m.minimap, m.minimap_pos, m.minimap_scale);
+        else if (n.name == "InfoPanelModel") take(n, m.info, m.info_pos, m.info_scale);
+        else if (n.name == "CommandPanelModel") take(n, m.command, m.command_pos, m.command_scale);
+    }
+    return m;
+}
+
+std::optional<std::string> Catalog::console_skin_featured_image(const std::string& skin_id) const {
+    std::optional<std::string> img;
+    for (const core::XmlNode& n : resolved("CConsoleSkin", skin_id))
+        if (n.name == "FeaturedImage") {
+            const std::string v = n.attr_or("value", "");
+            if (!v.empty())
+                img = resolve_asset(expand_entry_tokens("CConsoleSkin", skin_id, v));
+        }
+    return img;
 }
 
 std::optional<std::string> Catalog::button_display_name(const std::string& button_id) const {
@@ -1320,7 +1551,7 @@ std::optional<std::string> Catalog::ability_display_name(const std::string& abil
 
 std::optional<Catalog::MorphSpec> Catalog::morph_spec(const std::string& abil_id) const {
     const Entry* e = find("CAbil", abil_id);
-    if (!e || e->tag != "CAbilMorph") return std::nullopt;
+    if (!e || (e->tag != "CAbilMorph" && e->tag != "CAbilMorphPlacement")) return std::nullopt;
 
     struct Section { std::string name; double delay = 0, dur = 0; };
     struct Stage { std::string unit; std::vector<Section> secs; };
@@ -1329,6 +1560,7 @@ std::optional<Catalog::MorphSpec> Catalog::morph_spec(const std::string& abil_id
     int autopos = 0;
     auto stage_at = [&](int slot) -> Stage& {
         if (slot < 0) slot = 0;
+        if (slot > 65535) slot = 65535;
         if (int(stages.size()) <= slot) stages.resize(slot + 1);
         return stages[slot];
     };
@@ -1419,20 +1651,7 @@ std::optional<Catalog::BuildSpec> Catalog::build_spec(const std::string& abil_id
 }
 
 int Catalog::footprint_place_cells(const std::string& footprint_id) const {
-    int count = 0;
-    auto count_row = [&](const std::string& s) {
-        for (char c : s)
-            if (c != '.' && c != ' ' && c != '\t' && c != '\r' && c != '\n') ++count;
-    };
-    for (const XmlNode& layer : resolved("CFootprint", footprint_id)) {
-        if (layer.name != "Layers" || layer.attr_or("index", "") != "Place") continue;
-        for (const XmlNode& row : layer.children) {
-            if (row.name != "Rows") continue;
-            if (const std::string* v = row.attr("value")) count_row(*v);
-            else count_row(row.text);
-        }
-    }
-    return count;
+    return int(footprint_place_offsets(footprint_id).size());
 }
 
 std::optional<Catalog::SpawnBehavior> Catalog::spawn_behavior(const std::string& behavior_id) const {
@@ -1458,6 +1677,29 @@ std::optional<Catalog::SpawnBehavior> Catalog::spawn_behavior(const std::string&
     }
     if (!any || sb.unit.empty()) return std::nullopt;
     if (auto lim = scalar_num("CBehavior", behavior_id, "Limit")) sb.hard_cap = int(*lim);
+    {
+        auto parse_xy = [](const std::string& v, std::pair<double, double>& out) {
+            const std::size_t c = v.find(',');
+            if (c == std::string::npos) return false;
+            out.first = std::atof(v.substr(0, c).c_str());
+            out.second = std::atof(v.substr(c + 1).c_str());
+            return true;
+        };
+        int seq = 0;
+        for (const XmlNode& n : resolved("CBehavior", behavior_id)) {
+            const std::string* v = n.attr("value");
+            if (!v || v->empty()) continue;
+            if (n.name == "Center") {
+                parse_xy(*v, sb.center);
+            } else if (n.name == "Offset") {
+                const std::string* idxa = n.attr("index");
+                const int slot = idxa ? std::atoi(idxa->c_str()) : seq++;
+                if (slot < 0 || slot > 4095) continue;
+                if (int(sb.offsets.size()) <= slot) sb.offsets.resize(std::size_t(slot) + 1);
+                parse_xy(*v, sb.offsets[std::size_t(slot)]);
+            }
+        }
+    }
     return sb;
 }
 
@@ -1473,6 +1715,150 @@ std::optional<double> Catalog::effect_vital_fraction(const std::string& effect_i
                     return std::atof(v->c_str());
     }
     return std::nullopt;
+}
+
+std::optional<std::string> Catalog::unit_wireframe_image(const std::string& unit_id) const {
+    if (unit_id.empty()) return std::nullopt;
+    (void)unit_render_scale(unit_id);
+    auto it = actor_by_unit_.find(unit_id);
+    if (it == actor_by_unit_.end()) return std::nullopt;
+    for (const core::XmlNode& n : resolved("CActorUnit", it->second)) {
+        if (n.name != "Wireframe") continue;
+        for (const core::XmlNode& c : n.children)
+            if (c.name == "Image") {
+                const std::string v = c.attr_or("value", "");
+                if (!v.empty()) return v;
+            }
+        const std::string v = n.attr_or("value", "");
+        if (!v.empty()) return v;
+    }
+    return std::nullopt;
+}
+
+static std::string on_trim(const std::string& s) {
+    std::size_t a = 0, b = s.size();
+    auto space = [](char c) { return c == ' ' || c == '\t' || c == '\r' || c == '\n'; };
+    while (a < b && space(s[a])) ++a;
+    while (b > a && space(s[b - 1])) --b;
+    return s.substr(a, b - a);
+}
+
+static std::vector<std::string> on_split(const std::string& s, char sep) {
+    std::vector<std::string> out;
+    std::size_t start = 0;
+    for (std::size_t i = 0; i <= s.size(); ++i) {
+        if (i == s.size() || s[i] == sep) {
+            out.push_back(s.substr(start, i - start));
+            start = i + 1;
+        }
+    }
+    return out;
+}
+
+namespace {
+
+bool macro_ident_char(char c) {
+    return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '_';
+}
+
+void replace_token(std::string& s, const std::string& from, const std::string& to) {
+    if (from.empty()) return;
+    for (std::size_t p; (p = s.find(from)) != std::string::npos;)
+        s.replace(p, from.size(), to);
+}
+
+}
+
+std::string Catalog::expand_actor_tokens(const std::string& in, const std::string& unit_name,
+                                         const std::string& self_id) const {
+    if (in.find('$') == std::string::npos && in.find("##") == std::string::npos) return in;
+    std::string out;
+    out.reserve(in.size());
+    for (std::size_t i = 0; i < in.size();) {
+        if (in[i] == '$') {
+            std::size_t j = i + 1;
+            while (j < in.size() && macro_ident_char(in[j])) ++j;
+            if (j > i + 1) {
+                if (const std::string* v = const_value(in.substr(i, j - i))) {
+                    out += *v;
+                    i = j;
+                    continue;
+                }
+            }
+        }
+        out.push_back(in[i++]);
+    }
+    if (!unit_name.empty()) replace_token(out, "##unitName##", unit_name);
+    if (!self_id.empty()) replace_token(out, "##id##", self_id);
+    return out;
+}
+
+std::string Catalog::actor_unit_name(const std::string& actor_id,
+                                     const std::string& family) const {
+    if (const Entry* e = find(family, actor_id))
+        if (const std::string* un = e->attr("unitName"))
+            if (!un->empty()) return *un;
+    return actor_id;
+}
+
+std::vector<Catalog::ActorRule> Catalog::actor_rules(const std::string& actor_id,
+                                                     const std::string& family) const {
+    std::vector<ActorRule> out;
+    if (actor_id.empty()) return out;
+    const std::string unit_name = actor_unit_name(actor_id, family);
+    for (const NodeSlot& slot : resolve_node_slots(family, actor_id, "On")) {
+        if (slot.dead) continue;
+        const std::string* terms = nullptr;
+        const std::string* send = nullptr;
+        for (const SlotWrite& w : slot.writes) {
+            if (const std::string* t = w.node->attr("Terms")) terms = t;
+            if (const std::string* v = w.node->attr("Send")) send = v;
+        }
+        if (!terms && !send) continue;
+
+        ActorRule r;
+        if (terms) {
+            const std::string terms_x = expand_actor_tokens(*terms, unit_name, actor_id);
+            const std::vector<std::string> clauses = on_split(terms_x, ';');
+            for (std::size_t c = 0; c < clauses.size(); ++c) {
+                const std::string clause = on_trim(clauses[c]);
+                if (c == 0) {
+                    const std::vector<std::string> f = on_split(clause, '.');
+                    if (!f.empty()) r.head = f[0];
+                    if (f.size() > 1) r.subject = f[1];
+                    for (std::size_t i = 2; i < f.size(); ++i) {
+                        if (i > 2) r.sub += '.';
+                        r.sub += f[i];
+                    }
+                    continue;
+                }
+                if (clause.empty()) continue;
+                const std::size_t sp = clause.find_first_of(" \t");
+                if (sp == std::string::npos)
+                    r.filters.emplace_back(clause, std::string{});
+                else
+                    r.filters.emplace_back(clause.substr(0, sp), on_trim(clause.substr(sp + 1)));
+            }
+        }
+        if (send) {
+            std::size_t i = 0;
+            const std::string v = expand_actor_tokens(*send, unit_name, actor_id);
+            while (i < v.size()) {
+                while (i < v.size() && (v[i] == ' ' || v[i] == '\t')) ++i;
+                const std::size_t start = i;
+                while (i < v.size() && v[i] != ' ' && v[i] != '\t') ++i;
+                if (i > start) {
+                    std::string tok = v.substr(start, i - start);
+                    if (r.verb.empty() && r.args.empty())
+                        r.verb = std::move(tok);
+                    else
+                        r.args.push_back(std::move(tok));
+                }
+            }
+        }
+        out.push_back(std::move(r));
+    }
+    return out;
 }
 
 std::array<float, 3> Catalog::unit_render_scale(const std::string& unit_id) const {

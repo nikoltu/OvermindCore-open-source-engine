@@ -2,6 +2,7 @@
 
 #include <cstdint>
 #include <functional>
+#include <map>
 #include <string>
 #include <vector>
 
@@ -37,6 +38,33 @@ Layout parse_layout(const std::vector<uint8_t>& xml);
 
 std::string desc_name_of(const std::string& path);
 
+struct FontStyle {
+    std::string name;
+    std::string font;
+    int height = 0;
+    int shadow_offset = 0;
+    bool shadow = false;
+    std::string vjustify, hjustify;
+    bool has_color = false;
+    std::uint8_t r = 255, g = 255, b = 255, a = 255;
+    bool ok() const { return height > 0; }
+};
+
+struct StyleSet {
+    void ingest(const std::string& xml);
+    FontStyle resolve(const std::string& name) const;
+    std::size_t style_count() const { return styles_.size(); }
+    std::string expand(std::string v) const;
+
+private:
+    struct Raw {
+        std::vector<std::pair<std::string, std::string>> attrs;
+    };
+    std::map<std::string, std::string> consts_;
+    std::map<std::string, std::string> font_groups_;
+    std::map<std::string, Raw> styles_;
+};
+
 struct LayoutSet {
     struct Doc {
         std::string name;
@@ -69,9 +97,11 @@ struct SolvedFrame {
     std::string type;
     std::string name;
     std::string text;
+    std::string parent;
     int depth = 0;
     std::string texture;
     std::string visible;
+    std::string accepts_mouse;
 };
 
 int measure_text(const std::string& text, int scale = 1);
@@ -79,6 +109,7 @@ int measure_text(const std::string& text, int scale = 1);
 using TextResolver = std::function<std::string(const std::string& ref)>;
 
 using FrameCollapsed = std::function<bool(const Frame& frame)>;
+using DataResolver = std::function<std::string(const std::string& target, const std::string& property)>;
 
 std::vector<SolvedFrame> solve_layout(const Frame& root, const Rect& canvas);
 std::vector<SolvedFrame> solve_layout(const Frame& root, const Rect& canvas,
@@ -86,6 +117,10 @@ std::vector<SolvedFrame> solve_layout(const Frame& root, const Rect& canvas,
 std::vector<SolvedFrame> solve_layout(const Frame& root, const Rect& canvas,
                                       const TextResolver& resolve_text,
                                       const FrameCollapsed& collapsed);
+std::vector<SolvedFrame> solve_layout(const Frame& root, const Rect& canvas,
+                                      const TextResolver& resolve_text,
+                                      const FrameCollapsed& collapsed,
+                                      const DataResolver& data);
 
 struct FrameState {
     std::string name;
@@ -107,6 +142,11 @@ std::string selected_state(const Frame& owner, const FrameStateGroup& group, flo
 
 void apply_state_groups(Frame& root, float aspect);
 
+enum class WhenAnswer { False, True, Unknown };
+WhenAnswer evaluate_when(const Frame& owner, const core::XmlNode& when, float aspect,
+                         const std::vector<const Frame*>& ancestors);
+std::string selected_state(const Frame& owner, const FrameStateGroup& group, float aspect,
+                           const std::vector<const Frame*>& ancestors);
 std::vector<uint8_t> rasterize_layout(const std::vector<SolvedFrame>& frames,
                                       uint32_t w, uint32_t h);
 

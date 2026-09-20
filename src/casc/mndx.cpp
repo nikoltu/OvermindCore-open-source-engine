@@ -404,9 +404,9 @@ struct PathFragmentTable {
 
     void copy_fragment(std::string& out, uint32_t off) const {
         if (marks.is_empty()) {
-            while (fragments[off] != 0) out.push_back(char(fragments[off++]));
+            while (off < fragments.size() && fragments[off] != 0) out.push_back(char(fragments[off++]));
         } else {
-            while (!marks.is_item_present(off)) out.push_back(char(fragments[off++]));
+            while (off < fragments.size() && !marks.is_item_present(off)) out.push_back(char(fragments[off++]));
         }
     }
 };
@@ -614,6 +614,7 @@ void Mndx::parse(const std::vector<uint8_t>& root_blob) {
         throw std::runtime_error("mndx: not an MNDX blob");
 
     auto rd32 = [&](size_t off) {
+        if (off > size || size - off < 4) throw std::runtime_error("mndx: header offset past end of blob");
         uint32_t v;
         std::memcpy(&v, buf + off, 4);
         return v;
@@ -628,6 +629,9 @@ void Mndx::parse(const std::vector<uint8_t>& root_blob) {
     hdr.ckey_entries_count = rd32(0x24);
     hdr.file_name_count = rd32(0x28);
 
+    if (hdr.mar_info_size < 20 || hdr.mar_info_count > size / hdr.mar_info_size ||
+        hdr.mar_info_offset > size - size_t(hdr.mar_info_count) * hdr.mar_info_size)
+        throw std::runtime_error("mndx: MAR-info table does not fit the blob");
     std::vector<MarInfo> mar(hdr.mar_info_count);
     for (uint32_t i = 0; i < hdr.mar_info_count; ++i) {
         size_t o = hdr.mar_info_offset + size_t(i) * hdr.mar_info_size;
@@ -637,6 +641,9 @@ void Mndx::parse(const std::vector<uint8_t>& root_blob) {
     }
     if (mar.size() < 3) throw std::runtime_error("mndx: missing MAR files");
 
+    if (hdr.ckey_entries_count > size / 24 ||
+        hdr.ckey_entries_offset > size - size_t(hdr.ckey_entries_count) * 24)
+        throw std::runtime_error("mndx: CKey table does not fit the blob");
     std::vector<CKeyEntry> ckeys(hdr.ckey_entries_count);
     for (uint32_t i = 0; i < hdr.ckey_entries_count; ++i) {
         size_t o = hdr.ckey_entries_offset + size_t(i) * 24;

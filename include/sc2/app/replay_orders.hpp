@@ -68,6 +68,11 @@ struct ReplayCommand {
     uint32_t sequence = 0;
 
     uint32_t manager_state = 0;
+    std::vector<uint32_t> actor_tags;
+    bool has_other_unit = false;
+    uint32_t other_unit_tag = 0;
+    bool has_unit_group = false;
+    uint32_t unit_group = 0;
 
     bool operator==(const ReplayCommand& o) const;
     bool operator!=(const ReplayCommand& o) const { return !(*this == o); }
@@ -79,7 +84,7 @@ std::vector<ReplayCommand> translate_commands(const std::vector<formats::ReplayE
 ReplayCommand translate_command(const formats::ReplayEvent& event);
 
 inline constexpr char kReplayCommandLogMagic[8] = {'S', 'C', '2', 'R', 'C', 'M', 'D', '\0'};
-inline constexpr uint32_t kReplayCommandLogVersion = 1;
+inline constexpr uint32_t kReplayCommandLogVersion = 2;
 
 void write_replay_commands(const std::vector<ReplayCommand>& commands, std::vector<uint8_t>& out);
 bool read_replay_commands(const uint8_t* data, size_t len, std::vector<ReplayCommand>& out);

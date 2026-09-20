@@ -1,10 +1,12 @@
 #include "sc2/ai/melee_ai.hpp"
 
 #include <utility>
+#include <algorithm>
 #include <vector>
 
 #include "sc2/ai/defense.hpp"
 #include "sc2/ai/economy.hpp"
+#include "sc2/ai/scout.hpp"
 
 namespace sc2::ai {
 
@@ -52,6 +54,7 @@ bool MeleeAI::afford(const sim::World& w, const BuildItem& it) const {
 bool MeleeAI::supply_ok(const sim::World& w, const BuildItem& it) const {
     const int n = it.count > 1 ? it.count : 1;
     const sim::Fixed need = it.proto.supply_uses * sim::Fixed::from_int(n);
+    if (need.raw() <= 0) return true;
     return (w.supply_used(player_) + need) <= w.supply_max(player_);
 }
 
@@ -70,6 +73,7 @@ void MeleeAI::run_workers(sim::World& w) {
     for (uint32_t id = 0; id < U; ++id) {
         Unit& u = w.unit(id);
         if (!u.alive || u.player != player_ || !u.is_worker) continue;
+        if (id == scout_) continue;
         if (u.orders.empty()) {
             if (!live_node(u.gather_target)) {
                 u.home_depot = base_.depot;
@@ -95,8 +99,10 @@ void MeleeAI::run_production(sim::World& w) {
             wp.home_depot = base_.expansion;
             wp.gather_target = base_.expansion_mineral;
         }
-        w.queue_train(hall, wp, cfg_.worker_unit.minerals, cfg_.worker_unit.gas,
-                      cfg_.worker_unit.build_time);
+        if (cfg_.worker_train_delay_ticks <= 0 || w.tick() - last_worker_train_tick_ >= cfg_.worker_train_delay_ticks) {
+            if (w.queue_train(hall, wp, cfg_.worker_unit.minerals, cfg_.worker_unit.gas, cfg_.worker_unit.build_time))
+                last_worker_train_tick_ = w.tick();
+        }
     }
 
     if (base_.producer >= w.units().size() || !w.unit(base_.producer).alive) {
@@ -112,7 +118,7 @@ void MeleeAI::run_production(sim::World& w) {
             }
         }
         if (base_.producer == sim::kNoTarget) {
-            if (cfg_.has_producer && !producer_pending_ &&
+            if (cfg_.has_producer && !producer_pending_ && !stock_active() &&
                 base_.depot < w.units().size() && afford(w, cfg_.producer_unit)) {
                 if (w.queue_train(base_.depot, cfg_.producer_unit.proto,
                                   cfg_.producer_unit.minerals, cfg_.producer_unit.gas,
@@ -123,6 +129,7 @@ void MeleeAI::run_production(sim::World& w) {
         }
     }
     if (int(w.pending_count()) >= cfg_.max_pending) return;
+    if (stock_active()) return;
 
     if (cfg_.has_army_unit2 && !cfg_.tech_chain.empty() && base_.depot < w.units().size() &&
         w.unit(base_.depot).alive) {
@@ -214,7 +221,32 @@ bool MeleeAI::enemy_target(const sim::World& w, Fixed& tx, Fixed& ty) const {
 
 void MeleeAI::run_army(sim::World& w) {
     const int count = army_size(w);
-    if (!attacking_ && count >= cfg_.army_threshold) attacking_ = true;
+    int desired = cfg_.army_threshold;
+    int launch_at = cfg_.army_threshold;
+    if (!cfg_.wave_phases.empty()) {
+        const MeleeConfig::WavePhase& ph = cfg_.wave_phases[std::min(wave_phase_, cfg_.wave_phases.size() - 1)];
+        desired = ph.desired_army;
+        if (wave_phase_start_tick_ < 0) wave_phase_start_tick_ = w.tick();
+        const bool elapsed = w.tick() - wave_phase_start_tick_ >= ph.attack_duration_s * sim::World::kTicksPerSecond;
+        launch_at = elapsed ? std::max(1, desired / 2) : desired;
+    }
+    if (!attacking_ && count >= launch_at) {
+        int32_t enemy = -1;
+        for (const Unit& u : w.units())
+            if (u.alive && u.player >= 0 && u.player != player_) { enemy = u.player; break; }
+        const Fixed mine = army_power(w, player_);
+        const Fixed theirs = enemy >= 0 ? army_power(w, enemy) : Fixed();
+        if (should_engage(mine, theirs, cfg_.attack_caution)) {
+            attacking_ = true;
+            launched_desired_ = desired;
+            if (!cfg_.wave_phases.empty()) {
+                if (wave_phase_ + 1 < cfg_.wave_phases.size()) ++wave_phase_;
+                wave_phase_start_tick_ = w.tick();
+            }
+        }
+    } else if (attacking_ && count < std::max(1, (launched_desired_ > 0 ? launched_desired_ : desired) / 2)) {
+        attacking_ = false;
+    }
 
     Fixed tx = cfg_.enemy_x, ty = cfg_.enemy_y;
     if (!enemy_target(w, tx, ty)) {
@@ -227,6 +259,7 @@ void MeleeAI::run_army(sim::World& w) {
     };
 
     if (cfg_.smart_combat && attacking_) {
+        combat_.retreat_hp_frac = cfg_.flee_damage ? Fixed::from_ratio(1, 3) : Fixed();
         std::vector<uint32_t> army;
         for (const Unit& u : w.units())
             if (is_army(u)) army.push_back(u.id);
@@ -343,8 +376,122 @@ void MeleeAI::run_expansion(sim::World& w) {
     }
 }
 
+int MeleeAI::owned_or_pending(const sim::World& w, const std::string& id) const {
+    int n = 0;
+    for (const Unit& u : w.units())
+        if (u.alive && u.player == player_ && u.catalog_id == id) ++n;
+    return n + w.pending_of_type(player_, id);
+}
+
+void MeleeAI::run_stock(sim::World& w) {
+    const std::size_t U = w.units().size();
+    while (stock_idx_ < cfg_.stock.size()) {
+        const StockStep& s = cfg_.stock[stock_idx_];
+        if (s.kind == StockKind::Skip) { ++stock_idx_; continue; }
+        if (s.kind == StockKind::Worker) {
+            if (cfg_.worker_target < s.count) cfg_.worker_target = s.count;
+            if (worker_count(w) + w.pending_of_type(player_, s.id) >= s.count) { ++stock_idx_; continue; }
+            return;
+        }
+        if (owned_or_pending(w, s.id) >= s.count) { ++stock_idx_; continue; }
+        if (int(w.pending_count()) >= cfg_.max_pending) return;
+        if (!afford(w, s.item) || !supply_ok(w, s.item)) return;
+        const bool hall_ok = base_.depot < U && w.unit(base_.depot).alive;
+        const bool prod_ok = base_.producer < U && w.unit(base_.producer).alive;
+        const bool larva_hall = hall_ok && w.unit(base_.depot).spawner_proto >= 0;
+        uint32_t from = sim::kNoTarget;
+        if (s.kind == StockKind::Structure || s.kind == StockKind::Producer) from = hall_ok ? base_.depot : sim::kNoTarget;
+        else if (s.kind == StockKind::Supply) from = s.item.proto.speed.raw() > 0 && larva_hall ? base_.depot : (hall_ok ? base_.depot : sim::kNoTarget);
+        else if (s.kind == StockKind::Army) from = larva_hall && s.item.proto.speed.raw() > 0 ? base_.depot : (prod_ok ? base_.producer : sim::kNoTarget);
+        if (from == sim::kNoTarget) return;
+        if (w.queue_train(from, s.item.proto, s.item.minerals, s.item.gas, s.item.build_time, s.item.count) &&
+            s.kind == StockKind::Producer && base_.producer == sim::kNoTarget)
+            producer_pending_ = true;
+        return;
+    }
+}
+
+void MeleeAI::run_scout(sim::World& w) {
+    if (cfg_.num_scouts <= 0 || scout_done_) return;
+    const std::size_t U = w.units().size();
+    if (scout_ != sim::kNoTarget && (scout_ >= U || !w.unit(scout_).alive)) {
+        scout_done_ = true;
+        scout_ = sim::kNoTarget;
+        return;
+    }
+    if (scout_ == sim::kNoTarget) {
+        for (uint32_t id = 0; id < U; ++id) {
+            const Unit& u = w.unit(id);
+            if (u.alive && u.player == player_ && u.is_worker) { scout_ = id; break; }
+        }
+        if (scout_ == sim::kNoTarget) return;
+        const Unit& sc = w.unit(scout_);
+        Fixed lx = cfg_.enemy_x, ly = cfg_.enemy_y;
+        {
+            const Fixed dx = sc.x - cfg_.enemy_x, dy = sc.y - cfg_.enemy_y;
+            const Fixed d = sim::isqrt(dx * dx + dy * dy);
+            if (d.raw() > 0) {
+                lx = cfg_.enemy_x + dx * Fixed::from_int(6) / d;
+                ly = cfg_.enemy_y + dy * Fixed::from_int(6) / d;
+            }
+        }
+        w.issue(scout_, Order{OrderType::Move, lx, ly, sim::kNoTarget});
+        scout_at_start_ = true;
+        {
+            const Fixed dx = lx - sc.x, dy = ly - sc.y;
+            const Fixed d = sim::isqrt(dx * dx + dy * dy);
+            const int walk_ticks = sc.speed.raw() > 0 ? int((d / sc.speed).to_double() * sim::World::kTicksPerSecond) : 0;
+            scout_leg_deadline_ = w.tick() + 2 * walk_ticks + 2 * sim::World::kTicksPerSecond;
+        }
+        return;
+    }
+    const Unit& s = w.unit(scout_);
+    bool seen = false;
+    if (scout_at_start_ && !s.orders.empty()) {
+        const Fixed sight = s.sight.raw() > 0 ? s.sight : Fixed::from_int(8);
+        const Fixed dx = cfg_.enemy_x - s.x, dy = cfg_.enemy_y - s.y;
+        seen = dx * dx + dy * dy <= sight * sight;
+    }
+    bool stalled = false;
+    if (!s.orders.empty()) {
+        const Fixed dx = s.orders.front().tx - s.x, dy = s.orders.front().ty - s.y;
+        const Fixed d2 = dx * dx + dy * dy;
+        if (scout_best_d2_.raw() < 0 || d2 < scout_best_d2_) {
+            scout_best_d2_ = d2;
+            scout_no_progress_ = 0;
+        } else if (++scout_no_progress_ >= 8) {
+            stalled = true;
+        }
+        if (w.tick() >= scout_leg_deadline_) stalled = true;
+    }
+    if (!s.orders.empty() && !stalled && !seen) return;
+    if (stalled || seen) w.stop(scout_);
+    scout_best_d2_ = Fixed::from_int(-1);
+    scout_no_progress_ = 0;
+    if (s.is_worker || !has_bounds_) {
+        scout_done_ = true;
+        scout_ = sim::kNoTarget;
+        return;
+    }
+    vision_.compute(w, player_, Fixed::from_int(10), Fixed::from_int(2), bounds_,
+                    w.placement().configured() ? &w.placement() : nullptr);
+    Fixed tx, ty;
+    if (scout_target(vision_, bounds_, Fixed::from_int(2), s.x, s.y, tx, ty)) {
+        const Fixed dx = tx - s.x, dy = ty - s.y;
+        const Fixed d = sim::isqrt(dx * dx + dy * dy);
+        const int walk_ticks = s.speed.raw() > 0 ? int((d / s.speed).to_double() * sim::World::kTicksPerSecond) : 0;
+        scout_leg_deadline_ = w.tick() + 2 * walk_ticks + 2 * sim::World::kTicksPerSecond;
+        w.issue(scout_, Order{OrderType::Move, tx, ty, sim::kNoTarget});
+    } else {
+        scout_done_ = true;
+        scout_ = sim::kNoTarget;
+    }
+}
+
 void MeleeAI::update(sim::World& w) {
+    run_scout(w);
     run_workers(w);
+    run_stock(w);
     run_production(w);
     run_expansion(w);
     run_army(w);

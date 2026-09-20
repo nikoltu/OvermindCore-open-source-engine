@@ -67,7 +67,9 @@ inline MapInfoHeader parse_map_info(const std::vector<std::uint8_t>& b) {
         return true;
     };
 
-    std::size_t pos = kMapInfoStringsOffset;
+    std::size_t pos = (b.size() > kMapInfoStringsOffset && b[kMapInfoStringsOffset - 1] != 0)
+                          ? kMapInfoStringsOffset - 1
+                          : kMapInfoStringsOffset;
     std::string fog, tileset;
     const bool strings_ok = b.size() > kMapInfoStringsOffset && read_id(pos, fog) &&
                             read_id(pos, tileset) && !tileset.empty();

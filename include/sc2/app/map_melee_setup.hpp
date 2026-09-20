@@ -28,7 +28,7 @@ struct MapMeleeStarts {
     int cx, cy;
 };
 
-inline MapMeleeStarts map_melee_starts(const formats::LoadedMap& map) {
+inline MapMeleeStarts map_melee_starts_corner_layout(const formats::LoadedMap& map) {
     const int W = int(map.width), H = int(map.height);
     int minx = W, miny = H, maxx = -1, maxy = -1;
     for (std::uint32_t y = 0; y < map.height; ++y)
@@ -77,8 +77,8 @@ inline MapMeleeStarts map_melee_starts(const formats::LoadedMap& map) {
             };
             std::pair<float, float> a = sl[ai], b = sl[bi];
             if (near0(b) < near0(a)) std::swap(a, b);
-            const auto A = nearest_walkable(int(a.first + 0.5f), int(a.second + 0.5f));
-            const auto B = nearest_walkable(int(b.first + 0.5f), int(b.second + 0.5f));
+            const auto A = nearest_walkable(int(std::floor(a.first)), int(std::floor(a.second)));
+            const auto B = nearest_walkable(int(std::floor(b.first)), int(std::floor(b.second)));
             return {A.first, A.second, B.first, B.second, (minx + maxx) / 2, (miny + maxy) / 2};
         }
     }
@@ -124,7 +124,27 @@ inline MapMeleeStarts map_melee_starts(const formats::LoadedMap& map) {
     return {s0x, s0y, s1x, s1y, (minx + maxx) / 2, (miny + maxy) / 2};
 }
 
+inline MapMeleeStarts map_melee_starts(const formats::LoadedMap& map, std::uint64_t start_seed = 0) {
+    MapMeleeStarts st = map_melee_starts_corner_layout(map);
+    if (start_seed == 0) return st;
+    std::uint64_t z = start_seed + 0xD1B54A32D192ED03ull;
+    z = (z ^ (z >> 30)) * 0xBF58476D1CE4E5B9ull;
+    z = (z ^ (z >> 27)) * 0x94D049BB133111EBull;
+    z ^= z >> 31;
+    if (z & 1u) {
+        std::swap(st.s0x, st.s1x);
+        std::swap(st.s0y, st.s1y);
+    }
+    return st;
+}
+
 struct MeleeProtos {
+    float hall_facing = kPlacedStructureFacing;
+    int start_minerals = 50;
+    int food_ceiling = 200;
+    int worker_count = kStartingWorkers;
+    std::vector<std::pair<int, int>> worker_offsets;
+    std::vector<MeleePlayerSetup::StartExtra> start_extras;
     sim::Unit hall, worker, mineral, producer, army, supply, geyser;
 };
 
@@ -135,6 +155,7 @@ inline MeleePlayerSetup map_melee_player(const MeleeProtos& pr, int sx, int sy, 
     MeleePlayerSetup p;
     p.start = {cell(sx), cell(sy)};
     p.town_hall = pr.hall;
+    p.town_hall_facing = pr.hall_facing;
     p.worker = pr.worker;
     p.worker_count = worker_count;
     p.mineral_field = pr.mineral;
@@ -148,11 +169,14 @@ inline MeleePlayerSetup map_melee_player(const MeleeProtos& pr, int sx, int sy, 
     p.producer = pr.producer;
     p.army_unit = pr.army;
     p.supply_unit = pr.supply;
-    p.start_minerals = 50;
+    p.start_minerals = pr.start_minerals;
+    p.food_ceiling = pr.food_ceiling;
+    p.worker_offsets = pr.worker_offsets;
+    p.start_extras = pr.start_extras;
     return p;
 }
 
-inline MeleeSetup melee_setup_for_map(const formats::LoadedMap& map, int worker_count = 12,
+inline MeleeSetup melee_setup_for_map(const formats::LoadedMap& map, int worker_count = kStartingWorkers,
                                       int patches = 8) {
     using sim::Fixed;
     MapMeleeStarts st = map_melee_starts(map);
@@ -199,7 +223,7 @@ inline MeleeSetup melee_setup_for_map(const formats::LoadedMap& map, int worker_
 }
 
 inline MeleeSetup melee_setup_for_map(const formats::LoadedMap& map, const data::Catalog& cat,
-                                      int worker_count = 12, int patches = 8,
+                                      int worker_count = -1, int patches = 8,
                                       const data::UpgradeCatalog* up = nullptr,
                                       const std::vector<std::string>* researched_p0 = nullptr,
                                       const std::vector<std::string>* researched_p1 = nullptr) {
@@ -223,6 +247,12 @@ inline MeleeSetup melee_setup_for_map(const formats::LoadedMap& map, const data:
     pr.geyser.speed = Fixed();
     pr.geyser.is_gas = true;
     pr.army = make_unit(cat, "Marine", 0);
+    if (worker_count < 0) {
+        const int authored = cat.race_starting_unit_count("Terr", "SCV");
+        worker_count = authored > 0 ? authored : kStartingWorkers;
+    }
+    for (const data::Catalog::StartSlot& sl : cat.race_start_roster("Terr"))
+        if (sl.unit == "SCV") pr.worker_offsets = sl.offsets;
     const data::UnitCost mcost = data::unit_cost(cat, "Marine");
     const data::UnitCost scost = data::unit_cost(cat, "SCV");
     const data::UnitCost dcost = data::unit_cost(cat, "SupplyDepot");
@@ -250,6 +280,7 @@ inline MeleeSetup melee_setup_for_map(const formats::LoadedMap& map, const data:
         p.army_gas_cost = mcost.gas;
         p.army_build_time = secs("Marine", 18);
         p.army_threshold = 5;
+        p.wave_phases = {{10, 425}, {14, 336}, {18, 290}, {30, 279}};
         if (const std::vector<std::string>* r = side == 0 ? researched_p0 : researched_p1;
             up && r && !r->empty()) {
             apply_unit_upgrades(cat, *up, "Marine", *r, p.army_unit);

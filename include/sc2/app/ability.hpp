@@ -8,7 +8,6 @@
 #include "sc2/data/upgrades.hpp"
 #include "sc2/sim/ability_system.hpp"
 #include "sc2/sim/mule.hpp"
-#include "sc2/sim/repair.hpp"
 #include "sc2/sim/scan_sweep.hpp"
 #include "sc2/sim/sensor_tower.hpp"
 #include "sc2/sim/supply_drop.hpp"
@@ -43,7 +42,9 @@ sim::Unit make_unit_upgraded(const data::Catalog& cat, const data::UpgradeCatalo
 struct UpgradeRevert {
     std::uint32_t unit_id;
     sim::Fixed wpn_damage, wpn2_damage, armor, speed, shield_armor, hp_max, hp, energy_max, energy,
-        wpn_range, wpn2_range, wpn_period, wpn2_period;
+        wpn_range, wpn2_range, wpn_period, wpn2_period, wpn_bonus_amount,
+        shields_max, shields, acquire_range, speed_mult_creep, burrow_speed;
+    std::uint32_t wpn_bonus_attr;
 };
 
 std::size_t apply_upgrade_to_live(sim::World& w, const data::Catalog& cat,
@@ -66,8 +67,12 @@ struct AbilityBuild {
     bool requires_ground = false;
     bool requires_spawner_target = false;
     std::vector<sim::VitalGate> vital_gates;
+    std::vector<sim::VitalGate> autocast_caster_gates;
+    std::vector<std::uint32_t> autocast_not_behaviors;
     std::string spawn_unit;
     sim::Fixed spawn_life;
+    sim::Fixed spawn_dmg_fraction{sim::Fixed::from_int(1)};
+    bool spawn_no_damage = false;
     bool spawn_requires_creep = false;
     std::vector<sim::EffectNode> tree;
     int32_t tree_root = -1;
@@ -78,6 +83,7 @@ int32_t build_effect(const data::Catalog& cat, const std::string& effect_id, Abi
 int32_t register_ability(sim::World& world, const AbilityBuild& b);
 
 std::optional<AbilityBuild> make_ability(const data::Catalog& cat, const std::string& abil_id);
+void parse_ability_autocast_validators(const data::Catalog& cat, const std::string& abil_id, AbilityBuild& b);
 
 sim::Fixed ability_energy_cost(const data::Catalog& cat, const std::string& abil_id);
 sim::Fixed ability_cooldown_sec(const data::Catalog& cat, const std::string& abil_id);
@@ -88,9 +94,6 @@ AbilTargetMode ability_target_mode(const data::Catalog& cat, const std::string& 
 std::pair<int, int> morph_cost_delta(const data::Catalog& cat, const std::string& source_unit,
                                      const std::string& target_unit);
 
-bool order_repair(const data::Catalog& cat, sim::World& world, sim::RepairSystem& repairs,
-                  std::uint32_t repairer, std::uint32_t target, const std::string& target_unit_id);
-
 int add_sensor_tower(const data::Catalog& cat, sim::SensorTowerSystem& towers, std::int32_t owner,
                      sim::Fixed x, sim::Fixed y, const std::string& unit_id);
 
@@ -98,6 +101,23 @@ bool calldown_supply_drop(sim::World& world, sim::SupplyDropSystem& drops, std::
                           std::uint32_t depot);
 
 bool cast_abduct(sim::World& world, std::uint32_t caster, std::uint32_t target);
+
+bool is_resource_drop_off(const data::Catalog& cat, const std::string& unit_id,
+                          const std::string& resource);
+
+inline std::uint32_t behavior_id_hash(const std::string& id) {
+    std::uint32_t h = 2166136261u;
+    for (unsigned char c : id) {
+        h ^= c;
+        h *= 16777619u;
+    }
+    return h;
+}
+
+std::uint32_t nearest_drop_off(const data::Catalog& cat, const sim::World& world,
+                               std::uint32_t worker);
+
+bool order_return_cargo(const data::Catalog& cat, sim::World& world, std::uint32_t worker);
 
 sim::EffectRef route_primary_weapon_through_executor(sim::World& world, std::uint32_t unit);
 

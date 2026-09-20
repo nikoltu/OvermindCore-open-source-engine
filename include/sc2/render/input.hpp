@@ -1,6 +1,8 @@
 #pragma once
 
 #include <cstdint>
+#include <string>
+#include <vector>
 
 namespace sc2::render {
 
@@ -27,6 +29,11 @@ struct InputState {
     bool key_hold = false;
     bool key_stop = false;
     bool key_patrol = false;
+
+    char key_char = 0;
+
+    std::vector<std::string> key_tokens;
+    bool key_alt = false;
 
     bool quit = false;
 };

@@ -138,7 +138,7 @@ std::vector<uint8_t> composite_overlay(const std::vector<uint8_t>& base_rgba,
     if (base_rgba.size() != need || overlay_rgba.size() != need)
         throw std::runtime_error("composite_overlay: layer size != width*height*4");
 
-    Device gpu = Device::create_headless("composite_overlay");
+    Device& gpu = Device::shared_headless("composite_overlay");
     const VkPhysicalDevice pd = gpu.physical();
     const VkDevice dev = gpu.device();
     const VkQueue queue = gpu.graphics_queue();

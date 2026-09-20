@@ -1,9 +1,30 @@
 #include "sc2/ui/interact.hpp"
 
+#include <string>
+
 namespace sc2::ui {
 
+namespace {
+bool ends_with(const std::string& s, const char* suffix) {
+    const std::size_t n = std::char_traits<char>::length(suffix);
+    return s.size() >= n && s.compare(s.size() - n, n, suffix) == 0;
+}
+bool xml_true(const std::string& v) {
+    return v == "True" || v == "true" || v == "1" || v == "TRUE";
+}
+}
+
+bool interactive_type(const std::string& type) {
+    static const char* const kFamilies[] = {"Button",  "CheckBox", "Pulldown", "EditBox",  "ScrollBar", "Slider", "ListBox", "ListItem",
+                                            "TabControl", "ComboBox", "Toggle", "Link", "DropDown", "Spinner", "Radio"};
+    for (const char* fam : kFamilies)
+        if (ends_with(type, fam)) return true;
+    return false;
+}
+
 bool is_interactive(const SolvedFrame& f) {
-    return f.type == "Button";
+    if (!f.accepts_mouse.empty()) return xml_true(f.accepts_mouse);
+    return interactive_type(f.type);
 }
 
 std::string press_action(const SolvedFrame& f) {

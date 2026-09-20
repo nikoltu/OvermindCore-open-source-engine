@@ -14,6 +14,7 @@ const char* protocol_ability_name(sim::OrderType type) {
 
         case sim::OrderType::Idle: return nullptr;
 
+        case sim::OrderType::Repair:
         case sim::OrderType::Gather:
         case sim::OrderType::Cast:
         case sim::OrderType::Load:

@@ -52,23 +52,69 @@ EnvLight resolve_environment_light(const Catalog& cat, const std::string& tilese
         if (c.name != "ToDInfoArray") continue;
         const std::string idx = c.attr_or("index", "0");
         if (!(idx.empty() || idx == "0")) continue;
-        if (!c.children.empty()) frame = &c;
+        bool populated = !c.children.empty();
+        for (const auto& kv : c.attrs)
+            if (kv.first != "index") populated = true;
+        if (populated) frame = &c;
     }
     if (!frame) return out;
+
+    auto field = [](const XmlNode& n, const char* name) -> std::string {
+        std::string v = n.attr_or(name, "");
+        if (!v.empty()) return v;
+        if (const XmlNode* c = find_child(n, name)) return node_value(*c);
+        return std::string();
+    };
+    auto read_light = [&](const XmlNode& n, EnvDirLight& d) {
+        d.present = true;
+        std::string s;
+        if (!(s = field(n, "Color")).empty()) parse_vec3(s, d.color);
+        if (!(s = field(n, "SpecularColor")).empty()) parse_vec3(s, d.spec_color);
+        if (!(s = field(n, "Direction")).empty()) parse_vec3(s, d.direction);
+        if (!(s = field(n, "ColorMultiplier")).empty()) d.color_multiplier = std::strtod(s.c_str(), nullptr);
+        if (!(s = field(n, "SpecColorMultiplier")).empty()) d.spec_multiplier = std::strtod(s.c_str(), nullptr);
+        if (!(s = field(n, "UseAmbientOcclusion")).empty()) d.use_ambient_occlusion = (s != "0");
+    };
+
+    {
+        const std::string amb = frame->attr_or("AmbientColor", "");
+        if (!amb.empty() && parse_vec3(amb, out.ambient_color) == 3) out.has_ambient = true;
+    }
 
     for (const XmlNode& c : frame->children) {
         if (c.name == "Param") {
             const std::string idx = c.attr_or("index", "");
             const std::string v = node_value(c);
-            if (v.empty()) continue;
+            if (v.empty() || idx.empty()) continue;
+            out.params[idx] = std::strtod(v.c_str(), nullptr);
             if (idx == "HDRExposure") { out.hdr_exposure = std::strtod(v.c_str(), nullptr); out.has_hdr = true; }
             else if (idx == "HDRWhitePoint") { out.hdr_white_point = std::strtod(v.c_str(), nullptr); out.has_hdr = true; }
-        } else if (c.name == "DirectionalLight" && c.attr_or("index", "") == "Key") {
-            std::string dir = c.attr_or("Direction", "");
-            if (dir.empty())
-                if (const XmlNode* d = find_child(c, "Direction")) dir = node_value(*d);
-            if (!dir.empty() && parse_vec3(dir, out.key_dir) == 3) out.has_key_dir = true;
+        } else if (c.name == "AmbientColor") {
+            if (parse_vec3(node_value(c), out.ambient_color) == 3) out.has_ambient = true;
+        } else if (c.name == "DirectionalLight") {
+            const std::string which = c.attr_or("index", "");
+            if (which == "Key") {
+                read_light(c, out.key);
+                for (int i = 0; i < 3; ++i) out.key_dir[i] = out.key.direction[i];
+                out.has_key_dir = !field(c, "Direction").empty();
+            } else if (which == "Fill") {
+                read_light(c, out.fill);
+            } else if (which == "Back") {
+                read_light(c, out.back);
+            }
         }
+    }
+    return out;
+}
+
+std::map<std::string, double> camera_params(const Catalog& cat, const std::string& camera_id) {
+    std::map<std::string, double> out;
+    for (const XmlNode& c : cat.resolved("CCamera", camera_id)) {
+        if (c.name != "ParamInitial") continue;
+        const std::string idx = c.attr_or("index", "");
+        const std::string v = node_value(c);
+        if (idx.empty() || v.empty()) continue;
+        out[idx] = std::strtod(v.c_str(), nullptr);
     }
     return out;
 }

@@ -13,7 +13,8 @@ public:
         int32_t carry_amount = 25;
         Fixed hp = Fixed::from_int(60);
         Fixed speed = Fixed::from_ratio(63, 16);
-        Fixed mine_time = Fixed::from_ratio(1, 2);
+        Fixed mine_time_mult = Fixed::from_ratio(41, 20);
+        Fixed return_delay = Fixed::from_ratio(1, 2);
         Fixed radius = Fixed::from_ratio(3, 8);
     };
     static constexpr int kLifetimeSeconds = 90;
@@ -35,7 +36,8 @@ public:
         m.carry_amount = st.carry_amount;
         m.carry_override = true;
         m.saturation_exempt = true;
-        m.mine_time = st.mine_time;
+        m.mine_time_mult = st.mine_time_mult;
+        m.return_delay = st.return_delay;
         m.gather_target = node;
         m.home_depot = depot;
         m.alive = true;

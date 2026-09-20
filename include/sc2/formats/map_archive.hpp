@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <map>
 #include <stdexcept>
 #include <string>
 #include <unordered_map>
@@ -12,6 +13,7 @@
 #include "sc2/formats/mpq.hpp"
 #include "sc2/formats/placed_objects.hpp"
 #include "sc2/formats/terrain.hpp"
+#include "sc2/formats/tga.hpp"
 #include "sc2/formats/terrain_grid.hpp"
 #include "sc2/sim/nav.hpp"
 #include "sc2/sim/terrain_map.hpp"
@@ -26,6 +28,8 @@ struct LoadedMap {
     sim::NavGrid nav;
     sim::TerrainMap placement;
     std::size_t blocked_cells = 0;
+    std::vector<std::uint8_t> minimap_rgba;
+    std::uint32_t minimap_w = 0, minimap_h = 0;
     std::vector<std::uint8_t> body_nav_block;
     std::vector<std::uint8_t> body_place_block;
     PlacedObjects objects;
@@ -48,11 +52,29 @@ struct LoadedMap {
     SyncHeightMap sync_height;
     CellFlags cell_flags;
     std::size_t authored_blocked = 0;
+    PaintedPathing painted;
+    std::uint32_t painted_blocked = 0;
+    std::size_t ramp_rescued = 0;
     std::size_t doodad_blocked = 0;
     std::size_t unit_blocked = 0;
     std::size_t out_of_bounds_blocked = 0;
     std::size_t below_zero_blocked = 0;
     std::size_t void_tier_blocked = 0;
+    enum BlockSource : std::uint8_t {
+        kBlockSlope = 1 << 0,
+        kBlockAuthored = 1 << 1,
+        kBlockOutside = 1 << 2,
+        kBlockBelowZero = 1 << 3,
+        kBlockVoidTier = 1 << 4,
+        kBlockDoodad = 1 << 5,
+        kBlockBody = 1 << 6,
+        kBlockPainted = 1 << 7,
+    };
+    std::vector<std::uint8_t> block_source;
+    void note_block(int x, int y, std::uint8_t src) {
+        if (block_source.empty() || !nav.in_bounds(x, y)) return;
+        block_source[std::size_t(y) * std::size_t(nav.width()) + std::size_t(x)] |= src;
+    }
     bool has_cliff_levels = false;
     WaterMap water;
 
@@ -80,6 +102,18 @@ inline LoadedMap load_map_terrain(std::vector<std::uint8_t> sc2map_bytes) {
     LoadedMap out;
     out.heightmap = HeightMap::parse(hb);
 
+    if (arc.contains("Minimap.tga")) {
+        try {
+            TgaInfo ti;
+            std::vector<std::uint8_t> px = decode_tga(arc.read_file("Minimap.tga"), ti);
+            if (ti.width && ti.height && px.size() == std::size_t(ti.width) * ti.height * 4) {
+                out.minimap_rgba = std::move(px);
+                out.minimap_w = ti.width;
+                out.minimap_h = ti.height;
+            }
+        } catch (const std::exception&) {   }
+    }
+
     TerrainQuantize q;
     if (arc.contains("t3Terrain.xml")) {
         std::vector<std::uint8_t> tx = arc.read_file("t3Terrain.xml");
@@ -102,10 +136,18 @@ inline LoadedMap load_map_terrain(std::vector<std::uint8_t> sc2map_bytes) {
         try { out.cell_flags = CellFlags::parse(arc.read_file("t3CellFlags")); }
         catch (const std::exception&) { out.cell_flags = CellFlags{}; }
     }
+    if (arc.contains("PaintedPathingLayer")) {
+        try { out.painted = PaintedPathing::parse(arc.read_file("PaintedPathingLayer")); }
+        catch (const std::exception&) { out.painted = PaintedPathing{}; }
+    }
 
     out.blocked_cells =
         terrain_grid_to_nav(out.terrain, out.nav, sim::Fixed::from_int(1), sim::Fixed(), sim::Fixed(),
                              out.cell_flags.empty());
+    out.block_source.assign(std::size_t(out.nav.width()) * std::size_t(out.nav.height()), 0);
+    for (int y = 0; y < out.nav.height(); ++y)
+        for (int x = 0; x < out.nav.width(); ++x)
+            if (out.nav.is_blocked_cell(x, y)) out.note_block(x, y, LoadedMap::kBlockSlope);
 
     if (arc.contains("t3SyncCliffLevel")) {
         try {
@@ -132,18 +174,42 @@ inline LoadedMap load_map_terrain(std::vector<std::uint8_t> sc2map_bytes) {
             }
 
             {
+                if (!out.painted.empty()) {
+                    const int nw = out.nav.width(), nh = out.nav.height();
+                    const int pw = int(out.width) < nw ? int(out.width) : nw, ph = int(out.height) < nh ? int(out.height) : nh;
+                    for (int y = 0; y < ph; ++y)
+                        for (int x = 0; x < pw; ++x) {
+                            if (!out.painted.cell_unpathable(std::uint32_t(x), std::uint32_t(y))) continue;
+                            if (!out.nav.is_blocked_cell(x, y)) {
+                                out.nav.set_blocked(x, y, true);
+                                ++out.blocked_cells;
+                                ++out.painted_blocked;
+                            }
+                            out.note_block(x, y, LoadedMap::kBlockPainted);
+                        }
+                }
                 if (!out.cell_flags.empty()) {
                     const int nw = out.nav.width(), nh = out.nav.height();
                     const int fw = int(out.cell_flags.width), fh = int(out.cell_flags.height);
                     const int mw = fw < nw ? fw : nw, mh = fh < nh ? fh : nh;
+                    const bool have_ramp_mask =
+                        out.cliff.raw.size() ==
+                        std::size_t(out.cliff.width) * std::size_t(out.cliff.height);
+                    const int cw2 = int(out.cliff.width);
                     for (int y = 0; y < mh; ++y) {
                         for (int x = 0; x < mw; ++x) {
                             if (!out.cell_flags.blocked(std::uint32_t(x), std::uint32_t(y))) continue;
+                            if (have_ramp_mask && x < cw2 && y < int(out.cliff.height) &&
+                                (out.cliff.raw[std::size_t(y) * std::size_t(cw2) + std::size_t(x)] & 63)) {
+                                ++out.ramp_rescued;
+                                continue;
+                            }
                             if (!out.nav.is_blocked_cell(x, y)) {
                                 out.nav.set_blocked(x, y, true);
                                 ++out.blocked_cells;
                                 ++out.authored_blocked;
                             }
+                            out.note_block(x, y, LoadedMap::kBlockAuthored);
                             const std::uint8_t lv = out.nav.level_cell(x, y);
                             const bool wall =
                                 (x > 0 && out.nav.level_cell(x - 1, y) != lv) ||
@@ -178,7 +244,9 @@ inline LoadedMap load_map_terrain(std::vector<std::uint8_t> sc2map_bytes) {
                     const bool outside =
                         overhang || (bounded && !out.info.in_playable_area(std::uint32_t(x),
                                                                           std::uint32_t(y)));
-                    if (!outside || out.nav.is_blocked_cell(x, y)) continue;
+                    if (!outside) continue;
+                    out.note_block(x, y, LoadedMap::kBlockOutside);
+                    if (out.nav.is_blocked_cell(x, y)) continue;
                     out.nav.set_blocked(x, y, true);
                     ++out.blocked_cells;
                     if (!overhang) ++out.out_of_bounds_blocked;
@@ -192,6 +260,7 @@ inline LoadedMap load_map_terrain(std::vector<std::uint8_t> sc2map_bytes) {
                 if (out.nav.is_blocked_cell(x, y)) continue;
                 if (map_vertex_height(out, std::uint32_t(x), std::uint32_t(y)) >= 0.0f) continue;
                 out.nav.set_blocked(x, y, true);
+                out.note_block(x, y, LoadedMap::kBlockBelowZero);
                 ++out.blocked_cells;
                 ++out.below_zero_blocked;
             }
@@ -208,6 +277,7 @@ inline LoadedMap load_map_terrain(std::vector<std::uint8_t> sc2map_bytes) {
                     if (map_vertex_height(out, std::uint32_t(x), std::uint32_t(y)) >= threshold)
                         continue;
                     out.nav.set_blocked(x, y, true);
+                    out.note_block(x, y, LoadedMap::kBlockVoidTier);
                     ++out.blocked_cells;
                     ++out.void_tier_blocked;
                 }
@@ -311,6 +381,11 @@ inline float map_vertex_height(const LoadedMap& map, std::uint32_t col, std::uin
     return float(h) * scale - bias;
 }
 
+inline float map_cell_height(const LoadedMap& map, std::uint32_t col, std::uint32_t row) {
+    return 0.25f * (map_vertex_height(map, col, row) + map_vertex_height(map, col + 1, row) +
+                    map_vertex_height(map, col, row + 1) + map_vertex_height(map, col + 1, row + 1));
+}
+
 inline bool measure_lowest_tier_height(const LoadedMap& map, float& lowest_height, float& tier_step) {
     tier_step = 2.0f;
     const CliffMap& cm = map.cliff;
@@ -324,7 +399,7 @@ inline bool measure_lowest_tier_height(const LoadedMap& map, float& lowest_heigh
         for (std::uint32_t x = 0; x < cm.width; ++x) {
             const std::uint8_t L = cm.levels[std::size_t(y) * cm.width + x];
             if (L == 0) continue;
-            sum[L] += double(map_vertex_height(map, x, y));
+            sum[L] += double(map_cell_height(map, x, y));
             cnt[L] += 1;
         }
     bool have = false;
@@ -359,15 +434,27 @@ inline std::vector<float> tier_heights(const LoadedMap& map) {
     for (std::uint8_t v : cm.levels) maxL = v > maxL ? v : maxL;
     std::vector<double> sum(std::size_t(maxL) + 1, 0.0);
     std::vector<std::uint64_t> cnt(std::size_t(maxL) + 1, 0);
+    std::vector<std::map<int, std::uint64_t>> hist(std::size_t(maxL) + 1);
     for (std::uint32_t y = 0; y < cm.height; ++y)
         for (std::uint32_t x = 0; x < cm.width; ++x) {
             const std::uint8_t L = cm.levels[std::size_t(y) * cm.width + x];
-            sum[L] += height_at(x, y);
+            const float z = height_at(x, y);
+            sum[L] += map_cell_height(map, x, y);
             cnt[L] += 1;
+            ++hist[L][int(z * 256.0f + (z < 0.0f ? -0.5f : 0.5f))];
         }
     std::vector<float> level_height(std::size_t(maxL) + 1, 0.0f);
-    for (std::size_t L = 0; L <= maxL; ++L)
-        if (cnt[L]) level_height[L] = float(sum[L] / double(cnt[L]));
+    constexpr double kPlateauModeShare = 0.30;
+    for (std::size_t L = 0; L <= maxL; ++L) {
+        if (!cnt[L]) continue;
+        const double mean = sum[L] / double(cnt[L]);
+        int mode_q = 0;
+        std::uint64_t best = 0;
+        for (const auto& kv : hist[L])
+            if (kv.second > best) { best = kv.second; mode_q = kv.first; }
+        const double share = double(best) / double(cnt[L]);
+        level_height[L] = share >= kPlateauModeShare ? float(double(mode_q) / 256.0) : float(mean);
+    }
     float step = 2.0f;
     {
         float lowest_unused = 0.0f;
@@ -407,10 +494,147 @@ inline std::vector<float> tier_heights(const LoadedMap& map) {
     return level_height;
 }
 
+inline float air_floor_z(const LoadedMap& map) {
+    const CliffMap& cm = map.cliff;
+    if (cm.empty()) return 0.0f;
+    const std::vector<float> th = tier_heights(map);
+    float floor = 1e30f;
+    std::vector<bool> seen(th.size(), false);
+    for (std::uint8_t L : cm.levels)
+        if (L > 0 && std::size_t(L) < th.size() && !seen[L]) {
+            seen[L] = true;
+            floor = std::min(floor, th[L]);
+        }
+    return floor < 1e29f ? floor : 0.0f;
+}
+
 inline float tier_height_at(const LoadedMap& map, unsigned level) {
     const std::vector<float> th = tier_heights(map);
     if (th.empty()) return float(level) * 2.0f;
     return th[level < th.size() ? level : th.size() - 1];
+}
+
+inline std::vector<std::uint8_t> ramp_mask(const CliffMap& cm) {
+    std::vector<std::uint8_t> ramp(std::size_t(cm.width) * cm.height, 0);
+    if (cm.empty()) return ramp;
+    if (cm.raw.size() == std::size_t(cm.width) * cm.height) {
+        for (std::size_t i = 0; i < ramp.size(); ++i) ramp[i] = (cm.raw[i] & 63) ? 1 : 0;
+        return ramp;
+    }
+    auto lvl = [&](int x, int y) -> int {
+        if (x < 0 || y < 0 || x >= int(cm.width) || y >= int(cm.height)) return -1;
+        return int(cm.levels[std::size_t(y) * cm.width + x]);
+    };
+    for (int y = 0; y < int(cm.height); ++y)
+        for (int x = 0; x < int(cm.width); ++x) {
+            const int me = lvl(x, y);
+            bool higher = false, lower = false;
+            const int nx[4] = {x - 1, x + 1, x, x}, ny[4] = {y, y, y - 1, y + 1};
+            for (int k = 0; k < 4; ++k) {
+                const int n = lvl(nx[k], ny[k]);
+                if (n < 0) continue;
+                if (n > me) higher = true;
+                if (n < me) lower = true;
+            }
+            if (higher && lower) ramp[std::size_t(y) * cm.width + x] = 1;
+        }
+    return ramp;
+}
+
+inline std::vector<float> tier_relief(const LoadedMap& map);
+
+inline std::vector<float> bake_ground_heights(const LoadedMap& map, std::uint32_t& out_w,
+                                              std::uint32_t& out_h) {
+    out_w = map.cliff.width;
+    out_h = map.cliff.height;
+    std::vector<float> out;
+    if (map.cliff.empty() || out_w == 0 || out_h == 0) {
+        out_w = out_h = 0;
+        return out;
+    }
+    const std::vector<float> level_height = tier_heights(map);
+    const std::vector<std::uint8_t> ramp = ramp_mask(map.cliff);
+    const std::vector<float> relief = tier_relief(map);
+    out.resize(std::size_t(out_w) * out_h, 0.0f);
+    for (std::uint32_t y = 0; y < out_h; ++y)
+        for (std::uint32_t x = 0; x < out_w; ++x)
+            out[std::size_t(y) * out_w + x] =
+                graded_height_at(map.cliff, level_height, &ramp, float(x) + 0.5f, float(y) + 0.5f, &relief);
+    return out;
+}
+
+inline std::vector<float> tier_relief_unclamped(const LoadedMap& map);
+inline std::vector<float> tier_relief(const LoadedMap& map);
+
+inline std::vector<float> tier_relief_unclamped(const LoadedMap& map) {
+    std::vector<float> out;
+    if (map.cliff.empty()) return out;
+    const std::vector<float> level_height = tier_heights(map);
+    if (level_height.empty()) return out;
+    const CliffMap& cm = map.cliff;
+    const bool have_raw = cm.raw.size() == std::size_t(cm.width) * cm.height;
+    const std::size_t n = std::size_t(cm.width) * cm.height;
+    std::vector<float> off(n, 0.0f);
+    std::vector<std::uint8_t> lvl(n, 0);
+    std::vector<double> sum(level_height.size(), 0.0);
+    std::vector<std::uint64_t> cnt(level_height.size(), 0);
+    std::vector<std::map<int, std::uint64_t>> hist(level_height.size());
+    for (std::uint32_t y = 0; y < cm.height; ++y)
+        for (std::uint32_t x = 0; x < cm.width; ++x) {
+            const std::size_t k = std::size_t(y) * cm.width + x;
+            std::uint8_t L = cm.levels[k];
+            if (L >= level_height.size()) L = std::uint8_t(level_height.size() - 1);
+            lvl[k] = L;
+            off[k] = map_cell_height(map, x, y) - level_height[L];
+            sum[L] += off[k];
+            cnt[L] += 1;
+            ++hist[L][int(off[k] * 256.0f + (off[k] < 0.0f ? -0.5f : 0.5f))];
+        }
+    std::vector<float> shift(level_height.size(), 0.0f);
+    for (std::size_t L = 0; L < level_height.size(); ++L) {
+        if (!cnt[L]) continue;
+        int mode_q = 0;
+        std::uint64_t best = 0;
+        for (const auto& kv : hist[L])
+            if (kv.second > best) { best = kv.second; mode_q = kv.first; }
+        shift[L] = double(best) / double(cnt[L]) >= 0.30 ? float(double(mode_q) / 256.0) : float(sum[L] / double(cnt[L]));
+    }
+    out.assign(n, 0.0f);
+    for (std::size_t k = 0; k < n; ++k) {
+        if (have_raw && (cm.raw[k] & 63)) continue;
+        out[k] = off[k] - shift[lvl[k]];
+    }
+    return out;
+}
+
+inline std::vector<float> tier_relief(const LoadedMap& map) {
+    std::vector<float> out = tier_relief_unclamped(map);
+    if (out.empty()) return out;
+    const std::vector<float> level_height = tier_heights(map);
+    float step = 0.0f;
+    for (std::size_t L = 1; L < level_height.size(); ++L) {
+        const float d = level_height[L] - level_height[L - 1];
+        if (d > 1e-3f && (step <= 0.0f || d < step)) step = d;
+    }
+    const float band = step > 0.0f ? 0.45f * step : 0.45f;
+    for (float& d : out) d = d > band ? band : (d < -band ? -band : d);
+    const CliffMap& cm = map.cliff;
+    const bool have_raw = cm.raw.size() == std::size_t(cm.width) * cm.height;
+    for (std::uint32_t y = 0; y < cm.height; ++y)
+        for (std::uint32_t x = 0; x < cm.width; ++x) {
+            const std::size_t k = std::size_t(y) * cm.width + x;
+            const std::uint8_t L = cm.levels[k];
+            bool edge = false;
+            for (int dy = -1; dy <= 1 && !edge; ++dy)
+                for (int dx = -1; dx <= 1 && !edge; ++dx) {
+                    const int nx = int(x) + dx, ny = int(y) + dy;
+                    if (nx < 0 || ny < 0 || nx >= int(cm.width) || ny >= int(cm.height)) continue;
+                    const std::size_t q = std::size_t(ny) * cm.width + nx;
+                    if (cm.levels[q] != L || (have_raw && (cm.raw[q] & 63))) edge = true;
+                }
+            if (edge) out[k] = 0.0f;
+        }
+    return out;
 }
 
 inline Model build_map_mesh_stepped(const LoadedMap& map, float cell = 1.0f,
@@ -446,7 +670,8 @@ inline Model build_map_mesh_stepped(const LoadedMap& map, float cell = 1.0f,
             }
     }
 
-    Model mesh = build_terrain_mesh_stepped(map.cliff, level_height, cell, &ramp, with_walls);
+    const std::vector<float> relief = tier_relief(map);
+    Model mesh = build_terrain_mesh_stepped(map.cliff, level_height, cell, &ramp, with_walls, &relief);
     fit_mesh_to_playable(mesh, map);
     return mesh;
 }
@@ -512,7 +737,7 @@ inline void append_map_water(Model& ground, const LoadedMap& map, float cell = 1
         rg.first_vertex += vbase;
         rg.first_index += ibase;
         ground.regions.push_back(rg);
-        ground.region_material.push_back(-1);
+        ground.region_material.push_back(kUntexturedRegion);
     }
     ground.vertex_count = std::uint32_t(ground.positions.size() / 3);
 }

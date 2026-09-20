@@ -19,17 +19,25 @@ struct HudMessageLine {
     std::string text;
 };
 
+struct EquipmentEntry {
+    std::string icon;
+    std::string line;
+    int level = 0;
+};
+
 struct HudContent {
     int minerals = 0;
     int gas = 0;
     int supply_used = 0;
     int supply_max = 0;
+    int game_seconds = -1;
+    int idle_workers = 0;
+    std::vector<EquipmentEntry> equipment;
+    int lead_kills = 0;
 
     std::size_t selection_count = 0;
     std::size_t selection_owned = 0;
     std::string selection_summary;
-
-    std::vector<std::string> command_buttons;
 
     std::uint32_t lead_unit = 0xFFFFFFFFu;
     WireframeState lead_wireframe;

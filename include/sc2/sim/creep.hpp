@@ -20,6 +20,9 @@ public:
 
     int width() const { return w_; }
     int height() const { return h_; }
+    Fixed cell_size() const { return cell_; }
+    Fixed origin_x() const { return ox_; }
+    Fixed origin_y() const { return oy_; }
 
     bool in_bounds(int cx, int cy) const {
         return cx >= 0 && cy >= 0 && cx < w_ && cy < h_;
@@ -31,6 +34,21 @@ public:
 
     bool is_creep_cell(int cx, int cy) const {
         return in_bounds(cx, cy) && cover_[size_t(cy) * w_ + cx] > 0;
+    }
+    bool creep_near(Fixed wx, Fixed wy, Fixed r) const {
+        int x0 = 0, y0 = 0, x1 = 0, y1 = 0;
+        to_cell(wx - r, wy - r, x0, y0);
+        to_cell(wx + r, wy + r, x1, y1);
+        for (int cy = y0; cy <= y1; ++cy)
+            for (int cx = x0; cx <= x1; ++cx) {
+                if (!is_creep_cell(cx, cy)) continue;
+                const Fixed lx = ox_ + cell_ * Fixed::from_int(cx), ly = oy_ + cell_ * Fixed::from_int(cy);
+                const Fixed nx = wx < lx ? lx : (wx > lx + cell_ ? lx + cell_ : wx);
+                const Fixed ny = wy < ly ? ly : (wy > ly + cell_ ? ly + cell_ : wy);
+                const Fixed dx = wx - nx, dy = wy - ny;
+                if (dx * dx + dy * dy <= r * r) return true;
+            }
+        return false;
     }
     bool is_creep(Fixed wx, Fixed wy) const {
         int cx, cy;
@@ -115,13 +133,13 @@ public:
         return add_source(wx, wy, max_radius, period_ticks, {});
     }
     int add_source(Fixed wx, Fixed wy, int max_radius, int period_ticks,
-                   std::vector<std::pair<int, int>> mask) {
+                   std::vector<std::pair<int, int>> mask, int start_radius = 1) {
         CreepSource s;
         grid_.to_cell(wx, wy, s.cx, s.cy);
         s.max_radius = mask.empty() ? max_radius : mask_growth_radius(mask);
         s.period_ticks = period_ticks;
         s.timer = period_ticks;
-        s.radius = 1;
+        s.radius = start_radius < 1 ? 1 : (start_radius > s.max_radius ? s.max_radius : start_radius);
         s.mask = std::move(mask);
         stamp(s, s.radius, +1);
         sources_.push_back(std::move(s));
@@ -131,7 +149,8 @@ public:
     void tick() {
         for (CreepSource& s : sources_) {
             if (!s.alive) {
-                if (s.radius > 0) {
+                if (s.radius > 0 && --s.timer <= 0) {
+                    s.timer = s.period_ticks;
                     stamp(s, s.radius, -1);
                     stamp(s, --s.radius, +1);
                     if (s.radius == 0) stamp(s, 0, -1);
@@ -147,10 +166,14 @@ public:
     }
 
     void kill_source(int i) {
-        if (i >= 0 && i < int(sources_.size())) sources_[i].alive = false;
+        if (i < 0 || i >= int(sources_.size())) return;
+        sources_[i].alive = false;
+        sources_[i].timer = sources_[i].period_ticks;
     }
 
     bool is_creep(Fixed wx, Fixed wy) const { return grid_.is_creep(wx, wy); }
+    bool has_sources() const { return grid_.width() > 0 && !sources_.empty(); }
+    bool creep_near(Fixed wx, Fixed wy, Fixed r) const { return grid_.creep_near(wx, wy, r); }
     const CreepGrid& grid() const { return grid_; }
     uint64_t checksum() const { return grid_.checksum(); }
 

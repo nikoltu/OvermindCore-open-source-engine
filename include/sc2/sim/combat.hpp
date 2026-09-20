@@ -53,6 +53,8 @@ inline void apply_hit(const Weapon& w, Defender& d) {
         }
         eff = eff - d.shields;
         d.shields = Fixed();
+        eff = eff - d.armor * w.armor_reduction;
+        if (eff.raw() <= 0) return;
     }
     d.life = d.life - eff;
 }
@@ -103,7 +105,9 @@ inline bool in_arc(Fixed ax, Fixed ay, Fixed tx, Fixed ty, Fixed radius, Fixed c
     const Fixed blen = isqrt(bvx * bvx + bvy * bvy);
     const Fixed elen = isqrt(d2);
     if (blen.raw() <= 0 || elen.raw() <= 0) return true;
-    const Fixed dot = (bvx * ex + bvy * ey) / (blen * elen);
+    const Fixed denom = blen * elen;
+    if (denom.raw() <= 0) return (bvx * ex + bvy * ey).raw() >= 0;
+    const Fixed dot = (bvx * ex + bvy * ey) / denom;
     return dot >= cos_half;
 }
 

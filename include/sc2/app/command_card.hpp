@@ -21,6 +21,12 @@ struct CommandButton {
     float cooldown = 0;
     bool autocast = false;
     bool is_cancel = false;
+
+    uint32_t select_builder = 0xFFFFFFFFu;
+
+    uint32_t select_larva = 0xFFFFFFFFu;
+
+    bool is_passive = false;
     uint32_t ability = 0;
 };
 
@@ -56,7 +62,7 @@ struct CommandCard {
     void set(int slot, const CommandButton& b) {
         if (slot >= 0 && slot < kSlots) slots[slot] = b;
     }
-    void set_cancel(const std::string& icon = "btn-cancel") {
+    void set_cancel(const std::string& icon) {
         CommandButton b;
         b.icon = icon;
         b.name = "Cancel";

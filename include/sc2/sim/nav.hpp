@@ -34,6 +34,7 @@ public:
     }
 
     int width() const { return w_; }
+    Fixed cell_size() const { return cell_; }
     int height() const { return h_; }
     bool configured() const { return w_ > 0 && h_ > 0; }
 
@@ -57,6 +58,14 @@ public:
     bool is_blocked_cell(int cx, int cy) const {
         return in_bounds(cx, cy) && blocked_[idx(cx, cy)] != 0;
     }
+    Fixed clearance(int cx, int cy) const {
+        if (!in_bounds(cx, cy)) return Fixed();
+        ensure_clearance();
+        return Fixed::from_raw(int32_t(clearance_[idx(cx, cy)]) * (cell_.raw() / 16));
+    }
+    bool admits(int cx, int cy, Fixed radius) const {
+        return radius.raw() <= 0 || clearance(cx, cy) >= radius;
+    }
     bool is_blocked(Fixed wx, Fixed wy) const {
         int cx, cy;
         to_cell(wx, wy, cx, cy);
@@ -69,11 +78,14 @@ public:
         if (b && !c) {
             c = 1;
             ++blocked_count_;
+            ++revision_;
         } else if (!b && c) {
             c = 0;
             --blocked_count_;
+            ++revision_;
         }
     }
+    uint32_t revision() const { return revision_; }
     void block_cell(int cx, int cy) { set_blocked(cx, cy, true); }
 
     void block_world(Fixed wx, Fixed wy) {
@@ -180,6 +192,47 @@ public:
             }
     }
 
+    bool segment_walkable(Fixed ax, Fixed ay, Fixed bx, Fixed by, bool can_walk_cliffs = false) const {
+        int cx, cy, ex, ey;
+        to_cell(ax, ay, cx, cy);
+        to_cell(bx, by, ex, ey);
+        const int64_t dx = int64_t(bx.raw()) - ax.raw(), dy = int64_t(by.raw()) - ay.raw();
+        const int sx = dx > 0 ? 1 : (dx < 0 ? -1 : 0), sy = dy > 0 ? 1 : (dy < 0 ? -1 : 0);
+        const int64_t adx = dx < 0 ? -dx : dx, ady = dy < 0 ? -dy : dy;
+        auto enter = [&](int fx, int fy, int tx, int ty) {
+            return in_bounds(tx, ty) && !is_blocked_cell(tx, ty) &&
+                   can_traverse(fx, fy, tx, ty, false, can_walk_cliffs);
+        };
+        const int limit = (ex > cx ? ex - cx : cx - ex) + (ey > cy ? ey - cy : cy - ey) + 2;
+        for (int it = 0; it < limit && (cx != ex || cy != ey); ++it) {
+            const int64_t nbx = int64_t(ox_.raw()) + int64_t(cell_.raw()) * (sx > 0 ? cx + 1 : cx);
+            const int64_t nby = int64_t(oy_.raw()) + int64_t(cell_.raw()) * (sy > 0 ? cy + 1 : cy);
+            const int64_t distx = sx == 0 ? 0 : (sx > 0 ? nbx - ax.raw() : ax.raw() - nbx);
+            const int64_t disty = sy == 0 ? 0 : (sy > 0 ? nby - ay.raw() : ay.raw() - nby);
+            int cmp;
+            if (sx == 0) cmp = 1;
+            else if (sy == 0) cmp = -1;
+            else {
+                const int64_t lx = distx * ady, ly = disty * adx;
+                cmp = lx < ly ? -1 : (lx > ly ? 1 : 0);
+            }
+            if (cmp < 0) {
+                if (!enter(cx, cy, cx + sx, cy)) return false;
+                cx += sx;
+            } else if (cmp > 0) {
+                if (!enter(cx, cy, cx, cy + sy)) return false;
+                cy += sy;
+            } else {
+                if (!enter(cx, cy, cx + sx, cy) || !enter(cx, cy, cx, cy + sy) ||
+                    !enter(cx, cy, cx + sx, cy + sy))
+                    return false;
+                cx += sx;
+                cy += sy;
+            }
+        }
+        return cx == ex && cy == ey;
+    }
+
     uint64_t checksum() const {
         uint64_t h = 1469598103934665603ull;
         for (uint8_t c : blocked_) {
@@ -214,7 +267,40 @@ private:
     Fixed cell_ = Fixed::from_int(1);
     Fixed ox_, oy_;
     std::vector<uint8_t> blocked_;
+    mutable std::vector<uint8_t> clearance_;
+    mutable uint32_t clearance_rev_ = 0xFFFFFFFFu;
+    void ensure_clearance() const {
+        if (clearance_rev_ == revision_ && clearance_.size() == blocked_.size()) return;
+        clearance_.assign(blocked_.size(), 0);
+        constexpr int kWin = 4;
+        for (int y = 0; y < h_; ++y)
+            for (int x = 0; x < w_; ++x) {
+                if (blocked_[idx(x, y)]) continue;
+                int best = (kWin + 1) * (kWin + 1) * 2;
+                for (int dy = -kWin; dy <= kWin; ++dy)
+                    for (int dx = -kWin; dx <= kWin; ++dx) {
+                        const int nx = x + dx, ny = y + dy;
+                        const bool wall = !in_bounds(nx, ny) || blocked_[idx(nx, ny)];
+                        if (!wall) continue;
+                        const int d2 = dx * dx + dy * dy;
+                        if (d2 < best) best = d2;
+                    }
+                int32_t r = 0;
+                {
+                    const int64_t v = int64_t(best) * 256;
+                    int64_t lo = 0, hi = 4096;
+                    while (lo < hi) { const int64_t mid = (lo + hi + 1) / 2; if (mid * mid <= v) lo = mid; else hi = mid - 1; }
+                    r = int32_t(lo);
+                }
+                int32_t c = r - 8;
+                if (c < 0) c = 0;
+                if (c > 63) c = 63;
+                clearance_[idx(x, y)] = uint8_t(c);
+            }
+        clearance_rev_ = revision_;
+    }
     int blocked_count_ = 0;
+    uint32_t revision_ = 0;
     std::vector<uint8_t> levels_;
     std::vector<uint8_t> ramps_;
     std::vector<uint8_t> cliff_;
@@ -230,10 +316,70 @@ inline constexpr int32_t kNavFFCost = 30;
 
 inline void find_path(const NavGrid& g, int sx, int sy, int gx, int gy,
                       std::vector<NavCell>& out, bool can_jump = false, bool crush_ff = false,
-                      bool can_walk_cliffs = false) {
+                      bool can_walk_cliffs = false, const Fixed* goal_point_x = nullptr,
+                      const Fixed* goal_point_y = nullptr, Fixed radius = Fixed()) {
     out.clear();
     if (!g.in_bounds(sx, sy) || !g.in_bounds(gx, gy)) return;
-    if (g.is_blocked_cell(sx, sy) || g.is_blocked_cell(gx, gy)) return;
+    int64_t goal_px = 0, goal_py = 0;
+    {
+        Fixed ccx, ccy;
+        g.cell_center(gx, gy, ccx, ccy);
+        goal_px = goal_point_x ? goal_point_x->raw() : ccx.raw();
+        goal_py = goal_point_y ? goal_point_y->raw() : ccy.raw();
+    }
+
+    constexpr int kMaxRing = 8;
+    auto nearest_free = [&g](int& cx, int& cy) -> bool {
+        for (int r = 1; r <= kMaxRing; ++r)
+            for (int dy = -r; dy <= r; ++dy)
+                for (int dx = -r; dx <= r; ++dx) {
+                    if (dx > -r && dx < r && dy > -r && dy < r) continue;
+                    const int nx = cx + dx, ny = cy + dy;
+                    if (!g.in_bounds(nx, ny) || g.is_blocked_cell(nx, ny)) continue;
+                    cx = nx;
+                    cy = ny;
+                    return true;
+                }
+        return false;
+    };
+
+    if (g.is_blocked_cell(sx, sy)) {
+        int fx = sx, fy = sy;
+        if (!nearest_free(fx, fy)) return;
+        sx = fx;
+        sy = fy;
+    }
+
+    if (g.is_blocked_cell(gx, gy)) {
+        struct Cand { int x, y; int64_t dg, ds; };
+        std::vector<Cand> cands;
+        const int64_t gpx = goal_px, gpy = goal_py;
+        const int64_t half = g.cell_size().raw() / 2;
+        for (int dy = -kMaxRing; dy <= kMaxRing; ++dy)
+            for (int dx = -kMaxRing; dx <= kMaxRing; ++dx) {
+                const int nx = gx + dx, ny = gy + dy;
+                if (!g.in_bounds(nx, ny) || g.is_blocked_cell(nx, ny)) continue;
+                if (!g.admits(nx, ny, radius)) continue;
+                Fixed ccx, ccy;
+                g.cell_center(nx, ny, ccx, ccy);
+                const int64_t x0 = int64_t(ccx.raw()) - half, x1 = int64_t(ccx.raw()) + half;
+                const int64_t y0 = int64_t(ccy.raw()) - half, y1 = int64_t(ccy.raw()) + half;
+                const int64_t qx = gpx < x0 ? x0 - gpx : (gpx > x1 ? gpx - x1 : 0);
+                const int64_t qy = gpy < y0 ? y0 - gpy : (gpy > y1 ? gpy - y1 : 0);
+                const int64_t ddx = nx - sx, ddy = ny - sy;
+                cands.push_back(Cand{nx, ny, qx * qx + qy * qy, ddx * ddx + ddy * ddy});
+            }
+        if (cands.empty()) return;
+        std::stable_sort(cands.begin(), cands.end(), [](const Cand& a, const Cand& b) {
+            return a.dg != b.dg ? a.dg < b.dg : a.ds < b.ds;
+        });
+        constexpr std::size_t kMaxCandidates = 8;
+        for (std::size_t c = 0; c < cands.size() && c < kMaxCandidates; ++c) {
+            find_path(g, sx, sy, cands[c].x, cands[c].y, out, can_jump, crush_ff, can_walk_cliffs, nullptr, nullptr, radius);
+            if (!out.empty()) return;
+        }
+        return;
+    }
 
     const int W = g.width();
     const int N = W * g.height();
@@ -293,6 +439,7 @@ inline void find_path(const NavGrid& g, int sx, int sy, int gx, int gy,
                 if (crush_ff && g.has_ff() && g.is_ff_cell(nx, ny)) via_ff = true;
                 else continue;
             }
+            if (!via_ff && goal != index(nx, ny) && !g.admits(nx, ny, radius)) continue;
             const bool diag = (DX[k] != 0 && DY[k] != 0);
             if (diag) {
                 if (g.is_blocked_cell(cx + DX[k], cy) ||

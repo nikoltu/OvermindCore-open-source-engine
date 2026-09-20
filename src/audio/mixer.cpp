@@ -119,16 +119,6 @@ void put_tag(std::vector<std::uint8_t>& out, const char tag[4]) {
     out.insert(out.end(), tag, tag + 4);
 }
 
-std::uint16_t get_le16(const std::vector<std::uint8_t>& d, std::size_t off) {
-    return static_cast<std::uint16_t>(d[off] | (d[off + 1] << 8));
-}
-
-std::uint32_t get_le32(const std::vector<std::uint8_t>& d, std::size_t off) {
-    return static_cast<std::uint32_t>(d[off]) | (static_cast<std::uint32_t>(d[off + 1]) << 8) |
-           (static_cast<std::uint32_t>(d[off + 2]) << 16) |
-           (static_cast<std::uint32_t>(d[off + 3]) << 24);
-}
-
 bool tag_is(const std::vector<std::uint8_t>& d, std::size_t off, const char tag[4]) {
     return d[off] == static_cast<std::uint8_t>(tag[0]) && d[off + 1] == static_cast<std::uint8_t>(tag[1]) &&
            d[off + 2] == static_cast<std::uint8_t>(tag[2]) && d[off + 3] == static_cast<std::uint8_t>(tag[3]);
@@ -174,43 +164,116 @@ WavData read_wav(const std::string& path) {
     std::ifstream f(path, std::ios::binary);
     if (!f) throw std::runtime_error("audio::read_wav: cannot open " + path);
     std::vector<std::uint8_t> d((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
-
     if (d.size() < 12 || !tag_is(d, 0, "RIFF") || !tag_is(d, 8, "WAVE"))
         throw std::runtime_error("audio::read_wav: not a RIFF/WAVE file: " + path);
-
     WavData out;
-    bool have_fmt = false, have_data = false;
-    std::uint16_t fmt_tag = 0, bits = 0;
+    if (!decode_wav(d, out))
+        throw std::runtime_error("audio::read_wav: unsupported format (16-bit PCM or IMA ADPCM only): " + path);
+    return out;
+}
 
+static const std::int16_t kImaStep[89] = {
+    7,     8,     9,     10,    11,    12,    13,    14,    16,    17,    19,    21,    23,    25,    28,
+    31,    34,    37,    41,    45,    50,    55,    60,    66,    73,    80,    88,    97,    107,   118,
+    130,   143,   157,   173,   190,   209,   230,   253,   279,   307,   337,   371,   408,   449,   494,
+    544,   598,   658,   724,   796,   876,   963,   1060,  1166,  1282,  1411,  1552,  1707,  1878,  2066,
+    2272,  2499,  2749,  3024,  3327,  3660,  4026,  4428,  4871,  5358,  5894,  6484,  7132,  7845,  8630,
+    9493,  10442, 11487, 12635, 13899, 15289, 16818, 18500, 20350, 22385, 24623, 27086, 29794, 32767};
+static const int kImaIndex[16] = {-1, -1, -1, -1, 2, 4, 6, 8, -1, -1, -1, -1, 2, 4, 6, 8};
+
+bool decode_wav(const std::vector<std::uint8_t>& d, WavData& out) {
+    out = WavData{};
+    auto le16 = [&](std::size_t o) { return std::uint16_t(d[o] | (d[o + 1] << 8)); };
+    auto le32 = [&](std::size_t o) {
+        return std::uint32_t(d[o]) | (std::uint32_t(d[o + 1]) << 8) | (std::uint32_t(d[o + 2]) << 16) |
+               (std::uint32_t(d[o + 3]) << 24);
+    };
+    auto tag = [&](std::size_t o, const char* t) {
+        return o + 4 <= d.size() && d[o] == std::uint8_t(t[0]) && d[o + 1] == std::uint8_t(t[1]) &&
+               d[o + 2] == std::uint8_t(t[2]) && d[o + 3] == std::uint8_t(t[3]);
+    };
+    if (d.size() < 12 || !tag(0, "RIFF") || !tag(8, "WAVE")) return false;
+    std::uint16_t fmt_tag = 0, bits = 0, block_align = 0, spb = 0;
+    std::uint32_t fact = 0;
+    bool have_fmt = false, have_fact = false;
+    std::size_t data_at = 0, data_len = 0;
     std::size_t p = 12;
     while (p + 8 <= d.size()) {
-        const std::uint32_t csize = get_le32(d, p + 4);
+        const std::uint32_t csize = le32(p + 4);
         const std::size_t body = p + 8;
-        if (body + csize > d.size())
-            throw std::runtime_error("audio::read_wav: truncated chunk in " + path);
-
-        if (tag_is(d, p, "fmt ") && csize >= 16) {
-            fmt_tag = get_le16(d, body + 0);
-            out.channels = static_cast<int>(get_le16(d, body + 2));
-            out.rate = get_le32(d, body + 4);
-            bits = get_le16(d, body + 14);
+        if (body + csize > d.size()) break;
+        if (tag(p, "fmt ") && csize >= 16) {
+            fmt_tag = le16(body);
+            out.channels = int(le16(body + 2));
+            out.rate = le32(body + 4);
+            block_align = le16(body + 12);
+            bits = le16(body + 14);
+            if (csize >= 20) spb = le16(body + 18);
             have_fmt = true;
-        } else if (tag_is(d, p, "data")) {
-            const std::size_t n = csize / sizeof(std::int16_t);
-            out.samples.resize(n);
-            for (std::size_t i = 0; i < n; ++i)
-                out.samples[i] = static_cast<std::int16_t>(get_le16(d, body + i * 2));
-            have_data = true;
+        } else if (tag(p, "fact") && csize >= 4) {
+            fact = le32(body);
+            have_fact = true;
+        } else if (tag(p, "data")) {
+            data_at = body;
+            data_len = csize;
         }
         p = body + csize + (csize & 1u);
     }
-
-    if (!have_fmt) throw std::runtime_error("audio::read_wav: missing fmt chunk in " + path);
-    if (!have_data) throw std::runtime_error("audio::read_wav: missing data chunk in " + path);
-    if (fmt_tag != 1 || bits != 16)
-        throw std::runtime_error("audio::read_wav: only 16-bit PCM is supported: " + path);
-
-    return out;
+    if (!have_fmt || data_at == 0 || out.channels < 1) {
+        out = WavData{};
+        return false;
+    }
+    const int ch = out.channels;
+    if (fmt_tag == 1 && bits == 16) {
+        const std::size_t n = data_len / 2;
+        out.samples.resize(n);
+        for (std::size_t i = 0; i < n; ++i) out.samples[i] = std::int16_t(le16(data_at + i * 2));
+        return true;
+    }
+    if (fmt_tag == 0x11 && bits == 4 && block_align >= std::uint16_t(4 * ch)) {
+        const std::size_t hdr = std::size_t(4 * ch);
+        const std::size_t per_block = spb ? spb : 1 + (std::size_t(block_align) - hdr) * 2 / std::size_t(ch);
+        const std::size_t blocks = data_len / block_align;
+        out.samples.reserve(blocks * per_block * std::size_t(ch));
+        std::vector<int> pred(static_cast<std::size_t>(ch)), index(static_cast<std::size_t>(ch));
+        std::vector<std::vector<std::int16_t>> chan(static_cast<std::size_t>(ch));
+        for (std::size_t b = 0; b < blocks; ++b) {
+            const std::size_t base = data_at + b * block_align;
+            for (int c = 0; c < ch; ++c) {
+                pred[std::size_t(c)] = std::int16_t(le16(base + std::size_t(4 * c)));
+                int ix = d[base + std::size_t(4 * c) + 2];
+                index[std::size_t(c)] = ix > 88 ? 88 : ix;
+                chan[std::size_t(c)].assign(1, std::int16_t(pred[std::size_t(c)]));
+            }
+            const std::size_t nibbles = (per_block - 1) * std::size_t(ch);
+            for (std::size_t k = 0; k < nibbles; ++k) {
+                const std::size_t byte = base + hdr + (k >> 1);
+                if (byte >= base + block_align) break;
+                const int code = (k & 1) ? (d[byte] >> 4) & 0x0F : d[byte] & 0x0F;
+                const std::size_t c = ch == 1 ? 0 : (k / 8) % std::size_t(ch);
+                const int step = kImaStep[index[c]];
+                int diff = step >> 3;
+                if (code & 4) diff += step;
+                if (code & 2) diff += step >> 1;
+                if (code & 1) diff += step >> 2;
+                int v = (code & 8) ? pred[c] - diff : pred[c] + diff;
+                v = v < -32768 ? -32768 : (v > 32767 ? 32767 : v);
+                pred[c] = v;
+                int ni = index[c] + kImaIndex[code];
+                index[c] = ni < 0 ? 0 : (ni > 88 ? 88 : ni);
+                chan[c].push_back(std::int16_t(v));
+            }
+            std::size_t frames = chan[0].size();
+            for (const auto& cv : chan) frames = cv.size() < frames ? cv.size() : frames;
+            for (std::size_t f = 0; f < frames; ++f)
+                for (int c = 0; c < ch; ++c) out.samples.push_back(chan[std::size_t(c)][f]);
+        }
+        if (have_fact && std::size_t(fact) * std::size_t(ch) < out.samples.size())
+            out.samples.resize(std::size_t(fact) * std::size_t(ch));
+        return true;
+    }
+    out = WavData{};
+    return false;
 }
 
 }

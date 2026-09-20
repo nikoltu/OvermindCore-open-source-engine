@@ -53,15 +53,25 @@ public:
         qci.queueFamilyIndex = d.gfx_family_;
         qci.queueCount = 1;
         qci.pQueuePriorities = &prio;
+        VkPhysicalDeviceFeatures have{};
+        vkGetPhysicalDeviceFeatures(d.pd_, &have);
+        VkPhysicalDeviceFeatures want{};
+        want.samplerAnisotropy = have.samplerAnisotropy;
         VkDeviceCreateInfo dci{};
         dci.sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO;
         dci.queueCreateInfoCount = 1;
         dci.pQueueCreateInfos = &qci;
+        dci.pEnabledFeatures = &want;
         VkDevice dev = VK_NULL_HANDLE;
         check(vkCreateDevice(d.pd_, &dci, nullptr, &dev), "vkCreateDevice");
         d.device_ = Unique<VkDevice>(dev, [](VkDevice x) { vkDestroyDevice(x, nullptr); });
         vkGetDeviceQueue(dev, d.gfx_family_, 0, &d.gfx_queue_);
         return d;
+    }
+
+    static Device& shared_headless(const char* app_name) {
+        static Device* g = new Device(create_headless(app_name));
+        return *g;
     }
 
     VkInstance instance() const { return instance_.get(); }

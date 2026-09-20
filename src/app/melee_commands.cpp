@@ -15,8 +15,10 @@ ActionCheck MeleeCommands::can_train(const sim::World& w, uint32_t producer,
     const sim::Player& p = w.player(pl);
     c.minerals_ok = p.minerals >= mineral_cost;
     c.gas_ok = p.gas >= gas_cost;
-    c.supply_ok = (w.supply_used(pl) + proto.supply_uses) <= w.supply_max(pl);
-    c.pending_ok = int(w.pending_count()) < pending_cap;
+    c.supply_ok = w.supply_room(pl, proto.supply_uses);
+    const int depth = w.queue_depth(producer) > 0 && w.units()[producer].queue_size > 0 ? w.queue_depth(producer)
+                                                                                         : pending_cap;
+    c.pending_ok = int(w.queue_count(producer)) < depth;
     return c;
 }
 
@@ -38,7 +40,7 @@ ActionCheck MeleeCommands::can_build(const sim::World& w, int player,
     const sim::Player& p = w.player(player);
     c.minerals_ok = p.minerals >= mineral_cost;
     c.gas_ok = p.gas >= gas_cost;
-    c.supply_ok = (w.supply_used(player) + proto.supply_uses) <= w.supply_max(player);
+    c.supply_ok = w.supply_room(player, proto.supply_uses);
     return c;
 }
 

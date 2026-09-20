@@ -73,16 +73,29 @@ struct Image {
     Unique<VkImage> img;
     Unique<VkDeviceMemory> mem;
     Unique<VkImageView> view;
+    Image() = default;
+    Image(Image&&) noexcept = default;
+    Image& operator=(Image&& o) noexcept {
+        if (this != &o) {
+            view.reset();
+            img.reset();
+            mem.reset();
+            img = std::move(o.img);
+            mem = std::move(o.mem);
+            view = std::move(o.view);
+        }
+        return *this;
+    }
 };
 
 inline Image make_image(VkPhysicalDevice pd, VkDevice dev, VkFormat fmt, VkImageUsageFlags usage,
-                        VkImageAspectFlags aspect, uint32_t w, uint32_t h) {
+                        VkImageAspectFlags aspect, uint32_t w, uint32_t h, uint32_t mips = 1) {
     VkImageCreateInfo ii{};
     ii.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
     ii.imageType = VK_IMAGE_TYPE_2D;
     ii.format = fmt;
     ii.extent = {w, h, 1};
-    ii.mipLevels = 1;
+    ii.mipLevels = mips;
     ii.arrayLayers = 1;
     ii.samples = VK_SAMPLE_COUNT_1_BIT;
     ii.tiling = VK_IMAGE_TILING_OPTIMAL;
@@ -107,7 +120,7 @@ inline Image make_image(VkPhysicalDevice pd, VkDevice dev, VkFormat fmt, VkImage
     vi.image = raw;
     vi.viewType = VK_IMAGE_VIEW_TYPE_2D;
     vi.format = fmt;
-    vi.subresourceRange = {aspect, 0, 1, 0, 1};
+    vi.subresourceRange = {aspect, 0, mips, 0, 1};
     VkImageView rawview = VK_NULL_HANDLE;
     check(vkCreateImageView(dev, &vi, nullptr, &rawview), "vkCreateImageView");
     out.view = Unique<VkImageView>(rawview, [dev](VkImageView v) { vkDestroyImageView(dev, v, nullptr); });

@@ -20,6 +20,7 @@ struct HudMessage {
     int count = 1;
     bool has_target = false;
     float tx = 0, ty = 0;
+    std::string icon;
 };
 
 class MessageLog {
@@ -36,7 +37,7 @@ public:
                 return;
             }
         }
-        msgs_.push_back({zone, text, ttl, 1, has_target, tx, ty});
+        msgs_.push_back({zone, text, ttl, 1, has_target, tx, ty, std::string()});
     }
 
     void advance(float dt) {
@@ -61,6 +62,7 @@ public:
     }
 
     const std::vector<HudMessage>& all() const { return msgs_; }
+    std::vector<HudMessage>& mutable_all() { return msgs_; }
     std::size_t size() const { return msgs_.size(); }
     void clear() { msgs_.clear(); }
 

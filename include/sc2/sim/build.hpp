@@ -34,7 +34,7 @@ inline bool footprint_clear_of_blockers(const World& world, const TerrainMap& te
 inline bool can_place_structure(const World& world, const TerrainMap& terrain, int cx0,
                                 int cy0, int fw, int fh, std::uint32_t builder = kNoTarget,
                                 bool requires_vespene = false) {
-    if (!terrain.can_place(cx0, cy0, fw, fh)) return false;
+    if (!terrain.can_place(cx0, cy0, fw, fh,  requires_vespene)) return false;
     bool found_gas = false;
     if (!footprint_clear_of_blockers(world, terrain, cx0, cy0, fw, fh, builder, requires_vespene,
                                      &found_gas))

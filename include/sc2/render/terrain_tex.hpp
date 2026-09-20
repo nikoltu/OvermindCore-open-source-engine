@@ -28,6 +28,9 @@ struct ResolvedLayer {
     std::string normal;
 };
 
+bool decode_layer_rgba(const casc::Storage& store, const std::string& diffuse_rel, uint32_t& w,
+                       uint32_t& h, std::vector<uint8_t>& out);
+
 std::vector<ResolvedLayer> resolve_map_layers(const casc::Storage& store,
                                               const std::vector<std::string>& layer_names);
 

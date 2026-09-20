@@ -9,9 +9,10 @@ struct MatchResult {
         Ongoing,
         Victory,
         Defeat,
+        Draw,
     };
 
-    static Outcome evaluate(const sim::World& w, int human_player);
+    static Outcome evaluate(const sim::World& w, int human_player, int stalemate_ticks = 0);
 
     static const char* banner(Outcome o);
 };

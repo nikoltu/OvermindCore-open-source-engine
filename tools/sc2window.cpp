@@ -10,6 +10,7 @@
 #include "sc2/render/scene.hpp"
 #include "sc2/render/window.hpp"
 #include "sc2/sim/world.hpp"
+#include "tool_prelude.hpp"
 
 using namespace sc2;
 using sim::Fixed;
@@ -67,7 +68,7 @@ int main(int argc, char** argv) {
 
     try {
         casc::Storage store;
-        store.open(data);
+        sc2::tools::open_store(store, data);
 
         formats::Model marine, zergling;
         bool have_m = load_first(store, {

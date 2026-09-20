@@ -43,6 +43,7 @@ void apply_timed_order(sim::World& w, const TimedOrder& t) {
             w.clear_rally(t.unit_id);
             return;
         case sim::CommandKind::Research:
+            w.begin_research(c.player, c.research_id, c.build_time);
             return;
     }
 }
@@ -52,7 +53,7 @@ ReplayTrace replay(const OrderLog& log) {
     for (const sim::Unit& u : log.initial_units) w.add_unit(u);
 
     ReplayTrace trace;
-    trace.hashes.reserve(size_t(log.total_ticks));
+    if (log.total_ticks > 0) trace.hashes.reserve(size_t(log.total_ticks < (1 << 21) ? log.total_ticks : (1 << 21)));
 
     size_t oi = 0;
     for (int t = 0; t < log.total_ticks; ++t) {
@@ -209,6 +210,11 @@ void put_unit(std::vector<uint8_t>& o, const sim::Unit& u) {
         put_i32(o, f.first);
         put_i32(o, f.second);
     }
+    put_u32(o, uint32_t(u.creep_check_offsets.size()));
+    for (const std::pair<int16_t, int16_t>& c : u.creep_check_offsets) {
+        put_i32(o, c.first);
+        put_i32(o, c.second);
+    }
 }
 sim::Unit get_unit(Reader& r, uint32_t version) {
     sim::Unit u;
@@ -286,6 +292,14 @@ sim::Unit get_unit(Reader& r, uint32_t version) {
             u.footprint_offsets.push_back({int16_t(fx), int16_t(fy)});
         }
     }
+    if (version >= 5) {
+        uint32_t nc = r.u32();
+        for (uint32_t i = 0; i < nc && r.ok; ++i) {
+            const int32_t cx = r.i32();
+            const int32_t cy = r.i32();
+            u.creep_check_offsets.push_back({int16_t(cx), int16_t(cy)});
+        }
+    }
     return u;
 }
 
@@ -302,6 +316,7 @@ void put_command(std::vector<uint8_t>& o, const sim::Command& c) {
     put_i32(o, c.addon_kind);
     put_u8(o, uint8_t(c.verb));
     put_str(o, c.research_id);
+    put_i32(o, c.player);
 }
 sim::Command get_command(Reader& r, uint32_t version) {
     sim::Command c;
@@ -317,6 +332,7 @@ sim::Command get_command(Reader& r, uint32_t version) {
     c.addon_kind = r.i32();
     c.verb = sim::BuildVerb(r.u8());
     c.research_id = r.str();
+    if (version >= 4) c.player = r.i32();
     return c;
 }
 

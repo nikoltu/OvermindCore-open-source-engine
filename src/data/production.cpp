@@ -19,7 +19,8 @@ void Production::build(const Catalog& cat) {
 
         for (const Catalog::AbilInfoRow& r : cat.ability_info_rows(id)) {
             if (r.self_macro || r.unit.empty()) continue;
-            const ProductInfo pi{id,           r.index,      r.unit,        r.requirement,
+            const ProductInfo pi{id,           r.index,      r.unit,
+                                 cat.button_requirement(id, r.index),
                                  r.time,       r.unit_count, r.warp_charge, tag == "CAbilMorph"};
             edges_.push_back(pi);
             by_ability_[id].push_back(pi);

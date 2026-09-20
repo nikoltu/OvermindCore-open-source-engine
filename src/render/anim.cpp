@@ -1,5 +1,6 @@
 #include "sc2/render/anim.hpp"
 
+#include <algorithm>
 #include <cmath>
 #include <sstream>
 
@@ -63,7 +64,7 @@ bool sample(const formats::M3Track& tr, float t, uint16_t interp, int comps,
     float f = k1 > k0 ? (t - k0) / (k1 - k0) : 0.0f;
     const float* a = &tr.values[j * comps];
     const float* b = &tr.values[(j + 1) * comps];
-    if (comps == 4) {
+    if (comps == 4 && tr.slot == 3) {
         float dot = a[0] * b[0] + a[1] * b[1] + a[2] * b[2] + a[3] * b[3];
         float s = dot < 0 ? -1.0f : 1.0f;
         float len = 0;
@@ -135,6 +136,48 @@ std::vector<Mat4> pose_world(const formats::Model& m, uint32_t seq, float time_m
     return world;
 }
 
+bool posed_bounds(const formats::Model& m, int seq, float time_ms, float mn[3], float mx[3]) {
+    if (m.vertex_count == 0 || m.positions.size() < std::size_t(m.vertex_count) * 3) return false;
+    const std::vector<Mat4> pm = seq >= 0 ? pose(m, std::uint32_t(seq), time_ms) : std::vector<Mat4>{};
+    const bool skin = !pm.empty() && m.vertex_bone_weights.size() >= std::size_t(m.vertex_count) * 4 &&
+                      m.vertex_bone_indices.size() >= std::size_t(m.vertex_count) * 4;
+    std::vector<std::uint32_t> vregion(m.vertex_count, 0);
+    for (std::size_t ri = 0; ri < m.regions.size(); ++ri)
+        for (std::uint32_t x = m.regions[ri].first_vertex;
+             x < m.regions[ri].first_vertex + m.regions[ri].num_vertices && x < m.vertex_count; ++x)
+            vregion[x] = std::uint32_t(ri);
+    for (int c = 0; c < 3; ++c) { mn[c] = 1e30f; mx[c] = -1e30f; }
+    for (std::uint32_t v = 0; v < m.vertex_count; ++v) {
+        const float p[3] = {m.positions[v * 3], m.positions[v * 3 + 1], m.positions[v * 3 + 2]};
+        float o[3] = {p[0], p[1], p[2]};
+        if (skin) {
+            o[0] = o[1] = o[2] = 0.0f;
+            float wsum = 0.0f;
+            const std::uint32_t base = m.regions.empty() ? 0 : m.regions[vregion[v]].first_bone_lookup;
+            for (int k = 0; k < 4; ++k) {
+                const float w = m.vertex_bone_weights[v * 4 + k] / 255.0f;
+                if (w <= 0.0f) continue;
+                const std::uint32_t look = base + m.vertex_bone_indices[v * 4 + k];
+                std::uint32_t bone = look < m.bone_lookup.size() ? m.bone_lookup[look] : 0;
+                if (bone >= pm.size()) bone = 0;
+                const float* a = pm[bone].m.data();
+                for (int c = 0; c < 3; ++c)
+                    o[c] += w * (a[c] * p[0] + a[4 + c] * p[1] + a[8 + c] * p[2] + a[12 + c]);
+                wsum += w;
+            }
+            if (wsum > 0.0f)
+                for (int c = 0; c < 3; ++c) o[c] /= wsum;
+            else
+                for (int c = 0; c < 3; ++c) o[c] = p[c];
+        }
+        for (int c = 0; c < 3; ++c) {
+            mn[c] = std::min(mn[c], o[c]);
+            mx[c] = std::max(mx[c], o[c]);
+        }
+    }
+    return true;
+}
+
 std::vector<Mat4> pose(const formats::Model& m, uint32_t seq, float time_ms) {
     std::vector<Mat4> world = pose_world(m, seq, time_ms);
     size_t n = world.size();
@@ -202,6 +245,27 @@ bool attachment_transform(const formats::Model& m, const std::string& name, uint
     if (bone >= world.size()) return false;
     out = world[bone];
     return true;
+}
+
+void animated_layer_field(const formats::Model& model, uint32_t seq, uint16_t interp, uint16_t flags, uint32_t anim_id,
+                          float time_ms, int comps, const float* fallback, float* out) {
+    for (int c = 0; c < comps; ++c) out[c] = fallback[c];
+    if (flags == 0) return;
+    const formats::M3Track* tr = find_track(model, seq, anim_id);
+    if (!tr) return;
+    float v[4] = {0, 0, 0, 0};
+    if (!sample(*tr, time_ms, interp, comps, v)) return;
+    for (int c = 0; c < comps; ++c) out[c] = v[c];
+}
+
+float animated_scalar(const formats::Model& model, uint32_t seq, const formats::M3AnimRef& ref,
+                      float time_ms, float fallback) {
+    if (ref.anim_flags == 0) return fallback;
+    const formats::M3Track* tr = find_track(model, seq, ref.anim_id);
+    if (!tr) return fallback;
+    float v = 0.0f;
+    if (!sample(*tr, time_ms, ref.interp, 1, &v)) return fallback;
+    return v;
 }
 
 }

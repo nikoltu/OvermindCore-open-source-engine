@@ -32,7 +32,12 @@ void decode_chunk(const uint8_t* body_with_mode, size_t comp_size,
             break;
         }
         case 'F': {
-            auto d = blte_decode(body, body_len);
+            static thread_local int blte_depth = 0;
+            if (blte_depth >= 16) throw std::runtime_error("blte: nested deeper than 16");
+            ++blte_depth;
+            std::vector<uint8_t> d;
+            try { d = blte_decode(body, body_len); } catch (...) { --blte_depth; throw; }
+            --blte_depth;
             out.insert(out.end(), d.begin(), d.end());
             break;
         }

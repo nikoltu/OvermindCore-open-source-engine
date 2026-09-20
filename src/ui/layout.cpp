@@ -233,10 +233,28 @@ Frame instantiate_impl(const LayoutSet& set, const Frame& f,
 }
 }
 
+namespace {
+void expand_numeric_constants(const LayoutSet& set, Frame& f) {
+    for (XmlNode& p : f.props) {
+        const char* key = nullptr;
+        if (p.name == "Anchor") key = "offset";
+        else if (p.name == "Width" || p.name == "Height") key = "val";
+        if (!key) continue;
+        for (auto& kv : p.attrs) {
+            if (kv.first != key || kv.second.size() < 2 || kv.second[0] != '#') continue;
+            kv.second = set.resolve(kv.second);
+        }
+    }
+    for (Frame& c : f.children) expand_numeric_constants(set, c);
+}
+}
+
 Frame LayoutSet::instantiate(const Frame& f) const {
     std::unordered_set<std::string> active;
     int budget = kInstantiateBudget;
-    return instantiate_impl(*this, f, active, budget);
+    Frame out = instantiate_impl(*this, f, active, budget);
+    expand_numeric_constants(*this, out);
+    return out;
 }
 
 namespace {
@@ -251,6 +269,12 @@ float anchor_base(const Rect& p, bool horizontal, const std::string& pos) {
 float attr_f(const XmlNode& n, const char* key, float dflt) {
     if (const std::string* v = n.attr(key)) return float(std::atof(v->c_str()));
     return dflt;
+}
+
+std::string normalise_rel(std::string rel) {
+    for (char& c : rel)
+        if (c == '\\') c = '/';
+    return rel;
 }
 
 std::string sibling_ref_name(const std::string& rel) {
@@ -387,10 +411,21 @@ Rect solve_one(const Frame& f, const Rect& parent,
         else if (p.name == "Height") { H = attr_f(p, "val", 0); haveH = H > 0; }
         else if (p.name == "Anchor") {
             std::string side = p.attr_or("side", "");
-            if (side.empty()) continue;
+            if (side.empty()) {
+                const std::string rel = normalise_rel(p.attr_or("relative", ""));
+                if (rel.empty() || rel == "$parent" || rel == "$this") continue;
+                const float off = attr_f(p, "offset", 0);
+                const Rect base = anchor_target(rel, parent, siblings, ancestors, f, ancestorsF, g);
+                L = base.x + off;
+                R = base.x + base.w - off;
+                T = base.y + off;
+                B = base.y + base.h - off;
+                haveL = haveR = haveT = haveB = true;
+                continue;
+            }
             std::string pos = p.attr_or("pos", "Min");
             float off = attr_f(p, "offset", 0);
-            Rect base = anchor_target(p.attr_or("relative", ""), parent, siblings, ancestors, f,
+            Rect base = anchor_target(normalise_rel(p.attr_or("relative", "")), parent, siblings, ancestors, f,
                                       ancestorsF, g);
             bool horiz = (side == "Left" || side == "Right");
             float c = anchor_base(base, horiz, pos) + off;
@@ -408,14 +443,16 @@ Rect solve_one(const Frame& f, const Rect& parent,
         }
     }
     Rect r;
-    if (haveL && haveR) { r.x = L; r.w = R - L; }
+    if (haveL && haveR && haveW && R - L < 1.0f) { r.x = 0.5f * (L + R) - 0.5f * W; r.w = W; }
+    else if (haveL && haveR) { r.x = L; r.w = R - L; }
     else if (haveL && haveW) { r.x = L; r.w = W; }
     else if (haveR && haveW) { r.x = R - W; r.w = W; }
     else if (haveW) { r.x = parent.x + (parent.w - W) * 0.5f; r.w = W; }
     else if (haveL) { r.x = L; r.w = parent.x + parent.w - L; }
     else if (haveR) { r.x = parent.x; r.w = R - parent.x; }
     else { r.x = parent.x; r.w = parent.w; }
-    if (haveT && haveB) { r.y = T; r.h = B - T; }
+    if (haveT && haveB && haveH && B - T < 1.0f) { r.y = 0.5f * (T + B) - 0.5f * H; r.h = H; }
+    else if (haveT && haveB) { r.y = T; r.h = B - T; }
     else if (haveT && haveH) { r.y = T; r.h = H; }
     else if (haveB && haveH) { r.y = B - H; r.h = H; }
     else if (haveH) { r.y = parent.y + (parent.h - H) * 0.5f; r.h = H; }
@@ -469,6 +506,11 @@ std::string visible_ref(const Frame& f) {
     return "";
 }
 
+std::string accepts_mouse_ref(const Frame& f) {
+    if (const XmlNode* v = f.prop("AcceptsMouse")) return v->attr_or("val", "");
+    return "";
+}
+
 std::vector<std::size_t> sibling_solve_order(const std::vector<Frame>& children) {
     const std::size_t n = children.size();
     std::unordered_map<std::string, std::size_t> name_to_index;
@@ -479,7 +521,7 @@ std::vector<std::size_t> sibling_solve_order(const std::vector<Frame>& children)
     for (std::size_t i = 0; i < n; ++i)
         for (const XmlNode& p : children[i].props) {
             if (p.name != "Anchor") continue;
-            const std::string rel = p.attr_or("relative", "");
+            const std::string rel = normalise_rel(p.attr_or("relative", ""));
             if (ancestor_depth(rel)) continue;
             const std::string nm = sibling_ref_name(rel);
             if (nm.empty()) continue;
@@ -510,8 +552,9 @@ void emit_tree(const Frame& f, const Rect& rect, int depth, std::vector<SolvedFr
                std::vector<const Rect*>& chain, std::vector<const Frame*>& chainF,
                const GlobalResolve* g) {
     if (g && g->cur) (*g->cur)[&f] = rect;
-    out.push_back({rect, f.type, f.name, display_text(f, g ? g->text : nullptr), depth,
-                   texture_ref(f), visible_ref(f)});
+    out.push_back({rect, f.type, f.name, display_text(f, g ? g->text : nullptr),
+                   chainF.empty() ? std::string() : chainF.back()->name, depth, texture_ref(f),
+                   visible_ref(f), accepts_mouse_ref(f)});
     const std::size_t n = f.children.size();
     if (n == 0) return;
     chain.push_back(&rect);
@@ -577,10 +620,112 @@ FrameT* walk_state_path(FrameT& owner, const std::string& path) {
     return cur;
 }
 
-enum class Tri { False, True, Unknown };
+using Tri = WhenAnswer;
+}
 
-Tri evaluate_when(const Frame& owner, const XmlNode& when, float aspect) {
+std::string selected_state_at(const Frame& owner, const FrameStateGroup& group, float aspect,
+                              const std::vector<const Frame*>& ancestors, int depth);
+
+namespace {
+
+const Frame* resolve_state_target(const Frame& owner, const std::string& path,
+                                  const std::vector<const Frame*>& ancestors,
+                                  std::vector<const Frame*>& target_ancestors) {
+    target_ancestors = ancestors;
+    if (path.empty() || path == "$this") return &owner;
+    const std::vector<std::string> segs = split_path(path);
+    if (segs.empty()) return &owner;
+    const Frame* cur = &owner;
+    std::size_t first = 0;
+    const std::string& head = segs[0];
+    if (!head.empty() && head[0] == '$' && head != "$this") {
+        std::size_t idx = ancestors.size();
+        if (head == "$parent") {
+            if (ancestors.empty()) return nullptr;
+            idx = ancestors.size() - 1;
+            first = 1;
+            while (first < segs.size() && segs[first] == "$parent") {
+                if (idx == 0) return nullptr;
+                --idx;
+                ++first;
+            }
+        } else if (head.compare(0, 10, "$ancestor[") == 0) {
+            const std::size_t eq = head.find("@type=");
+            if (eq == std::string::npos) return nullptr;
+            const std::string want = head.substr(eq + 6, head.size() - (eq + 6) - (head.back() == ']' ? 1 : 0));
+            bool found = false;
+            for (std::size_t i = ancestors.size(); i-- > 0;)
+                if (ancestors[i]->type == want) { idx = i; found = true; break; }
+            if (!found) return nullptr;
+            first = 1;
+        } else {
+            const std::string want = head.substr(1);
+            bool found = false;
+            if (owner.name == want) { found = true; idx = ancestors.size(); }
+            if (!found)
+                for (std::size_t i = ancestors.size(); i-- > 0;)
+                    if (ancestors[i]->name == want) { idx = i; found = true; break; }
+            if (!found) return nullptr;
+            first = 1;
+        }
+        if (idx < ancestors.size()) {
+            cur = ancestors[idx];
+            target_ancestors.assign(ancestors.begin(), ancestors.begin() + std::ptrdiff_t(idx));
+        }
+    }
+    for (std::size_t i = first; i < segs.size(); ++i) {
+        const std::string& seg = segs[i];
+        if (seg == "$this") continue;
+        if (!seg.empty() && seg[0] == '$') return nullptr;
+        const Frame* next = nullptr;
+        for (const Frame& c : cur->children)
+            if (c.name == seg) { next = &c; break; }
+        if (!next) return nullptr;
+        target_ancestors.push_back(cur);
+        cur = next;
+    }
+    return cur;
+}
+
+Tri evaluate_when_at(const Frame& owner, const XmlNode& when, float aspect,
+                     const std::vector<const Frame*>& ancestors, int depth) {
     const std::string type = when.attr_or("type", "");
+    if (type == "StateGroup") {
+        if (depth > 6) return Tri::Unknown;
+        std::string group, state;
+        for (const auto& [k, v] : when.attrs) {
+            if (k == "type" || k == "frame") continue;
+            if (!group.empty()) return Tri::Unknown;
+            group = k;
+            state = v;
+        }
+        if (group.empty()) return Tri::Unknown;
+        std::vector<const Frame*> target_chain;
+        const Frame* target = resolve_state_target(owner, when.attr_or("frame", ""), ancestors, target_chain);
+        if (!target) return Tri::Unknown;
+        for (const FrameStateGroup& g : frame_state_groups(*target)) {
+            if (g.name != group) continue;
+            std::string active;
+            bool unknown_seen = false;
+            for (const FrameState& st : g.states) {
+                if (st.whens.empty()) continue;
+                bool all_true = true, any_unknown = false;
+                for (const XmlNode& w : st.whens) {
+                    const Tri a = evaluate_when_at(*target, w, aspect, target_chain, depth + 1);
+                    if (a == Tri::False) { all_true = false; any_unknown = false; break; }
+                    if (a == Tri::Unknown) { all_true = false; any_unknown = true; }
+                }
+                if (all_true) { active = st.name; break; }
+                if (any_unknown) unknown_seen = true;
+            }
+            if (active.empty()) {
+                if (unknown_seen) return Tri::Unknown;
+                active = g.default_state;
+            }
+            return active == state ? Tri::True : Tri::False;
+        }
+        return Tri::Unknown;
+    }
     if (type != "Property") return Tri::Unknown;
     const std::string* want = when.attr("Visible");
     if (!want) return Tri::Unknown;
@@ -686,21 +831,37 @@ bool frame_visible_at_aspect(const Frame& f, float aspect) {
     return !xml_false(val);
 }
 
-std::string selected_state(const Frame& owner, const FrameStateGroup& group, float aspect) {
+std::string selected_state_at(const Frame& owner, const FrameStateGroup& group, float aspect,
+                              const std::vector<const Frame*>& ancestors, int depth) {
     for (const FrameState& s : group.states) {
         if (s.whens.empty()) continue;
         bool all_true = true;
         for (const XmlNode& w : s.whens)
-            if (evaluate_when(owner, w, aspect) != Tri::True) { all_true = false; break; }
+            if (evaluate_when_at(owner, w, aspect, ancestors, depth) != Tri::True) { all_true = false; break; }
         if (all_true) return s.name;
     }
     return group.default_state;
 }
 
-void apply_state_groups(Frame& root, float aspect) {
+std::string selected_state(const Frame& owner, const FrameStateGroup& group, float aspect) {
+    return selected_state_at(owner, group, aspect, {}, 0);
+}
+
+std::string selected_state(const Frame& owner, const FrameStateGroup& group, float aspect,
+                           const std::vector<const Frame*>& ancestors) {
+    return selected_state_at(owner, group, aspect, ancestors, 0);
+}
+
+WhenAnswer evaluate_when(const Frame& owner, const core::XmlNode& when, float aspect,
+                         const std::vector<const Frame*>& ancestors) {
+    return evaluate_when_at(owner, when, aspect, ancestors, 0);
+}
+
+namespace {
+void apply_state_groups_at(Frame& root, float aspect, std::vector<const Frame*>& chain) {
     const std::vector<FrameStateGroup> groups = frame_state_groups(root);
     for (const FrameStateGroup& g : groups) {
-        const std::string active = selected_state(root, g, aspect);
+        const std::string active = selected_state_at(root, g, aspect, chain, 0);
         if (active.empty()) continue;
         for (const FrameState& s : g.states) {
             if (s.name != active) continue;
@@ -708,7 +869,15 @@ void apply_state_groups(Frame& root, float aspect) {
             break;
         }
     }
-    for (Frame& c : root.children) apply_state_groups(c, aspect);
+    chain.push_back(&root);
+    for (Frame& c : root.children) apply_state_groups_at(c, aspect, chain);
+    chain.pop_back();
+}
+}
+
+void apply_state_groups(Frame& root, float aspect) {
+    std::vector<const Frame*> chain;
+    apply_state_groups_at(root, aspect, chain);
 }
 
 int measure_text(const std::string& text, int scale) {
@@ -728,8 +897,35 @@ std::vector<SolvedFrame> solve_layout(const Frame& root, const Rect& canvas,
 std::vector<SolvedFrame> solve_layout(const Frame& root, const Rect& canvas,
                                       const TextResolver& resolve_text,
                                       const FrameCollapsed& collapsed) {
+    return solve_layout(root, canvas, resolve_text, collapsed, DataResolver{});
+}
+
+static void bind_data_properties(Frame& f, const DataResolver& data) {
+    for (core::XmlNode& p : f.props) {
+        if (p.name != "Visible" && p.name != "Text") continue;
+        for (auto& kv : p.attrs) {
+            if (kv.first != "val") continue;
+            const std::string& v = kv.second;
+            if (v.size() < 6 || v[0] != '{' || v[1] != '$' || v.back() != '}') continue;
+            const std::size_t at = v.find("/@");
+            if (at == std::string::npos) continue;
+            const std::string target = v.substr(2, at - 2);
+            const std::string property = v.substr(at + 2, v.size() - at - 3);
+            if (target.empty() || property.empty()) continue;
+            const std::string answer = data(target, property);
+            if (!answer.empty()) kv.second = answer;
+        }
+    }
+    for (Frame& c : f.children) bind_data_properties(c, data);
+}
+
+std::vector<SolvedFrame> solve_layout(const Frame& root, const Rect& canvas,
+                                      const TextResolver& resolve_text,
+                                      const FrameCollapsed& collapsed,
+                                      const DataResolver& data) {
     Frame tree = root;
     apply_state_groups(tree, canvas.h > 0.0f ? canvas.w / canvas.h : 0.0f);
+    if (data) bind_data_properties(tree, data);
     propagate_label_text(tree);
     constexpr int kMaxPasses = 64;
     std::unordered_map<const Frame*, Rect> prev;
@@ -810,8 +1006,10 @@ std::vector<uint8_t> rasterize_impl(const std::vector<SolvedFrame>& frames,
         if (!drew_texture) {
             uint8_t r, g, b;
             tint(f.type, r, g, b);
-            for (int y = y0; y < y1; ++y)
-                for (int x = x0; x < x1; ++x) blend(x, y, r, g, b, 0.18f);
+            const int fy0 = y0 < 0 ? 0 : y0, fy1 = y1 > int(h) ? int(h) : y1;
+            const int fx0 = x0 < 0 ? 0 : x0, fx1 = x1 > int(w) ? int(w) : x1;
+            for (int y = fy0; y < fy1; ++y)
+                for (int x = fx0; x < fx1; ++x) blend(x, y, r, g, b, 0.18f);
             for (int x = x0; x < x1; ++x) { blend(x, y0, r, g, b, 0.9f); blend(x, y1 - 1, r, g, b, 0.9f); }
             for (int y = y0; y < y1; ++y) { blend(x0, y, r, g, b, 0.9f); blend(x1 - 1, y, r, g, b, 0.9f); }
         }
@@ -852,6 +1050,145 @@ std::vector<uint8_t> rasterize_layout(const std::vector<SolvedFrame>& frames,
                                       uint32_t w, uint32_t h,
                                       const TextureFetcher& fetch) {
     return rasterize_impl(frames, w, h, &fetch);
+}
+
+std::string StyleSet::expand(std::string v) const {
+    for (int hops = 0; hops < 16 && !v.empty() && v[0] == '#'; ++hops) {
+        auto it = consts_.find(v.substr(1));
+        if (it == consts_.end()) break;
+        if (it->second == v) break;
+        v = it->second;
+    }
+    return v;
+}
+
+void StyleSet::ingest(const std::string& xml) {
+    core::XmlNode root;
+    try {
+        root = core::xml_parse(xml);
+    } catch (const std::exception&) {
+        return;
+    }
+    std::vector<const core::XmlNode*> flat;
+    for (const core::XmlNode& c : root.children) {
+        flat.push_back(&c);
+        for (const core::XmlNode& g : c.children) flat.push_back(&g);
+    }
+    for (const core::XmlNode* e : flat) {
+        if (e->name == "Constant") {
+            const std::string* n = e->attr("name");
+            const std::string* v = e->attr("val");
+            if (n && v) consts_[*n] = *v;
+        } else if (e->name == "FontGroup") {
+            const std::string* n = e->attr("name");
+            if (!n) continue;
+            std::string file;
+            for (const core::XmlNode& cr : e->children) {
+                if (cr.name != "CodepointRange") continue;
+                const std::string* f = cr.attr("font");
+                if (!f || f->empty()) continue;
+                std::string cand = expand(*f);
+                if (!cand.empty() && cand[0] != '#') file = cand;
+            }
+            if (!file.empty()) {
+                for (char& c : file)
+                    if (c == '\\') c = '/';
+                font_groups_[*n] = file;
+            }
+        } else if (e->name == "Style") {
+            const std::string* n = e->attr("name");
+            if (!n) continue;
+            Raw raw;
+            for (const auto& kv : e->attrs) raw.attrs.push_back(kv);
+            styles_[*n] = std::move(raw);
+        }
+    }
+}
+
+FontStyle StyleSet::resolve(const std::string& name) const {
+    FontStyle out;
+    out.name = name;
+    std::vector<std::pair<std::string, std::string>> merged;
+    std::string cur = name;
+    for (int depth = 0; depth < 16 && !cur.empty(); ++depth) {
+        auto it = styles_.find(cur);
+        if (it == styles_.end()) break;
+        std::string next;
+        for (const auto& kv : it->second.attrs) {
+            if (kv.first == "template") { next = kv.second; continue; }
+            bool have = false;
+            for (const auto& m : merged)
+                if (m.first == kv.first) { have = true; break; }
+            if (!have) merged.push_back(kv);
+        }
+        cur = next;
+    }
+    if (merged.empty()) return out;
+    auto get = [&](const char* k) -> std::string {
+        for (const auto& m : merged)
+            if (m.first == k) return expand(m.second);
+        return std::string();
+    };
+    const std::string h = get("height");
+    if (!h.empty()) {
+        try {
+            out.height = std::stoi(h);
+        } catch (...) {
+            out.height = 0;
+        }
+    }
+    const std::string so = get("shadowoffset");
+    if (!so.empty()) {
+        try {
+            out.shadow_offset = std::stoi(so);
+        } catch (...) {
+        }
+    }
+    const std::string flags = get("styleflags");
+    out.shadow = flags.find("Shadow") != std::string::npos;
+    out.vjustify = get("vjustify");
+    out.hjustify = get("hjustify");
+    {
+        const std::string tc = get("textcolor");
+        unsigned comp[4] = {255, 255, 255, 255};
+        bool okc = false;
+        if (!tc.empty() && tc[0] != '#') {
+            if (tc.find(',') != std::string::npos) {
+                std::vector<unsigned> vals;
+                std::string cur;
+                for (char c : tc + ",") {
+                    if (c == ',') {
+                        try { vals.push_back(unsigned(std::stoul(cur)) & 255u); } catch (...) { vals.clear(); break; }
+                        cur.clear();
+                    } else if (c != ' ') cur += c;
+                }
+                if (vals.size() == 3) { comp[0] = 255; comp[1] = vals[0]; comp[2] = vals[1]; comp[3] = vals[2]; okc = true; }
+                else if (vals.size() == 4) { comp[0] = vals[0]; comp[1] = vals[1]; comp[2] = vals[2]; comp[3] = vals[3]; okc = true; }
+            } else if (tc.size() == 6 || tc.size() == 8) {
+                bool hex = true;
+                for (char c : tc) hex = hex && std::isxdigit(static_cast<unsigned char>(c));
+                if (hex) {
+                    const unsigned long v = std::stoul(tc, nullptr, 16);
+                    if (tc.size() == 8) comp[0] = unsigned((v >> 24) & 255u);
+                    comp[1] = unsigned((v >> 16) & 255u); comp[2] = unsigned((v >> 8) & 255u); comp[3] = unsigned(v & 255u);
+                    okc = true;
+                }
+            }
+        }
+        if (okc) {
+            out.has_color = true;
+            out.a = std::uint8_t(comp[0]); out.r = std::uint8_t(comp[1]); out.g = std::uint8_t(comp[2]); out.b = std::uint8_t(comp[3]);
+        }
+    }
+    std::string f = get("font");
+    if (!f.empty()) {
+        auto g = font_groups_.find(f);
+        if (g != font_groups_.end()) f = g->second;
+        for (char& c : f)
+            if (c == '\\') c = '/';
+        if (!f.empty() && f[0] != '#') out.font = f;
+    }
+    return out;
 }
 
 }

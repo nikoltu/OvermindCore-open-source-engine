@@ -1,15 +1,24 @@
 #include "sc2/app/console_panel.hpp"
 
+#include "sc2/data/catalog.hpp"
 #include "sc2/formats/dds.hpp"
+#include "sc2/formats/m3.hpp"
+
+#include <algorithm>
+#include <vector>
 
 namespace sc2::app {
 
-ConsoleTexture load_console(casc::Storage& store, int race) {
+static const char* const kRoots[] = {
+    "mods/liberty.sc2mod/base.sc2assets/", "mods/core.sc2mod/base.sc2assets/",
+    "mods/swarm.sc2mod/base.sc2assets/", "mods/void.sc2mod/base.sc2assets/",
+    "mods/voidmulti.sc2mod/base.sc2assets/", "", nullptr};
+
+const char* const* console_asset_roots() { return kRoots; }
+
+ConsoleTexture load_console(casc::Storage& store, int race, const data::Catalog* cat) {
     ConsoleTexture tex;
-    static const char* kRoots[] = {
-        "mods/liberty.sc2mod/base.sc2assets/", "mods/core.sc2mod/base.sc2assets/",
-        "mods/swarm.sc2mod/base.sc2assets/", "mods/void.sc2mod/base.sc2assets/",
-        "mods/voidmulti.sc2mod/base.sc2assets/", ""};
+
     static const char* kTerran[] = {
         "sc2_ui_collection_huds_large_consoleskinterrandefault",
         "sc2_ui_collection_huds_large_consoleterran_classic", nullptr};
@@ -18,8 +27,29 @@ ConsoleTexture load_console(casc::Storage& store, int race) {
     static const char* kZerg[] = {
         "sc2_ui_collection_huds_large_consoleskinzergdefault", nullptr};
     const char* const* names = race == 1 ? kProtoss : race == 2 ? kZerg : kTerran;
+    if (cat) {
+        const char* skin = console_skin_id_for_race(race);
+        if (auto authored = cat->console_skin_featured_image(skin)) {
+            for (const char* const* rp = kRoots; *rp; ++rp) {
+            const char* r = *rp;
+                try {
+                    std::vector<std::uint8_t> bytes = store.read_by_name(std::string(r) + *authored);
+                    formats::DdsInfo info;
+                    std::vector<std::uint8_t> rgba = formats::dds_decode_rgba(bytes, info);
+                    if (info.width && info.height &&
+                        rgba.size() == std::size_t(info.width) * info.height * 4) {
+                        tex.w = info.width;
+                        tex.h = info.height;
+                        tex.rgba = std::move(rgba);
+                        return tex;
+                    }
+                } catch (...) {   }
+            }
+        }
+    }
     for (const char* const* n = names; *n; ++n) {
-        for (const char* r : kRoots) {
+        for (const char* const* rp = kRoots; *rp; ++rp) {
+            const char* r = *rp;
             const std::string path = std::string(r) + "Assets/Textures/" + *n + ".dds";
             try {
                 std::vector<std::uint8_t> bytes = store.read_by_name(path);
@@ -75,6 +105,11 @@ void composite_console(std::vector<std::uint8_t>& img, std::uint32_t view_w,
             img[di + 3] = std::uint8_t(oa * 255.0f + 0.5f);
         }
     }
+}
+
+const char* console_skin_id_for_race(int race) {
+    return race == 1 ? "ConsoleProtoss_Default" : race == 2 ? "ConsoleZerg_Default"
+                                                            : "ConsoleTerran_Default";
 }
 
 }

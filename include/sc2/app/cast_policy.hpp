@@ -117,7 +117,8 @@ public:
             for (const Entry& e : autocast_entries(world, u.catalog_id)) {
                 if (!autocast_on(ci, e.abil_id, e.autocast_default_on)) continue;
                 if (!abils_.ready(world, ci, e.slot)) continue;
-                const std::uint32_t tgt = e.support ? wounded_ally(world, u, e.engage_range)
+                if (!autocast_caster_ok(u, e)) continue;
+                const std::uint32_t tgt = e.support ? wounded_ally(world, u, e.engage_range, e.heal_vital)
                                                     : best_target(world, u, e);
                 if (tgt == sim::kNoTarget) continue;
                 if (abils_.try_cast(world, ci, e.slot, tgt)) {
@@ -142,7 +143,7 @@ public:
                 if (e.self_cast) {
                     cast = enemy_within(world, u, e.engage_range) && abils_.try_cast(world, ci, e.slot, ci);
                 } else if (e.support) {
-                    const std::uint32_t tgt = wounded_ally(world, u, e.engage_range);
+                    const std::uint32_t tgt = wounded_ally(world, u, e.engage_range, e.heal_vital);
                     cast = tgt != sim::kNoTarget && abils_.try_cast(world, ci, e.slot, tgt);
                 } else if (e.point_cast) {
                     Fixed px, py;
@@ -213,13 +214,25 @@ private:
         Fixed aoe_radius;
         bool self_cast = false;
         bool support = false;
+        sim::HealVital heal_vital = sim::HealVital::Life;
         Fixed engage_range;
         std::string abil_id;
         bool autocast_default_on = false;
+        std::vector<sim::VitalGate> autocast_caster_gates;
+        std::vector<std::uint32_t> autocast_not_behaviors;
         bool requires_creep = false;
         bool requires_ground = false;
         bool requires_spawner = false;
     };
+
+    static bool autocast_caster_ok(const sim::Unit& u, const Entry& e) {
+        for (const sim::VitalGate& g : e.autocast_caster_gates)
+            if (!sim::vital_gate_passes(g, u)) return false;
+        for (std::uint32_t tag : e.autocast_not_behaviors)
+            for (const sim::BehaviorInstance& b : u.behaviors)
+                if (b.src == tag) return false;
+        return true;
+    }
 
     static bool enemy_within(const sim::World& world, const sim::Unit& caster, Fixed range) {
         for (const sim::Unit& c : world.units()) {
@@ -231,12 +244,15 @@ private:
         return false;
     }
 
-    static std::uint32_t wounded_ally(const sim::World& world, const sim::Unit& caster, Fixed range) {
+    static std::uint32_t wounded_ally(const sim::World& world, const sim::Unit& caster, Fixed range,
+                                      sim::HealVital vital = sim::HealVital::Life) {
         std::uint32_t best = sim::kNoTarget;
         Fixed best_d2;
         for (const sim::Unit& o : world.units()) {
             if (!o.alive || o.id == caster.id || o.player != caster.player) continue;
-            if (o.hp >= o.hp_max) continue;
+            if (vital == sim::HealVital::Shields ? (o.shields_max.raw() <= 0 || o.shields >= o.shields_max)
+                                                 : o.hp >= o.hp_max)
+                continue;
             if (o.loaded) continue;
             const Fixed dx = o.x - caster.x, dy = o.y - caster.y;
             const Fixed reach = range + caster.radius + o.radius;
@@ -265,6 +281,8 @@ private:
             e.range = e.engage_range;
             e.abil_id = btn.ability;
             e.autocast_default_on = ac.on_by_default;
+            e.autocast_caster_gates = b->autocast_caster_gates;
+            e.autocast_not_behaviors = b->autocast_not_behaviors;
             out.push_back(std::move(e));
         }
         return autocast_cache_.emplace(unit_id, std::move(out)).first->second;
@@ -288,6 +306,8 @@ private:
         e.exc_attr = b.exc_attr_mask;
         e.req_energy = b.require_energy;
         e.requires_ground = b.requires_ground;
+        if (!b.tree.empty() && b.tree_root >= 0 && b.tree_root < int32_t(b.tree.size()))
+            e.heal_vital = b.tree[b.tree_root].heal_vital;
         return e;
     }
 
@@ -304,12 +324,18 @@ private:
             !b->spawn_unit.empty() && b->def.spawn_proto < 0) {
             sim::Unit proto = make_unit(*cat_, b->spawn_unit, 0);
             if (b->spawn_life.raw() > 0) proto.time_life = b->spawn_life;
+            if (b->spawn_dmg_fraction.raw() != sim::Fixed::from_int(1).raw())
+                proto.dmg_fraction = b->spawn_dmg_fraction;
+            proto.deals_no_damage = b->spawn_no_damage;
             if (b->def.spawn_snap_resource) {
                 const sim::MuleSystem::MuleStats st;
-                proto.carry_amount = st.carry_amount;
+                const data::Catalog::HarvestSpec hs = cat_->harvest_spec(b->spawn_unit);
+                proto.carry_amount = hs.amount_request > 0 ? hs.amount_request : st.carry_amount;
                 proto.carry_override = true;
                 proto.saturation_exempt = true;
-                proto.mine_time = st.mine_time;
+                proto.mine_time_mult =
+                    hs.time_mult > 0 ? sim::Fixed::from_double(hs.time_mult) : st.mine_time_mult;
+                proto.return_delay = st.return_delay;
             }
             b->def.spawn_proto = world.add_spawn_proto(std::move(proto));
         }

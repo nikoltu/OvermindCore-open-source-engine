@@ -20,6 +20,23 @@ struct M3Ref {
     bool empty() const { return count == 0; }
 };
 
+struct M3Light {
+    uint32_t type = 0;
+    int32_t bone = -1;
+    uint32_t flags = 0;
+    float color[3] = {0, 0, 0};
+    float intensity = 0;
+    uint16_t intensity_interp = 0, intensity_flags = 0;
+    uint32_t intensity_id = 0;
+    uint16_t color_interp = 0, color_flags = 0;
+    uint32_t color_id = 0;
+    float attenuation_far = 0;
+    float attenuation_near = 0;
+    uint32_t version = 0;
+};
+
+enum M3LightType : uint32_t { kLightPoint = 1, kLightSpot = 2 };
+
 struct M3Particle {
     uint32_t bone = 0;
     uint32_t material_ref_index = 0;
@@ -29,7 +46,21 @@ struct M3Particle {
     float size_start = 0;
     float size_end = 0;
     uint32_t version = 0;
+    std::vector<uint8_t> raw;
+
+    uint32_t additional_flags = 0;
+    uint32_t rate_anim_id = 0;
+
+    uint32_t life_anim_flags = 0;
+    uint32_t life_anim_id = 0;
+    uint16_t rate_anim_flags = 0;
+    uint16_t rate_interp = 0;
+    uint32_t max_particles = 0;
 };
+
+int particle_count(const M3Particle& p);
+
+int particle_count_at_rate(const M3Particle& p, float rate);
 
 struct Model;
 
@@ -64,6 +95,7 @@ struct M3 {
     void decode_animation(Model& m) const;
 
     std::vector<M3Particle> decode_particles() const;
+    std::vector<M3Light> decode_lights() const;
 
     uint32_t bone_count() const;
 };
@@ -76,9 +108,35 @@ struct M3Region {
     uint32_t first_bone_lookup = 0;
 };
 
+struct M3AnimRef;
+
 struct M3Layer {
     std::string usage;
     std::string image_path;
+    std::uint32_t word36 = 0, word40 = 0, word44 = 0;
+    std::vector<std::uint8_t> raw_record;
+    std::uint32_t layr_version = 0;
+    struct AnimRefs {
+        float color[4] = {1.0f, 1.0f, 1.0f, 1.0f};
+        std::uint16_t bright_mult_interp = 0, bright_mult_flags = 0;
+        std::uint32_t bright_mult_id = 0;
+        float bright_mult = 1.0f;
+        std::uint16_t midtone_interp = 0, midtone_flags = 0;
+        std::uint32_t midtone_id = 0;
+        float midtone_offset = 0.0f;
+        std::uint16_t uv_offset_interp = 0, uv_offset_flags = 0;
+        std::uint32_t uv_offset_id = 0;
+        float uv_offset[2] = {0.0f, 0.0f};
+        std::uint16_t uv_angle_interp = 0, uv_angle_flags = 0;
+        std::uint32_t uv_angle_id = 0;
+        float uv_angle[3] = {0.0f, 0.0f, 0.0f};
+        std::uint16_t uv_tiling_interp = 0, uv_tiling_flags = 0;
+        std::uint32_t uv_tiling_id = 0;
+        float uv_tiling[2] = {1.0f, 1.0f};
+        std::uint16_t brightness_interp = 0, brightness_flags = 0;
+        std::uint32_t brightness_id = 0;
+        float brightness = 1.0f;
+    } anim;
     std::vector<uint8_t> inline_rgba{};
     uint32_t inline_w = 0, inline_h = 0;
 };
@@ -86,7 +144,43 @@ struct M3Layer {
 struct M3Material {
     std::string name;
     std::vector<M3Layer> layers;
+    std::uint32_t flags = 0;
+    std::uint32_t blend_mode = 0;
+    std::int32_t priority = 0;
+    float specularity = 0.0f;
 };
+
+enum M3Blend : std::uint32_t {
+    kBlendOpaque = 0,
+    kBlendAlphaBlend = 1,
+    kBlendAdd = 2,
+    kBlendAlphaAdd = 3,
+};
+
+inline bool material_is_additive(const M3Material& m) {
+    return m.blend_mode == kBlendAdd || m.blend_mode == kBlendAlphaAdd;
+}
+
+inline const M3Layer* material_alpha_mask(const M3Material& m) {
+    for (const M3Layer& L : m.layers)
+        if (L.usage == "AlphaMask") return &L;
+    return nullptr;
+}
+
+inline int material_alpha_mask_channel(const M3Material& m) {
+    const M3Layer* L = material_alpha_mask(m);
+    if (!L) return 0;
+    switch (L->word44) {
+        case 3: return 2;
+        case 4: return 3;
+        case 5: return 4;
+        default: return 1;
+    }
+}
+
+inline bool material_is_alpha_blended(const M3Material& m) {
+    return m.blend_mode == kBlendAlphaBlend && material_alpha_mask(m) != nullptr;
+}
 
 struct M3MaterialRef {
     uint32_t type = 0;
@@ -131,6 +225,7 @@ struct M3Track {
     std::vector<float> values;
     std::vector<M3Event> events;
     uint8_t comps = 0;
+    uint8_t slot = 0;
 };
 
 struct M3STC {
@@ -170,6 +265,9 @@ struct Model {
     std::vector<float> inverse_bind;
     std::vector<uint8_t> vertex_bone_weights;
     std::vector<uint8_t> vertex_bone_indices;
+    std::vector<float> normals;
+    std::vector<float> tangents;
+    std::vector<uint8_t> normals_w;
     std::vector<uint16_t> bone_lookup;
     std::vector<M3Sequence> sequences;
     std::vector<M3STG> stg;
@@ -179,6 +277,8 @@ struct Model {
     std::vector<uint16_t> attachment_lookup;
 
     std::vector<M3Particle> particles;
+
+    std::vector<M3Light> lights;
 
     std::vector<M3Event> events_for_sequence(size_t seq) const;
 
@@ -194,8 +294,18 @@ struct Model {
         return splat_w && splat_h && !splat_layers.empty() &&
                splat_weights.size() >= size_t(splat_w) * splat_h * 8;
     }
+    bool cliff_skin_opaque = false;
 };
 
 std::string m3_tag(uint32_t tag);
+
+constexpr int kUntexturedRegion = -2;
+
+inline int particle_material(const Model& m, const M3Particle& pe) {
+    if (pe.material_ref_index >= m.material_refs.size()) return -1;
+    const M3MaterialRef& r = m.material_refs[pe.material_ref_index];
+    if (r.type != 1 || r.index >= m.materials.size()) return -1;
+    return int(r.index);
+}
 
 }

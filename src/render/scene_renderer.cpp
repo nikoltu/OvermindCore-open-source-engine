@@ -8,6 +8,7 @@
 
 #include "sc2/casc/storage.hpp"
 #include "sc2/data/environment.hpp"
+#include "sc2/render/shadow_fit.hpp"
 #include "sc2/formats/dds.hpp"
 #include "sc2/render/anim.hpp"
 
@@ -47,6 +48,7 @@ Vec3 mul_point(const Mat4& m, const Vec3& p) {
 struct TonemapPC {
     float exposure;
     int32_t curve;
+    int32_t keep_alpha;
 };
 struct GlobalsUBO {
     float viewProj[16];
@@ -55,6 +57,14 @@ struct GlobalsUBO {
     float eyePos[4];
     float lightDir[4];
     float terrainExtent[4];
+    float rigAmbient[4];
+    float rigDir[3][4];
+    float rigColor[3][4];
+    float rigParams[4];
+    float fogExtent[4];
+    float lightPos[16][4];
+    float lightCol[16][4];
+    float lightMeta[4];
 };
 
 void particle_rng(uint32_t emitter, int particle, float& u1, float& u2, float& u3) {
@@ -68,15 +78,6 @@ void particle_rng(uint32_t emitter, int particle, float& u1, float& u2, float& u
     u3 = float((h >> 40) & 0xFFFFF) / 1048576.0f;
 }
 
-int particle_count(const formats::M3Particle& p) {
-    if (p.emission_rate > 0.0f) {
-        long r = std::lround(double(p.emission_rate) * double(p.lifetime));
-        if (r < 1) r = 1;
-        if (r > 64) r = 64;
-        return int(r);
-    }
-    return 8;
-}
 }
 
 void SceneRenderer::apply_environment(Tunables& tun, const data::EnvLight& env) {
@@ -85,6 +86,8 @@ void SceneRenderer::apply_environment(Tunables& tun, const data::EnvLight& env) 
         if (d.x * d.x + d.y * d.y + d.z * d.z > 1e-9f) tun.light_dir = normalize(d);
     }
     if (env.has_hdr && env.hdr_exposure > 0.0) tun.exposure = float(env.hdr_exposure);
+    const LightRig r = rig_from_env(env);
+    if (r.present) tun.rig = r;
 }
 
 void SceneRenderer::set_environment(const data::EnvLight& env) { apply_environment(tun_, env); }
@@ -112,11 +115,128 @@ void SceneRenderer::one_time(const std::function<void(VkCommandBuffer)>& rec) {
     vkFreeCommandBuffers(dev_, cmdPool_.get(), 1, &cb);
 }
 
+void SceneRenderer::create_targets() {
+    VkDevice dev = dev_;
+    hdrColor_ = make_image(pd_, dev_, kHdr, VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,
+                           VK_IMAGE_ASPECT_COLOR_BIT, width_, height_);
+    ldrColor_ = make_image(pd_, dev_, ldr_format_, VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT,
+                           VK_IMAGE_ASPECT_COLOR_BIT, width_, height_);
+    depth_ = make_image(pd_, dev_, kDepthF, VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT, VK_IMAGE_ASPECT_DEPTH_BIT, width_, height_);
+    {
+        VkImageView fbViews[2] = {hdrColor_.view.get(), depth_.view.get()};
+        VkFramebufferCreateInfo fbi{};
+        fbi.sType = VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO;
+        fbi.renderPass = litPass_.get();
+        fbi.attachmentCount = 2;
+        fbi.pAttachments = fbViews;
+        fbi.width = width_;
+        fbi.height = height_;
+        fbi.layers = 1;
+        VkFramebuffer rawFb = VK_NULL_HANDLE;
+        check(vkCreateFramebuffer(dev_, &fbi, nullptr, &rawFb), "vkCreateFramebuffer(lit)");
+        litFb_ = Unique<VkFramebuffer>(rawFb, [dev](VkFramebuffer f) { vkDestroyFramebuffer(dev, f, nullptr); });
+    }
+    {
+        VkImageView tmView = ldrColor_.view.get();
+        VkFramebufferCreateInfo tmfbi{};
+        tmfbi.sType = VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO;
+        tmfbi.renderPass = tmPass_.get();
+        tmfbi.attachmentCount = 1;
+        tmfbi.pAttachments = &tmView;
+        tmfbi.width = width_;
+        tmfbi.height = height_;
+        tmfbi.layers = 1;
+        VkFramebuffer rawTmFb = VK_NULL_HANDLE;
+        check(vkCreateFramebuffer(dev_, &tmfbi, nullptr, &rawTmFb), "vkCreateFramebuffer(tonemap)");
+        tmFb_ = Unique<VkFramebuffer>(rawTmFb, [dev](VkFramebuffer f) { vkDestroyFramebuffer(dev, f, nullptr); });
+    }
+    VkDescriptorImageInfo dii{sampler_.get(), hdrColor_.view.get(), VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL};
+    VkWriteDescriptorSet w{};
+    w.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+    w.dstSet = tm_set_;
+    w.dstBinding = 0;
+    w.descriptorCount = 1;
+    w.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+    w.pImageInfo = &dii;
+    vkUpdateDescriptorSets(dev_, 1, &w, 0, nullptr);
+}
+
+void SceneRenderer::resize(uint32_t w, uint32_t h) {
+    if (w == 0 || h == 0 || (w == width_ && h == height_)) return;
+    vkDeviceWaitIdle(dev_);
+    width_ = w;
+    height_ = h;
+    create_targets();
+}
+
+void SceneRenderer::upload_fog_image(uint32_t w, uint32_t h, const std::vector<uint8_t>& rgba) {
+    const bool recreate = !fogImg_.img.get() || w != fog_w_ || h != fog_h_;
+    if (recreate) {
+        fogImg_ = make_image(pd_, dev_, kTexColor, VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
+                             VK_IMAGE_ASPECT_COLOR_BIT, w, h);
+        fog_w_ = w;
+        fog_h_ = h;
+    }
+    Buffer stg = make_buffer(pd_, dev_, rgba.size(), VK_BUFFER_USAGE_TRANSFER_SRC_BIT, const_cast<uint8_t*>(rgba.data()));
+    one_time([&](VkCommandBuffer cb) {
+        VkImageMemoryBarrier b{};
+        b.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+        b.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+        b.newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+        b.image = fogImg_.img.get();
+        b.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+        b.srcAccessMask = 0;
+        b.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+        vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr, 1, &b);
+        VkBufferImageCopy rgn{};
+        rgn.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+        rgn.imageExtent = {w, h, 1};
+        vkCmdCopyBufferToImage(cb, stg.buf.get(), fogImg_.img.get(), VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &rgn);
+        b.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+        b.newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+        b.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+        b.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+        vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, 0, 0, nullptr, 0, nullptr, 1, &b);
+    });
+    if (recreate && global_set_ != VK_NULL_HANDLE) {
+        VkDescriptorImageInfo fgi{fogSampler_.get(), fogImg_.view.get(), VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL};
+        VkWriteDescriptorSet gw = vk_init<VkWriteDescriptorSet>(VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET);
+        gw.dstSet = global_set_;
+        gw.dstBinding = 2;
+        gw.descriptorCount = 1;
+        gw.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+        gw.pImageInfo = &fgi;
+        vkUpdateDescriptorSets(dev_, 1, &gw, 0, nullptr);
+    }
+}
+
+void SceneRenderer::set_fog(const FogField& fog) {
+    if (!fog.valid()) {
+        if (fog_present_) upload_fog_image(1, 1, {0, 0, 0, 0});
+        fog_present_ = false;
+        fog_last_.clear();
+        return;
+    }
+    fog_world_w_ = fog.world_w;
+    fog_world_h_ = fog.world_h;
+    fog_present_ = true;
+    if (fog.w == fog_w_ && fog.h == fog_h_ && fog.alpha == fog_last_) return;
+    fog_last_ = fog.alpha;
+    std::vector<uint8_t> rgba(std::size_t(fog.w) * fog.h * 4);
+    for (std::size_t i = 0; i < fog.alpha.size(); ++i)
+        rgba[i * 4] = rgba[i * 4 + 1] = rgba[i * 4 + 2] = rgba[i * 4 + 3] = fog.alpha[i];
+    upload_fog_image(fog.w, fog.h, rgba);
+}
+
 int SceneRenderer::upload_texture(uint32_t w, uint32_t h, const std::vector<uint8_t>& rgba) {
+    if (w == 0 || h == 0 || w > 16384 || h > 16384 || rgba.size() < size_t(w) * h * 4)
+        throw std::runtime_error("upload_texture: rgba bytes do not cover w*h*4");
     int idx = int(textures_.size());
+    uint32_t mips = 1;
+    for (uint32_t d = (w > h ? w : h); d > 1; d >>= 1) ++mips;
     Image img = make_image(pd_, dev_, kTexColor,
-                           VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
-                           VK_IMAGE_ASPECT_COLOR_BIT, w, h);
+                           VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT,
+                           VK_IMAGE_ASPECT_COLOR_BIT, w, h, mips);
     Buffer stg = make_buffer(pd_, dev_, rgba.size(), VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
                              const_cast<uint8_t*>(rgba.data()));
     one_time([&](VkCommandBuffer cb) {
@@ -125,7 +245,7 @@ int SceneRenderer::upload_texture(uint32_t w, uint32_t h, const std::vector<uint
         b.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
         b.newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
         b.image = img.img.get();
-        b.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+        b.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, mips, 0, 1};
         b.srcAccessMask = 0;
         b.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
         vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
@@ -135,8 +255,35 @@ int SceneRenderer::upload_texture(uint32_t w, uint32_t h, const std::vector<uint
         rgn.imageExtent = {w, h, 1};
         vkCmdCopyBufferToImage(cb, stg.buf.get(), img.img.get(),
                                VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &rgn);
+        int32_t mw = int32_t(w), mh = int32_t(h);
+        for (uint32_t lv = 1; lv < mips; ++lv) {
+            VkImageMemoryBarrier pb{};
+            pb.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+            pb.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+            pb.newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+            pb.image = img.img.get();
+            pb.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, lv - 1, 1, 0, 1};
+            pb.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+            pb.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+            vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr, 1, &pb);
+            const int32_t nw = mw > 1 ? mw / 2 : 1, nh = mh > 1 ? mh / 2 : 1;
+            VkImageBlit bl{};
+            bl.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, lv - 1, 0, 1};
+            bl.srcOffsets[1] = {mw, mh, 1};
+            bl.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, lv, 0, 1};
+            bl.dstOffsets[1] = {nw, nh, 1};
+            vkCmdBlitImage(cb, img.img.get(), VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, img.img.get(), VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &bl, VK_FILTER_LINEAR);
+            pb.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+            pb.newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+            pb.srcAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+            pb.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+            vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, 0, 0, nullptr, 0, nullptr, 1, &pb);
+            mw = nw;
+            mh = nh;
+        }
         b.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
         b.newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+        b.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, mips - 1, 1, 0, 1};
         b.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
         b.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
         vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
@@ -183,19 +330,92 @@ int SceneRenderer::resolve_texture(const formats::Model& m, int material, const 
     return idx;
 }
 
-SceneRenderer::Mesh& SceneRenderer::ensure_mesh(const formats::Model& m) {
+static void material_anim(const formats::Model& m, int mi, int seq, float time_ms, float out[4]) {
+    out[0] = 0.0f; out[1] = 0.0f; out[2] = 1.0f; out[3] = 1.0f;
+    if (mi < 0 || std::size_t(mi) >= m.materials.size()) return;
+    const formats::M3Material& mat = m.materials[std::size_t(mi)];
+    const uint32_t s = seq >= 0 ? uint32_t(seq) : UINT32_MAX;
+    for (const formats::M3Layer& L : mat.layers) {
+        const formats::M3Layer::AnimRefs& a = L.anim;
+        if (L.usage == "Diffuse") {
+            if (seq >= 0) {
+                animated_layer_field(m, s, a.uv_offset_interp, a.uv_offset_flags, a.uv_offset_id, time_ms, 2, a.uv_offset, out);
+                animated_layer_field(m, s, a.bright_mult_interp, a.bright_mult_flags, a.bright_mult_id, time_ms, 1, &a.bright_mult, out + 3);
+            } else {
+                out[0] = a.uv_offset[0]; out[1] = a.uv_offset[1]; out[3] = a.bright_mult;
+            }
+        } else if (L.usage == "Emissive") {
+            if (seq >= 0)
+                animated_layer_field(m, s, a.bright_mult_interp, a.bright_mult_flags, a.bright_mult_id, time_ms, 1, &a.bright_mult, out + 2);
+            else
+                out[2] = a.bright_mult;
+        }
+    }
+}
+
+VkDescriptorSet SceneRenderer::alloc_set(Unique<VkDescriptorPool>& main, std::vector<Unique<VkDescriptorPool>>& extra,
+                                         VkDescriptorSetLayout layout, VkDescriptorType type, uint32_t per_set,
+                                         uint32_t max_sets, const char* what) {
+    VkDescriptorSetAllocateInfo dsa{};
+    dsa.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
+    dsa.descriptorSetCount = 1;
+    dsa.pSetLayouts = &layout;
+    VkDescriptorSet set = VK_NULL_HANDLE;
+    auto try_pool = [&](VkDescriptorPool p) {
+        dsa.descriptorPool = p;
+        const VkResult r = vkAllocateDescriptorSets(dev_, &dsa, &set);
+        if (r == VK_SUCCESS) return true;
+        if (r == VK_ERROR_OUT_OF_POOL_MEMORY || r == VK_ERROR_FRAGMENTED_POOL) return false;
+        check(r, what);
+        return false;
+    };
+    if (try_pool(main.get())) return set;
+    for (auto& p : extra)
+        if (try_pool(p.get())) return set;
+    VkDescriptorPoolSize sz{type, per_set * max_sets};
+    VkDescriptorPoolCreateInfo dpi{};
+    dpi.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
+    dpi.maxSets = max_sets;
+    dpi.poolSizeCount = 1;
+    dpi.pPoolSizes = &sz;
+    VkDescriptorPool raw = VK_NULL_HANDLE;
+    check(vkCreateDescriptorPool(dev_, &dpi, nullptr, &raw), "vkCreateDescriptorPool(overflow)");
+    const VkDevice dev = dev_;
+    extra.emplace_back(raw, [dev](VkDescriptorPool p) { vkDestroyDescriptorPool(dev, p, nullptr); });
+    if (!try_pool(raw)) throw std::runtime_error(std::string("vkAllocateDescriptorSets(") + what + "): fresh pool refused");
+    return set;
+}
+
+SceneRenderer::Mesh& SceneRenderer::ensure_mesh(const formats::Model& m, std::uint64_t version) {
     auto it = mesh_cache_.find(&m);
-    if (it != mesh_cache_.end()) return it->second;
+    if (it != mesh_cache_.end()) {
+        if (it->second.version == version) return it->second;
+        for (VkDescriptorSet s : it->second.draw_set)
+            if (s != VK_NULL_HANDLE) free_mat_sets_.push_back(s);
+        mesh_cache_.erase(it);
+    }
     Mesh mesh;
+    mesh.version = version;
     std::vector<uint32_t> tri = resolve_indices(m, mesh.draws);
     std::vector<Vertex> verts = build_vertices(m, tri);
+    mesh.lmin = {1e30f, 1e30f, 1e30f};
+    mesh.lmax = {-1e30f, -1e30f, -1e30f};
+    for (uint32_t i = 0; i < m.vertex_count; ++i)
+        for (int a = 0; a < 3; ++a) {
+            const float c = m.positions[i * 3 + a];
+            (&mesh.lmin.x)[a] = std::min((&mesh.lmin.x)[a], c);
+            (&mesh.lmax.x)[a] = std::max((&mesh.lmax.x)[a], c);
+        }
+    if (mesh.lmin.x > mesh.lmax.x) { mesh.lmin = {0, 0, 0}; mesh.lmax = {0, 0, 0}; }
     mesh.draw_tex.resize(mesh.draws.size());
     for (size_t i = 0; i < mesh.draws.size(); ++i) {
         int mat = mesh.draws[i].material;
-        mesh.draw_tex[i] = {resolve_texture(m, mat, "Diffuse", kDefaultWhite),
+        const bool adds = mat >= 0 && std::size_t(mat) < m.materials.size() && formats::material_is_additive(m.materials[std::size_t(mat)]);
+        mesh.draw_tex[i] = {resolve_texture(m, mat, "Diffuse", adds ? kDefaultEmissive : kDefaultWhite),
                             resolve_texture(m, mat, "Normal", kDefaultNormal),
                             resolve_texture(m, mat, "Emissive", kDefaultEmissive),
-                            resolve_texture(m, mat, "Specular", kDefaultSpecular)};
+                            resolve_texture(m, mat, "Specular", kDefaultSpecular),
+                            resolve_texture(m, mat, "AlphaMask", kDefaultWhite)};
     }
     mesh.vbuf = make_buffer(pd_, dev_, sizeof(Vertex) * verts.size(),
                             VK_BUFFER_USAGE_VERTEX_BUFFER_BIT, verts.data());
@@ -203,17 +423,16 @@ SceneRenderer::Mesh& SceneRenderer::ensure_mesh(const formats::Model& m) {
                             VK_BUFFER_USAGE_INDEX_BUFFER_BIT, tri.data());
     mesh.draw_set.assign(mesh.draws.size(), VK_NULL_HANDLE);
     for (size_t d = 0; d < mesh.draws.size(); ++d) {
-        VkDescriptorSetAllocateInfo dsa{};
-        dsa.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
-        dsa.descriptorPool = matPool_.get();
-        dsa.descriptorSetCount = 1;
-        VkDescriptorSetLayout tl = texLayout_.get();
-        dsa.pSetLayouts = &tl;
-        check(vkAllocateDescriptorSets(dev_, &dsa, &mesh.draw_set[d]),
-              "vkAllocateDescriptorSets(material)");
-        VkDescriptorImageInfo dii[4];
-        VkWriteDescriptorSet w[4];
-        for (int s = 0; s < 4; ++s) {
+        if (!free_mat_sets_.empty()) {
+            mesh.draw_set[d] = free_mat_sets_.back();
+            free_mat_sets_.pop_back();
+        } else {
+            mesh.draw_set[d] = alloc_set(matPool_, matPoolsExtra_, texLayout_.get(),
+                                         VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 5, 512, "material");
+        }
+        VkDescriptorImageInfo dii[5];
+        VkWriteDescriptorSet w[5];
+        for (int s = 0; s < 5; ++s) {
             dii[s] = {sampler_.get(), textures_[mesh.draw_tex[d][s]].view.get(),
                       VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL};
             w[s] = vk_init<VkWriteDescriptorSet>(VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET);
@@ -223,7 +442,7 @@ SceneRenderer::Mesh& SceneRenderer::ensure_mesh(const formats::Model& m) {
             w[s].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
             w[s].pImageInfo = &dii[s];
         }
-        vkUpdateDescriptorSets(dev_, 4, w, 0, nullptr);
+        vkUpdateDescriptorSets(dev_, 5, w, 0, nullptr);
     }
     return mesh_cache_.emplace(&m, std::move(mesh)).first->second;
 }
@@ -348,11 +567,18 @@ SceneRenderer::SceneRenderer(VkPhysicalDevice pd, VkDevice dev, VkQueue queue,
     check(vkCreateCommandPool(dev_, &cpi, nullptr, &rawCmdPool), "vkCreateCommandPool(scene)");
     cmdPool_ = Unique<VkCommandPool>(rawCmdPool, [dev](VkCommandPool p) { vkDestroyCommandPool(dev, p, nullptr); });
 
+    VkPhysicalDeviceFeatures feat{};
+    vkGetPhysicalDeviceFeatures(pd_, &feat);
+    VkPhysicalDeviceProperties props{};
+    vkGetPhysicalDeviceProperties(pd_, &props);
     VkSamplerCreateInfo smi{};
     smi.sType = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO;
     smi.magFilter = smi.minFilter = VK_FILTER_LINEAR;
+    smi.mipmapMode = VK_SAMPLER_MIPMAP_MODE_LINEAR;
     smi.addressModeU = smi.addressModeV = smi.addressModeW = VK_SAMPLER_ADDRESS_MODE_REPEAT;
-    smi.maxLod = 1.0f;
+    smi.maxLod = VK_LOD_CLAMP_NONE;
+    smi.anisotropyEnable = feat.samplerAnisotropy ? VK_TRUE : VK_FALSE;
+    smi.maxAnisotropy = feat.samplerAnisotropy ? (props.limits.maxSamplerAnisotropy < 16.0f ? props.limits.maxSamplerAnisotropy : 16.0f) : 1.0f;
     VkSampler rawSampler = VK_NULL_HANDLE;
     check(vkCreateSampler(dev_, &smi, nullptr, &rawSampler), "vkCreateSampler");
     sampler_ = Unique<VkSampler>(rawSampler, [dev](VkSampler s) { vkDestroySampler(dev, s, nullptr); });
@@ -367,9 +593,18 @@ SceneRenderer::SceneRenderer(VkPhysicalDevice pd, VkDevice dev, VkQueue queue,
     VkSampler rawShadowSampler = VK_NULL_HANDLE;
     check(vkCreateSampler(dev_, &ssmi, nullptr, &rawShadowSampler), "vkCreateSampler(shadow)");
     shadowSampler_ = Unique<VkSampler>(rawShadowSampler, [dev](VkSampler s) { vkDestroySampler(dev, s, nullptr); });
+    VkSamplerCreateInfo fsmi{};
+    fsmi.sType = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO;
+    fsmi.magFilter = fsmi.minFilter = VK_FILTER_LINEAR;
+    fsmi.addressModeU = fsmi.addressModeV = fsmi.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+    fsmi.maxLod = 1.0f;
+    VkSampler rawFogSampler = VK_NULL_HANDLE;
+    check(vkCreateSampler(dev_, &fsmi, nullptr, &rawFogSampler), "vkCreateSampler(fog)");
+    fogSampler_ = Unique<VkSampler>(rawFogSampler, [dev](VkSampler s) { vkDestroySampler(dev, s, nullptr); });
+    upload_fog_image(1, 1, {0, 0, 0, 0});
 
-    VkDescriptorSetLayoutBinding texb[4]{};
-    for (int s = 0; s < 4; ++s) {
+    VkDescriptorSetLayoutBinding texb[5]{};
+    for (int s = 0; s < 5; ++s) {
         texb[s].binding = uint32_t(s);
         texb[s].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
         texb[s].descriptorCount = 1;
@@ -377,7 +612,7 @@ SceneRenderer::SceneRenderer(VkPhysicalDevice pd, VkDevice dev, VkQueue queue,
     }
     VkDescriptorSetLayoutCreateInfo texli{};
     texli.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
-    texli.bindingCount = 4;
+    texli.bindingCount = 5;
     texli.pBindings = texb;
     VkDescriptorSetLayout rawTexLayout = VK_NULL_HANDLE;
     check(vkCreateDescriptorSetLayout(dev_, &texli, nullptr, &rawTexLayout), "vkCreateDescriptorSetLayout(tex)");
@@ -396,7 +631,7 @@ SceneRenderer::SceneRenderer(VkPhysicalDevice pd, VkDevice dev, VkQueue queue,
     check(vkCreateDescriptorSetLayout(dev_, &boneli, nullptr, &rawBoneLayout), "vkCreateDescriptorSetLayout(bone)");
     boneLayout_ = Unique<VkDescriptorSetLayout>(rawBoneLayout, [dev](VkDescriptorSetLayout l) { vkDestroyDescriptorSetLayout(dev, l, nullptr); });
 
-    VkDescriptorSetLayoutBinding gb[2]{};
+    VkDescriptorSetLayoutBinding gb[3]{};
     gb[0].binding = 0;
     gb[0].descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
     gb[0].descriptorCount = 1;
@@ -405,9 +640,13 @@ SceneRenderer::SceneRenderer(VkPhysicalDevice pd, VkDevice dev, VkQueue queue,
     gb[1].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
     gb[1].descriptorCount = 1;
     gb[1].stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
+    gb[2].binding = 2;
+    gb[2].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+    gb[2].descriptorCount = 1;
+    gb[2].stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
     VkDescriptorSetLayoutCreateInfo gli{};
     gli.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
-    gli.bindingCount = 2;
+    gli.bindingCount = 3;
     gli.pBindings = gb;
     VkDescriptorSetLayout rawGlobalLayout = VK_NULL_HANDLE;
     check(vkCreateDescriptorSetLayout(dev_, &gli, nullptr, &rawGlobalLayout), "vkCreateDescriptorSetLayout(global)");
@@ -439,14 +678,6 @@ SceneRenderer::SceneRenderer(VkPhysicalDevice pd, VkDevice dev, VkQueue queue,
     check(vkCreateDescriptorSetLayout(dev_, &tmli, nullptr, &rawTmLayout), "vkCreateDescriptorSetLayout(tonemap)");
     tmLayout_ = Unique<VkDescriptorSetLayout>(rawTmLayout, [dev](VkDescriptorSetLayout l) { vkDestroyDescriptorSetLayout(dev, l, nullptr); });
 
-    hdrColor_ = make_image(pd_, dev_, kHdr,
-                           VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,
-                           VK_IMAGE_ASPECT_COLOR_BIT, width_, height_);
-    ldrColor_ = make_image(pd_, dev_, ldr_format_,
-                           VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT,
-                           VK_IMAGE_ASPECT_COLOR_BIT, width_, height_);
-    depth_ = make_image(pd_, dev_, kDepthF, VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT,
-                        VK_IMAGE_ASPECT_DEPTH_BIT, width_, height_);
     shadowMap_ = make_image(pd_, dev_, kDepthF,
                             VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,
                             VK_IMAGE_ASPECT_DEPTH_BIT, tun_.shadow_dim, tun_.shadow_dim);
@@ -455,7 +686,7 @@ SceneRenderer::SceneRenderer(VkPhysicalDevice pd, VkDevice dev, VkQueue queue,
     globalsBuf_ = make_buffer(pd_, dev_, sizeof(GlobalsUBO), VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT, &zero);
 
     VkDescriptorPoolSize gpsizes[2] = {{VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1},
-                                       {VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1}};
+                                       {VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 2}};
     VkDescriptorPoolCreateInfo gdpi{};
     gdpi.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
     gdpi.maxSets = 1;
@@ -475,7 +706,8 @@ SceneRenderer::SceneRenderer(VkPhysicalDevice pd, VkDevice dev, VkQueue queue,
         VkDescriptorBufferInfo ubi{globalsBuf_.buf.get(), 0, sizeof(GlobalsUBO)};
         VkDescriptorImageInfo smi2{shadowSampler_.get(), shadowMap_.view.get(),
                                    VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL};
-        VkWriteDescriptorSet gw[2]{};
+        VkDescriptorImageInfo fgi{fogSampler_.get(), fogImg_.view.get(), VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL};
+        VkWriteDescriptorSet gw[3]{};
         gw[0] = vk_init<VkWriteDescriptorSet>(VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET);
         gw[0].dstSet = global_set_;
         gw[0].dstBinding = 0;
@@ -488,11 +720,17 @@ SceneRenderer::SceneRenderer(VkPhysicalDevice pd, VkDevice dev, VkQueue queue,
         gw[1].descriptorCount = 1;
         gw[1].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
         gw[1].pImageInfo = &smi2;
-        vkUpdateDescriptorSets(dev_, 2, gw, 0, nullptr);
+        gw[2] = vk_init<VkWriteDescriptorSet>(VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET);
+        gw[2].dstSet = global_set_;
+        gw[2].dstBinding = 2;
+        gw[2].descriptorCount = 1;
+        gw[2].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+        gw[2].pImageInfo = &fgi;
+        vkUpdateDescriptorSets(dev_, 3, gw, 0, nullptr);
     }
 
     const uint32_t kMaxMeshSets = 512, kMaxBoneSets = 4096, kMaxPartSets = 256;
-    VkDescriptorPoolSize matSize{VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 4 * kMaxMeshSets};
+    VkDescriptorPoolSize matSize{VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 5 * kMaxMeshSets};
     VkDescriptorPoolCreateInfo matdpi{};
     matdpi.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
     matdpi.maxSets = kMaxMeshSets;
@@ -569,22 +807,8 @@ SceneRenderer::SceneRenderer(VkPhysicalDevice pd, VkDevice dev, VkQueue queue,
     VkRenderPass rawPass = VK_NULL_HANDLE;
     check(vkCreateRenderPass(dev_, &rpi, nullptr, &rawPass), "vkCreateRenderPass(lit)");
     litPass_ = Unique<VkRenderPass>(rawPass, [dev](VkRenderPass p) { vkDestroyRenderPass(dev, p, nullptr); });
-    {
-        VkImageView fbViews[2] = {hdrColor_.view.get(), depth_.view.get()};
-        VkFramebufferCreateInfo fbi{};
-        fbi.sType = VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO;
-        fbi.renderPass = rawPass;
-        fbi.attachmentCount = 2;
-        fbi.pAttachments = fbViews;
-        fbi.width = width_;
-        fbi.height = height_;
-        fbi.layers = 1;
-        VkFramebuffer rawFb = VK_NULL_HANDLE;
-        check(vkCreateFramebuffer(dev_, &fbi, nullptr, &rawFb), "vkCreateFramebuffer(lit)");
-        litFb_ = Unique<VkFramebuffer>(rawFb, [dev](VkFramebuffer f) { vkDestroyFramebuffer(dev, f, nullptr); });
-    }
 
-    VkPushConstantRange pcr{VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0, 80};
+    VkPushConstantRange pcr{VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0, 112};
     VkDescriptorSetLayout set_layouts[3] = {texLayout_.get(), boneLayout_.get(), globalLayout_.get()};
     VkPipelineLayoutCreateInfo pli{};
     pli.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
@@ -619,6 +843,11 @@ SceneRenderer::SceneRenderer(VkPhysicalDevice pd, VkDevice dev, VkQueue queue,
     vps.pViewports = &vp;
     vps.scissorCount = 1;
     vps.pScissors = &scis;
+    const VkDynamicState dynStates[2] = {VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR};
+    VkPipelineDynamicStateCreateInfo dyn{};
+    dyn.sType = VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO;
+    dyn.dynamicStateCount = 2;
+    dyn.pDynamicStates = dynStates;
     VkPipelineRasterizationStateCreateInfo rs{};
     rs.sType = VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO;
     rs.polygonMode = VK_POLYGON_MODE_FILL;
@@ -660,6 +889,7 @@ SceneRenderer::SceneRenderer(VkPhysicalDevice pd, VkDevice dev, VkQueue queue,
         gpi.pVertexInputState = &vin;
         gpi.pInputAssemblyState = &ia;
         gpi.pViewportState = &vps;
+        gpi.pDynamicState = &dyn;
         gpi.pRasterizationState = &rs;
         gpi.pMultisampleState = &ms;
         gpi.pDepthStencilState = &ds;
@@ -669,6 +899,25 @@ SceneRenderer::SceneRenderer(VkPhysicalDevice pd, VkDevice dev, VkQueue queue,
         VkPipeline rawPipeline = VK_NULL_HANDLE;
         check(vkCreateGraphicsPipelines(dev_, VK_NULL_HANDLE, 1, &gpi, nullptr, &rawPipeline), "vkCreateGraphicsPipelines(lit)");
         litPipeline_ = Unique<VkPipeline>(rawPipeline, [dev](VkPipeline p) { vkDestroyPipeline(dev, p, nullptr); });
+
+        ds.depthWriteEnable = VK_FALSE;
+        cba.blendEnable = VK_TRUE;
+        cba.colorBlendOp = VK_BLEND_OP_ADD;
+        cba.alphaBlendOp = VK_BLEND_OP_ADD;
+        cba.srcAlphaBlendFactor = VK_BLEND_FACTOR_ZERO;
+        cba.dstAlphaBlendFactor = VK_BLEND_FACTOR_ONE;
+        auto make_blended = [&](VkBlendFactor src, VkBlendFactor dst, const char* what) {
+            cba.srcColorBlendFactor = src;
+            cba.dstColorBlendFactor = dst;
+            VkPipeline p = VK_NULL_HANDLE;
+            check(vkCreateGraphicsPipelines(dev_, VK_NULL_HANDLE, 1, &gpi, nullptr, &p), what);
+            return Unique<VkPipeline>(p, [dev](VkPipeline q) { vkDestroyPipeline(dev, q, nullptr); });
+        };
+        addPipeline_ = make_blended(VK_BLEND_FACTOR_ONE, VK_BLEND_FACTOR_ONE, "vkCreateGraphicsPipelines(lit add)");
+        alphaAddPipeline_ = make_blended(VK_BLEND_FACTOR_SRC_ALPHA, VK_BLEND_FACTOR_ONE,
+                                         "vkCreateGraphicsPipelines(lit alpha-add)");
+        alphaBlendPipeline_ = make_blended(VK_BLEND_FACTOR_SRC_ALPHA, VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA,
+                                           "vkCreateGraphicsPipelines(lit alpha-blend)");
     }
 
     {
@@ -727,6 +976,7 @@ SceneRenderer::SceneRenderer(VkPhysicalDevice pd, VkDevice dev, VkQueue queue,
         gpi.pVertexInputState = &vin;
         gpi.pInputAssemblyState = &ia;
         gpi.pViewportState = &vps;
+        gpi.pDynamicState = &dyn;
         gpi.pRasterizationState = &rs;
         gpi.pMultisampleState = &ms;
         gpi.pDepthStencilState = &ds;
@@ -903,6 +1153,7 @@ SceneRenderer::SceneRenderer(VkPhysicalDevice pd, VkDevice dev, VkQueue queue,
         pgpi.pVertexInputState = &pvin;
         pgpi.pInputAssemblyState = &ia;
         pgpi.pViewportState = &vps;
+        pgpi.pDynamicState = &dyn;
         pgpi.pRasterizationState = &rs;
         pgpi.pMultisampleState = &ms;
         pgpi.pDepthStencilState = &pds;
@@ -938,20 +1189,6 @@ SceneRenderer::SceneRenderer(VkPhysicalDevice pd, VkDevice dev, VkQueue queue,
     check(vkCreateRenderPass(dev_, &tmrpi, nullptr, &rawTmPass), "vkCreateRenderPass(tonemap)");
     tmPass_ = Unique<VkRenderPass>(rawTmPass, [dev](VkRenderPass p) { vkDestroyRenderPass(dev, p, nullptr); });
     {
-        VkImageView tmView = ldrColor_.view.get();
-        VkFramebufferCreateInfo tmfbi{};
-        tmfbi.sType = VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO;
-        tmfbi.renderPass = rawTmPass;
-        tmfbi.attachmentCount = 1;
-        tmfbi.pAttachments = &tmView;
-        tmfbi.width = width_;
-        tmfbi.height = height_;
-        tmfbi.layers = 1;
-        VkFramebuffer rawTmFb = VK_NULL_HANDLE;
-        check(vkCreateFramebuffer(dev_, &tmfbi, nullptr, &rawTmFb), "vkCreateFramebuffer(tonemap)");
-        tmFb_ = Unique<VkFramebuffer>(rawTmFb, [dev](VkFramebuffer f) { vkDestroyFramebuffer(dev, f, nullptr); });
-    }
-    {
         VkDescriptorPoolSize tmpsize{VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1};
         VkDescriptorPoolCreateInfo tmdpi{};
         tmdpi.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
@@ -968,16 +1205,8 @@ SceneRenderer::SceneRenderer(VkPhysicalDevice pd, VkDevice dev, VkQueue queue,
         VkDescriptorSetLayout tml = tmLayout_.get();
         tmdsa.pSetLayouts = &tml;
         check(vkAllocateDescriptorSets(dev_, &tmdsa, &tm_set_), "vkAllocateDescriptorSets(tonemap)");
-        VkDescriptorImageInfo dii{sampler_.get(), hdrColor_.view.get(), VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL};
-        VkWriteDescriptorSet w{};
-        w.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-        w.dstSet = tm_set_;
-        w.dstBinding = 0;
-        w.descriptorCount = 1;
-        w.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
-        w.pImageInfo = &dii;
-        vkUpdateDescriptorSets(dev_, 1, &w, 0, nullptr);
     }
+    create_targets();
     {
         VkPushConstantRange tmpcr{VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(TonemapPC)};
         VkPipelineLayoutCreateInfo tmpli{};
@@ -1017,6 +1246,7 @@ SceneRenderer::SceneRenderer(VkPhysicalDevice pd, VkDevice dev, VkQueue queue,
         tmgpi.pVertexInputState = &tmvin;
         tmgpi.pInputAssemblyState = &ia;
         tmgpi.pViewportState = &vps;
+        tmgpi.pDynamicState = &dyn;
         tmgpi.pRasterizationState = &rs;
         tmgpi.pMultisampleState = &ms;
         tmgpi.pColorBlendState = &tmcb;
@@ -1029,27 +1259,74 @@ SceneRenderer::SceneRenderer(VkPhysicalDevice pd, VkDevice dev, VkQueue queue,
 }
 
 void SceneRenderer::prepare(const std::vector<const SceneInstance*>& live) {
-    Vec3 wmn{1e30f, 1e30f, 1e30f}, wmx{-1e30f, -1e30f, -1e30f};
-    for (const SceneInstance* inst : live) {
-        const formats::Model& m = *inst->model;
-        ensure_mesh(m);
-        Vec3 lmn{1e30f, 1e30f, 1e30f}, lmx{-1e30f, -1e30f, -1e30f};
-        for (uint32_t i = 0; i < m.vertex_count; ++i)
-            for (int a = 0; a < 3; ++a) {
-                float c = m.positions[i * 3 + a];
-                (&lmn.x)[a] = std::min((&lmn.x)[a], c);
-                (&lmx.x)[a] = std::max((&lmx.x)[a], c);
+    frame_lights_.clear();
+    for (const SceneInstance* instp : live) {
+        const SceneInstance& inst = *instp;
+        if (!inst.model || inst.model->lights.empty()) continue;
+        const formats::Model& m = *inst.model;
+        const uint32_t seq = inst.seq >= 0 ? uint32_t(inst.seq) : UINT32_MAX;
+        std::vector<Mat4> bw;
+        bool posed = false;
+        for (const formats::M3Light& L : m.lights) {
+            if (L.type != formats::kLightPoint && L.type != formats::kLightSpot) continue;
+            float intensity = L.intensity;
+            if (L.intensity_flags && inst.seq >= 0) {
+                formats::M3AnimRef ref;
+                ref.interp = L.intensity_interp;
+                ref.anim_flags = L.intensity_flags;
+                ref.anim_id = L.intensity_id;
+                intensity = animated_scalar(m, seq, ref, inst.time_ms, L.intensity);
             }
+            if (intensity <= 0.0f || L.attenuation_far <= 0.0f) continue;
+            if (!posed) { bw = pose_world(m, seq, inst.seq >= 0 ? inst.time_ms : 0.0f); posed = true; }
+            const Mat4 mb = (L.bone >= 0 && size_t(L.bone) < bw.size()) ? inst.world * bw[size_t(L.bone)] : inst.world;
+            FrameLight f;
+            f.pos = {mb.m[12], mb.m[13], mb.m[14]};
+            f.col = {L.color[0] * intensity, L.color[1] * intensity, L.color[2] * intensity};
+            f.att_near = L.attenuation_near;
+            f.att_far = L.attenuation_far;
+            frame_lights_.push_back(f);
+        }
+    }
+    Vec3 wmn{1e30f, 1e30f, 1e30f}, wmx{-1e30f, -1e30f, -1e30f};
+    inst_aabb_.assign(live.size(), {Vec3{0, 0, 0}, Vec3{0, 0, 0}});
+    for (size_t li = 0; li < live.size(); ++li) {
+        const SceneInstance* inst = live[li];
+        const formats::Model& m = *inst->model;
+        const Mesh& mesh = ensure_mesh(m, inst->mesh_version);
+        const Vec3 lmn = mesh.lmin, lmx = mesh.lmax;
+        Vec3 imn{1e30f, 1e30f, 1e30f}, imx{-1e30f, -1e30f, -1e30f};
         for (int cx = 0; cx < 2; ++cx)
             for (int cy = 0; cy < 2; ++cy)
                 for (int cz = 0; cz < 2; ++cz) {
                     Vec3 corner{cx ? lmx.x : lmn.x, cy ? lmx.y : lmn.y, cz ? lmx.z : lmn.z};
                     Vec3 w = mul_point(inst->world, corner);
                     for (int a = 0; a < 3; ++a) {
-                        (&wmn.x)[a] = std::min((&wmn.x)[a], (&w.x)[a]);
-                        (&wmx.x)[a] = std::max((&wmx.x)[a], (&w.x)[a]);
+                        (&imn.x)[a] = std::min((&imn.x)[a], (&w.x)[a]);
+                        (&imx.x)[a] = std::max((&imx.x)[a], (&w.x)[a]);
                     }
                 }
+        if (inst->seq >= 0 && !m.bones.empty()) {
+            const std::vector<Mat4> bw = pose_world(m, uint32_t(inst->seq), inst->time_ms);
+            const float dx = lmx.x - lmn.x, dy = lmx.y - lmn.y, dz = lmx.z - lmn.z;
+            const float diag = std::sqrt(dx * dx + dy * dy + dz * dz);
+            float scale = 0.0f;
+            for (int c = 0; c < 3; ++c) {
+                const float* col = &inst->world.m[std::size_t(c) * 4];
+                scale = std::max(scale, std::sqrt(col[0] * col[0] + col[1] * col[1] + col[2] * col[2]));
+            }
+            const float r = diag * scale;
+            for (const Mat4& b : bw) {
+                const Vec3 o = mul_point(inst->world, Vec3{b.m[12], b.m[13], b.m[14]});
+                imn = {std::min(imn.x, o.x - r), std::min(imn.y, o.y - r), std::min(imn.z, o.z - r)};
+                imx = {std::max(imx.x, o.x + r), std::max(imx.y, o.y + r), std::max(imx.z, o.z + r)};
+            }
+        }
+        inst_aabb_[li] = {imn, imx};
+        for (int a = 0; a < 3; ++a) {
+            (&wmn.x)[a] = std::min((&wmn.x)[a], (&imn.x)[a]);
+            (&wmx.x)[a] = std::max((&wmx.x)[a], (&imx.x)[a]);
+        }
     }
     if (wmn.x > wmx.x) { wmn = {0, 0, 0}; wmx = {0, 0, 0}; }
     aabb_min_ = wmn;
@@ -1061,28 +1338,11 @@ void SceneRenderer::record(VkCommandBuffer cmd, const std::vector<const SceneIns
                            const std::vector<ParticleGroup>& pgroups) {
     Mat4 view_proj = cam.view_proj(float(width_) / float(height_));
 
-    Vec3 wmn = aabb_min_, wmx = aabb_max_;
-    Vec3 sc{(wmn.x + wmx.x) * 0.5f, (wmn.y + wmx.y) * 0.5f, (wmn.z + wmx.z) * 0.5f};
-    float sradius = 0.5f * std::sqrt(dot(sub(wmx, wmn), sub(wmx, wmn)));
-    if (sradius < 1e-4f) sradius = 1.0f;
-    Vec3 L = tun_.light_dir;
-    Vec3 leye{sc.x + L.x * sradius * 2.0f, sc.y + L.y * sradius * 2.0f, sc.z + L.z * sradius * 2.0f};
-    Vec3 lup = std::fabs(L.z) > 0.99f ? Vec3{0, 1, 0} : Vec3{0, 0, 1};
-    Mat4 lview = look_at(leye, sc, lup);
-    float lxmn = 1e30f, lxmx = -1e30f, lymn = 1e30f, lymx = -1e30f, lzmn = 1e30f, lzmx = -1e30f;
-    for (int cx = 0; cx < 2; ++cx)
-        for (int cy = 0; cy < 2; ++cy)
-            for (int cz = 0; cz < 2; ++cz) {
-                Vec3 corner{cx ? wmx.x : wmn.x, cy ? wmx.y : wmn.y, cz ? wmx.z : wmn.z};
-                Vec3 v = mul_point(lview, corner);
-                lxmn = std::min(lxmn, v.x); lxmx = std::max(lxmx, v.x);
-                lymn = std::min(lymn, v.y); lymx = std::max(lymx, v.y);
-                lzmn = std::min(lzmn, v.z); lzmx = std::max(lzmx, v.z);
-            }
-    float p = tun_.fit_pad;
-    float znear = std::max(0.001f, -lzmx - p);
-    float zfar = -lzmn + p;
-    Mat4 lproj = ortho(lxmn - p, lxmx + p, lymn - p, lymx + p, znear, zfar);
+    const ShadowBox sbox =
+        fit_shadow_ortho(aabb_min_, aabb_max_, cam, float(width_) / float(height_), tun_.light_dir,
+                         tun_.fit_pad, tun_.shadow_dim, tun_.shadow_clip, tun_.camera_fit_shadow);
+    Mat4 lview = look_at(sbox.eye, sbox.center, sbox.up);
+    Mat4 lproj = ortho(sbox.xmn, sbox.xmx, sbox.ymn, sbox.ymx, sbox.znear, sbox.zfar);
     Mat4 lightVP = lproj * lview;
 
     GlobalsUBO globals{};
@@ -1100,6 +1360,22 @@ void SceneRenderer::record(VkCommandBuffer cmd, const std::vector<const SceneIns
     globals.lightDir[1] = tun_.light_dir.y;
     globals.lightDir[2] = tun_.light_dir.z;
     globals.lightDir[3] = 0.0f;
+    globals.rigAmbient[0] = tun_.rig.ambient[0];
+    globals.rigAmbient[1] = tun_.rig.ambient[1];
+    globals.rigAmbient[2] = tun_.rig.ambient[2];
+    globals.rigAmbient[3] = tun_.rig.present ? 1.0f : 0.0f;
+    {
+        const RigLight* ls[3] = {&tun_.rig.key, &tun_.rig.fill, &tun_.rig.back};
+        for (int i = 0; i < 3; ++i) {
+            globals.rigDir[i][0] = ls[i]->dir.x;
+            globals.rigDir[i][1] = ls[i]->dir.y;
+            globals.rigDir[i][2] = ls[i]->dir.z;
+            globals.rigDir[i][3] = ls[i]->present ? 1.0f : 0.0f;
+            for (int c = 0; c < 3; ++c) globals.rigColor[i][c] = ls[i]->color[c];
+            globals.rigColor[i][3] = 0.0f;
+        }
+        globals.rigParams[0] = tun_.rig_shadow_floor;
+    }
     for (const SceneInstance* p : live)
         if (p->model && p->model->has_splat_payload()) {
             if (TerrainSplat* ts = ensure_splat(*p->model)) {
@@ -1108,6 +1384,27 @@ void SceneRenderer::record(VkCommandBuffer cmd, const std::vector<const SceneIns
             }
             break;
         }
+    globals.fogExtent[0] = fog_world_w_;
+    globals.fogExtent[1] = fog_world_h_;
+    globals.fogExtent[2] = fog_present_ ? 1.0f : 0.0f;
+    globals.fogExtent[3] = 0.0f;
+    {
+        std::vector<FrameLight> fl = frame_lights_;
+        std::sort(fl.begin(), fl.end(), [&](const FrameLight& a, const FrameLight& b) {
+            const float da = (a.pos.x - cam.center.x) * (a.pos.x - cam.center.x) + (a.pos.y - cam.center.y) * (a.pos.y - cam.center.y) + (a.pos.z - cam.center.z) * (a.pos.z - cam.center.z);
+            const float db = (b.pos.x - cam.center.x) * (b.pos.x - cam.center.x) + (b.pos.y - cam.center.y) * (b.pos.y - cam.center.y) + (b.pos.z - cam.center.z) * (b.pos.z - cam.center.z);
+            return da < db;
+        });
+        const size_t n = std::min<size_t>(fl.size(), 16);
+        for (size_t i = 0; i < n; ++i) {
+            globals.lightPos[i][0] = fl[i].pos.x; globals.lightPos[i][1] = fl[i].pos.y; globals.lightPos[i][2] = fl[i].pos.z; globals.lightPos[i][3] = fl[i].att_far;
+            globals.lightCol[i][0] = fl[i].col.x; globals.lightCol[i][1] = fl[i].col.y; globals.lightCol[i][2] = fl[i].col.z; globals.lightCol[i][3] = fl[i].att_near;
+        }
+        globals.lightMeta[0] = float(n);
+        globals.lightMeta[1] = globals.lightMeta[2] = globals.lightMeta[3] = 0.0f;
+        lights_drawn_ = n;
+        lights_seen_ = frame_lights_.size();
+    }
     void* gp = nullptr;
     check(vkMapMemory(dev_, globalsBuf_.mem.get(), 0, sizeof(GlobalsUBO), 0, &gp), "vkMapMemory(globals)");
     std::memcpy(gp, &globals, sizeof(GlobalsUBO));
@@ -1115,6 +1412,7 @@ void SceneRenderer::record(VkCommandBuffer cmd, const std::vector<const SceneIns
 
     size_t bidx = 0;
     vkResetDescriptorPool(dev_, bonePool_.get(), 0);
+    for (auto& p : bonePoolsExtra_) vkResetDescriptorPool(dev_, p.get(), 0);
     std::vector<VkDescriptorSet> bone_set(live.size(), VK_NULL_HANDLE);
     auto alloc_bone_set = [&](const std::vector<float>& flat) -> VkDescriptorSet {
         const VkDeviceSize need = VkDeviceSize(flat.size()) * 4;
@@ -1134,14 +1432,8 @@ void SceneRenderer::record(VkCommandBuffer cmd, const std::vector<const SceneIns
         }
         Buffer& slot = bonebufs_[bidx];
         ++bidx;
-        VkDescriptorSetAllocateInfo dsa{};
-        dsa.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
-        dsa.descriptorPool = bonePool_.get();
-        dsa.descriptorSetCount = 1;
-        VkDescriptorSetLayout bl = boneLayout_.get();
-        dsa.pSetLayouts = &bl;
-        VkDescriptorSet set = VK_NULL_HANDLE;
-        check(vkAllocateDescriptorSets(dev_, &dsa, &set), "vkAllocateDescriptorSets(bone)");
+        VkDescriptorSet set = alloc_set(bonePool_, bonePoolsExtra_, boneLayout_.get(),
+                                        VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, 4096, "bone");
         VkDescriptorBufferInfo bdi{slot.buf.get(), 0, VK_WHOLE_SIZE};
         VkWriteDescriptorSet bw{};
         bw.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
@@ -1182,15 +1474,11 @@ void SceneRenderer::record(VkCommandBuffer cmd, const std::vector<const SceneIns
                                VK_BUFFER_USAGE_VERTEX_BUFFER_BIT,
                                const_cast<ParticleVertex*>(pverts.data()));
         vkResetDescriptorPool(dev_, partPool_.get(), 0);
+        for (auto& p : partPoolsExtra_) vkResetDescriptorPool(dev_, p.get(), 0);
         part_set.assign(pgroups.size(), VK_NULL_HANDLE);
         for (size_t g = 0; g < pgroups.size(); ++g) {
-            VkDescriptorSetAllocateInfo dsa{};
-            dsa.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
-            dsa.descriptorPool = partPool_.get();
-            dsa.descriptorSetCount = 1;
-            VkDescriptorSetLayout pl = partLayout_.get();
-            dsa.pSetLayouts = &pl;
-            check(vkAllocateDescriptorSets(dev_, &dsa, &part_set[g]), "vkAllocateDescriptorSets(particle)");
+            part_set[g] = alloc_set(partPool_, partPoolsExtra_, partLayout_.get(),
+                                    VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1, 256, "particle");
             int ti = pgroups[g].tex;
             if (ti < 0 || ti >= int(textures_.size())) ti = kDefaultWhite;
             VkDescriptorImageInfo dii{sampler_.get(), textures_[ti].view.get(), VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL};
@@ -1219,43 +1507,7 @@ void SceneRenderer::record(VkCommandBuffer cmd, const std::vector<const SceneIns
     vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, layout_.get(), 2, 1, &global_set_, 0, nullptr);
     for (size_t i = 0; i < live.size(); ++i) {
         const SceneInstance& inst = *live[i];
-        Mesh& mesh = ensure_mesh(*inst.model);
-        float pc[20];
-        std::memcpy(pc, inst.world.m.data(), 64);
-        pc[16] = inst.team[0]; pc[17] = inst.team[1];
-        pc[18] = inst.team[2]; pc[19] = inst.team[3];
-        vkCmdPushConstants(cmd, layout_.get(), VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0, 80, pc);
-        VkDeviceSize off = 0;
-        VkBuffer vb = mesh.vbuf.buf.get();
-        vkCmdBindVertexBuffers(cmd, 0, 1, &vb, &off);
-        vkCmdBindIndexBuffer(cmd, mesh.ibuf.buf.get(), 0, VK_INDEX_TYPE_UINT32);
-        vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, layout_.get(), 1, 1, &bone_set[i], 0, nullptr);
-        for (size_t d = 0; d < mesh.draws.size(); ++d)
-            vkCmdDrawIndexed(cmd, mesh.draws[d].index_count, 1, mesh.draws[d].first_index, 0, 0);
-    }
-    vkCmdEndRenderPass(cmd);
-
-    VkClearValue clears[2];
-    clears[0].color = {{0.06f, 0.07f, 0.09f, 1.0f}};
-    clears[1].depthStencil = {1.0f, 0};
-    VkRenderPassBeginInfo rbi{};
-    rbi.sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO;
-    rbi.renderPass = litPass_.get();
-    rbi.framebuffer = litFb_.get();
-    rbi.renderArea = {{0, 0}, {width_, height_}};
-    rbi.clearValueCount = 2;
-    rbi.pClearValues = clears;
-    vkCmdBeginRenderPass(cmd, &rbi, VK_SUBPASS_CONTENTS_INLINE);
-    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, litPipeline_.get());
-    vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, layout_.get(), 2, 1, &global_set_, 0, nullptr);
-    std::vector<size_t> splat_draws;
-    for (size_t i = 0; i < live.size(); ++i) {
-        const SceneInstance& inst = *live[i];
-        if (inst.model->has_splat_payload() && ensure_splat(*inst.model)) {
-            splat_draws.push_back(i);
-            continue;
-        }
-        Mesh& mesh = ensure_mesh(*inst.model);
+        Mesh& mesh = ensure_mesh(*inst.model, inst.mesh_version);
         float pc[20];
         std::memcpy(pc, inst.world.m.data(), 64);
         pc[16] = inst.team[0]; pc[17] = inst.team[1];
@@ -1267,6 +1519,102 @@ void SceneRenderer::record(VkCommandBuffer cmd, const std::vector<const SceneIns
         vkCmdBindIndexBuffer(cmd, mesh.ibuf.buf.get(), 0, VK_INDEX_TYPE_UINT32);
         vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, layout_.get(), 1, 1, &bone_set[i], 0, nullptr);
         for (size_t d = 0; d < mesh.draws.size(); ++d) {
+            const int mi = mesh.draws[d].material;
+            if (mi >= 0 && std::size_t(mi) < inst.model->materials.size() &&
+                formats::material_is_additive(inst.model->materials[mi]))
+                continue;
+            vkCmdDrawIndexed(cmd, mesh.draws[d].index_count, 1, mesh.draws[d].first_index, 0, 0);
+        }
+    }
+    vkCmdEndRenderPass(cmd);
+
+    VkClearValue clears[2];
+    clears[0].color = {{0.06f, 0.07f, 0.09f, cam.transparent_clear ? 0.0f : 1.0f}};
+    clears[1].depthStencil = {1.0f, 0};
+    VkRenderPassBeginInfo rbi{};
+    rbi.sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO;
+    rbi.renderPass = litPass_.get();
+    rbi.framebuffer = litFb_.get();
+    rbi.renderArea = {{0, 0}, {width_, height_}};
+    rbi.clearValueCount = 2;
+    rbi.pClearValues = clears;
+    vkCmdBeginRenderPass(cmd, &rbi, VK_SUBPASS_CONTENTS_INLINE);
+    {
+        VkViewport dvp{0, 0, float(width_), float(height_), 0, 1};
+        VkRect2D dsc{{0, 0}, {width_, height_}};
+        vkCmdSetViewport(cmd, 0, 1, &dvp);
+        vkCmdSetScissor(cmd, 0, 1, &dsc);
+    }
+    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, litPipeline_.get());
+    vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, layout_.get(), 2, 1, &global_set_, 0, nullptr);
+    std::vector<size_t> splat_draws;
+    struct BlendedDraw {
+        size_t inst;
+        size_t draw;
+        float dist2;
+    };
+    std::vector<BlendedDraw> blended;
+    auto outside_frustum = [&](size_t li) -> bool {
+        if (li >= inst_aabb_.size()) return false;
+        const Vec3 mn = inst_aabb_[li][0], mx = inst_aabb_[li][1];
+        int out[6] = {0, 0, 0, 0, 0, 0};
+        for (int c = 0; c < 8; ++c) {
+            const Vec3 p{(c & 1) ? mx.x : mn.x, (c & 2) ? mx.y : mn.y, (c & 4) ? mx.z : mn.z};
+            const float* m = view_proj.m.data();
+            const float cx = m[0] * p.x + m[4] * p.y + m[8] * p.z + m[12];
+            const float cy = m[1] * p.x + m[5] * p.y + m[9] * p.z + m[13];
+            const float cz = m[2] * p.x + m[6] * p.y + m[10] * p.z + m[14];
+            const float cw = m[3] * p.x + m[7] * p.y + m[11] * p.z + m[15];
+            if (cx < -cw) ++out[0];
+            if (cx > cw) ++out[1];
+            if (cy < -cw) ++out[2];
+            if (cy > cw) ++out[3];
+            if (cz < 0.0f) ++out[4];
+            if (cz > cw) ++out[5];
+        }
+        for (int k = 0; k < 6; ++k)
+            if (out[k] == 8) return true;
+        return false;
+    };
+    lit_drawn_ = lit_culled_ = 0;
+    for (size_t i = 0; i < live.size(); ++i) {
+        const SceneInstance& inst = *live[i];
+        if (outside_frustum(i)) { ++lit_culled_; continue; }
+        ++lit_drawn_;
+        if (inst.model->has_splat_payload() && ensure_splat(*inst.model)) {
+            splat_draws.push_back(i);
+            continue;
+        }
+        Mesh& mesh = ensure_mesh(*inst.model, inst.mesh_version);
+        float pc[20];
+        std::memcpy(pc, inst.world.m.data(), 64);
+        pc[16] = inst.team[0]; pc[17] = inst.team[1];
+        pc[18] = inst.team[2]; pc[19] = inst.team[3];
+        vkCmdPushConstants(cmd, layout_.get(), VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0, 80, pc);
+        VkDeviceSize off = 0;
+        VkBuffer vb = mesh.vbuf.buf.get();
+        vkCmdBindVertexBuffers(cmd, 0, 1, &vb, &off);
+        vkCmdBindIndexBuffer(cmd, mesh.ibuf.buf.get(), 0, VK_INDEX_TYPE_UINT32);
+        vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, layout_.get(), 1, 1, &bone_set[i], 0, nullptr);
+        for (size_t d = 0; d < mesh.draws.size(); ++d) {
+            const int mi = mesh.draws[d].material;
+            float mpc[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+            if (mi >= 0 && std::size_t(mi) < inst.model->materials.size())
+                mpc[0] = inst.model->materials[mi].specularity;
+            if (mi >= 0 && std::size_t(mi) < inst.model->materials.size() &&
+                (formats::material_is_additive(inst.model->materials[mi]) ||
+                 (formats::material_is_alpha_blended(inst.model->materials[mi]) && !inst.model->cliff_skin_opaque))) {
+                const float dx = inst.world.m[12] - cam.eye.x, dy = inst.world.m[13] - cam.eye.y,
+                            dz = inst.world.m[14] - cam.eye.z;
+                blended.push_back(BlendedDraw{i, d, dx * dx + dy * dy + dz * dz});
+                continue;
+            }
+            vkCmdPushConstants(cmd, layout_.get(),
+                               VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 80, 16, mpc);
+            float apc[4];
+            material_anim(*inst.model, mi, inst.seq, inst.time_ms, apc);
+            vkCmdPushConstants(cmd, layout_.get(),
+                               VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 96, 16, apc);
             vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, layout_.get(), 0, 1, &mesh.draw_set[d], 0, nullptr);
             vkCmdDrawIndexed(cmd, mesh.draws[d].index_count, 1, mesh.draws[d].first_index, 0, 0);
         }
@@ -1274,7 +1622,7 @@ void SceneRenderer::record(VkCommandBuffer cmd, const std::vector<const SceneIns
     for (size_t i : splat_draws) {
         const SceneInstance& inst = *live[i];
         TerrainSplat* ts = ensure_splat(*inst.model);
-        Mesh& mesh = ensure_mesh(*inst.model);
+        Mesh& mesh = ensure_mesh(*inst.model, inst.mesh_version);
         vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, splatPipeline_.get());
         vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, splatPipeLayout_.get(), 0, 1, &ts->set, 0, nullptr);
         vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, splatPipeLayout_.get(), 1, 1, &bone_set[i], 0, nullptr);
@@ -1291,6 +1639,42 @@ void SceneRenderer::record(VkCommandBuffer cmd, const std::vector<const SceneIns
         for (size_t d = 0; d < mesh.draws.size(); ++d)
             vkCmdDrawIndexed(cmd, mesh.draws[d].index_count, 1, mesh.draws[d].first_index, 0, 0);
     }
+    if (!blended.empty()) {
+        std::stable_sort(blended.begin(), blended.end(),
+                         [](const BlendedDraw& a, const BlendedDraw& b) { return a.dist2 > b.dist2; });
+        VkPipeline bound = VK_NULL_HANDLE;
+        for (const BlendedDraw& bd : blended) {
+            const SceneInstance& inst = *live[bd.inst];
+            Mesh& mesh = ensure_mesh(*inst.model, inst.mesh_version);
+            const int mi = mesh.draws[bd.draw].material;
+            const formats::M3Material& mat = inst.model->materials[std::size_t(mi)];
+            const VkPipeline want = mat.blend_mode == formats::kBlendAlphaAdd    ? alphaAddPipeline_.get()
+                                    : mat.blend_mode == formats::kBlendAlphaBlend ? alphaBlendPipeline_.get()
+                                                                                  : addPipeline_.get();
+            if (want != bound) {
+                vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, want);
+                vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, layout_.get(), 2, 1, &global_set_, 0, nullptr);
+                bound = want;
+            }
+            float pc[20];
+            std::memcpy(pc, inst.world.m.data(), 64);
+            pc[16] = inst.team[0]; pc[17] = inst.team[1];
+            pc[18] = inst.team[2]; pc[19] = inst.team[3];
+            vkCmdPushConstants(cmd, layout_.get(), VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0, 80, pc);
+            float mpc[4] = {mat.specularity, float(mat.blend_mode), float(formats::material_alpha_mask_channel(mat)), 0.0f};
+            vkCmdPushConstants(cmd, layout_.get(), VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 80, 16, mpc);
+            float apc[4];
+            material_anim(*inst.model, mi, inst.seq, inst.time_ms, apc);
+            vkCmdPushConstants(cmd, layout_.get(), VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 96, 16, apc);
+            VkDeviceSize off = 0;
+            VkBuffer vb = mesh.vbuf.buf.get();
+            vkCmdBindVertexBuffers(cmd, 0, 1, &vb, &off);
+            vkCmdBindIndexBuffer(cmd, mesh.ibuf.buf.get(), 0, VK_INDEX_TYPE_UINT32);
+            vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, layout_.get(), 1, 1, &bone_set[bd.inst], 0, nullptr);
+            vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, layout_.get(), 0, 1, &mesh.draw_set[bd.draw], 0, nullptr);
+            vkCmdDrawIndexed(cmd, mesh.draws[bd.draw].index_count, 1, mesh.draws[bd.draw].first_index, 0, 0);
+        }
+    }
     if (draw_particles) {
         vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, partPipeline_.get());
         float pmvp[16];
@@ -1306,7 +1690,7 @@ void SceneRenderer::record(VkCommandBuffer cmd, const std::vector<const SceneIns
     }
     vkCmdEndRenderPass(cmd);
 
-    TonemapPC tm{tun_.exposure, tun_.curve};
+    TonemapPC tm{tun_.exposure, tun_.curve, cam.transparent_clear ? 1 : 0};
     VkRenderPassBeginInfo tmrbi{};
     tmrbi.sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO;
     tmrbi.renderPass = tmPass_.get();
@@ -1315,6 +1699,12 @@ void SceneRenderer::record(VkCommandBuffer cmd, const std::vector<const SceneIns
     tmrbi.clearValueCount = 0;
     tmrbi.pClearValues = nullptr;
     vkCmdBeginRenderPass(cmd, &tmrbi, VK_SUBPASS_CONTENTS_INLINE);
+    {
+        VkViewport dvp{0, 0, float(width_), float(height_), 0, 1};
+        VkRect2D dsc{{0, 0}, {width_, height_}};
+        vkCmdSetViewport(cmd, 0, 1, &dvp);
+        vkCmdSetScissor(cmd, 0, 1, &dsc);
+    }
     vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, tmPipeline_.get());
     vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, tmPipeLayout_.get(), 0, 1, &tm_set_, 0, nullptr);
     vkCmdPushConstants(cmd, tmPipeLayout_.get(), VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(TonemapPC), &tm);
@@ -1343,10 +1733,8 @@ void build_particles(SceneRenderer& sr, const std::vector<const SceneInstance*>&
             ++emitter_uid;
             if (pe.lifetime <= 0.0f) continue;
             int ptex = sr.default_white();
-            if (pe.material_ref_index < m.material_refs.size())
-                ptex = sr.resolve_texture(
-                    m, int(m.material_refs[pe.material_ref_index].index), "Diffuse",
-                    sr.default_white());
+            if (const int pm = formats::particle_material(m, pe); pm >= 0)
+                ptex = sr.resolve_texture(m, pm, "Diffuse", sr.default_white());
             Mat4 mb = pe.bone < bw.size() ? inst.world * bw[pe.bone] : inst.world;
             Vec3 origin{mb.m[12], mb.m[13], mb.m[14]};
             Vec3 axis = normalize({mb.m[8], mb.m[9], mb.m[10]});
@@ -1354,7 +1742,15 @@ void build_particles(SceneRenderer& sr, const std::vector<const SceneInstance*>&
             Vec3 t1 = normalize(cross(axis, right));
             if (dot(t1, t1) < 0.5f) t1 = normalize(cross(axis, upc));
             Vec3 t2 = cross(axis, t1);
-            int n = particle_count(pe);
+            formats::M3AnimRef rate_ref;
+            rate_ref.interp = pe.rate_interp;
+            rate_ref.anim_flags = pe.rate_anim_flags;
+            rate_ref.anim_id = pe.rate_anim_id;
+            rate_ref.init[0] = pe.emission_rate;
+            const float live_rate =
+                animated_scalar(m, pseq, rate_ref, inst.time_ms, pe.emission_rate);
+            int n = formats::particle_count_at_rate(pe, live_rate);
+            if (n <= 0) continue;
             for (int i = 0; i < n; ++i) {
                 float u1, u2, u3;
                 particle_rng(emitter_uid, i, u1, u2, u3);

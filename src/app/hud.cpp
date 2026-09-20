@@ -39,6 +39,8 @@ HudContent HudModel::build(const sim::World& world, int player,
         wf.energy_frac =
             u.energy_max.raw() > 0 ? clamp01(u.energy.to_double() / u.energy_max.to_double())
                                    : 0.0f;
+        wf.shield_frac =
+            u.shields_max.raw() > 0 ? clamp01(u.shields.to_double() / u.shields_max.to_double()) : 0.0f;
         wf.constructing = u.constructing;
         wf.build_progress = float(u.build_progress.to_double());
         break;

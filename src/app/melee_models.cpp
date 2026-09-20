@@ -1,5 +1,8 @@
 #include "sc2/app/melee_models.hpp"
 
+#include <cstring>
+#include "sc2/formats/m3.hpp"
+
 #include <cctype>
 #include <cstdio>
 
@@ -122,6 +125,22 @@ const formats::Model* MeleeModels::ensure(casc::Storage& store, const std::strin
     return model_for(token);
 }
 
+const formats::Model* MeleeModels::ensure_build(casc::Storage& store, const std::string& token) {
+    const std::string key = token + "\x1f" "BuildModel";
+    if (auto it = models_.find(key); it != models_.end()) return &it->second;
+
+    auto path = data::resolve_build_model(catalog(store), token);
+    if (!path) return nullptr;
+
+    formats::Model model;
+    for (const char* root : kAssetRoots) {
+        if (try_decode(store, std::string(root) + *path, model)) {
+            return &models_.emplace(key, std::move(model)).first->second;
+        }
+    }
+    return nullptr;
+}
+
 static std::string with_variation(const std::string& path, int variation) {
     if (variation <= 0) return path;
     const std::size_t dot = path.rfind(".m3");
@@ -134,6 +153,205 @@ static std::string with_variation(const std::string& path, int variation) {
     return path.substr(0, i) + buf + path.substr(dot);
 }
 
+const formats::Model* MeleeModels::carry_model(casc::Storage& store, const std::string& node_type) {
+    if (auto it = carries_.find(node_type); it != carries_.end())
+        return it->second.vertex_count > 0 ? &it->second : nullptr;
+    formats::Model model;
+    data::Catalog& cat = catalog(store);
+    std::string carry_id;
+    for (const std::string& link : cat.array_links("CUnit", node_type, "BehaviorArray")) {
+        const data::Catalog::Entry* be = cat.find("CBehavior", link);
+        if (!be || be->tag != "CBehaviorResource") continue;
+        if (auto cb = cat.scalar("CBehavior", link, "CarryResourceBehavior");
+            cb && !cb->empty()) {
+            carry_id = *cb;
+            break;
+        }
+        if (auto def = cat.tag_default_scalar("CBehaviorResource", "CarryResourceBehavior");
+            def && !def->empty()) {
+            carry_id = *def;
+            for (std::size_t at = carry_id.find("##id##"); at != std::string::npos;
+                 at = carry_id.find("##id##", at))
+                carry_id.replace(at, 6, link);
+            if (!carry_id.empty()) break;
+        }
+    }
+    if (!carry_id.empty()) {
+        auto pth = cat.scalar("CModel", carry_id, "Model");
+        if (std::optional<std::string> path = pth) {
+            std::string rel = *path;
+            for (char& c : rel)
+                if (c == '\\') c = '/';
+            for (const char* root : kAssetRoots)
+                if (try_decode(store, std::string(root) + rel, model)) break;
+        }
+    }
+    formats::Model& slot = carries_[node_type];
+    slot = std::move(model);
+    return slot.vertex_count > 0 ? &slot : nullptr;
+}
+
+const formats::Model* MeleeModels::death_model(casc::Storage& store, const std::string& actor_model_id) {
+    if (actor_model_id.empty()) return nullptr;
+    if (auto it = deaths_.find(actor_model_id); it != deaths_.end())
+        return it->second.vertex_count > 0 ? &it->second : nullptr;
+    formats::Model model;
+    data::Catalog& cat = catalog(store);
+    std::optional<std::string> model_id = cat.scalar("CActorModel", actor_model_id, "Model");
+    if (!model_id) model_id = actor_model_id;
+    if (auto path = cat.scalar("CModel", *model_id, "Model")) {
+        std::string rel = *path;
+        for (char& c : rel)
+            if (c == '\\') c = '/';
+        for (const char* root : kAssetRoots)
+            if (try_decode(store, std::string(root) + rel, model)) break;
+    }
+    formats::Model& slot = deaths_[actor_model_id];
+    slot = std::move(model);
+    return slot.vertex_count > 0 ? &slot : nullptr;
+}
+
+const formats::Model* MeleeModels::scaffold_model(casc::Storage& store, const std::string& actor_model_id, float scale[3]) {
+    if (actor_model_id.empty()) return nullptr;
+    auto it = scaffolds_.find(actor_model_id);
+    if (it == scaffolds_.end()) {
+        Scaffold sc;
+        data::Catalog& cat = catalog(store);
+        if (cat.find("CActorModel", actor_model_id)) {
+            std::optional<std::string> model_id = cat.scalar("CActorModel", actor_model_id, "Model");
+            if (!model_id || model_id->empty()) model_id = actor_model_id;
+            if (auto path = cat.scalar("CModel", *model_id, "Model")) {
+                std::string rel = cat.expand_entry_tokens("CModel", *model_id, *path);
+                for (char& c : rel)
+                    if (c == '\\') c = '/';
+                for (const char* root : kAssetRoots)
+                    if (try_decode(store, std::string(root) + rel, sc.model)) break;
+            }
+            if (auto sm = cat.scalar("CModel", *model_id, "ScaleMax"); sm && !sm->empty()) {
+                float v[3] = {1.0f, 1.0f, 1.0f};
+                if (std::sscanf(sm->c_str(), "%f,%f,%f", &v[0], &v[1], &v[2]) >= 1) {
+                    sc.scale[0] = v[0];
+                    sc.scale[1] = v[1];
+                    sc.scale[2] = v[2];
+                }
+            }
+        }
+        it = scaffolds_.emplace(actor_model_id, std::move(sc)).first;
+    }
+    if (it->second.model.vertex_count == 0) return nullptr;
+    for (int k = 0; k < 3; ++k) scale[k] = it->second.scale[k];
+    return &it->second.model;
+}
+
+const MeleeModels::Portrait* MeleeModels::portrait(casc::Storage& store, const std::string& unit_id) {
+    if (unit_id.empty()) return nullptr;
+    if (auto it = portraits_.find(unit_id); it != portraits_.end()) return it->second.ok ? &it->second : nullptr;
+    Portrait p;
+    data::Catalog& cat = catalog(store);
+    std::optional<std::string> pm = cat.scalar("CActorUnit", unit_id, "PortraitModel");
+    if (!pm || pm->empty()) pm = unit_id + "Portrait";
+    if (auto path = cat.scalar("CModel", *pm, "Model")) {
+        std::string rel = cat.expand_entry_tokens("CModel", *pm, *path);
+        for (char& c : rel)
+            if (c == '\\') c = '/';
+        for (const char* root : kAssetRoots) {
+            try {
+                formats::M3 parsed = formats::M3::parse(store.read_by_name(std::string(root) + rel));
+                if (const formats::M3Section* cam = parsed.section_by_tag("CAM_")) {
+                    if (cam->count > 0 && std::size_t(cam->offset) + 72 <= parsed.data.size()) {
+                        std::uint32_t bone = 0;
+                        float f = 0.0f, zf = 0.0f, zn = 0.0f;
+                        std::memcpy(&bone, &parsed.data[cam->offset], 4);
+                        std::memcpy(&f, &parsed.data[cam->offset + 24], 4);
+                        std::memcpy(&zf, &parsed.data[cam->offset + 48], 4);
+                        std::memcpy(&zn, &parsed.data[cam->offset + 68], 4);
+                        if (f > 0.01f && f < 3.14f) p.fov_rad = f;
+                        if (zn > 0.0f && zf > zn) {
+                            p.znear = zn;
+                            p.zfar = zf;
+                        }
+                        p.cam_bone = int(bone);
+                    }
+                }
+                p.model = parsed.decode_model();
+                if (p.model.vertex_count) {
+                    p.path = std::string(root) + rel;
+                    p.ok = true;
+                    break;
+                }
+            } catch (const std::exception&) {
+            }
+        }
+    }
+    Portrait& slot = portraits_[unit_id];
+    slot = std::move(p);
+    return slot.ok ? &slot : nullptr;
+}
+
+const formats::Model* MeleeModels::unit_splat(casc::Storage& store, const std::string& unit_id) {
+    if (unit_id.empty()) return nullptr;
+    if (auto it = splats_.find(unit_id); it != splats_.end())
+        return it->second.vertex_count == 0 && !it->second.materials.empty() ? &it->second : nullptr;
+    data::Catalog& cat = catalog(store);
+    if (!splat_index_built_) {
+        splat_index_built_ = true;
+        for (const std::string& id : cat.ids("CActorSplat")) {
+            const data::Catalog::Entry* e = cat.find("CActorSplat", id);
+            if (!e) continue;
+            const std::string* un = e->attr("unitName");
+            if (!un || un->empty() || *un == "Bogus" || *un == "BogusBurrowed") continue;
+            splat_actor_by_unit_.emplace(*un, id);
+        }
+    }
+    formats::Model model;
+    auto it = splat_actor_by_unit_.find(unit_id);
+    if (it != splat_actor_by_unit_.end()) {
+        std::optional<std::string> model_id = cat.scalar("CActorSplat", it->second, "Model");
+        if (!model_id) model_id = it->second;
+        if (auto path = cat.scalar("CModel", *model_id, "Model")) {
+            std::string rel = *path;
+            for (char& c : rel)
+                if (c == '\\') c = '/';
+            std::string rel00 = rel;
+            if (rel00.size() > 3 && rel00.compare(rel00.size() - 3, 3, ".m3") == 0) rel00.insert(rel00.size() - 3, "_00");
+            for (const char* root : kAssetRoots) {
+                bool ok = false;
+                for (const std::string& r : {rel, rel00}) {
+                    try {
+                        model = formats::M3::parse(store.read_by_name(std::string(root) + r)).decode_model();
+                        ok = !model.materials.empty();
+                    } catch (const std::exception&) { ok = false; }
+                    if (ok) break;
+                }
+                if (ok) break;
+            }
+        }
+    }
+    formats::Model& slot = splats_[unit_id];
+    slot = std::move(model);
+    return slot.vertex_count == 0 && !slot.materials.empty() ? &slot : nullptr;
+}
+
+const formats::Model* MeleeModels::missile_model(casc::Storage& store, const std::string& weapon_id) {
+    if (weapon_id.empty()) return nullptr;
+    if (auto it = missiles_.find(weapon_id); it != missiles_.end())
+        return it->second.vertex_count > 0 ? &it->second : nullptr;
+    formats::Model model;
+    data::Catalog& cat = catalog(store);
+    if (auto id = cat.weapon_missile_model_id(weapon_id)) {
+        if (auto path = cat.scalar("CModel", *id, "Model")) {
+            std::string rel = *path;
+            for (char& c : rel)
+                if (c == '\\') c = '/';
+            for (const char* root : kAssetRoots)
+                if (try_decode(store, std::string(root) + rel, model)) break;
+        }
+    }
+    formats::Model& slot = missiles_[weapon_id];
+    slot = std::move(model);
+    return slot.vertex_count > 0 ? &slot : nullptr;
+}
+
 const formats::Model* MeleeModels::doodad_model(casc::Storage& store, const std::string& type,
                                                 int variation) {
     const std::string key = variation > 0 ? type + '#' + std::to_string(variation) : type;
@@ -141,7 +359,9 @@ const formats::Model* MeleeModels::doodad_model(casc::Storage& store, const std:
         return it->second.vertex_count > 0 ? &it->second : nullptr;
     formats::Model model;
     data::Catalog& cat = catalog(store);
-    if (std::optional<std::string> model_id = cat.scalar("CActorDoodad", type, "Model")) {
+    std::optional<std::string> model_id = cat.scalar("CActorDoodad", type, "Model");
+    if (!model_id) model_id = type;
+    {
         if (std::optional<std::string> path = cat.scalar("CModel", *model_id, "Model")) {
             std::string rel = *path;
             for (char& c : rel)
@@ -152,6 +372,22 @@ const formats::Model* MeleeModels::doodad_model(casc::Storage& store, const std:
             if (model.vertex_count == 0 && vrel != rel)
                 for (const char* root : kAssetRoots)
                     if (try_decode(store, std::string(root) + rel, model)) break;
+            if (model.vertex_count == 0 && rel.size() > 3 &&
+                rel.compare(rel.size() - 3, 3, ".m3") == 0) {
+                std::size_t i = rel.size() - 3;
+                while (i > 0 && std::isdigit(static_cast<unsigned char>(rel[i - 1]))) --i;
+                const bool already_numbered = i != rel.size() - 3 && i > 0 && rel[i - 1] == '_';
+                if (!already_numbered && cat.scalar("CModel", *model_id, "VariationCount")) {
+                    const std::string base = rel.substr(0, rel.size() - 3);
+                    char suf[16];
+                    std::snprintf(suf, sizeof(suf), "_%02d.m3", variation > 0 ? variation : 0);
+                    for (const char* root : kAssetRoots)
+                        if (try_decode(store, std::string(root) + base + suf, model)) break;
+                    if (model.vertex_count == 0 && variation > 0)
+                        for (const char* root : kAssetRoots)
+                            if (try_decode(store, std::string(root) + base + "_00.m3", model)) break;
+                }
+            }
         }
     }
     if (model.vertex_count == 0) {
