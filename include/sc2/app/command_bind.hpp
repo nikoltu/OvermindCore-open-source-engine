@@ -14,6 +14,7 @@ struct MeleeCommandContext {
         int slot = -1;
         std::string icon;
         std::string name;
+        std::string hotkey;
     };
     UniversalCell univ_stop, univ_hold, univ_attack, univ_patrol;
     UniversalCell univ_burrow, univ_unburrow;
@@ -38,6 +39,7 @@ struct MeleeCommandContext {
     bool unburrow_selected = false;
     bool burrow_requirement_met = true;
     bool liftoff_selected = false;
+    bool liftoff_busy = false;
     bool land_selected = false;
     bool depot_lower_selected = false;
     bool depot_raise_selected = false;
@@ -142,7 +144,7 @@ inline CommandCard build_melee_command_card(const MeleeCommandContext& ctx) {
         e.name = "Lift Off";
         e.hotkey = "L";
         e.ability = kMeleeAbilLiftOff;
-        e.requirement_met = true;
+        e.requirement_met = !ctx.liftoff_busy;
         entries.push_back(e);
     }
     if (ctx.land_selected) {
@@ -188,7 +190,7 @@ inline CommandCard build_melee_command_card(const MeleeCommandContext& ctx) {
         entries.push_back(e);
     }
 
-    if (ctx.mobile_selected && ctx.commandable_selected && !ctx.worker_selected) {
+    if (ctx.mobile_selected && ctx.commandable_selected) {
         struct Univ { int slot; const char* icon; const char* name; const char* hotkey; std::uint32_t ability;
                       const MeleeCommandContext::UniversalCell* authored; };
         const Univ kUniv[] = {
@@ -200,7 +202,7 @@ inline CommandCard build_melee_command_card(const MeleeCommandContext& ctx) {
         };
         for (const Univ& u : kUniv) {
             CardEntry e;
-            e.slot = u.authored->slot >= 0 ? u.authored->slot : u.slot;
+            e.slot = u.authored->slot >= 0 ? u.authored->slot : (ctx.worker_selected ? -1 : u.slot);
             if (e.slot < 0) continue;
             bool clash = false;
             for (const CardEntry& prior : entries)
@@ -208,7 +210,7 @@ inline CommandCard build_melee_command_card(const MeleeCommandContext& ctx) {
             if (clash) continue;
             e.icon = u.authored->icon.empty() ? std::string(u.icon) : u.authored->icon;
             e.name = u.authored->name.empty() ? std::string(u.name) : u.authored->name;
-            e.hotkey = u.hotkey;
+            e.hotkey = u.authored->hotkey.empty() ? std::string(u.hotkey) : u.authored->hotkey;
             e.ability = u.ability;
             e.requirement_met = true;
             entries.push_back(e);

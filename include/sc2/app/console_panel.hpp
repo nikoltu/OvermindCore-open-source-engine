@@ -8,6 +8,7 @@
 
 namespace sc2::data {
 class Catalog;
+struct EnvLight;
 }
 
 namespace sc2::formats {
@@ -37,13 +38,26 @@ struct ConsoleView {
     float half_h = 0.0f;
     float centre_z = 0.0f;
     std::uint32_t height = 0;
+    const data::EnvLight* map_env = nullptr;
 
     float frame_w = 0.0f;
     float frame_h = 0.0f;
 };
 
+inline float& portrait_time_ms() {
+    static float t = 0.0f;
+    return t;
+}
+struct PortraitDof {
+    float focus = 0.0f, start = 0.0f, end = 0.0f, amount = 0.0f, px_scale = 1.0f;
+};
+inline PortraitDof& portrait_dof() {
+    static PortraitDof d;
+    return d;
+}
 std::vector<std::uint8_t> render_portrait(casc::Storage& store, const formats::Model& model, float fov_rad,
-                                          int cam_bone, float znear, float zfar, std::uint32_t w, std::uint32_t h);
+                                          int cam_bone, float znear, float zfar, std::uint32_t w, std::uint32_t h,
+                                          const data::EnvLight* env = nullptr);
 ConsoleTexture render_console_models(casc::Storage& store, const data::Catalog& cat,
                                      const std::string& skin_id, std::uint32_t width,
                                      const ConsoleView& view = {});

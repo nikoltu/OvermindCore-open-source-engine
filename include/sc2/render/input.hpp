@@ -35,6 +35,8 @@ struct InputState {
     std::vector<std::string> key_tokens;
     bool key_alt = false;
 
+    std::string text;
+
     bool quit = false;
 };
 

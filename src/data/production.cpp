@@ -14,7 +14,7 @@ void Production::build(const Catalog& cat) {
         if (!e) continue;
         const std::string& tag = e->tag;
         if (tag != "CAbilBuild" && tag != "CAbilTrain" && tag != "CAbilWarpTrain" &&
-            tag != "CAbilMorph" && tag != "CAbilMerge")
+            tag != "CAbilMorph" && tag != "CAbilMerge" && !cat.calldown_magazine(id))
             continue;
 
         for (const Catalog::AbilInfoRow& r : cat.ability_info_rows(id)) {

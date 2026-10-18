@@ -32,6 +32,8 @@ struct ActorRules {
     std::vector<std::string> by_state[kAnimStateCount];
     bool valid = false;
 
+    double walk_anim_move_speed = 0.0;
+
     const std::vector<std::string>& tokens(AnimState s) const { return by_state[int(s)]; }
 
     static ActorRules from_actor(const data::CActorUnit& actor);

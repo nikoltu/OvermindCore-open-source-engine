@@ -1,5 +1,6 @@
 #pragma once
 
+#include <cmath>
 #include <cstdint>
 #include <string>
 #include <vector>
@@ -21,6 +22,7 @@ struct CommandButton {
     float cooldown = 0;
     bool autocast = false;
     bool is_cancel = false;
+    int charges = -1;
 
     uint32_t select_builder = 0xFFFFFFFFu;
 
@@ -29,6 +31,16 @@ struct CommandButton {
     bool is_passive = false;
     uint32_t ability = 0;
 };
+
+inline bool cooldown_sweep_covers(float cx, float cy, float px, float py, float frac) {
+    if (frac <= 0.0f) return false;
+    if (frac >= 1.0f) return true;
+    const float dx = px - cx, dy = py - cy;
+    if (dx == 0.0f && dy == 0.0f) return true;
+    float a = std::atan2(dx, -dy);
+    if (a < 0.0f) a += 6.28318530718f;
+    return a >= (1.0f - frac) * 6.28318530718f;
+}
 
 inline ButtonState resolve_button_state(bool requirement_met, float cooldown_frac) {
     if (!requirement_met) return ButtonState::Disabled;

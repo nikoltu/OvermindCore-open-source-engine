@@ -1,3 +1,8 @@
+#include <cctype>
+#include <cstdlib>
+#include <cstdio>
+#include <cstring>
+#include <algorithm>
 #include "sc2/render/terrain_tex.hpp"
 
 #include "sc2/render/creep_layer.hpp"
@@ -179,8 +184,16 @@ std::vector<ResolvedLayer> resolve_map_layers(const casc::Storage& store,
         for (const core::XmlNode& cat : tex_cats) {
             const core::XmlNode* tex = find_by_id(cat, "CTerrainTex", name);
             if (!tex) continue;
-            std::string diffuse, normal;
+            std::string diffuse, normal, heightmap;
+            float hscale = 1.0f, hoffset = 0.0f;
             for (const core::XmlNode& c : tex->children) {
+                if (c.name == "Heightmap") {
+                    if (const std::string* v = c.attr("value"); v && !v->empty()) heightmap = normalise_asset_path(*v);
+                } else if (c.name == "HeightMapScale") {
+                    if (const std::string* v = c.attr("value")) hscale = std::strtof(v->c_str(), nullptr);
+                } else if (c.name == "HeightMapOffset") {
+                    if (const std::string* v = c.attr("value")) hoffset = std::strtof(v->c_str(), nullptr);
+                }
                 if (diffuse.empty() && c.name == "Texture") {
                     if (const std::string* v = c.attr("value"); v && !v->empty()) {
                         std::string rel = normalise_asset_path(*v);
@@ -194,8 +207,15 @@ std::vector<ResolvedLayer> resolve_map_layers(const casc::Storage& store,
             if (!diffuse.empty()) {
                 layer.diffuse = std::move(diffuse);
                 layer.normal = std::move(normal);
+                layer.heightmap = std::move(heightmap);
+                layer.height_scale = hscale;
+                layer.height_offset = hoffset;
                 break;
             }
+        }
+        if (const char* ov = std::getenv("SC2_TERRAIN_TEX_OVERRIDE"); ov && !layer.diffuse.empty()) {
+            const std::string rel = normalise_asset_path(ov);
+            if (diffuse_decodes(store, rel)) layer.diffuse = rel;
         }
         out.push_back(std::move(layer));
     }
@@ -285,7 +305,8 @@ GroundImage composite_map_ground(const casc::Storage& store, const formats::Text
 
 bool set_terrain_splat_gpu(formats::Model& m, const casc::Storage& store,
                            const std::vector<std::string>& layer_names,
-                           const formats::TextureMask& mask, float extent_x, float extent_y) {
+                           const formats::TextureMask& mask, float extent_x, float extent_y,
+                           const formats::VertexTint* tint) {
     if (!mask.planar_ok() || layer_names.empty() || extent_x <= 0 || extent_y <= 0)
         return false;
     std::vector<ResolvedLayer> layers = resolve_map_layers(store, layer_names);
@@ -296,12 +317,81 @@ bool set_terrain_splat_gpu(formats::Model& m, const casc::Storage& store,
             decode_asset(store, layers[i].diffuse, imgs[i].w, imgs[i].h, imgs[i].rgba))
             any = true;
     if (!any) return false;
-    std::vector<uint8_t> planes(size_t(mask.mask_w) * mask.mask_h * 8);
+    std::vector<formats::Model::SplatLayerImage> nrm(imgs.size());
+    for (size_t i = 0; i < nrm.size(); ++i)
+        if (!layers[i].normal.empty() && decode_asset(store, layers[i].normal, nrm[i].w, nrm[i].h, nrm[i].rgba))
+            dxt5nm_to_rgb(nrm[i].rgba);
+    const char* nflip = std::getenv("SC2_TERRAIN_NFLIP");
+    if (const char* fl = nflip ? nflip : "y") {
+        const bool fx = std::strchr(fl, 'x') != nullptr, fy = std::strchr(fl, 'y') != nullptr, sw = std::strchr(fl, 's') != nullptr;
+        for (auto& im : nrm)
+            for (size_t p = 0; p + 3 < im.rgba.size(); p += 4) {
+                if (sw) std::swap(im.rgba[p], im.rgba[p + 1]);
+                if (fx) im.rgba[p] = uint8_t(255 - im.rgba[p]);
+                if (fy) im.rgba[p + 1] = uint8_t(255 - im.rgba[p + 1]);
+            }
+    }
+    m.splat_height.assign(nrm.size(), {1.0f, 0.0f, 0.0f});
+    static const bool kHeightBlend = std::getenv("SC2_HEIGHT_BLEND") != nullptr && std::getenv("SC2_NO_HEIGHT_BLEND") == nullptr;
+    for (size_t i = 0; i < nrm.size(); ++i) {
+        if (layers[i].heightmap.empty() || nrm[i].rgba.empty() || !kHeightBlend) continue;
+        auto lower = [](std::string s) { for (char& ch : s) ch = char(std::tolower(static_cast<unsigned char>(ch))); return s; };
+        if (lower(layers[i].heightmap) != lower(layers[i].normal)) {
+            uint32_t hw = 0, hh = 0;
+            std::vector<uint8_t> hr;
+            if (!decode_asset(store, layers[i].heightmap, hw, hh, hr) || hw == 0 || hh == 0) continue;
+            for (uint32_t y = 0; y < nrm[i].h; ++y)
+                for (uint32_t x = 0; x < nrm[i].w; ++x) {
+                    const uint32_t sx = uint32_t(uint64_t(x) * hw / nrm[i].w), sy = uint32_t(uint64_t(y) * hh / nrm[i].h);
+                    nrm[i].rgba[(size_t(y) * nrm[i].w + x) * 4 + 3] = hr[(size_t(sy) * hw + sx) * 4];
+                }
+        }
+        m.splat_height[i] = {layers[i].height_scale, layers[i].height_offset, 1.0f};
+    }
+    m.splat_normals = std::move(nrm);
+    std::vector<uint8_t> planes(size_t(mask.mask_w) * mask.mask_h * 9, 255);
     for (uint32_t L = 0; L < 8; ++L) {
         uint8_t* dst = planes.data() + size_t(L) * mask.mask_w * mask.mask_h;
         for (uint32_t y = 0; y < mask.mask_h; ++y)
             for (uint32_t x = 0; x < mask.mask_w; ++x)
                 dst[size_t(y) * mask.mask_w + x] = mask.layer_weight(L, x, y);
+    }
+    if (const char* only = std::getenv("SC2_SPLAT_ONLY")) {
+        const uint32_t keep = uint32_t(std::atoi(only));
+        for (uint32_t L = 0; L < 8; ++L)
+            std::memset(planes.data() + size_t(L) * mask.mask_w * mask.mask_h, L == keep ? 255 : 0, size_t(mask.mask_w) * mask.mask_h);
+    }
+    if (tint) {
+        uint8_t* dst = planes.data() + size_t(8) * mask.mask_w * mask.mask_h;
+        const float sx = float(mask.mask_w) / extent_x, sy = float(mask.mask_h) / extent_y;
+        for (const formats::VertexTint::Patch& p : tint->patches) {
+            if (!p.plain()) continue;
+            const int tx0 = std::max(0, int(p.x0 * sx)), tx1 = std::min(int(mask.mask_w) - 1, int(p.x1 * sx));
+            const int ty0 = std::max(0, int(p.y0 * sy)), ty1 = std::min(int(mask.mask_h) - 1, int(p.y1 * sy));
+            for (int ty = ty0; ty <= ty1; ++ty)
+                for (int tx = tx0; tx <= tx1; ++tx) {
+                    const float u = std::clamp(((float(tx) + 0.5f) / sx - p.x0) / (p.x1 - p.x0), 0.0f, 1.0f) * 4.0f;
+                    const float v = std::clamp(((float(ty) + 0.5f) / sy - p.y0) / (p.y1 - p.y0), 0.0f, 1.0f) * 4.0f;
+                    const int cx = std::min(3, int(u)), cy = std::min(3, int(v));
+                    const float fx = u - float(cx), fy = v - float(cy);
+                    const float a = float(p.at(cx, cy)) * (1 - fx) + float(p.at(cx + 1, cy)) * fx;
+                    const float b = float(p.at(cx, cy + 1)) * (1 - fx) + float(p.at(cx + 1, cy + 1)) * fx;
+                    dst[size_t(ty) * mask.mask_w + size_t(tx)] = uint8_t(a * (1 - fy) + b * fy + 0.5f);
+                }
+        }
+    }
+    if (std::getenv("SC2_TINT_TRACE")) {
+        std::size_t dark = 0;
+        const uint8_t* t8 = planes.data() + size_t(8) * mask.mask_w * mask.mask_h;
+        for (size_t i = 0; i < size_t(mask.mask_w) * mask.mask_h; ++i) dark += t8[i] < 250;
+        std::fprintf(stderr, "terrain tint: %zu patches, %zu of %zu texels shaded\n", tint ? tint->patches.size() : 0, dark, size_t(mask.mask_w) * mask.mask_h);
+    }
+    if (const char* fg = std::getenv("SC2_TERRAIN_FLAT_GREY")) {
+        int r = 0, gch = 0, b = 0;
+        if (std::sscanf(fg, "%d,%d,%d", &r, &gch, &b) != 3) r = gch = b = std::atoi(fg);
+        const uint8_t v[3] = {uint8_t(std::clamp(r, 0, 255)), uint8_t(std::clamp(gch, 0, 255)), uint8_t(std::clamp(b, 0, 255))};
+        for (auto& im : imgs)
+            for (size_t i = 0; i + 3 < im.rgba.size(); i += 4) { im.rgba[i] = v[0]; im.rgba[i + 1] = v[1]; im.rgba[i + 2] = v[2]; im.rgba[i + 3] = 255; }
     }
     m.splat_layers = std::move(imgs);
     m.splat_w = mask.mask_w;
@@ -337,7 +427,9 @@ void set_terrain_diffuse_rgba(formats::Model& m, uint32_t w, uint32_t h,
     m.region_material.assign(m.regions.size(), 0);
 }
 
-void apply_grid_uvs(formats::Model& m, float uv_tiles) {
+void apply_grid_uvs(formats::Model& m, float uv_tiles) { apply_grid_uvs(m, uv_tiles, uv_tiles); }
+
+void apply_grid_uvs(formats::Model& m, float uv_tiles_u, float uv_tiles_v) {
     if (m.vertex_count == 0 || m.positions.size() < size_t(m.vertex_count) * 3) return;
     float minx = 1e30f, miny = 1e30f, maxx = -1e30f, maxy = -1e30f;
     for (uint32_t i = 0; i < m.vertex_count; ++i) {
@@ -349,10 +441,13 @@ void apply_grid_uvs(formats::Model& m, float uv_tiles) {
     }
     float dx = maxx - minx, dy = maxy - miny;
     m.uvs.assign(size_t(m.vertex_count) * 2, 0.0f);
+    const char* fl = std::getenv("SC2_TERRAIN_UV_FLIP");
+    if (!fl) fl = "v";
+    const bool flip_u = std::strchr(fl, 'u') != nullptr, flip_v = std::strchr(fl, 'v') != nullptr;
     for (uint32_t i = 0; i < m.vertex_count; ++i) {
         float x = m.positions[i * 3], y = m.positions[i * 3 + 1];
-        m.uvs[i * 2] = dx > 1e-6f ? (x - minx) / dx * uv_tiles : 0.0f;
-        m.uvs[i * 2 + 1] = dy > 1e-6f ? (y - miny) / dy * uv_tiles : 0.0f;
+        m.uvs[i * 2] = dx > 1e-6f ? (flip_u ? (maxx - x) : (x - minx)) / dx * uv_tiles_u : 0.0f;
+        m.uvs[i * 2 + 1] = dy > 1e-6f ? (flip_v ? (maxy - y) : (y - miny)) / dy * uv_tiles_v : 0.0f;
     }
 }
 

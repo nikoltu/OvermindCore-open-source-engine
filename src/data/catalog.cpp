@@ -1,6 +1,7 @@
 #include <algorithm>
 #include "sc2/data/catalog.hpp"
 
+#include <cstdio>
 #include <cstdlib>
 #include <functional>
 
@@ -44,6 +45,16 @@ void Catalog::ingest(const std::vector<uint8_t>& xml) {
     XmlNode root = core::xml_parse(xml);
     if (root.name != "Catalog") return;
     for (const XmlNode& e : root.children) {
+        if (add_only_) {
+            const std::string* aid = e.attr("id");
+            if (e.name == "const" || e.name.empty() || !aid) continue;
+            const std::string fam_name = family_of(e.name);
+            const std::string key = fam_name + std::string(1, '\x1f') + *aid;
+            const auto fit = families_.find(fam_name);
+            const bool existed = fit != families_.end() && fit->second.find(*aid) != fit->second.end();
+            if (existed && add_only_new_.find(key) == add_only_new_.end()) continue;
+            add_only_new_.insert(key);
+        }
         if (e.name == "const") {
             const std::string* cid = e.attr("id");
             const std::string* cv = e.attr("value");
@@ -60,6 +71,9 @@ void Catalog::ingest(const std::vector<uint8_t>& xml) {
                 auto& defs = tag_defaults_[e.name];
                 for (const XmlNode& field : e.children)
                     if (!field.attr("index")) defs.push_back(field);
+                auto& idefs = tag_default_indexed_[e.name];
+                for (const XmlNode& field : e.children)
+                    if (field.attr("index")) idefs.push_back(field);
             }
             continue;
         }
@@ -434,7 +448,7 @@ std::optional<Catalog::BehaviorBuff> Catalog::behavior_buff(const std::string& b
     if (!e || e->tag.rfind("CBehaviorBuff", 0) != 0) return std::nullopt;
     BehaviorBuff bb;
     bool any = false;
-    if (auto d = scalar_num("CBehavior", behavior_id, "Duration")) { bb.duration = *d; any = true; }
+    if (auto d = scalar_num("CBehavior", behavior_id, "Duration")) { bb.duration = *d; bb.duration_authored = true; any = true; }
     if (auto ms = scalar_num("CBehavior", behavior_id, "MaxStackCount")) bb.max_stack = int(*ms);
     if (auto p = scalar_num("CBehavior", behavior_id, "Period")) bb.dmg_period = *p;
     if (auto pe = scalar("CBehavior", behavior_id, "PeriodicEffect"); pe && !pe->empty())
@@ -448,8 +462,34 @@ std::optional<Catalog::BehaviorBuff> Catalog::behavior_buff(const std::string& b
         any = true;
         if (const std::string* v = n.attr("MoveSpeedMultiplier"); v && !v->empty())
             bb.move_speed_mult = std::strtod(v->c_str(), nullptr);
+        if (const std::string* v = n.attr("DecelerationMultiplier"); v && !v->empty())
+            bb.decel_mult *= std::strtod(v->c_str(), nullptr);
+        for (const core::XmlNode& g : n.children)
+            if (g.name == "DecelerationMultiplier")
+                if (const std::string v2 = g.attr_or("value", ""); !v2.empty())
+                    bb.decel_mult *= std::strtod(v2.c_str(), nullptr);
+        if (const std::string* v = n.attr("MoveSpeedMaximum"); v && !v->empty())
+            bb.move_speed_max = std::strtod(v->c_str(), nullptr);
+        for (const core::XmlNode& g : n.children)
+            if (g.name == "MoveSpeedMaximum")
+                if (const std::string v2 = g.attr_or("value", ""); !v2.empty())
+                    bb.move_speed_max = std::strtod(v2.c_str(), nullptr);
+        if (const std::string* v = n.attr("WeaponRange"); v && !v->empty())
+            bb.weapon_range_bonus += std::strtod(v->c_str(), nullptr);
+        for (const core::XmlNode& g : n.children)
+            if (g.name == "WeaponRange")
+                if (const std::string v2 = g.attr_or("value", ""); !v2.empty())
+                    bb.weapon_range_bonus += std::strtod(v2.c_str(), nullptr);
         if (const std::string* v = n.attr("AttackSpeedMultiplier"); v && !v->empty())
             bb.attack_speed_mult = std::strtod(v->c_str(), nullptr);
+        if (const std::string* v = n.attr("Food"); v && !v->empty()) bb.food = std::strtod(v->c_str(), nullptr);
+        for (const core::XmlNode& g : n.children) {
+            const std::string v2 = g.attr_or("value", "");
+            if (v2.empty()) continue;
+            if (g.name == "Food") bb.food = std::strtod(v2.c_str(), nullptr);
+            else if (g.name == "VitalMaxArray" && g.attr_or("index", "") == "Life")
+                bb.life_max_bonus = std::strtod(v2.c_str(), nullptr);
+        }
         if (const std::string* v = n.attr("LifeArmorBonus"); v && !v->empty())
             bb.life_armor_bonus = std::strtod(v->c_str(), nullptr);
         if (const std::string* v = n.attr("ShieldArmorBonus"); v && !v->empty())
@@ -476,12 +516,34 @@ std::optional<Catalog::BehaviorBuff> Catalog::behavior_buff(const std::string& b
                 if (idx == "Invulnerable" && on) bb.invulnerable = true;
                 if (idx == "Uncommandable" && on) bb.uncommandable = true;
                 if (idx == "Untargetable" && on) bb.untargetable = true;
+                if (idx == "SuppressCloak" && on) bb.suppress_cloak = true;
+                if (idx == "SuppressCollision" && on) bb.suppress_collision = true;
+                if (idx == "SuppressPassenger" && on) bb.suppress_passenger = true;
+                if (idx == "Benign" && on) bb.benign = true;
+                if (idx == "Passive" && on) bb.passive = true;
+            }
+        for (const core::XmlNode& g : n.children)
+            if (g.name == "ModifyFlags" && g.attr_or("value", "") == "1") {
+                const std::string idx = g.attr_or("index", "");
+                if (idx == "DisableAbils") { bb.disable_abils = true; any = true; }
+                if (idx == "SuppressMoving") { bb.root = true; any = true; }
             }
         for (const core::XmlNode& g : n.children)
             if (g.name == "AbilClassDisableArray" && g.attr_or("value", "") == "1") {
                 const std::string idx = g.attr_or("index", "");
                 if (idx == "CAbilAttack") bb.suppress_attack = true;
                 if (idx == "CAbilMove") bb.root = true;
+                if (idx == "CAbilTrain" || idx == "CAbilQueue" || idx == "CAbilWarpTrain") bb.disable_production = true;
+                if (idx == "CAbilMorph" || idx == "CAbilMorphPlacement") bb.disable_morph = true;
+                if (idx == "CAbilTransport") bb.disable_transport = true;
+            } else if (g.name == "BehaviorLinkDisableArray" && g.attr_or("value", "") == "SpawnLarva") {
+                bb.disable_spawner = true;
+            } else if (g.name == "WeaponDisableArray") {
+                const std::string v = g.attr_or("value", "");
+                if (!v.empty()) bb.disabled_weapons.push_back(v);
+            } else if (g.name == "AbilLinkDisableArray") {
+                const std::string v = g.attr_or("value", "");
+                if (!v.empty()) bb.disabled_abils.push_back(v);
             }
     }
     if (bb.move_speed_mult == 0.0) bb.root = true;
@@ -515,7 +577,7 @@ Catalog::AbilityAutocast Catalog::ability_autocast(const std::string& abil_id) c
         if (n.name != "Flags") continue;
         const std::string* idx = n.attr("index");
         if (!idx) continue;
-        const std::string& v = n.attr_or("value", "1");
+        const std::string v = n.attr_or("value", "1");
         const bool on = !v.empty() && v != "0" && v != "false";
         if (*idx == "AutoCast") a.offered = on;
         else if (*idx == "AutoCastOn") a.on_by_default = on;
@@ -553,6 +615,7 @@ Catalog::DamageResponse Catalog::behavior_damage_response(const std::string& beh
         if (auto v = field(n, "Minimum")) r.minimum = *v;
         if (auto v = field(n, "ModifyMinimumDamage")) r.minimum = *v;
         if (auto v = field(n, "ModifyAmount")) r.modify_amount = *v;
+        if (const std::string* h = n.attr("Handled"); h && !h->empty()) r.handled = *h;
         for (const core::XmlNode& cost : n.children) {
             if (cost.name != "Cost") continue;
             for (const core::XmlNode& cd : cost.children) {
@@ -640,6 +703,15 @@ std::optional<Catalog::CreateUnitSpec> Catalog::effect_create_unit(const std::st
                 s.count = std::atoi(c->c_str());
             if (auto f = scalar("CEffect", id, "SpawnEffect"); f && !f->empty()) s.spawn_effect = *f;
             if (auto r = scalar_num("CEffect", id, "SpawnRange"); r && *r > 0) s.spawn_range = *r;
+            for (const core::XmlNode& n : resolved("CEffect", id)) {
+                if (n.name != "SpawnOwner") continue;
+                const std::string* v = n.attr("Value");
+                if (!v) continue;
+                if (*v == "Neutral") s.spawn_owner = SpawnOwner::Neutral;
+                else if (*v == "Target") s.spawn_owner = SpawnOwner::Target;
+                else if (*v == "Source") s.spawn_owner = SpawnOwner::Source;
+                else s.spawn_owner = SpawnOwner::Caster;
+            }
             if (s.unit.empty()) return std::nullopt;
             return s;
         });
@@ -997,25 +1069,84 @@ Catalog::weapon_arc_splash(const std::string& weapon_id) const {
 std::optional<double> Catalog::missile_speed(const std::string& weapon_id) const {
     const std::string eff = weapon_effect_id(weapon_id);
     if (eff.empty()) return std::nullopt;
-    const Entry* ee = find("CEffect", eff);
-    if (!ee || ee->tag != "CEffectLaunchMissile") return std::nullopt;
-    std::string mover;
-    if (auto mv = scalar("CEffect", eff, "Movers"); mv && !mv->empty())
-        mover = *mv;
-    else if (auto au = scalar("CEffect", eff, "AmmoUnit"); au && !au->empty()) {
-        if (auto m = scalar("CUnit", *au, "Mover"); m && !m->empty()) mover = *m;
-    }
-    if (mover.empty()) return std::nullopt;
-    for (const core::XmlNode& n : resolved("CMover", mover)) {
-        if (n.name != "MotionPhases") continue;
-        for (const char* fld : {"MaxSpeed", "Speed"})
-            for (const core::XmlNode& c : n.children)
-                if (c.name == fld)
-                    if (const std::string* v = c.attr("value"); v && !v->empty()) {
-                        try { return std::stod(*v); } catch (...) { return std::nullopt; }
-                    }
-    }
+    if (auto v = effect_missile_speed(eff)) return v;
+    static const bool no_burst = [] { const char* e = std::getenv("SC2_NO_BURST_MISSILE"); return e && e[0] == '1'; }();
+    if (no_burst) return std::nullopt;
+    const Entry* pe = find("CEffect", eff);
+    if (!pe || pe->tag != "CEffectCreatePersistent") return std::nullopt;
+    for (const std::string& lm : array_links("CEffect", eff, "PeriodicEffectArray"))
+        if (auto v = effect_missile_speed(lm)) return v;
     return std::nullopt;
+}
+
+std::optional<double> Catalog::effect_missile_speed(const std::string& eff) const {
+    const std::vector<MissileMover> movers = effect_missile_movers(eff);
+    if (movers.empty()) return std::nullopt;
+    const MissileMover& m = movers.front();
+    if (m.max_speed > 0.0) return m.max_speed;
+    if (m.speed > 0.0) return m.speed;
+    return std::nullopt;
+}
+
+double Catalog::weapon_turret_yaw_rate(const std::string& unit_id) const {
+    for (const std::string& w : array_links("CUnit", unit_id, "WeaponArray")) {
+        const std::string tid = weapon_turret(unit_id, w);
+        if (tid.empty()) continue;
+        if (const auto ts = turret(tid)) return ts->yaw_rate;
+    }
+    return 0.0;
+}
+
+std::vector<Catalog::MissileMover> Catalog::effect_missile_movers(const std::string& eff) const {
+    std::vector<MissileMover> out;
+    const Entry* ee = find("CEffect", eff);
+    if (!ee || ee->tag != "CEffectLaunchMissile") return out;
+    auto kinematics = [&](const std::string& mover, double range_lte) {
+        MissileMover m;
+        m.range_lte = range_lte;
+        bool any = false;
+        int ordinal = 0;
+        for (const core::XmlNode& n : resolved("CMover", mover)) {
+            if (n.name != "MotionPhases") continue;
+            int phase = ordinal++;
+            if (const std::string* ix = n.attr("index")) {
+                try { phase = std::stoi(*ix); } catch (...) {}
+                --ordinal;
+            }
+            if (phase != 0) continue;
+            for (const core::XmlNode& c : n.children) {
+                const std::string* v = c.attr("value");
+                if (!v || v->empty()) continue;
+                double d = 0.0;
+                try { d = std::stod(*v); } catch (...) { continue; }
+                if (c.name == "Speed") { m.speed = d; any = true; }
+                else if (c.name == "MaxSpeed") { m.max_speed = d; any = true; }
+                else if (c.name == "Acceleration") m.accel = d;
+            }
+        }
+        if (any) out.push_back(m);
+    };
+    for (const core::XmlNode& n : resolved("CEffect", eff)) {
+        if (n.name != "Movers") continue;
+        const std::string* link = n.attr("Link");
+        if (!link || link->empty()) link = n.attr("value");
+        if (!link || link->empty()) continue;
+        double lte = 0.0;
+        if (const std::string* r = n.attr("IfRangeLTE")) { try { lte = std::stod(*r); } catch (...) {} }
+        kinematics(*link, lte);
+    }
+    if (!out.empty()) return out;
+    std::string mover;
+    {
+        std::string au = scalar("CEffect", eff, "AmmoUnit").value_or("");
+        if (au.empty()) au = eff + "Weapon";
+        if (find("CUnit", au)) {
+            if (auto m = scalar("CUnit", au, "Mover"); m && !m->empty()) mover = *m;
+            else if (find("CMover", au)) mover = au;
+        }
+    }
+    if (!mover.empty()) kinematics(mover, 0.0);
+    return out;
 }
 
 std::optional<std::string> Catalog::weapon_missile_model_id(const std::string& weapon_id) const {
@@ -1030,6 +1161,10 @@ std::optional<std::string> Catalog::weapon_missile_model_id(const std::string& w
             if (const std::string* v = e->attr("effectLaunch")) launch = *v;
         if (launch != eff) continue;
         auto missile = scalar("CActorAction", act, "Missile");
+        static const bool kTrace = std::getenv("SC2_SHOT_TRACE") != nullptr;
+        if (kTrace)
+            std::fprintf(stderr, "[shotmodel] weapon '%s' effect '%s' action '%s' Missile '%s' model '%s'\n", weapon_id.c_str(), eff.c_str(), act.c_str(),
+                         missile ? missile->c_str() : "(none)", missile ? scalar("CActorMissile", *missile, "Model").value_or("(none)").c_str() : "-");
         if (!missile || missile->empty()) continue;
         auto model = scalar("CActorMissile", *missile, "Model");
         if (!model || model->empty()) continue;
@@ -1038,6 +1173,54 @@ std::optional<std::string> Catalog::weapon_missile_model_id(const std::string& w
         for (std::size_t at = id.find(tok); at != std::string::npos; at = id.find(tok, at))
             id.replace(at, tok.size(), actor_unit_name(*missile, "CActorMissile"));
         if (auto path = scalar("CModel", id, "Model"); path && !path->empty()) return id;
+    }
+    return std::nullopt;
+}
+
+std::optional<std::string> Catalog::weapon_impact_model_id(const std::string& weapon_id) const {
+    if (weapon_id.empty()) return std::nullopt;
+    const std::string eff = weapon_effect_id(weapon_id);
+    for (const std::string& act : ids("CActorAction")) {
+        std::string attack, launch;
+        for (const Entry* e = find("CActorAction", act); e; e = e->parent.empty() ? nullptr : find("CActorAction", e->parent)) {
+            if (const std::string* v = e->attr("effectAttack"); v && attack.empty()) attack = *v;
+            if (const std::string* v = e->attr("effectLaunch"); v && launch.empty()) launch = *v;
+        }
+        static const bool kAttackOnly = std::getenv("SC2_IMPACT_ATTACK_ONLY") != nullptr;
+        const bool by_attack = !attack.empty() && (attack == weapon_id || attack == eff);
+        const bool by_missile = !kAttackOnly && !launch.empty() && launch == eff;
+        if (!by_attack && !by_missile) continue;
+        std::string model;
+        for (const XmlNode& n : resolved("CActorAction", act))
+            if (n.name == "ImpactMap" && n.attr_or("index", "") == "None")
+                if (const std::string* m = n.attr("Model")) model = *m;
+        if (model.empty()) continue;
+        const std::string tok = "##id##";
+        for (std::size_t at = model.find(tok); at != std::string::npos; at = model.find(tok, at))
+            model.replace(at, tok.size(), act);
+        if (auto path = scalar("CModel", model, "Model"); path && !path->empty()) return model;
+    }
+    return std::nullopt;
+}
+
+std::optional<std::string> Catalog::weapon_launch_model_id(const std::string& weapon_id) const {
+    if (weapon_id.empty()) return std::nullopt;
+    const std::string eff = weapon_effect_id(weapon_id);
+    for (const std::string& act : ids("CActorAction")) {
+        std::string attack;
+        for (const Entry* e = find("CActorAction", act); e && attack.empty();
+             e = e->parent.empty() ? nullptr : find("CActorAction", e->parent))
+            if (const std::string* v = e->attr("effectAttack")) attack = *v;
+        if (attack.empty() || (attack != weapon_id && attack != eff)) continue;
+        std::string model;
+        for (const XmlNode& n : resolved("CActorAction", act))
+            if (n.name == "LaunchAssets")
+                if (const std::string* m = n.attr("Model")) model = *m;
+        if (model.empty()) continue;
+        const std::string tok = "##id##";
+        for (std::size_t at = model.find(tok); at != std::string::npos; at = model.find(tok, at))
+            model.replace(at, tok.size(), act);
+        if (auto path = scalar("CModel", model, "Model"); path && !path->empty()) return model;
     }
     return std::nullopt;
 }
@@ -1260,6 +1443,34 @@ std::string Catalog::cabil_effect_link(const std::string& abil_id) const {
     return (!link.empty() && find("CEffect", link)) ? link : std::string{};
 }
 
+std::optional<Catalog::CursorLook> Catalog::cursor_look(const std::string& cursor_id) const {
+    CursorLook look;
+    for (const core::XmlNode& n : resolved("CCursor", cursor_id)) {
+        const std::string v = n.attr_or("value", "");
+        if (v.empty()) continue;
+        if (n.name == "Texture") look.texture = v;
+        else if (n.name == "HotspotX") look.hotspot_x = std::atoi(v.c_str());
+        else if (n.name == "HotspotY") look.hotspot_y = std::atoi(v.c_str());
+    }
+    if (look.texture.empty()) return std::nullopt;
+    return look;
+}
+
+std::optional<std::string> Catalog::behavior_info_icon(const std::string& behavior_id) const {
+    std::optional<std::string> icon;
+    bool hidden = false;
+    for (const core::XmlNode& n : resolved("CBehavior", behavior_id)) {
+        if (n.name == "InfoIcon") {
+            const std::string v = n.attr_or("value", "");
+            if (!v.empty()) icon = v;
+        } else if (n.name == "InfoFlags" && n.attr_or("index", "") == "Hidden") {
+            hidden = n.attr_or("value", "0") != "0";
+        }
+    }
+    if (hidden) return std::nullopt;
+    return icon;
+}
+
 std::optional<std::string> Catalog::button_icon(const std::string& button_id) const {
     std::optional<std::string> icon;
     for (const core::XmlNode& n : resolved("CButton", button_id))
@@ -1355,12 +1566,16 @@ void Catalog::load_melee(const casc::Storage& store) {
                        "RequirementNodeData.xml", "ActorData.xml",
                        "ConsoleSkinData.xml",
                        "ModelData.xml", "SoundData.xml",
+                       "TerrainData.xml",
+                       "LightData.xml",
                        "GameData.xml", "RaceData.xml",
+                       "GameUIData.xml",
                        "CameraData.xml",
                        "AlertData.xml",
                        "CursorData.xml",
                        "SoundtrackData.xml",
-                       "TurretData.xml"});
+                       "TurretData.xml",
+                       "FoWData.xml"});
     load_strings(store);
     load_hotkeys(store, {});
     load_assets(store);
@@ -1385,6 +1600,18 @@ void Catalog::load_root_files(const casc::Storage& store,
             }
         }
     }
+}
+
+void Catalog::load_missing_only(const casc::Storage& store, const std::vector<std::string>& roots) {
+    std::vector<std::string> basenames(std::begin(kCampaignFiles), std::end(kCampaignFiles));
+    add_only_ = true;
+    try {
+        load_root_files(store, roots, basenames);
+    } catch (...) {
+        add_only_ = false;
+        throw;
+    }
+    add_only_ = false;
 }
 
 void Catalog::load_campaign(const casc::Storage& store,
@@ -1571,7 +1798,7 @@ std::optional<Catalog::MorphSpec> Catalog::morph_spec(const std::string& abil_id
         if (const std::string* u = info.attr("Unit"); u && !u->empty()) st.unit = *u;
         for (const XmlNode& sec : info.children) {
             if (sec.name != "SectionArray") continue;
-            const std::string& sname = sec.attr_or("index", "");
+            const std::string sname = sec.attr_or("index", "");
             for (const XmlNode& ef : sec.children)
                 if (ef.name == "EffectArray" && ef.attr_or("index", "") == "Finish")
                     if (const std::string* v = ef.attr("value"); v && !v->empty()) finish_effect = *v;
@@ -1584,16 +1811,25 @@ std::optional<Catalog::MorphSpec> Catalog::morph_spec(const std::string& abil_id
                 if (d.name != "DurationArray") continue;
                 const std::string* v = d.attr("value");
                 const double val = v ? std::atof(v->c_str()) : 0.0;
-                const std::string& idx = d.attr_or("index", "");
+                const std::string idx = d.attr_or("index", "");
                 if (idx == "Delay") slot->delay = val;
                 else if (idx == "Duration") slot->dur = val;
             }
         }
     }
 
+    static const bool kDropRepeats = std::getenv("SC2_MORPH_REPEATED_STAGES") == nullptr;
     MorphSpec spec;
+    const Stage* prev = nullptr;
     for (const Stage& st : stages) {
         if (st.unit.empty() || st.unit.find("##") != std::string::npos) continue;
+        if (kDropRepeats && prev && prev->unit == st.unit && prev->secs.size() == st.secs.size()) {
+            bool same = true;
+            for (std::size_t k = 0; k < st.secs.size() && same; ++k)
+                same = prev->secs[k].name == st.secs[k].name && prev->secs[k].delay == st.secs[k].delay && prev->secs[k].dur == st.secs[k].dur;
+            if (same) continue;
+        }
+        prev = &st;
         double stage_time = 0.0;
         for (const Section& s : st.secs)
             if (s.delay + s.dur > stage_time) stage_time = s.delay + s.dur;
@@ -1802,21 +2038,40 @@ std::string Catalog::actor_unit_name(const std::string& actor_id,
 }
 
 std::vector<Catalog::ActorRule> Catalog::actor_rules(const std::string& actor_id,
-                                                     const std::string& family) const {
+                                                     const std::string& family, bool with_macros) const {
     std::vector<ActorRule> out;
     if (actor_id.empty()) return out;
     const std::string unit_name = actor_unit_name(actor_id, family);
-    for (const NodeSlot& slot : resolve_node_slots(family, actor_id, "On")) {
+    std::vector<NodeSlot> on_slots = resolve_node_slots(family, actor_id, "On");
+    static const bool kMacros = std::getenv("SC2_NO_ACTOR_MACROS") == nullptr;
+    if (kMacros && with_macros) {
+        std::vector<std::string> mids;
+        for (const NodeSlot& ms : resolve_node_slots(family, actor_id, "Macros")) {
+            if (ms.dead) continue;
+            for (const SlotWrite& w : ms.writes)
+                if (const std::string* v = w.node->attr("value"); v && !v->empty() && std::find(mids.begin(), mids.end(), *v) == mids.end()) mids.push_back(*v);
+        }
+        for (const std::string& mid : mids) {
+            std::vector<NodeSlot> mrows = resolve_node_slots("CActorEventMacro", mid, "On");
+            if (std::getenv("SC2_MACRO_TRACE"))
+                std::fprintf(stderr, "[macro] %s: %s -> %zu rows\n", actor_id.c_str(), mid.c_str(), mrows.size());
+            for (NodeSlot& mo : mrows) on_slots.push_back(std::move(mo));
+        }
+    }
+    for (const NodeSlot& slot : on_slots) {
         if (slot.dead) continue;
         const std::string* terms = nullptr;
         const std::string* send = nullptr;
+        const std::string* target = nullptr;
         for (const SlotWrite& w : slot.writes) {
             if (const std::string* t = w.node->attr("Terms")) terms = t;
             if (const std::string* v = w.node->attr("Send")) send = v;
+            if (const std::string* g = w.node->attr("Target")) target = g;
         }
         if (!terms && !send) continue;
 
         ActorRule r;
+        if (target) r.target = expand_actor_tokens(*target, unit_name, actor_id);
         if (terms) {
             const std::string terms_x = expand_actor_tokens(*terms, unit_name, actor_id);
             const std::vector<std::string> clauses = on_split(terms_x, ';');
@@ -1865,16 +2120,7 @@ std::array<float, 3> Catalog::unit_render_scale(const std::string& unit_id) cons
     const std::array<float, 3> kIdentity{1.0f, 1.0f, 1.0f};
     if (unit_id.empty()) return kIdentity;
 
-    if (!actor_by_unit_built_) {
-        actor_by_unit_built_ = true;
-        for (const std::string& aid : ids("CActorUnit")) {
-            const Entry* e = find("CActorUnit", aid);
-            if (!e) continue;
-            const std::string* un = e->attr("unitName");
-            const std::string& key = (un && !un->empty()) ? *un : aid;
-            actor_by_unit_.emplace(key, aid);
-        }
-    }
+    ensure_actor_by_unit();
     auto it = actor_by_unit_.find(unit_id);
     if (it == actor_by_unit_.end()) return kIdentity;
 
@@ -1895,6 +2141,147 @@ std::array<float, 3> Catalog::unit_render_scale(const std::string& unit_id) cons
     if (comps == 0) return kIdentity;
     if (comps == 1) out[1] = out[2] = out[0];
     return out;
+}
+
+void Catalog::ensure_actor_by_unit() const {
+    if (actor_by_unit_built_) return;
+    actor_by_unit_built_ = true;
+    for (const std::string& aid : ids("CActorUnit")) {
+        const Entry* e = find("CActorUnit", aid);
+        if (!e) continue;
+        const std::string* un = e->attr("unitName");
+        const std::string& key = (un && !un->empty()) ? *un : aid;
+        actor_by_unit_.emplace(key, aid);
+    }
+}
+
+std::optional<std::array<float, 3>> Catalog::actor_tint(const std::string& unit_id, const std::string& terms_prefix,
+                                                        const std::string& terms_contains) const {
+    if (unit_id.empty()) return std::nullopt;
+    ensure_actor_by_unit();
+    auto it = actor_by_unit_.find(unit_id);
+    if (it == actor_by_unit_.end()) return std::nullopt;
+    std::optional<std::array<float, 3>> out;
+    for (const XmlNode& n : resolved("CActorUnit", it->second)) {
+        if (n.name != "On") continue;
+        const std::string terms = n.attr_or("Terms", "");
+        const std::string send = n.attr_or("Send", "");
+        if (terms.rfind(terms_prefix, 0) != 0 || terms.find(terms_contains) == std::string::npos) continue;
+        if (send.rfind("SetTintColor ", 0) != 0) continue;
+        int r = 255, g = 255, b = 255;
+        if (std::sscanf(send.c_str() + 13, "%d,%d,%d", &r, &g, &b) != 3) continue;
+        out = std::array<float, 3>{float(r) / 255.0f, float(g) / 255.0f, float(b) / 255.0f};
+    }
+    return out;
+}
+
+void Catalog::build_range_rings() const {
+    if (range_rings_built_) return;
+    range_rings_built_ = true;
+
+    auto in_placement_chain = [&](const std::string& actor_id) {
+        std::string cur = actor_id;
+        for (int hops = 0; hops < 16 && !cur.empty(); ++hops) {
+            if (cur == "PlacementModel") return true;
+            const Entry* e = find("CActor", cur);
+            if (!e) return false;
+            cur = e->parent;
+        }
+        return false;
+    };
+    auto field = [&](const std::string& id, const char* name, const char* key) -> std::string {
+        const auto& kids = resolved("CActor", id);
+        std::string v;
+        for (const XmlNode& n : kids)
+            if (n.name == name)
+                if (const std::string* a = n.attr(key)) v = *a;
+        if (v.empty()) return v;
+        v = expand_entry_tokens("CActor", id, v);
+        return v.find("##") == std::string::npos ? v : std::string();
+    };
+
+    std::unordered_set<std::string> placement_rings;
+    const std::vector<std::string> actors = ids("CActor");
+    for (const std::string& id : actors) {
+        const Entry* e = find("CActor", id);
+        if (!e) continue;
+        const bool placement_parent = in_placement_chain(id);
+        for (const XmlNode& n : e->own) {
+            if (n.name != "On") continue;
+            const std::string terms = n.attr_or("Terms", "");
+            const std::string send = n.attr_or("Send", "");
+            if (terms.rfind("ActorCreation", 0) != 0 || send.rfind("Create ", 0) != 0) continue;
+            if (!placement_parent && terms.find("Placement") == std::string::npos) continue;
+            const std::string ring = send.substr(7);
+            const Entry* r = find("CActor", ring);
+            if (r && r->tag == "CActorRange") placement_rings.insert(ring);
+        }
+    }
+
+    for (const std::string& id : actors) {
+        const Entry* e = find("CActor", id);
+        if (!e || e->tag != "CActorRange") continue;
+        const std::string weapon = field(id, "Weapon", "value");
+        const std::string abil = field(id, "Abil", "Link");
+        const std::string sight = field(id, "Sight", "value");
+        const std::string own_range = field(id, "Range", "value");
+        double radius = 0;
+        if (!own_range.empty()) radius = std::strtod(own_range.c_str(), nullptr);
+        else if (!weapon.empty()) radius = std::strtod(scalar("CWeapon", weapon, "Range").value_or("0").c_str(), nullptr);
+        else if (!abil.empty()) radius = std::strtod(scalar("CAbil", abil, "Range").value_or("0").c_str(), nullptr);
+        else if (!sight.empty()) radius = std::strtod(scalar("CUnit", sight, "Sight").value_or("0").c_str(), nullptr);
+        if (radius <= 0) continue;
+
+        std::vector<std::string> selected_units;
+        bool targeting = false;
+        for (const XmlNode& n : resolved("CActor", id)) {
+            if (n.name != "On") continue;
+            const std::string terms = expand_entry_tokens("CActor", id, n.attr_or("Terms", ""));
+            const std::string send = n.attr_or("Send", "");
+            if (terms.rfind("SelectionLocalUpdate.", 0) == 0 && (send == "Create" || send == "SetVisibility 1")) {
+                const std::size_t a = 21, b = terms.find('.', a);
+                if (b != std::string::npos && terms.compare(b, 6, ".Start") == 0) {
+                    const std::string unit = terms.substr(a, b - a);
+                    if (unit != "*") selected_units.push_back(unit);
+                }
+            }
+            if (terms.rfind("Abil.", 0) == 0 && terms.size() > 14 &&
+                terms.compare(terms.size() - 9, 9, ".TargetOn") == 0 && send == "Create")
+                targeting = true;
+        }
+        if (targeting && !abil.empty()) abil_rings_[abil] = radius;
+
+        RangeRing ring;
+        ring.radius = radius;
+        ring.source = id;
+        const bool placed = placement_rings.count(id) != 0;
+        for (const std::string& unit : selected_units) {
+            RangeRing r = ring;
+            r.on_selection = true;
+            range_rings_[unit].push_back(r);
+        }
+        if (placed) {
+            for (const std::string& unit : ids("CUnit")) {
+                bool owns = false;
+                if (!weapon.empty()) {
+                    for (const std::string& w : equipped_weapons(unit, true))
+                        if (w == weapon) { owns = true; break; }
+                } else if (!abil.empty()) {
+                    owns = unit_carries_ability(unit, abil);
+                }
+                if (!owns) continue;
+                std::vector<RangeRing>& rs = range_rings_[unit];
+                bool merged = false;
+                for (RangeRing& r : rs)
+                    if (r.source == id) { r.on_placement = true; merged = true; }
+                if (!merged) {
+                    RangeRing r = ring;
+                    r.on_placement = true;
+                    rs.push_back(r);
+                }
+            }
+        }
+    }
 }
 
 }

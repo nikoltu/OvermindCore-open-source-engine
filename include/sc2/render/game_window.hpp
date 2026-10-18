@@ -20,6 +20,8 @@ using GameFrameFn = std::function<bool(const InputState& in, float dt_ms,
                                        std::vector<SceneInstance>& scene, Camera& cam,
                                        std::vector<uint8_t>& overlay_rgba)>;
 
+void set_os_cursor_hidden(bool hidden);
+
 WindowResult run_game_window(const GameFrameFn& frame,
                              const casc::Storage* storage = nullptr,
                              uint32_t width = 1280, uint32_t height = 720,

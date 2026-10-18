@@ -2,6 +2,7 @@
 
 #include <cstdint>
 #include <string>
+#include <array>
 #include <utility>
 #include <vector>
 
@@ -56,6 +57,13 @@ struct MeleePlayerSetup {
     sim::Fixed tech_build_time = sim::Fixed::from_int(25);
     bool has_tech = false;
     std::vector<ai::StockStep> stock;
+    struct HdBuildSteps {
+        std::string id, style;
+        std::vector<ai::StockStep> stock;
+        int deadline_s = 0;
+    };
+    std::vector<HdBuildSteps> hd_openings, hd_mids, hd_lates;
+    int race_index = 0;
     sim::Unit army_unit;
     int army_mineral_cost = 50;
     int army_gas_cost = 0;
@@ -72,12 +80,40 @@ struct MeleePlayerSetup {
     int food_ceiling = 200;
     int army_threshold = 3;
     std::vector<std::pair<int, int>> wave_phases;
+    std::array<std::vector<std::pair<int, int>>, 5> wave_ladders;
 };
+
+inline std::vector<std::pair<int, int>> low_tier_wave_ladder(int race_index, int tier) {
+    using L = std::vector<std::pair<int, int>>;
+    static const L kTerran[5] = {{{3, 484}, {5, 422}, {9, 363}, {15, 334}},
+                                 {{5, 431}, {12, 411}, {15, 337}, {22, 289}},
+                                 {{10, 425}, {14, 336}, {18, 290}, {30, 279}},
+                                 {{14, 418}, {18, 327}, {27, 282}, {41, 280}},
+                                 {{15, 394}, {22, 319}, {28, 272}, {45, 254}}};
+    static const L kProtoss[5] = {{{1, 455}, {3, 450}, {4, 323}, {8, 329}},
+                                  {{4, 457}, {7, 401}, {6, 313}, {12, 311}},
+                                  {{6, 445}, {11, 371}, {10, 292}, {16, 268}},
+                                  {{8, 418}, {13, 336}, {14, 283}, {17, 240}},
+                                  {{9, 377}, {15, 319}, {15, 262}, {22, 234}}};
+    static const L kZerg[5] = {{{6, 484}, {7, 419}, {7, 346}, {12, 299}},
+                               {{16, 446}, {11, 367}, {18, 330}, {28, 325}},
+                               {{20, 413}, {19, 367}, {23, 313}, {39, 278}},
+                               {{24, 378}, {18, 317}, {29, 287}, {42, 283}},
+                               {{26, 358}, {23, 323}, {38, 256}, {52, 236}}};
+    const int t = tier < 0 ? 0 : (tier > 4 ? 4 : tier);
+    return race_index == 0 ? kTerran[t] : race_index == 1 ? kProtoss[t] : kZerg[t];
+}
 
 struct MeleeSetup {
     std::vector<MeleePlayerSetup> players;
     std::vector<sim::Unit> neutrals;
     std::vector<float> neutral_facing;
+    struct PlacedVariation {
+        std::string type;
+        double x = 0.0, y = 0.0;
+        int variation = 0;
+    };
+    std::vector<PlacedVariation> placed_variations;
     std::vector<MeleePos> expansion_sites;
 };
 
@@ -96,6 +132,7 @@ struct MeleeLayout {
     std::vector<std::string> unit_type;
     std::vector<float> unit_facing;
     std::vector<char> unit_facing_set;
+    std::vector<int> unit_variation;
 };
 
 MeleeLayout build_melee(sim::World& w, const MeleeSetup& s);

@@ -54,6 +54,10 @@ inline void apply_difficulty(MeleeConfig& cfg, Difficulty d, int& period_ticks) 
     cfg.worker_train_delay_ticks = r->worker_delay_s * sim::World::kTicksPerSecond;
     cfg.flee_damage = r->flee_damage;
     period_ticks = difficulty_period_ticks(r->apm);
+    const int tier = d <= Difficulty::Harder ? int(d) - 1 : 4;
+    if (tier >= 0 && tier < 5 && !cfg.wave_ladders[std::size_t(tier)].empty())
+        cfg.wave_phases = cfg.wave_ladders[std::size_t(tier)];
+    if (d >= Difficulty::VeryHard && !cfg.hd_stock.empty()) cfg.stock = cfg.hd_stock;
 }
 
 }

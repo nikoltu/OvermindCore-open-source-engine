@@ -1,3 +1,4 @@
+#include <cstdio>
 #include "sc2/app/front_end.hpp"
 #include "sc2/ui/layout.hpp"
 #include "sc2/app/shell_emblem.hpp"
@@ -6,7 +7,10 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cctype>
 #include <cstdlib>
+#include <cstring>
+#include <unordered_map>
 #include <chrono>
 #include <filesystem>
 #include <fstream>
@@ -20,23 +24,48 @@
 #include "sc2/app/race_melee_setup.hpp"
 #include "sc2/app/shipping_wiring.hpp"
 #include "sc2/app/spawn.hpp"
+#include "sc2/app/shoreline_place.hpp"
 #include "sc2/app/water_heights.hpp"
+#include "sc2/app/road_place.hpp"
+#include "sc2/app/splat_place.hpp"
+#include "sc2/app/terrain_doodad_place.hpp"
+#include "sc2/app/adjust_terrain_place.hpp"
 #include "sc2/app/water_material.hpp"
 #include "sc2/casc/storage.hpp"
 #include "sc2/core/version.hpp"
+#include "sc2/data/actor_model.hpp"
 #include "sc2/data/catalog.hpp"
 #include "sc2/data/environment.hpp"
 #include "sc2/render/creep_layer.hpp"
 #include "sc2/data/economy.hpp"
 #include "sc2/data/production.hpp"
+#include "sc2/app/ui_settings.hpp"
+#include "sc2/formats/mpq.hpp"
+#include "sc2/formats/tga.hpp"
 
 namespace sc2::app {
+
+static std::uint64_t new_match_seed() {
+    if (std::getenv("SC2_FIXED_MATCH_SEED")) return 0;
+    const std::uint64_t t = std::uint64_t(std::chrono::steady_clock::now().time_since_epoch().count()) ^
+                            (std::uint64_t(std::chrono::system_clock::now().time_since_epoch().count()) << 17);
+    return (t * 0x9E3779B97F4A7C15ull) | 1ull;
+}
 
 using sim::Fixed;
 using sim::Unit;
 
 namespace {
 Fixed Fx(float v) { return Fixed::from_ratio(int(std::lround(double(v) * 64.0)), 64); }
+
+bool shell_v1() {
+    static const bool v1 = std::getenv("SC2_SHELL_V1") != nullptr;
+    return v1;
+}
+std::string& boot_screen_request() {
+    static std::string name;
+    return name;
+}
 
 const char* race_name(Race r) {
     switch (r) {
@@ -50,6 +79,42 @@ const char* race_name(Race r) {
 constexpr int kActWatch = 20, kReplayRow0 = 100000;
 constexpr int kActStart = 1, kActBack = 2, kActMapsFolder = 3, kActScrollUp = 4,
               kActScrollDown = 5, kActP0Race = 10, kActP1Race = 11, kMapRow0 = 100;
+constexpr int kActAiDiff = 12, kActSpeed = 13, kActQuit = 30, kActQuitYes = 31, kActQuitNo = 32,
+              kActProfileName = 40, kActProfileRace = 41, kActOptRail0 = 200, kActOptEngine = 250,
+              kActOptRow0 = 300;
+constexpr const char* kRailNames[] = {"GAMEPLAY", "GRAPHICS", "VIDEO",    "SOUND",  "VOICE",
+                                      "INPUT",    "HOTKEYS",  "COLOR",    "LANGUAGE", "OBSERVER",
+                                      "SOCIAL",   "STEREOSCOPIC", "ENGINE"};
+constexpr int kRailCount = int(sizeof(kRailNames) / sizeof(kRailNames[0]));
+constexpr int kRailHotkeys = 6, kRailEngine = kRailCount - 1;
+
+struct EngineRow {
+    enum class Kind { Slider, Pulldown, Toggle };
+    const char* key;
+    const char* label;
+    Kind kind;
+};
+int label_w(std::uint32_t view_h, const std::string& s, theme::Type t) {
+    return draw::text_w_em(s, std::max(1, theme::scaled(t.px, view_h)), t.track);
+}
+
+const std::vector<EngineRow>& engine_rows() {
+    static const std::vector<EngineRow> k = {
+        {"opt/sound.master", "Master Volume", EngineRow::Kind::Slider},
+        {"opt/sound.music", "Music", EngineRow::Kind::Slider},
+        {"opt/sound.effects", "Sound Effects", EngineRow::Kind::Slider},
+        {"opt/sound.voice", "Voices", EngineRow::Kind::Slider},
+        {"opt/sound.ui", "Interface Sounds", EngineRow::Kind::Slider},
+        {"opt/sound.ambient", "Ambient Sounds", EngineRow::Kind::Slider},
+        {"opt/gameplay.unit_status", "Show Unit Life Bars", EngineRow::Kind::Pulldown},
+        {"opt/gameplay.game_speed", "Game Speed", EngineRow::Kind::Pulldown},
+        {"opt/hotkey.profile", "Hotkey Profile", EngineRow::Kind::Pulldown},
+        {"opt/display.mode", "Display Mode", EngineRow::Kind::Pulldown},
+        {"opt/display.vsync", "Vertical Sync", EngineRow::Kind::Toggle},
+        {"opt/display.ui_scale", "UI Scale", EngineRow::Kind::Slider},
+    };
+    return k;
+}
 
 constexpr const char* kMainMenuLayoutPath =
     "mods/core.sc2mod/base.sc2data/UI/Layout/Glue/ScreenNavigationSC2.SC2Layout";
@@ -78,7 +143,7 @@ namespace {
 struct Board {
     std::vector<std::uint8_t>& out;
     std::uint32_t w, h;
-    const render::OverlayFont* face[2] = {nullptr, nullptr};
+    const render::OverlayFont* face[theme::kFaceCount] = {nullptr, nullptr, nullptr};
     const std::map<std::string, theme::Rgb>* style_rgb = nullptr;
     int s(int authored) const { return theme::scaled(authored, h); }
     int rx(int authored) const { return int(w) - s(authored); }
@@ -165,8 +230,37 @@ void image_well(const Board& b, int x0, int y0, int x1, int y1, const IconAtlas:
     }
 }
 
+struct Look {
+    float hover = 0.0f;
+    bool pressed = false;
+    bool focused = false;
+    float pulse = 0.0f;
+};
+
+theme::Rgb mix_rgb(theme::Rgb a, theme::Rgb c, float t) {
+    t = t < 0.0f ? 0.0f : (t > 1.0f ? 1.0f : t);
+    auto ch = [t](std::uint8_t x, std::uint8_t y) { return std::uint8_t(int(x) + int((int(y) - int(x)) * t)); };
+    return theme::Rgb{ch(a.r, c.r), ch(a.g, c.g), ch(a.b, c.b)};
+}
+
+void apply_look(const Board& b, int x0, int y0, int x1, int y1, const Look& k) {
+    if (k.pressed) draw::fill_a(b.out, b.w, b.h, x0 + 1, y0 + 1, x1 - 1, y1 - 1, 0, 0, 0, 70);
+    if (k.hover > 0.0f) {
+        const std::uint8_t a = std::uint8_t(k.hover * 255.0f);
+        draw::box_a(b.out, b.w, b.h, x0, y0, x1, y1, theme::kAccentHot.r, theme::kAccentHot.g,
+                    theme::kAccentHot.b, a);
+        draw::inset_hi(b.out, b.w, b.h, x0, y0, x1, y1, theme::kInsetHi.r, theme::kInsetHi.g,
+                       theme::kInsetHi.b, std::uint8_t(k.hover * 90.0f));
+    }
+    if (k.focused) {
+        const std::uint8_t a = std::uint8_t(150.0f + 105.0f * k.pulse);
+        draw::box_a(b.out, b.w, b.h, x0 - 2, y0 - 2, x1 + 2, y1 + 2, theme::kAccent.r, theme::kAccent.g,
+                    theme::kAccent.b, a);
+    }
+}
+
 void button_menu(const Board& b, int x0, int y0, int x1, int y1, const std::string& label,
-                 bool active, bool live = true) {
+                 bool active, bool live = true, const Look& k = Look{}) {
     if (x1 <= x0 || y1 <= y0) return;
     draw::vgrad(b.out, b.w, b.h, x0, y0, x1, y1, theme::kMenuBtnTop.r, theme::kMenuBtnTop.g,
                 theme::kMenuBtnTop.b, theme::kMenuBtnBottom.r, theme::kMenuBtnBottom.g,
@@ -175,7 +269,8 @@ void button_menu(const Board& b, int x0, int y0, int x1, int y1, const std::stri
     draw::box_a(b.out, b.w, b.h, x0, y0, x1, y1, border.r, border.g, border.b, 255);
     draw::inset_hi(b.out, b.w, b.h, x0, y0, x1, y1, theme::kInsetHi.r, theme::kInsetHi.g,
                    theme::kInsetHi.b, theme::kAlphaInsetBtn);
-    const theme::Rgb label_c = active ? theme::kTextHi : theme::kTextBody;
+    if (live) apply_look(b, x0, y0, x1, y1, k);
+    const theme::Rgb label_c = active || k.hover > 0.5f ? theme::kTextHi : theme::kTextBody;
     if (live) {
         text_box(b, x0, y0, x1, y1, label, theme::kTypeMenuBtn, label_c);
     } else {
@@ -184,7 +279,7 @@ void button_menu(const Board& b, int x0, int y0, int x1, int y1, const std::stri
 }
 
 void button_primary(const Board& b, int x0, int y0, int x1, int y1, const std::string& label,
-                    theme::Type t) {
+                    theme::Type t, const Look& k = Look{}, bool live = true) {
     if (x1 <= x0 || y1 <= y0) return;
     draw::vgrad(b.out, b.w, b.h, x0, y0, x1, y1, theme::kPrimaryTop.r, theme::kPrimaryTop.g,
                 theme::kPrimaryTop.b, theme::kPrimaryBottom.r, theme::kPrimaryBottom.g,
@@ -193,24 +288,80 @@ void button_primary(const Board& b, int x0, int y0, int x1, int y1, const std::s
                 theme::kBorderAccent.b, 255);
     draw::inset_hi(b.out, b.w, b.h, x0, y0, x1, y1, theme::kInsetPrimary.r, theme::kInsetPrimary.g,
                    theme::kInsetPrimary.b, theme::kAlphaInsetPrimary);
-    text_box(b, x0, y0, x1, y1, label, t, theme::kTextOnPrimary);
+    if (live) apply_look(b, x0, y0, x1, y1, k);
+    else draw::fill_a(b.out, b.w, b.h, x0, y0, x1, y1, theme::kGround.r, theme::kGround.g, theme::kGround.b,
+                      std::uint8_t(255.0f * (1.0f - theme::kDisabledOpacity)));
+    text_box(b, x0, y0, x1, y1, label, t, live ? theme::kTextOnPrimary : theme::kTextMuted2);
 }
 
 void button_secondary(const Board& b, int x0, int y0, int x1, int y1, const std::string& label,
-                      theme::Type t) {
+                      theme::Type t, const Look& k = Look{}) {
     if (x1 <= x0 || y1 <= y0) return;
     panel(b, x0, y0, x1, y1, theme::kSurfaceRaised, 255, theme::kAccentDeep);
-    text_box(b, x0, y0, x1, y1, label, t, theme::kTextBody);
+    apply_look(b, x0, y0, x1, y1, k);
+    text_box(b, x0, y0, x1, y1, label, t, k.hover > 0.5f ? theme::kTextHi : theme::kTextBody);
 }
 
 void pulldown(const Board& b, int x0, int y0, int x1, int y1, const std::string& label,
-              theme::Rgb label_c) {
+              theme::Rgb label_c, const Look& k = Look{}, const std::string& caption = std::string()) {
     if (x1 <= x0 || y1 <= y0) return;
     panel(b, x0, y0, x1, y1, theme::kSurfaceCtl, 255, theme::kBorder);
+    apply_look(b, x0, y0, x1, y1, k);
     const int pad = b.s(theme::kPulldownPadX);
     const int caret_w = run_w(b, "v", theme::kTypeFine);
-    text_left(b, x0 + pad, y0, y1, label, theme::kTypeSmall, label_c, x1 - pad - caret_w);
+    text_left(b, x0 + pad, y0, y1, label, theme::kTypeSmall, k.hover > 0.5f ? theme::kTextHi : label_c,
+              x1 - pad - caret_w);
     text_left(b, x1 - pad - caret_w, y0, y1, "v", theme::kTypeFine, theme::kAccentDeep, x1);
+    if (!caption.empty()) {
+        const int ch = draw::text_h_em(type_px(b, theme::kTypeCaption));
+        text_at(b, x0, y0 - ch - b.s(3), caption, theme::kTypeCaption, theme::kTextFaint, x1);
+    }
+}
+
+void slider(const Board& b, int x0, int y0, int x1, int y1, const std::string& label, float frac,
+            const std::string& value_text, const Look& k = Look{}) {
+    if (x1 <= x0 || y1 <= y0) return;
+    if (k.focused || k.hover > 0.0f)
+        draw::fill_a(b.out, b.w, b.h, x0, y0, x1, y1, theme::kSurfaceSel.r, theme::kSurfaceSel.g,
+                     theme::kSurfaceSel.b, std::uint8_t(60 + int(60.0f * k.hover)));
+    if (k.focused) apply_look(b, x0, y0, x1, y1, Look{0.0f, false, true, k.pulse});
+    text_left(b, x0 + b.s(theme::kPulldownPadX), y0, y1, label, theme::kTypeBody, theme::kTextBody,
+              x0 + (x1 - x0) / 2);
+    const int vw = run_w(b, "100 %", theme::kTypeSmall) + b.s(theme::kPulldownPadX);
+    const int tx0 = x0 + (x1 - x0) / 2, tx1 = x1 - vw - b.s(theme::kPulldownPadX);
+    const int th = std::max(2, b.s(6)), knob = std::max(4, b.s(14));
+    const int ty = (y0 + y1) / 2 - th / 2;
+    draw::fill_a(b.out, b.w, b.h, tx0, ty, tx1, ty + th, theme::kSurfaceHi.r, theme::kSurfaceHi.g,
+                 theme::kSurfaceHi.b, 255);
+    frac = frac < 0.0f ? 0.0f : (frac > 1.0f ? 1.0f : frac);
+    const int kx = tx0 + int(float(tx1 - tx0 - knob) * frac) + knob / 2;
+    draw::fill_a(b.out, b.w, b.h, tx0, ty, kx, ty + th, theme::kAccent.r, theme::kAccent.g, theme::kAccent.b, 255);
+    const theme::Rgb kc = mix_rgb(theme::kBorderCtl, theme::kAccentHot, k.hover);
+    draw::fill_a(b.out, b.w, b.h, kx - knob / 2, (y0 + y1) / 2 - knob / 2, kx + knob / 2,
+                 (y0 + y1) / 2 + knob / 2, kc.r, kc.g, kc.b, 255);
+    draw::box_a(b.out, b.w, b.h, kx - knob / 2, (y0 + y1) / 2 - knob / 2, kx + knob / 2,
+                (y0 + y1) / 2 + knob / 2, theme::kTextHi.r, theme::kTextHi.g, theme::kTextHi.b, 160);
+    text_left(b, tx1 + b.s(theme::kPulldownPadX), y0, y1, value_text, theme::kTypeSmall, theme::kTextCell, x1);
+}
+
+void card(const Board& b, int x0, int y0, int x1, int y1, const std::string& title,
+          const std::string& sub, const std::string& go, const Look& k = Look{}) {
+    if (x1 <= x0 || y1 <= y0) return;
+    const theme::Rgb fill = mix_rgb(theme::kSurface, theme::kSurfaceSel, k.hover);
+    panel(b, x0, y0, x1, y1, fill, theme::kAlphaPanel, mix_rgb(theme::kBorder, theme::kAccentHot, k.hover));
+    if (k.pressed) draw::fill_a(b.out, b.w, b.h, x0 + 1, y0 + 1, x1 - 1, y1 - 1, 0, 0, 0, 70);
+    if (k.focused) apply_look(b, x0, y0, x1, y1, Look{0.0f, false, true, k.pulse});
+    const int px = b.s(theme::kTilePadX), py = b.s(theme::kTilePadY);
+    int ty = y0 + py;
+    text_at(b, x0 + px, ty, title, theme::kTypeTileTitle, theme::kTextHi, x1 - px);
+    ty += draw::text_h_em(type_px(b, theme::kTypeTileTitle)) + b.s(6);
+    const int rule_w = int(float(x1 - x0 - 2 * px) * (0.35f + 0.65f * k.hover));
+    draw::fill_a(b.out, b.w, b.h, x0 + px, ty, x0 + px + rule_w, ty + b.s(theme::kTabRuleH), theme::kAccentPure.r,
+                 theme::kAccentPure.g, theme::kAccentPure.b, 255);
+    ty += b.s(theme::kTabRuleH) + b.s(10);
+    text_at(b, x0 + px, ty, sub, theme::kTypeMicro, theme::kTextMuted, x1 - px);
+    const int gh = draw::text_h_em(type_px(b, theme::kTypeGo));
+    text_at(b, x0 + px, y1 - py - gh, go, theme::kTypeGo, theme::kAccentDeep, x1 - px);
 }
 
 void band_flow_strip(const Board& b, const std::string& title) {
@@ -272,14 +423,95 @@ void wordmark(const Board& b, int x, int y, theme::Type top, theme::Type bottom)
 
 struct Ctl {
     std::string label;
+    std::string key;
     int x0 = 0, y0 = 0, x1 = 0, y1 = 0;
     int action = 0;
     bool live = false;
     bool selected = false;
+    Look look;
 };
 
 void compose_controls(const Board& b, const std::vector<Ctl>& ctls) {
-    for (const Ctl& c : ctls) button_menu(b, c.x0, c.y0, c.x1, c.y1, c.label, false, c.live);
+    for (const Ctl& c : ctls) button_menu(b, c.x0, c.y0, c.x1, c.y1, c.label, false, c.live, c.look);
+}
+
+void draw_toasts(const Board& b, const std::vector<ShellFx::Toast>& toasts) {
+    if (toasts.empty()) return;
+    const int th = draw::text_h_em(type_px(b, theme::kTypeBody)) + b.s(theme::kPagePad);
+    int y1 = b.by(theme::kFooterH) - b.s(theme::kPagePad);
+    for (std::size_t i = toasts.size(); i-- > 0;) {
+        const ShellFx::Toast& t = toasts[i];
+        const float fade = t.ttl_ms < 400.0f ? t.ttl_ms / 400.0f : 1.0f;
+        const int tw = run_w(b, t.text, theme::kTypeBody) + b.s(theme::kPagePad) * 2;
+        const int x0 = (int(b.w) - tw) / 2, y0 = y1 - th;
+        draw::fill_a(b.out, b.w, b.h, x0, y0, x0 + tw, y1, theme::kSurfaceRaised.r, theme::kSurfaceRaised.g,
+                     theme::kSurfaceRaised.b, std::uint8_t(float(theme::kAlphaBand) * fade));
+        const theme::Rgb edge = t.error ? theme::kErr : theme::kBorderStrong;
+        draw::box_a(b.out, b.w, b.h, x0, y0, x0 + tw, y1, edge.r, edge.g, edge.b, std::uint8_t(255.0f * fade));
+        draw::fill_a(b.out, b.w, b.h, x0, y0, x0 + b.s(theme::kVersionRimW), y1, edge.r, edge.g, edge.b,
+                     std::uint8_t(255.0f * fade));
+        text_box(b, x0, y0, x0 + tw, y1, t.text, theme::kTypeBody, t.error ? theme::kErr : theme::kTextBody);
+        y1 = y0 - b.s(theme::kMapRowGap);
+    }
+}
+
+void draw_tooltip(const Board& b, int mx, int my, const std::string& text) {
+    if (text.empty()) return;
+    std::vector<std::string> lines;
+    std::size_t start = 0;
+    while (start <= text.size()) {
+        std::size_t nl = text.find('\n', start);
+        if (nl == std::string::npos) nl = text.size();
+        lines.push_back(text.substr(start, nl - start));
+        start = nl + 1;
+    }
+    const int lh = draw::text_h_em(type_px(b, theme::kTypeSmall)) + b.s(4);
+    int tw = 0;
+    for (const std::string& l : lines) tw = std::max(tw, run_w(b, l, theme::kTypeSmall));
+    const int pad = b.s(theme::kPulldownPadX);
+    const int w = tw + pad * 2, h = int(lines.size()) * lh + pad * 2 - b.s(4);
+    int x0 = mx + b.s(16), y0 = my + b.s(20);
+    if (x0 + w > int(b.w) - b.s(4)) x0 = int(b.w) - b.s(4) - w;
+    if (y0 + h > int(b.h) - b.s(4)) y0 = my - b.s(12) - h;
+    if (x0 < 0) x0 = 0;
+    if (y0 < 0) y0 = 0;
+    panel(b, x0, y0, x0 + w, y0 + h, theme::kSurface, 245, theme::kBorderStrong);
+    int y = y0 + pad;
+    for (const std::string& l : lines) {
+        text_at(b, x0 + pad, y, l, theme::kTypeSmall, theme::kTextBody, x0 + w - pad);
+        y += lh;
+    }
+}
+
+void dialog_frame(const Board& b, int x0, int y0, int x1, int y1, const std::string& title,
+                  const std::string& body) {
+    draw::fill_a(b.out, b.w, b.h, 0, 0, int(b.w), int(b.h), 0, 0, 0, theme::kAlphaScrim);
+    panel_grad(b, x0, y0, x1, y1, theme::kSurfaceRaised, theme::kSurface, 255, theme::kBorderStrong);
+    draw::fill_a(b.out, b.w, b.h, x0, y0, x1, y0 + 1, theme::kAccent.r, theme::kAccent.g, theme::kAccent.b, 128);
+    const int th = draw::text_h_em(type_px(b, theme::kTypeDialogTitle));
+    text_box(b, x0, y0 + b.s(theme::kDialogPadTop), x1, y0 + b.s(theme::kDialogPadTop) + th, title,
+             theme::kTypeDialogTitle, theme::kTextHi);
+    if (!body.empty())
+        text_box(b, x0, y0 + b.s(theme::kDialogPadTop) + th + b.s(theme::kDialogTitleGap), x1,
+                 y0 + b.s(theme::kDialogPadTop) + th + b.s(theme::kDialogTitleGap) + draw::text_h_em(type_px(b, theme::kTypeBody)),
+                 body, theme::kTypeBody, theme::kTextMuted);
+}
+
+void list_row(const Board& b, int x0, int y0, int x1, int y1, const std::string& label, bool selected,
+              const Look& k, const std::string& right = std::string()) {
+    const theme::Rgb fill = selected ? theme::kSurfaceSel : mix_rgb(theme::kSurfaceRow, theme::kSurfaceSel, k.hover * 0.6f);
+    const theme::Rgb edge = selected ? theme::kAccent : mix_rgb(theme::kBorderFaint, theme::kAccentHot, k.hover);
+    panel(b, x0, y0, x1, y1, fill, theme::kAlphaPanelDim, edge);
+    if (k.pressed) draw::fill_a(b.out, b.w, b.h, x0 + 1, y0 + 1, x1 - 1, y1 - 1, 0, 0, 0, 70);
+    if (k.focused) apply_look(b, x0, y0, x1, y1, Look{0.0f, false, true, k.pulse});
+    const int pad = b.s(theme::kMapRowPadX);
+    int rw = 0;
+    if (!right.empty()) {
+        rw = run_w(b, right, theme::kTypeMicro) + pad;
+        text_left(b, x1 - rw, y0, y1, right, theme::kTypeMicro, theme::kTextFaint, x1 - pad);
+    }
+    text_left(b, x0 + pad, y0, y1, label, theme::kTypeSmall, selected || k.hover > 0.5f ? theme::kTextHi : theme::kTextCell,
+              x1 - pad - rw);
 }
 
 void draw_shell_root(const Board& b, const std::vector<Ctl>& ctls) {
@@ -338,13 +570,114 @@ void draw_shell_root(const Board& b, const std::vector<Ctl>& ctls) {
             const int dy = (navh - dh) / 2;
             draw::fill_a(b.out, b.w, b.h, c.x0, dy, c.x0 + 1, dy + dh, theme::kBorderCtl.r,
                          theme::kBorderCtl.g, theme::kBorderCtl.b, 255);
+            if (c.live && (c.look.hover > 0.0f || c.look.focused)) {
+                const int uw = int(float(c.x1 - c.x0) * (c.look.focused ? 1.0f : c.look.hover));
+                draw::fill_a(b.out, b.w, b.h, c.x0 + (c.x1 - c.x0 - uw) / 2, navh - 1 - b.s(theme::kTabRuleH),
+                             c.x0 + (c.x1 - c.x0 + uw) / 2, navh - 1, theme::kAccent.r, theme::kAccent.g,
+                             theme::kAccent.b, 255);
+            }
             text_box(b, c.x0, c.y0, c.x1, c.y1, c.label, theme::kTypeNavItem,
-                     c.live ? theme::kTextBody : theme::kTextMuted2);
+                     c.live ? (c.look.hover > 0.5f || c.look.focused ? theme::kTextHi : theme::kTextBody)
+                            : theme::kTextMuted2);
         } else {
-            button_menu(b, c.x0, c.y0, c.x1, c.y1, c.label, false, c.live);
+            button_menu(b, c.x0, c.y0, c.x1, c.y1, c.label, false, c.live, c.look);
         }
     }
     band_footer(b);
+}
+
+void draw_play_hub(const Board& b, const std::vector<Ctl>& ctls) {
+    band_flow_strip(b, "PLAY");
+    const int ty = b.s(theme::kHomeEmblemTop);
+    text_box(b, 0, ty, int(b.w), ty + draw::text_h_em(type_px(b, theme::kTypeLoadTitle)), "CHOOSE HOW TO PLAY",
+             theme::kTypeLoadTitle, theme::kTextHi);
+    struct Face { const char* key; const char* sub; const char* go; };
+    static const Face kFaces[] = {
+        {"FindMatchButton", "One-on-one against the computer on any map. Pick the races, the tier, the speed.", "-> LOBBY"},
+        {"CustomButton", "Every melee map the install ships, plus any folder of your own, with a preview.", "-> CUSTOM GAMES"},
+        {"ReplayButton", "Every match this client recorded, played back at its recorded seed.", "-> REPLAYS"},
+    };
+    for (const Ctl& c : ctls) {
+        if (c.x1 <= c.x0 || c.y1 <= c.y0) continue;
+        const Face* f = nullptr;
+        for (const Face& k : kFaces)
+            if (c.key == k.key) f = &k;
+        if (f) card(b, c.x0, c.y0, c.x1, c.y1, c.label, f->sub, f->go, c.look);
+        else button_secondary(b, c.x0, c.y0, c.x1, c.y1, c.label, theme::kTypeSecondaryLg, c.look);
+    }
+    band_footer(b);
+}
+
+struct ProfileInfo {
+    std::string name;
+    bool editing = false;
+    int matches = 0, wins = 0;
+    float caret = 0.0f;
+};
+void draw_profile(const Board& b, const std::vector<Ctl>& ctls, const ProfileInfo& info) {
+    band_flow_strip(b, "PROFILE");
+    const int ex0 = b.s(theme::kHomeLeft), ey0 = b.s(theme::kHomeEmblemTop);
+    const int esz = b.s(theme::kEmblemSmall);
+    image_well(b, ex0, ey0, ex0 + esz, ey0 + esz, shell_emblem(false));
+    const int lx = ex0 + esz + b.s(theme::kEmblemGapSmall);
+    text_at(b, lx, ey0, info.name, theme::kTypeWordmarkSm, theme::kTextHi);
+    text_at(b, lx, ey0 + draw::text_h_em(type_px(b, theme::kTypeWordmarkSm)) + b.s(6),
+            std::to_string(info.matches) + " matches played, " + std::to_string(info.wins) + " won",
+            theme::kTypeBody, theme::kTextMuted);
+    const int cx0 = ex0, cy0 = b.s(theme::kHomeCardTop), cx1 = ex0 + b.s(theme::kHomeCardW);
+    const int cy1 = cy0 + b.s(theme::kHomeCardPadY) * 2 + b.s(theme::kRowH) * 3;
+    panel(b, cx0, cy0, cx1, cy1, theme::kSurfaceSel, theme::kAlphaCard, theme::kBorderSlot);
+    int ry = cy0 + b.s(theme::kHomeCardPadY);
+    const int rh = b.s(theme::kRowH), px = b.s(theme::kHomeCardPadX);
+    const int lost = info.matches - info.wins;
+    const int pct = info.matches > 0 ? (info.wins * 100 + info.matches / 2) / info.matches : 0;
+    struct Row { std::string k, v; };
+    const Row rows[] = {{"MATCHES", std::to_string(info.matches)},
+                        {"WON / LOST", std::to_string(info.wins) + " / " + std::to_string(lost)},
+                        {"WIN RATE", std::to_string(pct) + " %"}};
+    for (const Row& r : rows) {
+        text_left(b, cx0 + px, ry, ry + rh, r.k, theme::kTypeCat, theme::kTextMuted2, cx0 + (cx1 - cx0) / 2);
+        text_left(b, cx0 + (cx1 - cx0) / 2, ry, ry + rh, r.v, theme::kTypeBody, theme::kTextCell, cx1 - px);
+        draw::fill_a(b.out, b.w, b.h, cx0 + px, ry + rh - 1, cx1 - px, ry + rh, theme::kBorderRow.r, theme::kBorderRow.g,
+                     theme::kBorderRow.b, 255);
+        ry += rh;
+    }
+    for (const Ctl& c : ctls) {
+        if (c.x1 <= c.x0 || c.y1 <= c.y0) continue;
+        if (c.action == kActProfileName) {
+            panel(b, c.x0, c.y0, c.x1, c.y1, theme::kSurfaceCtl, 255, info.editing ? theme::kAccent : theme::kBorder);
+            apply_look(b, c.x0, c.y0, c.x1, c.y1, c.look);
+            const int pad = b.s(theme::kPulldownPadX);
+            const int pen = draw::text_w_em(info.name, type_px(b, theme::kTypeSmall), theme::kTypeSmall.track);
+            text_left(b, c.x0 + pad, c.y0, c.y1, info.name, theme::kTypeSmall, theme::kTextHi, c.x1 - pad);
+            if (info.editing && info.caret > 0.5f)
+                draw::fill_a(b.out, b.w, b.h, c.x0 + pad + pen + 1, c.y0 + b.s(8), c.x0 + pad + pen + 2, c.y1 - b.s(8),
+                             theme::kAccent.r, theme::kAccent.g, theme::kAccent.b, 255);
+            const int ch = draw::text_h_em(type_px(b, theme::kTypeCaption));
+            text_at(b, c.x0, c.y0 - ch - b.s(3), info.editing ? "NAME  (type letters, Backspace, Space to finish)" : "NAME  (click to edit)",
+                    theme::kTypeCaption, theme::kTextFaint, c.x1);
+        } else if (c.action == kActProfileRace) {
+            pulldown(b, c.x0, c.y0, c.x1, c.y1, c.label, theme::kTextBody, c.look, "PREFERRED RACE");
+        } else if (c.action == kActBack) {
+            button_secondary(b, c.x0, c.y0, c.x1, c.y1, c.label, theme::kTypeSecondaryLg, c.look);
+        } else {
+            button_menu(b, c.x0, c.y0, c.x1, c.y1, c.label, false, c.live, c.look);
+        }
+    }
+    band_footer(b);
+}
+
+void draw_quit_dialog(const Board& b, const std::vector<Ctl>& ctls) {
+    const int dw = b.s(theme::kDialogW);
+    const int dh = b.s(theme::kDialogPadTop) + draw::text_h_em(type_px(b, theme::kTypeDialogTitle)) +
+                   b.s(theme::kDialogTitleGap) + draw::text_h_em(type_px(b, theme::kTypeBody)) + b.s(theme::kDialogTitleGap) +
+                   b.s(theme::kMenuBtnH) + b.s(theme::kDialogPadBottom);
+    const int x0 = (int(b.w) - dw) / 2, y0 = (int(b.h) - dh) / 2;
+    dialog_frame(b, x0, y0, x0 + dw, y0 + dh, "LEAVE THE CLIENT?", "Unsaved lobby choices are kept in the config.");
+    for (const Ctl& c : ctls) {
+        if (c.action == kActQuitYes) button_primary(b, c.x0, c.y0, c.x1, c.y1, c.label, theme::kTypePrimaryMd, c.look);
+        else if (c.action == kActQuitNo) button_secondary(b, c.x0, c.y0, c.x1, c.y1, c.label, theme::kTypeSecondary, c.look);
+    }
 }
 
 void draw_home(const Board& b, const std::vector<Ctl>& ctls) {
@@ -359,7 +692,15 @@ void draw_home(const Board& b, const std::vector<Ctl>& ctls) {
     band_footer(b);
 }
 
-void draw_custom(const Board& b, const std::vector<Ctl>& ctls) {
+struct CustomInfo {
+    std::string selected;
+    std::string size_line;
+    std::string count_line;
+    std::string error;
+    const IconAtlas::Icon* preview = nullptr;
+    bool preview_pending = false;
+};
+void draw_custom(const Board& b, const std::vector<Ctl>& ctls, const CustomInfo& info) {
     band_flow_strip(b, "CUSTOM GAMES - MAP SELECTION");
     const int pad = b.s(theme::kScreenPad);
     const int tabs_y = b.s(theme::kTabsTop);
@@ -372,6 +713,8 @@ void draw_custom(const Board& b, const std::vector<Ctl>& ctls) {
                  theme::kTextHi);
         draw::fill_a(b.out, b.w, b.h, pad, tabs_y + tab_h - b.s(theme::kTabRuleH), pad + tw,
                      tabs_y + tab_h, theme::kAccent.r, theme::kAccent.g, theme::kAccent.b, 255);
+        text_left(b, pad + tw + b.s(theme::kTabPadX), tabs_y, tabs_y + tab_h, info.count_line, theme::kTypeMicro,
+                  theme::kTextFaint, int(b.w) - pad);
     }
     const int top = b.s(theme::kCustomListTop);
     const int bot = b.by(theme::kCustomBottomGap);
@@ -381,12 +724,39 @@ void draw_custom(const Board& b, const std::vector<Ctl>& ctls) {
     panel(b, detail_x0, top, b.rx(theme::kScreenPad), bot, theme::kSurface, theme::kAlphaPanel,
           theme::kBorder);
     const int pv = b.s(theme::kCustomPreview), dp = b.s(theme::kCustomDetailPad);
-    image_well(b, detail_x0 + dp, top + dp, detail_x0 + dp + pv, top + dp + pv);
-    compose_controls(b, ctls);
+    if (info.preview) image_well(b, detail_x0 + dp, top + dp, detail_x0 + dp + pv, top + dp + pv, *info.preview);
+    else image_well(b, detail_x0 + dp, top + dp, detail_x0 + dp + pv, top + dp + pv);
+    if (!info.preview)
+        text_box(b, detail_x0 + dp, top + dp, detail_x0 + dp + pv, top + dp + pv,
+                 info.preview_pending ? "reading the minimap..." : "no minimap in this archive", theme::kTypeCaption,
+                 theme::kTextFaint);
+    int iy = top + dp + pv + dp;
+    text_at(b, detail_x0 + dp, iy, info.selected, theme::kTypeDetailTitle, theme::kTextHi, b.rx(theme::kScreenPad) - dp);
+    iy += draw::text_h_em(type_px(b, theme::kTypeDetailTitle)) + b.s(8);
+    text_at(b, detail_x0 + dp, iy, info.size_line, theme::kTypeSmall, theme::kTextMuted, b.rx(theme::kScreenPad) - dp);
+    if (!info.error.empty()) {
+        iy += draw::text_h_em(type_px(b, theme::kTypeSmall)) + b.s(8);
+        text_at(b, detail_x0 + dp, iy, info.error, theme::kTypeMicro, theme::kErr, b.rx(theme::kScreenPad) - dp);
+    }
+    for (const Ctl& c : ctls) {
+        if (c.x1 <= c.x0 || c.y1 <= c.y0) continue;
+        if (c.key == "CreateButton") button_primary(b, c.x0, c.y0, c.x1, c.y1, c.label, theme::kTypePrimaryMd, c.look);
+        else if (c.key == "BackButton") button_secondary(b, c.x0, c.y0, c.x1, c.y1, c.label, theme::kTypeSecondaryMd, c.look);
+        else if (c.action == kActMapsFolder) button_secondary(b, c.x0, c.y0, c.x1, c.y1, c.label, theme::kTypeSecondaryMd, c.look);
+        else if (c.action >= kMapRow0) list_row(b, c.x0, c.y0, c.x1, c.y1, c.label, c.selected, c.look);
+        else pulldown(b, c.x0, c.y0, c.x1, c.y1, c.label, theme::kTextBody, c.look);
+    }
     band_footer(b);
 }
 
-void draw_options(const Board& b, const std::vector<Ctl>& ctls, int documents, int selected_rail) {
+struct OptionsInfo {
+    int selected_rail = 0;
+    bool engine_page = false;
+    int documents = 0;
+    std::vector<std::string> row_values;
+    std::vector<float> row_fracs;
+};
+void draw_options(const Board& b, const std::vector<Ctl>& ctls, const OptionsInfo& info) {
     band_flow_strip(b, "OPTIONS");
     const int dw = b.s(theme::kOptionsW), dh = b.s(theme::kOptionsH);
     const int x0 = (int(b.w) - dw) / 2, y0 = b.s(theme::kOptionsTop);
@@ -395,28 +765,69 @@ void draw_options(const Board& b, const std::vector<Ctl>& ctls, int documents, i
     const int rail = x0 + b.s(theme::kOptionsRailW);
     draw::fill_a(b.out, b.w, b.h, rail, y0 + 1, rail + 1, y1 - 1, theme::kSurfaceHi.r,
                  theme::kSurfaceHi.g, theme::kSurfaceHi.b, 255);
-    static const char* const kPanels[] = {"GAMEPLAY", "GRAPHICS", "VIDEO",    "SOUND",
-                                          "VOICE",    "INPUT",    "HOTKEYS",  "COLOR",
-                                          "LANGUAGE", "OBSERVER", "SOCIAL",   "STEREOSCOPIC"};
-    const int cat_h =
-        b.s(theme::kCatPadY) * 2 + draw::text_h_em(type_px(b, theme::kTypeCat));
-    int cy = y0 + b.s(theme::kOptionsRailPadY);
-    for (int i = 0; i < int(sizeof(kPanels) / sizeof(kPanels[0])); ++i) {
-        if (i == selected_rail) {
-            draw::fill_a(b.out, b.w, b.h, x0 + 1, cy, rail, cy + cat_h, theme::kSurfaceSel.r,
-                         theme::kSurfaceSel.g, theme::kSurfaceSel.b, theme::kAlphaCatActive);
-            draw::fill_a(b.out, b.w, b.h, x0 + 1, cy, x0 + 1 + b.s(theme::kCatRuleW), cy + cat_h,
-                         theme::kAccent.r, theme::kAccent.g, theme::kAccent.b, 255);
+    for (const Ctl& c : ctls) {
+        if (c.action < kActOptRail0 || c.action >= kActOptRow0) continue;
+        const int i = c.action == kActOptEngine ? kRailEngine : c.action - kActOptRail0;
+        const bool on = i == info.selected_rail;
+        if (on || c.look.hover > 0.0f || c.look.focused) {
+            const std::uint8_t a = on ? theme::kAlphaCatActive : std::uint8_t(float(theme::kAlphaCatActive) * 0.6f * std::max(c.look.hover, c.look.focused ? 1.0f : 0.0f));
+            draw::fill_a(b.out, b.w, b.h, c.x0, c.y0, c.x1, c.y1, theme::kSurfaceSel.r, theme::kSurfaceSel.g,
+                         theme::kSurfaceSel.b, a);
         }
-        text_left(b, x0 + b.s(theme::kCatPadX), cy, cy + cat_h, kPanels[i], theme::kTypeCat,
-                  i == selected_rail ? theme::kTextHi : theme::kTextMuted, rail);
-        cy += cat_h;
+        if (on)
+            draw::fill_a(b.out, b.w, b.h, c.x0, c.y0, c.x0 + b.s(theme::kCatRuleW), c.y1, theme::kAccent.r,
+                         theme::kAccent.g, theme::kAccent.b, 255);
+        if (c.look.focused) apply_look(b, c.x0, c.y0, c.x1, c.y1, Look{0.0f, false, true, c.look.pulse});
+        text_left(b, c.x0 + b.s(theme::kCatPadX), c.y0, c.y1, c.label, theme::kTypeCat,
+                  on || c.look.hover > 0.5f ? theme::kTextHi : theme::kTextMuted, c.x1);
     }
     band_footer(b);
-    compose_controls(b, ctls);
-    const std::string note = std::to_string(ctls.size()) + " controls: the OptionsDialog + its " +
-                             kPanels[selected_rail < 0 ? 0 : selected_rail] + " panel (of " + std::to_string(documents - 1) +
-                             " panel documents, one shown at a time)";
+    if (info.engine_page) {
+        const int px = b.s(theme::kOptionsPadX), py = b.s(theme::kOptionsPadY);
+        text_at(b, rail + px, y0 + py, "ENGINE", theme::kTypeSectionHead, theme::kAccent, x1 - px);
+        text_at(b, rail + px, y0 + py + draw::text_h_em(type_px(b, theme::kTypeSectionHead)) + b.s(4),
+                "Every row here is honoured by this client and saved as you change it. Left / Right nudge the focused row.",
+                theme::kTypeMicro, theme::kTextMuted, x1 - px);
+        const std::vector<EngineRow>& rows = engine_rows();
+        for (const Ctl& c : ctls) {
+            if (c.action < kActOptRow0 || c.action - kActOptRow0 >= int(rows.size())) continue;
+            const std::size_t i = std::size_t(c.action - kActOptRow0);
+            const EngineRow& r = rows[i];
+            const std::string v = i < info.row_values.size() ? info.row_values[i] : std::string();
+            const float f = i < info.row_fracs.size() ? info.row_fracs[i] : 0.0f;
+            if (r.kind == EngineRow::Kind::Slider) {
+                slider(b, c.x0, c.y0, c.x1, c.y1, r.label, f, v, c.look);
+            } else {
+                if (c.look.focused || c.look.hover > 0.0f)
+                    draw::fill_a(b.out, b.w, b.h, c.x0, c.y0, c.x1, c.y1, theme::kSurfaceSel.r, theme::kSurfaceSel.g,
+                                 theme::kSurfaceSel.b, std::uint8_t(60 + int(60.0f * c.look.hover)));
+                text_left(b, c.x0 + b.s(theme::kPulldownPadX), c.y0, c.y1, r.label, theme::kTypeBody, theme::kTextBody,
+                          c.x0 + (c.x1 - c.x0) / 2);
+                const int wx0 = c.x0 + (c.x1 - c.x0) / 2, wy0 = c.y0 + (c.y1 - c.y0 - b.s(theme::kPulldownH)) / 2;
+                if (r.kind == EngineRow::Kind::Pulldown) {
+                    pulldown(b, wx0, wy0, c.x1 - b.s(theme::kPulldownPadX), wy0 + b.s(theme::kPulldownH), v, theme::kTextCell,
+                             Look{c.look.hover, c.look.pressed, false, 0.0f});
+                } else {
+                    const int cb = b.s(18), cy = (c.y0 + c.y1) / 2 - cb / 2;
+                    panel(b, wx0, cy, wx0 + cb, cy + cb, theme::kSurfaceDim, 255,
+                          mix_rgb(theme::kBorderCtl, theme::kAccentHot, c.look.hover));
+                    if (f > 0.5f)
+                        draw::fill_a(b.out, b.w, b.h, wx0 + cb / 4, cy + cb / 4, wx0 + cb - cb / 4, cy + cb - cb / 4,
+                                     theme::kAccent.r, theme::kAccent.g, theme::kAccent.b, 255);
+                    text_left(b, wx0 + cb + b.s(theme::kPulldownPadX), c.y0, c.y1, v, theme::kTypeSmall, theme::kTextCell, c.x1);
+                }
+                if (c.look.focused) apply_look(b, c.x0, c.y0, c.x1, c.y1, Look{0.0f, false, true, c.look.pulse});
+            }
+        }
+        for (const Ctl& c : ctls)
+            if (c.action == 0) button_menu(b, c.x0, c.y0, c.x1, c.y1, c.label, false, c.live, c.look);
+        return;
+    }
+    for (const Ctl& c : ctls)
+        if (c.action == 0) button_menu(b, c.x0, c.y0, c.x1, c.y1, c.label, false, c.live, c.look);
+    const std::string note = "the OptionsDialog + its " + std::string(kRailNames[info.selected_rail < 0 ? 0 : info.selected_rail]) +
+                             " panel (of " + std::to_string(std::max(0, info.documents - 1)) +
+                             " panel documents, one shown at a time) - the ENGINE row holds the settings this client applies";
     text_at(b, b.s(theme::kScreenPad), b.by(theme::kFooterH + theme::kPagePad), note,
             theme::kTypeCaption, theme::kTextMuted, int(b.w) - b.s(theme::kScreenPad));
 }
@@ -446,6 +857,8 @@ struct LoadInfo {
     bool have_colors = false;
     int done = 0, total = 0;
     std::string stage;
+    float pulse = 0.0f;
+    std::string difficulty, speed;
 };
 void draw_loading(const Board& b, const LoadInfo& info) {
     band_flow_strip(b, "LOADING");
@@ -486,10 +899,23 @@ void draw_loading(const Board& b, const LoadInfo& info) {
         const int fill = int(std::int64_t(bw) * info.done / info.total);
         if (fill > 0)
             panel(b, bx0, by0, bx0 + fill, by0 + bh, theme::kBorderSel, 255, theme::kBorderSel);
+        if (fill < bw) {
+            const int sw = std::max(4, bw / 12);
+            const int sx = bx0 + fill + int(float(bw - fill - sw) * info.pulse);
+            draw::fill_a(b.out, b.w, b.h, std::max(bx0 + fill, sx), by0 + 1, std::min(bx0 + bw, sx + sw), by0 + bh - 1,
+                         theme::kAccentHot.r, theme::kAccentHot.g, theme::kAccentHot.b, 70);
+        }
         text_at(b, bx0, by0 + bh + b.s(6),
                 info.stage + "  -  " + std::to_string(info.done) + " / " +
                     std::to_string(info.total),
                 theme::kTypeCaption, theme::kTextFaint, bx0 + bw);
+    } else {
+        text_at(b, bx0, by0 + bh + b.s(6), "Preparing the load plan", theme::kTypeCaption, theme::kTextFaint, bx0 + bw);
+    }
+    if (!info.difficulty.empty()) {
+        const std::string line = "A.I. " + info.difficulty + "   -   speed " + info.speed + "   -   Esc cancels";
+        text_box(b, 0, by0 - b.s(theme::kRowH), int(b.w), by0 - b.s(theme::kRowH) + draw::text_h_em(type_px(b, theme::kTypeSmall)),
+                 line, theme::kTypeSmall, theme::kTextMuted);
     }
     text_box(b, 0, b.by(theme::kLoadTipBottom), int(b.w),
              b.by(theme::kLoadTipBottom) + draw::text_h_em(type_px(b, theme::kTypeBody)),
@@ -502,12 +928,17 @@ struct LobbyInfo {
     std::string selected;
     std::string count_line;
     std::string error;
+    std::string host_name;
+    const IconAtlas::Icon* preview = nullptr;
+    bool preview_pending = false;
 };
 void draw_lobby(const Board& b, const std::vector<Ctl>& ctls, const LobbyInfo& info, int act_start,
                 int act_back, int act_folder, int map_row0) {
     band_nav(b);
     const int pad = b.s(theme::kScreenPad);
     text_at(b, pad, b.s(14), "GAME LOBBY", theme::kTypePanelTitle, theme::kTextHi);
+    text_at(b, pad + run_w(b, "GAME LOBBY", theme::kTypePanelTitle) + b.s(theme::kPagePad), b.s(22),
+            "1V1 MELEE  -  Tab / arrows move, Space picks, Esc leaves", theme::kTypeMicro, theme::kTextFaint);
 
     const int slots_y = b.s(theme::kLobbySlotsTop);
     const int slot_h = b.s(theme::kPulldownH) + b.s(theme::kSlotPadY) * 2;
@@ -519,18 +950,27 @@ void draw_lobby(const Board& b, const std::vector<Ctl>& ctls, const LobbyInfo& i
         pulldown(b, pad + b.s(theme::kSlotPadX), ry + b.s(theme::kSlotPadY),
                  pad + b.s(theme::kSlotPadX) + b.s(theme::kColPlayer),
                  ry + b.s(theme::kSlotPadY) + b.s(theme::kPulldownH),
-                 i == 0 ? "You (Host)" : "A.I. SLOT", theme::kTextBody);
+                 i == 0 ? info.host_name + "  (Host)" : "A.I. SLOT", theme::kTextBody, Look{},
+                 i == 0 ? "PLAYER" : "");
     }
     const int band_y = b.s(theme::kLobbyOptionsTop);
     panel(b, pad, band_y, pad + slots_w, b.by(theme::kFooterH) - b.s(theme::kPagePad),
           theme::kSurface, theme::kAlphaPanelDim, theme::kBorderFaint);
+    text_at(b, pad + b.s(theme::kMapRowPadX), band_y - draw::text_h_em(type_px(b, theme::kTypeCaption)) - b.s(3),
+            "MAP  -  wheel / Page Up / Page Down scroll the library", theme::kTypeCaption, theme::kTextFaint,
+            pad + slots_w);
 
     const int mi_x1 = b.rx(theme::kScreenPad), mi_x0 = mi_x1 - b.s(theme::kMapInfoW);
     const int mi_h = b.s(theme::kMinimapBox) + b.s(theme::kMapInfoPad) * 2;
     panel(b, mi_x0, slots_y, mi_x1, slots_y + mi_h, theme::kSurface, theme::kAlphaPanel,
           theme::kBorder);
     const int mm = b.s(theme::kMinimapBox), mp = b.s(theme::kMapInfoPad);
-    image_well(b, mi_x0 + mp, slots_y + mp, mi_x0 + mp + mm, slots_y + mp + mm);
+    if (info.preview) image_well(b, mi_x0 + mp, slots_y + mp, mi_x0 + mp + mm, slots_y + mp + mm, *info.preview);
+    else {
+        image_well(b, mi_x0 + mp, slots_y + mp, mi_x0 + mp + mm, slots_y + mp + mm);
+        text_box(b, mi_x0 + mp, slots_y + mp, mi_x0 + mp + mm, slots_y + mp + mm,
+                 info.preview_pending ? "reading..." : "no minimap", theme::kTypeCaption, theme::kTextFaint);
+    }
     const int inf_x = mi_x0 + mp + mm + mp;
     text_at(b, inf_x, slots_y + mp, info.selected, theme::kTypeDetailTitle, theme::kTextBody,
             mi_x1 - mp);
@@ -543,20 +983,28 @@ void draw_lobby(const Board& b, const std::vector<Ctl>& ctls, const LobbyInfo& i
     for (const Ctl& c : ctls) {
         if (c.x1 <= c.x0 || c.y1 <= c.y0) continue;
         if (c.action == act_start) {
-            button_primary(b, c.x0, c.y0, c.x1, c.y1, c.label, theme::kTypePrimaryLg);
+            button_primary(b, c.x0, c.y0, c.x1, c.y1, c.label, theme::kTypePrimaryLg, c.look);
         } else if (c.action == act_back) {
-            button_secondary(b, c.x0, c.y0, c.x1, c.y1, c.label, theme::kTypeSecondaryLg);
+            button_secondary(b, c.x0, c.y0, c.x1, c.y1, c.label, theme::kTypeSecondaryLg, c.look);
         } else if (c.action == act_folder) {
-            button_secondary(b, c.x0, c.y0, c.x1, c.y1, c.label, theme::kTypeSecondary);
+            button_secondary(b, c.x0, c.y0, c.x1, c.y1, c.label, theme::kTypeSecondary, c.look);
         } else if (c.action >= map_row0) {
-            panel(b, c.x0, c.y0, c.x1, c.y1, c.selected ? theme::kSurfaceSel : theme::kSurfaceRow,
-                  theme::kAlphaPanelDim, c.selected ? theme::kAccent : theme::kBorderFaint);
-            text_left(b, c.x0 + b.s(theme::kMapRowPadX), c.y0, c.y1, c.label, theme::kTypeSmall,
-                      c.selected ? theme::kTextHi : theme::kTextCell,
-                      c.x1 - b.s(theme::kMapRowPadX));
+            list_row(b, c.x0, c.y0, c.x1, c.y1, c.label, c.selected, c.look);
+        } else if (c.action == kActP0Race || c.action == kActP1Race) {
+            pulldown(b, c.x0, c.y0, c.x1, c.y1, c.label, theme::kTextBody, c.look, c.action == kActP0Race ? "RACE" : "");
+        } else if (c.action == kActAiDiff) {
+            pulldown(b, c.x0, c.y0, c.x1, c.y1, c.label, theme::kTextBody, c.look, "");
+        } else if (c.action == kActSpeed) {
+            pulldown(b, c.x0, c.y0, c.x1, c.y1, c.label, theme::kTextBody, c.look, "");
         } else {
-            pulldown(b, c.x0, c.y0, c.x1, c.y1, c.label, theme::kTextBody);
+            pulldown(b, c.x0, c.y0, c.x1, c.y1, c.label, theme::kTextBody, c.look);
         }
+    }
+    for (const Ctl& c : ctls) {
+        if (c.action != kActAiDiff && c.action != kActSpeed) continue;
+        const int ch = draw::text_h_em(type_px(b, theme::kTypeCaption));
+        text_at(b, c.x0, slots_y - ch - b.s(3), c.action == kActAiDiff ? "A.I. DIFFICULTY" : "GAME SPEED",
+                theme::kTypeCaption, theme::kTextFaint, c.x1);
     }
     mark_version(b);
 }
@@ -570,7 +1018,7 @@ FrontEnd::FrontEnd(data::Catalog& cat, MeleeModels& models, casc::Storage& store
     menu_ctl_.distance = 48.0f;
     menu_ctl_.yaw = 1.5707963f;
     menu_ctl_.pitch = 1.0f;
-    menu_ctl_.mirror_x = true;
+    menu_ctl_.mirror_x = false;
     maps_.push_back({"", "Synthetic Arena (72x72)  [built-in, no cliffs]"});
 }
 
@@ -578,6 +1026,11 @@ void FrontEnd::set_maps(std::vector<platform::MapEntry> maps) {
     maps_.assign(1, platform::MapEntry{"", "Synthetic Arena (72x72)  [built-in, no cliffs]"});
     for (auto& m : maps) maps_.push_back(std::move(m));
     sel_map_ = maps_.size() > 1 ? 1 : 0;
+    thumb_cursor_ = 0;
+    const std::string stored = shell_v1() ? std::string() : settings_.lobby_map();
+    if (!stored.empty())
+        for (std::size_t i = 1; i < maps_.size(); ++i)
+            if (maps_[i].path == stored) sel_map_ = int(i);
     map_scroll_ = 0;
 }
 
@@ -612,8 +1065,9 @@ const MainMenu* FrontEnd::real_menu(std::uint32_t view_w, std::uint32_t view_h) 
         if (const char* env = std::getenv("SC2_DATA_DIR")) dir = env;
     if (dir.empty()) return nullptr;
 
-    const float ref_scale = float(view_h) / app::kRefHeight;
-    const ui::Rect canvas{0, 0, app::kRefHeight * float(view_w) / float(view_h), app::kRefHeight};
+    const float shell_ref = float(app::theme::kDesignRefH);
+    const float ref_scale = float(view_h) / shell_ref;
+    const ui::Rect canvas{0, 0, shell_ref * float(view_w) / float(view_h), shell_ref};
     std::optional<MainMenu> m = MainMenu::from_store(store_, kMainMenuLayoutPath, canvas);
     if (!m) return nullptr;
     m->scale(ref_scale);
@@ -651,10 +1105,14 @@ std::vector<FrontEnd::Button> FrontEnd::menu_buttons(std::uint32_t view_w, std::
 
     struct OwnEntry { const char* label; const char* trigger; };
     static const OwnEntry kOwn[] = {
-        {"1v1 Melee  vs AI", "PlayButton"},
-        {"Sandbox  Test Map", "SandboxButton"},
-        {"Options", "menu/Options"},
-        {"Credits", "Credits entry"},
+        {"VERSUS A.I.", "PlayButton"},
+        {"CUSTOM GAME", "CustomButton"},
+        {"REPLAYS", "ReplayButton"},
+        {"SANDBOX", "SandboxButton"},
+        {"PROFILE", "ProfileButton"},
+        {"OPTIONS", "menu/Options"},
+        {"CREDITS", "Credits entry"},
+        {"QUIT", "Quit game"},
     };
     const int bw = theme::scaled(theme::kMenuBtnW, view_h);
     const int bh = theme::scaled(theme::kMenuBtnH, view_h);
@@ -664,14 +1122,448 @@ std::vector<FrontEnd::Button> FrontEnd::menu_buttons(std::uint32_t view_w, std::
     for (const Button& b : out)
         if (b.y1 + gap > y && b.x1 > x0 && b.x0 < x0 + bw) y = b.y1 + gap;
     for (const OwnEntry& e : kOwn) {
-        bool already = false;
-        for (const Button& b : out)
-            if (trigger_for_control(ScreenId::GlueRoot, b.trigger) == e.trigger) already = true;
-        if (already) continue;
-        out.push_back({x0, y, x0 + bw, y + bh, e.label, e.trigger, 0});
+        out.push_back({x0, y, x0 + bw, y + bh, e.label, e.trigger, e.trigger == std::string("Quit game") ? kActQuit : 0});
         y += bh + gap;
     }
     return out;
+}
+
+std::vector<FrontEnd::Button> FrontEnd::quit_dialog_buttons(std::uint32_t view_w, std::uint32_t view_h) const {
+    std::vector<Button> out;
+    auto S = [view_h](int a) { return theme::scaled(a, view_h); };
+    const int dw = S(theme::kDialogW);
+    const int th = S(20), bh_body = S(13);
+    const int dh = S(theme::kDialogPadTop) + th + S(theme::kDialogTitleGap) + bh_body + S(theme::kDialogTitleGap) +
+                   S(theme::kMenuBtnH) + S(theme::kDialogPadBottom);
+    const int x0 = (int(view_w) - dw) / 2, y0 = (int(view_h) - dh) / 2;
+    const int by = y0 + dh - S(theme::kDialogPadBottom) - S(theme::kMenuBtnH);
+    const int col = S(theme::kMenuBtnW), gap = S(theme::kActionGap);
+    const int half = (col - gap) / 2, cx0 = x0 + S(theme::kDialogPadX);
+    out.push_back({cx0, by, cx0 + half, by + S(theme::kMenuBtnH), "LEAVE", "Confirm quit", kActQuitYes});
+    out.push_back({cx0 + half + gap, by, cx0 + col, by + S(theme::kMenuBtnH), "STAY", "Cancel quit", kActQuitNo});
+    return out;
+}
+
+std::vector<FrontEnd::Button> FrontEnd::play_hub_buttons(std::uint32_t view_w, std::uint32_t view_h) const {
+    std::vector<Button> out;
+    auto S = [view_h](int a) { return theme::scaled(a, view_h); };
+    const int tw = S(theme::kTileW), th = S(theme::kTileH), gap = S(theme::kTileGap);
+    const int total = tw * 3 + gap * 2;
+    int x = (int(view_w) - total) / 2;
+    const int y = S(theme::kHomeCardTop);
+    struct Tile { const char* label; const char* key; };
+    static const Tile kTiles[] = {{"VERSUS A.I.", "FindMatchButton"}, {"CUSTOM GAME", "CustomButton"}, {"REPLAYS", "ReplayButton"}};
+    for (const Tile& t : kTiles) {
+        out.push_back({x, y, x + tw, y + th, t.label, t.key, 0});
+        x += tw + gap;
+    }
+    const int bw = S(theme::kPrimaryW), bh = S(theme::kPrimaryH);
+    const int bx = (int(view_w) - bw) / 2, by = y + th + S(theme::kHomeCardGap) * 2;
+    out.push_back({bx, by, bx + bw, by + bh, "BACK", "BackButton", 0});
+    return out;
+}
+
+int FrontEnd::custom_rows_per_page(std::uint32_t view_h) const {
+    const int pitch = theme::scaled(theme::kPulldownH, view_h) + theme::scaled(theme::kMapRowGap, view_h);
+    const int top = theme::scaled(theme::kCustomListTop, view_h) + theme::scaled(theme::kMapRowPadY, view_h);
+    const int bottom = int(view_h) - theme::scaled(theme::kCustomBottomGap, view_h) - pitch * 2;
+    return std::max(1, (bottom - top) / std::max(1, pitch));
+}
+
+void FrontEnd::clamp_custom_scroll(std::uint32_t view_h) {
+    const int max_scroll = std::max(0, int(maps_.size()) - custom_rows_per_page(view_h));
+    custom_scroll_ = std::max(0, std::min(custom_scroll_, max_scroll));
+}
+
+std::vector<FrontEnd::Button> FrontEnd::custom_buttons(std::uint32_t view_w, std::uint32_t view_h) const {
+    std::vector<Button> out;
+    auto S = [view_h](int a) { return theme::scaled(a, view_h); };
+    const int pad = S(theme::kScreenPad);
+    const int lx0 = pad + S(theme::kMapRowPadX), lx1 = pad + S(theme::kCustomListW) - S(theme::kMapRowPadX);
+    const int listy = S(theme::kCustomListTop) + S(theme::kMapRowPadY);
+    const int pd_h = S(theme::kPulldownH), pitch = pd_h + S(theme::kMapRowGap);
+    const int page = custom_rows_per_page(view_h);
+    for (int i = 0; i < page && custom_scroll_ + i < int(maps_.size()); ++i) {
+        const int y = listy + i * pitch;
+        out.push_back({lx0, y, lx1, y + pd_h, maps_[std::size_t(custom_scroll_ + i)].name, "", kMapRow0 + custom_scroll_ + i});
+    }
+    if (int(maps_.size()) > page) {
+        const int sy = listy + page * pitch;
+        const int half = (lx1 - lx0 - S(theme::kSlotGapX)) / 2;
+        out.push_back({lx0, sy, lx0 + half, sy + pd_h, "Prev", "", kActScrollUp});
+        out.push_back({lx1 - half, sy, lx1, sy + pd_h, "Next", "", kActScrollDown});
+    }
+    const int dx1 = int(view_w) - pad, dx0 = dx1 - S(theme::kCustomDetailW), dp = S(theme::kCustomDetailPad);
+    const int bot = int(view_h) - S(theme::kCustomBottomGap);
+    const int ah = S(theme::kActionH);
+    const int cw = label_w(view_h, "CREATE GAME", theme::kTypePrimaryMd) + S(theme::kActionPadX) * 2;
+    out.push_back({dx1 - dp - cw, bot - dp - ah, dx1 - dp, bot - dp, "CREATE GAME", "CreateButton", 0});
+    if (maps_folder_cb_) {
+        const int fw = label_w(view_h, "MAPS FOLDER...", theme::kTypeSecondaryMd) + S(theme::kActionPadX) * 2;
+        out.push_back({dx1 - dp - cw - S(theme::kActionGap) - fw, bot - dp - ah, dx1 - dp - cw - S(theme::kActionGap), bot - dp,
+                       "MAPS FOLDER...", "", kActMapsFolder});
+    }
+    const int bw = S(theme::kPrimaryW);
+    out.push_back({dx0 + dp, bot - dp - ah, dx0 + dp + bw, bot - dp, "BACK", "BackButton", 0});
+    return out;
+}
+
+std::vector<FrontEnd::Button> FrontEnd::profile_buttons(std::uint32_t view_w, std::uint32_t view_h) const {
+    std::vector<Button> out;
+    auto S = [view_h](int a) { return theme::scaled(a, view_h); };
+    const int x0 = S(theme::kHomeLeft) + S(theme::kHomeCardW) + S(theme::kHomeCardGap);
+    const int y0 = S(theme::kHomeCardTop) + S(theme::kHomeCardPadY) + S(12);
+    const int w = S(theme::kColPlayer) + S(theme::kColRace);
+    out.push_back({x0, y0, x0 + w, y0 + S(theme::kPulldownH), settings_.profile_name(), "Profile name", kActProfileName});
+    const int y1 = y0 + S(theme::kPulldownH) + S(theme::kRowH);
+    out.push_back({x0, y1, x0 + w, y1 + S(theme::kPulldownH), lobby_race_name(settings_.profile_race()), "Profile race", kActProfileRace});
+    const int bw = S(theme::kPrimaryW), bh = S(theme::kPrimaryH);
+    const int bx1 = int(view_w) - S(theme::kScreenPad), by = int(view_h) - S(theme::kFooterH) - S(theme::kPagePad) - bh;
+    out.push_back({bx1 - bw, by, bx1, by + bh, "BACK", "BackButton", kActBack});
+    return out;
+}
+
+std::vector<FrontEnd::Button> FrontEnd::options_shell_buttons(std::uint32_t view_w, std::uint32_t view_h,
+                                                              const std::vector<Button>& authored) const {
+    auto free_slot = [&authored](int x0, int y0, int x1, int y1) {
+        const float cx = float(x0 + x1) * 0.5f, cy = float(y0 + y1) * 0.5f;
+        for (const Button& a : authored) {
+            if (a.x1 <= a.x0 || a.y1 <= a.y0) continue;
+            const float ax = float(a.x0 + a.x1) * 0.5f, ay = float(a.y0 + a.y1) * 0.5f;
+            if (ax >= float(x0) && ax < float(x1) && ay >= float(y0) && ay < float(y1)) return false;
+            if (a.hit(cx, cy)) return false;
+        }
+        return true;
+    };
+    std::vector<Button> out;
+    auto S = [view_h](int a) { return theme::scaled(a, view_h); };
+    const int dw = S(theme::kOptionsW);
+    const int x0 = (int(view_w) - dw) / 2, y0 = S(theme::kOptionsTop);
+    const int y1 = y0 + S(theme::kOptionsH);
+    const int rail = x0 + S(theme::kOptionsRailW);
+    const int cat_h = S(theme::kCatPadY) * 2 + S(12);
+    int cy = y0 + S(theme::kOptionsRailPadY);
+    for (int i = 0; i < kRailCount; ++i) {
+        const std::string key = i == kRailHotkeys ? std::string("HotkeysButton") : std::string("rail/") + kRailNames[i];
+        if (i == kRailEngine) {
+            int ey = cy;
+            while (ey + cat_h <= y1 && !free_slot(x0 + 1, ey, rail, ey + cat_h)) ey += cat_h;
+            if (ey + cat_h > y1) ey = y1 - cat_h;
+            out.push_back({x0 + 1, ey, rail, ey + cat_h, kRailNames[i], key, kActOptEngine});
+        } else if (free_slot(x0 + 1, cy, rail, cy + cat_h)) {
+            out.push_back({x0 + 1, cy, rail, cy + cat_h, kRailNames[i], key, kActOptRail0 + i});
+        }
+        cy += cat_h;
+    }
+    if (options_engine_page_) {
+        const int px = S(theme::kOptionsPadX), py = S(theme::kOptionsPadY);
+        const int rx0 = rail + px, rx1 = x0 + dw - px;
+        int ry = y0 + py + S(17) + S(4) + S(11) + S(theme::kPagePad);
+        const int rh = S(theme::kRowH);
+        const std::vector<EngineRow>& rows = engine_rows();
+        for (std::size_t i = 0; i < rows.size(); ++i) {
+            while (ry + rh <= y1 && !free_slot(rx0, ry, rx1, ry + rh)) ry += rh + S(theme::kMapRowGap);
+            if (ry + rh > y1) break;
+            out.push_back({rx0, ry, rx1, ry + rh, rows[i].label, rows[i].key, kActOptRow0 + int(i)});
+            ry += rh + S(theme::kMapRowGap);
+        }
+    }
+    return out;
+}
+
+std::vector<FrontEnd::Button> FrontEnd::screen_buttons(std::uint32_t view_w, std::uint32_t view_h) {
+    const ScreenId id = router_.top();
+    if (id == ScreenId::GlueRoot) return quit_confirm_ ? quit_dialog_buttons(view_w, view_h) : menu_buttons(view_w, view_h);
+    if (id == ScreenId::Lobby) return lobby_buttons(view_w, view_h);
+    if (id == ScreenId::ReplayBrowse) return replay_buttons(view_w, view_h);
+    if (id == ScreenId::VersusAI) return play_hub_buttons(view_w, view_h);
+    if (id == ScreenId::Custom) return custom_buttons(view_w, view_h);
+    if (id == ScreenId::Profile) return profile_buttons(view_w, view_h);
+    std::vector<Button> out;
+    if (const GlueScreen* s = glue_screen(id, view_w, view_h))
+        for (std::size_t i = 0; i < s->controls().size(); ++i) {
+            const ui::Rect& r = s->hit_rect(i);
+            const ui::SolvedFrame& f = s->controls()[i];
+            out.push_back({int(r.x), int(r.y), int(r.x + r.w), int(r.y + r.h), f.text.empty() ? f.name : f.text, f.name, 0});
+        }
+    if (id == ScreenId::Options) {
+        const std::vector<Button> shell = options_shell_buttons(view_w, view_h, out);
+        out.insert(out.end(), shell.begin(), shell.end());
+    }
+    if (id == ScreenId::Home) {
+        auto S = [view_h](int a) { return theme::scaled(a, view_h); };
+        const int x0 = S(theme::kHomeLeft), y0 = S(theme::kHomeCardTop);
+        out.push_back({x0, y0, x0 + S(theme::kHomeCardW), y0 + S(theme::kHomeCardPadY) * 2 + S(theme::kHomeThumb), "PLAY", "PlayButton", 0});
+    }
+    return out;
+}
+
+void FrontEnd::activate(const Button& b, float mx, std::uint32_t view_w, std::uint32_t view_h) {
+    (void)view_w;
+    const ScreenId id = router_.top();
+    auto follow = [&](const std::string& control) { router_.follow(trigger_for_control(id, control)); };
+    if (id == ScreenId::GlueRoot) {
+        if (quit_confirm_) {
+            if (b.action == kActQuitYes) { quit_confirm_ = false; router_.follow("Esc / close client"); }
+            else if (b.action == kActQuitNo) quit_confirm_ = false;
+            return;
+        }
+        if (b.action == kActQuit) { quit_confirm_ = true; fx_.focus = -1; return; }
+        follow(b.trigger);
+        return;
+    }
+    if (id == ScreenId::Lobby) {
+        if (b.action >= kMapRow0) {
+            sel_map_ = b.action - kMapRow0;
+            match_error_.clear();
+            if (!shell_v1() && sel_map_ >= 0 && sel_map_ < int(maps_.size())) settings_.set_lobby_map(maps_[std::size_t(sel_map_)].path);
+        }
+        else if (b.action == kActP0Race) {
+            p0_pick_ = lobby_race_cycle(p0_pick_);
+            if (p0_pick_ != LobbyRace::Random) p0_race_ = Race(int(p0_pick_));
+            settings_.set(ShellSettings::kProfileRaceKey, std::to_string(int(p0_pick_)));
+        } else if (b.action == kActP1Race) {
+            p1_pick_ = lobby_race_cycle(p1_pick_);
+            if (p1_pick_ != LobbyRace::Random) p1_race_ = Race(int(p1_pick_));
+            if (!shell_v1()) settings_.set_opponent_race(p1_pick_);
+        } else if (b.action == kActAiDiff) settings_.cycle_ai_difficulty(1);
+        else if (b.action == kActSpeed) settings_.cycle_game_speed(1);
+        else if (b.action == kActMapsFolder) {
+            if (maps_folder_cb_) maps_folder_cb_();
+            if (maps_.size() <= 1) fx_.toast("No .SC2Map found in that folder - the built-in arena only", true);
+        }
+        else if (b.action == kActScrollUp) { map_scroll_ -= lobby_rows_per_page(view_h); clamp_map_scroll(view_h); }
+        else if (b.action == kActScrollDown) { map_scroll_ += lobby_rows_per_page(view_h); clamp_map_scroll(view_h); }
+        else if (b.action == kActBack) router_.follow("Back / leave lobby");
+        else if (b.action == kActStart) {
+            match_seed_ = new_match_seed();
+            const std::uint64_t match_seed = match_seed_ ? match_seed_ : MeleeGameConfig{}.seed;
+            p0_race_ = resolve_lobby_race(p0_pick_, match_seed, 0);
+            p1_race_ = resolve_lobby_race(p1_pick_, match_seed, 1);
+            match_error_.clear();
+            loading_frames_ = 0;
+            load_plan_.reset();
+            router_.follow("StartButton -> countdown");
+        }
+        return;
+    }
+    if (id == ScreenId::ReplayBrowse) {
+        if (b.action >= kReplayRow0) sel_replay_ = b.action - kReplayRow0;
+        else if (b.action == kActBack) router_.follow("BackButton");
+        else if (b.action == kActWatch && sel_replay_ >= 0 && sel_replay_ < int(replays_.size())) {
+            OrderLog log;
+            if (read_order_log_file(replays_[std::size_t(sel_replay_)].path, log)) {
+                replay_log_pending_ = std::move(log);
+                replay_pending_ = true;
+                replay_name_ = replays_[std::size_t(sel_replay_)].name;
+                sel_map_ = 0;
+                for (std::size_t i = 0; i < maps_.size(); ++i)
+                    if (!replay_log_pending_.map_id.empty() && maps_[i].path == replay_log_pending_.map_id) sel_map_ = int(i);
+                if (replay_log_pending_.player_races.size() >= 2) {
+                    p0_race_ = Race(std::max(0, std::min(2, int(replay_log_pending_.player_races[0]))));
+                    p1_race_ = Race(std::max(0, std::min(2, int(replay_log_pending_.player_races[1]))));
+                }
+                match_error_.clear();
+                loading_frames_ = 0;
+                load_plan_.reset();
+                router_.follow("Watch replay");
+            } else {
+                match_error_ = "cannot read replay " + replays_[std::size_t(sel_replay_)].name;
+                fx_.toast(match_error_, true);
+            }
+        }
+        return;
+    }
+    if (id == ScreenId::Custom) {
+        if (b.action >= kMapRow0) { sel_map_ = b.action - kMapRow0; match_error_.clear(); }
+        else if (b.action == kActScrollUp) { custom_scroll_ -= custom_rows_per_page(view_h); clamp_custom_scroll(view_h); }
+        else if (b.action == kActScrollDown) { custom_scroll_ += custom_rows_per_page(view_h); clamp_custom_scroll(view_h); }
+        else if (b.action == kActMapsFolder) {
+            if (maps_folder_cb_) maps_folder_cb_();
+            if (maps_.size() <= 1) fx_.toast("No .SC2Map found in that folder - the built-in arena only", true);
+        } else follow(b.trigger);
+        return;
+    }
+    if (id == ScreenId::Profile) {
+        if (b.action == kActProfileName) profile_editing_ = !profile_editing_;
+        else if (b.action == kActProfileRace) {
+            settings_.cycle_profile_race(1);
+            p0_pick_ = settings_.profile_race();
+            if (p0_pick_ != LobbyRace::Random) p0_race_ = Race(int(p0_pick_));
+        } else if (b.action == kActBack) { profile_editing_ = false; router_.follow("BackButton"); }
+        return;
+    }
+    if (id == ScreenId::Options && b.action != 0) {
+        if (b.action == kActOptEngine) {
+            if (!options_engine_page_) glue_cache_[std::size_t(ScreenId::Options)].tried = false;
+            options_engine_page_ = true;
+            fx_.focus = -1;
+            return;
+        }
+        if (b.action >= kActOptRail0 && b.action < kActOptEngine) {
+            const int i = b.action - kActOptRail0;
+            if (i == kRailHotkeys) { router_.follow("HotkeysButton"); return; }
+            if (options_engine_page_) glue_cache_[std::size_t(ScreenId::Options)].tried = false;
+            options_engine_page_ = false;
+            select_options_panel(i < kRailHotkeys ? i : i - 1);
+            return;
+        }
+        if (b.action >= kActOptRow0) {
+            const std::vector<EngineRow>& rows = engine_rows();
+            const std::size_t i = std::size_t(b.action - kActOptRow0);
+            if (i >= rows.size()) return;
+            const EngineRow& r = rows[i];
+            bool ok = true;
+            if (r.kind == EngineRow::Kind::Slider) {
+                const int half = b.x0 + (b.x1 - b.x0) / 2;
+                const int vw = theme::scaled(64, view_h);
+                const float t0 = float(half), t1 = float(b.x1 - vw);
+                float f = t1 > t0 ? (mx - t0) / (t1 - t0) : 0.0f;
+                f = f < 0.0f ? 0.0f : (f > 1.0f ? 1.0f : f);
+                if (std::string(r.key) == "opt/display.ui_scale") ok = settings_.set_ui_scale(kUiScaleMin + f * (kUiScaleMax - kUiScaleMin));
+                else
+                    for (const ShellSettings::Bus& bus : ShellSettings::buses())
+                        if (std::string("opt/") + bus.key == r.key) ok = settings_.set_bus_gain(bus, f);
+            } else {
+                const std::string k = r.key;
+                if (k == "opt/gameplay.unit_status") settings_.cycle_unit_status(1);
+                else if (k == "opt/gameplay.game_speed") settings_.cycle_game_speed(1);
+                else if (k == "opt/hotkey.profile") settings_.cycle_hotkey_profile(1);
+                else if (k == "opt/display.mode") settings_.cycle_display_mode(1);
+                else if (k == "opt/display.vsync") settings_.toggle_vsync();
+            }
+            if (!ok) fx_.toast("The setting could not be written to the config file", true);
+            if (skirmish_) apply_settings_to_match();
+            return;
+        }
+    }
+    if (id == ScreenId::VersusAI) { follow(b.trigger); return; }
+    if (id == ScreenId::Options) {
+        if (b.trigger.size() > 6 && b.trigger.compare(b.trigger.size() - 6, 6, "Button") == 0) {
+            const std::string panel = b.trigger.substr(0, b.trigger.size() - 6) + "OptionsPanel";
+            const std::vector<const char*>& panels = options_panels();
+            for (std::size_t i = 0; i < panels.size(); ++i)
+                if (panel == panels[i]) {
+                    if (options_engine_page_) glue_cache_[std::size_t(ScreenId::Options)].tried = false;
+                    options_engine_page_ = false;
+                    select_options_panel(int(i));
+                    return;
+                }
+        }
+        if (b.trigger.size() > 8 && b.trigger.compare(b.trigger.size() - 8, 8, "CheckBox") == 0) { toggle_option(b.trigger); return; }
+    }
+    follow(b.trigger);
+}
+
+void FrontEnd::shell_keyboard(const render::InputState& in, std::uint32_t view_w, std::uint32_t view_h) {
+    const ShellKeys k = ShellKeys::read(in);
+    const bool pan_now[4] = {k.left, k.right, k.up, k.down};
+    bool edge[4];
+    for (int i = 0; i < 4; ++i) { edge[i] = pan_now[i] && !prev_pan_[i]; prev_pan_[i] = pan_now[i]; }
+    const ScreenId id = router_.top();
+    if (id == ScreenId::Profile && profile_editing_) {
+        std::string n = settings_.profile_name();
+        bool changed = false;
+        if (k.letter && n.size() < 16) { n.push_back(k.letter); changed = true; }
+        if (k.backspace && !n.empty()) { n.pop_back(); changed = true; }
+        if (changed) settings_.set_profile_name(n);
+        if (k.space || k.enter) profile_editing_ = false;
+        return;
+    }
+    std::vector<Button> bs = screen_buttons(view_w, view_h);
+    std::vector<ui::Rect> rects;
+    rects.reserve(bs.size());
+    for (const Button& b : bs) rects.push_back({float(b.x0), float(b.y0), float(b.x1 - b.x0), float(b.y1 - b.y0)});
+    if (k.tab) fx_.focus_tab(int(bs.size()), 1);
+    if (k.shift_tab) fx_.focus_tab(int(bs.size()), -1);
+    const bool focused_slider = fx_.focus >= 0 && fx_.focus < int(bs.size()) && id == ScreenId::Options && bs[std::size_t(fx_.focus)].action >= kActOptRow0;
+    const bool focused_picker = fx_.focus >= 0 && fx_.focus < int(bs.size()) &&
+                                (bs[std::size_t(fx_.focus)].action == kActP0Race || bs[std::size_t(fx_.focus)].action == kActP1Race ||
+                                 bs[std::size_t(fx_.focus)].action == kActAiDiff || bs[std::size_t(fx_.focus)].action == kActSpeed ||
+                                 bs[std::size_t(fx_.focus)].action == kActProfileRace);
+    if ((edge[0] || edge[1]) && (focused_slider || focused_picker)) {
+        const Button& b = bs[std::size_t(fx_.focus)];
+        const int dir = edge[1] ? 1 : -1;
+        if (focused_slider) {
+            const EngineRow& r = engine_rows()[std::size_t(b.action - kActOptRow0)];
+            const std::string key = r.key;
+            if (r.kind == EngineRow::Kind::Slider) {
+                if (key == "opt/display.ui_scale") settings_.set_ui_scale(settings_.ui_scale() + 0.05f * float(dir));
+                else
+                    for (const ShellSettings::Bus& bus : ShellSettings::buses())
+                        if (std::string("opt/") + bus.key == key) settings_.set_bus_gain(bus, settings_.bus_gain(bus) + 0.05f * float(dir));
+            } else if (key == "opt/gameplay.unit_status") settings_.cycle_unit_status(dir);
+            else if (key == "opt/gameplay.game_speed") settings_.cycle_game_speed(dir);
+            else if (key == "opt/hotkey.profile") settings_.cycle_hotkey_profile(dir);
+            else if (key == "opt/display.mode") settings_.cycle_display_mode(dir);
+            else if (key == "opt/display.vsync") settings_.toggle_vsync();
+            if (skirmish_) apply_settings_to_match();
+        } else if (b.action == kActAiDiff) settings_.cycle_ai_difficulty(dir);
+        else if (b.action == kActSpeed) settings_.cycle_game_speed(dir);
+        else if (b.action == kActProfileRace) { settings_.cycle_profile_race(dir); p0_pick_ = settings_.profile_race(); if (p0_pick_ != LobbyRace::Random) p0_race_ = Race(int(p0_pick_)); }
+        else activate(b, float(b.x0 + b.x1) * 0.5f, view_w, view_h);
+        return;
+    }
+    if (edge[0]) fx_.focus_arrow(rects, -1, 0);
+    if (edge[1]) fx_.focus_arrow(rects, 1, 0);
+    if (edge[2]) fx_.focus_arrow(rects, 0, -1);
+    if (edge[3]) fx_.focus_arrow(rects, 0, 1);
+    if (id == ScreenId::Lobby || id == ScreenId::Custom) {
+        int& scroll = id == ScreenId::Lobby ? map_scroll_ : custom_scroll_;
+        const int page = id == ScreenId::Lobby ? lobby_rows_per_page(view_h) : custom_rows_per_page(view_h);
+        if (k.page_up) scroll -= page;
+        if (k.page_down) scroll += page;
+        if (k.home) scroll = 0;
+        if (k.end) scroll = int(maps_.size());
+        if (id == ScreenId::Lobby) clamp_map_scroll(view_h); else clamp_custom_scroll(view_h);
+    }
+    if ((k.space || k.enter) && fx_.focus >= 0 && fx_.focus < int(bs.size())) {
+        const Button b = bs[std::size_t(fx_.focus)];
+        activate(b, float(b.x0 + b.x1) * 0.5f, view_w, view_h);
+    }
+}
+
+const IconAtlas::Icon* FrontEnd::map_preview(int index) {
+    if (index <= 0 || index >= int(maps_.size())) return nullptr;
+    const platform::MapEntry& e = maps_[std::size_t(index)];
+    if (e.path.empty()) return nullptr;
+    auto it = preview_cache_.find(e.path);
+    if (it != preview_cache_.end()) return it->second.ok() ? &it->second : nullptr;
+    if (preview_failed_ == e.path) return nullptr;
+    IconAtlas::Icon icon;
+    try {
+        std::vector<std::uint8_t> bytes;
+        if (e.casc) bytes = store_.read_by_name(e.path);
+        else {
+            std::ifstream in(e.path, std::ios::binary);
+            bytes.assign(std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>());
+        }
+        formats::Mpq arc = formats::Mpq::open(std::move(bytes));
+        if (arc.contains("Minimap.tga")) {
+            formats::TgaInfo ti;
+            std::vector<std::uint8_t> px = formats::decode_tga(arc.read_file("Minimap.tga"), ti);
+            if (ti.width && ti.height && px.size() == std::size_t(ti.width) * ti.height * 4) {
+                icon.w = ti.width;
+                icon.h = ti.height;
+                icon.rgba = std::move(px);
+            }
+        }
+    } catch (const std::exception&) {
+        preview_failed_ = e.path;
+        return nullptr;
+    }
+    IconAtlas::Icon& slot = preview_cache_[e.path];
+    slot = std::move(icon);
+    return slot.ok() ? &slot : nullptr;
+}
+
+void FrontEnd::apply_settings_to_match() {
+    if (!skirmish_) return;
+    skirmish_->set_speed(settings_.game_speed());
+    if (MeleeAudio* a = skirmish_->audio())
+        for (const ShellSettings::Bus& b : ShellSettings::buses())
+            for (const char* cat : b.categories) a->set_category_gain(cat, settings_.bus_gain(b));
+    skirmish_->set_status_bar_mode(settings_.unit_status_mode());
 }
 
 const GlueScreen* FrontEnd::glue_screen(ScreenId id, std::uint32_t view_w, std::uint32_t view_h) {
@@ -689,10 +1581,12 @@ const GlueScreen* FrontEnd::glue_screen(ScreenId id, std::uint32_t view_w, std::
     if (id == ScreenId::Options) {
         opts.screen_docs = 1;
         const std::vector<const char*>& panels = options_panels();
-        if (options_panel_ >= 0 && std::size_t(options_panel_) < panels.size()) opts.shown.push_back(panels[std::size_t(options_panel_)]);
+        if (!options_engine_page_ && options_panel_ >= 0 && std::size_t(options_panel_) < panels.size())
+            opts.shown.push_back(panels[std::size_t(options_panel_)]);
     }
-    e.screen = GlueScreen::harvest(store_, paths, ui::Rect{0, 0, app::kRefHeight * float(view_w) / float(view_h), app::kRefHeight}, opts);
-    if (e.screen) e.screen->scale(float(view_h) / app::kRefHeight);
+    const float shell_ref = float(app::theme::kDesignRefH);
+    e.screen = GlueScreen::harvest(store_, paths, ui::Rect{0, 0, shell_ref * float(view_w) / float(view_h), shell_ref}, opts);
+    if (e.screen) e.screen->scale(float(view_h) / shell_ref);
     return e.screen ? &*e.screen : nullptr;
 }
 
@@ -824,6 +1718,16 @@ std::vector<FrontEnd::Button> FrontEnd::lobby_buttons(std::uint32_t view_w,
         out.push_back({race_x0, ry, race_x1, ry + pd_h,
                        lobby_race_name(i == 0 ? p0_pick_ : p1_pick_), "",
                        i == 0 ? kActP0Race : kActP1Race});
+        if (i == 1) {
+            const int diff_x0 = race_x1 + S(theme::kSlotGapX) + S(theme::kColColor) + S(theme::kSlotGapX) +
+                                S(theme::kColTeam) + S(theme::kSlotGapX) + S(theme::kColHandicap) + S(theme::kSlotGapX);
+            const int diff_x1 = diff_x0 + S(theme::kColAiDiff);
+            out.push_back({diff_x0, ry, diff_x1, ry + pd_h, ShellSettings::difficulty_name(settings_.ai_difficulty()),
+                           "", kActAiDiff});
+            const int sp_x0 = diff_x1 + S(theme::kSlotGapX);
+            out.push_back({sp_x0, ry, sp_x0 + S(theme::kColAiBuild), ry + pd_h,
+                           ShellSettings::speed_name(settings_.game_speed()), "", kActSpeed});
+        }
     }
 
     const int lx0 = pad + S(theme::kMapRowPadX);
@@ -1075,23 +1979,127 @@ bool FrontEnd::build_real_map_phase(int phase) {
                                           std::istreambuf_iterator<char>());
             }
         } else if (phase == 1) {
+            {
+                std::unordered_map<std::string, std::vector<std::uint8_t>> ov;
+                if (!std::getenv("SC2_NO_MAP_ASSETS")) {
+                    try {
+                        const formats::Mpq arc = formats::Mpq::open(pending_map_bytes_);
+                        for (const std::string& name : arc.list()) {
+                            std::string key = name;
+                            for (char& c : key) c = c == '\\' ? '/' : char(std::tolower(static_cast<unsigned char>(c)));
+                            if (key.compare(0, 7, "assets/") != 0) continue;
+                            try { ov.emplace(std::move(key), arc.read_file(name)); } catch (const std::exception&) {}
+                        }
+                    } catch (const std::exception&) {}
+                }
+                if (std::getenv("SC2_MAP_ASSETS_TRACE")) std::fprintf(stderr, "[mapassets] %zu files from the map archive\n", ov.size());
+                store_.set_overlay(std::move(ov));
+            }
+            if (!std::getenv("SC2_NO_MAP_CAMPAIGN_UNITS")) {
+                try {
+                    const formats::Mpq arc = formats::Mpq::open(pending_map_bytes_);
+                    const std::vector<std::uint8_t> hb = arc.read_file("DocumentHeader");
+                    std::string header(hb.begin(), hb.end());
+                    for (char& c : header) c = char(std::tolower(static_cast<unsigned char>(c)));
+                    int depth = 0;
+                    if (header.find("campaigns/liberty.sc2campaign") != std::string::npos) depth = std::max(depth, 1);
+                    if (header.find("campaigns/swarm.sc2campaign") != std::string::npos) depth = std::max(depth, 2);
+                    if (header.find("campaigns/void.sc2campaign") != std::string::npos) depth = std::max(depth, 3);
+                    static int loaded_depth = 0;
+                    if (depth > loaded_depth) {
+                        static const char* const kChain[] = {"campaigns/liberty.sc2campaign/base.sc2data",
+                                                             "campaigns/swarm.sc2campaign/base.sc2data",
+                                                             "campaigns/void.sc2campaign/base.sc2data"};
+                        std::vector<std::string> roots(kChain + loaded_depth, kChain + depth);
+                        cat_.load_missing_only(store_, roots);
+                        loaded_depth = depth;
+                        if (std::getenv("SC2_PLACED_DROP_TRACE"))
+                            std::fprintf(stderr, "[map-campaign] dependency depth %d: %zu campaign root(s) added (missing ids only)\n", depth, roots.size());
+                    }
+                } catch (const std::exception&) {
+                }
+            }
             real_map_ = std::make_unique<formats::LoadedMap>(
                 formats::load_map_terrain(std::move(pending_map_bytes_)));
             pending_map_bytes_.clear();
+            models_.set_tileset(store_, real_map_->tileset);
             app::stamp_map_doodads(cat_, *real_map_);
             app::stamp_map_units(cat_, *real_map_);
-            current_env_ = data::resolve_environment_light(cat_, real_map_->tileset);
+            if (!std::getenv("SC2_NO_DOODAD_MODEL_SCALE")) {
+                std::map<std::string, std::array<float, 3>> model_scale;
+                for (formats::PlacedDoodad& d : real_map_->objects.doodads) {
+                    auto it = model_scale.find(d.type);
+                    if (it == model_scale.end()) it = model_scale.emplace(d.type, data::resolve_doodad_model_scale(cat_, d.type)).first;
+                    d.sx *= it->second[0];
+                    d.sy *= it->second[1];
+                    d.sz *= it->second[2];
+                }
+            }
+            current_env_ = data::resolve_map_environment(cat_, real_map_->tileset);
+            if (const std::vector<std::uint8_t>* lx = real_map_->game_data_file("LightData.xml")) data::overlay_map_light(current_env_, *lx);
+            if (const std::vector<std::uint8_t>* tx = real_map_->game_data_file("TerrainData.xml")) data::overlay_map_terrain(current_env_, *tx, real_map_->tileset);
+            current_env_.params["EngineZOffset"] = formats::engine_z_offset(*real_map_);
+            if (std::getenv("SC2_ENV_TRACE"))
+                std::fprintf(stderr, "env: tileset %s -> light %s (%s) found=%d exposure=%.3f white=%.3f ambient=%.3f,%.3f,%.3f key=%d params=%zu\n",
+                             real_map_->tileset.c_str(), current_env_.light_id.c_str(), current_env_.resolution.c_str(),
+                             int(current_env_.found), current_env_.hdr_exposure, current_env_.hdr_white_point,
+                             current_env_.ambient_color[0], current_env_.ambient_color[1], current_env_.ambient_color[2],
+                             int(current_env_.key.present), current_env_.params.size());
         } else if (phase == 2) {
             real_cliffs_ = app::place_cliffs(store_, *real_map_);
+            app::apply_cliff_vertex_shade(real_cliffs_, *real_map_);
         } else {
-            const bool have_cliffs = !real_cliffs_.instances.empty();
-            real_ground_ = formats::build_map_mesh_stepped(*real_map_, 1.0f, 128, !have_cliffs);
+            const bool vertex_ground = !real_map_->cliff.empty();
+            const bool cliff_ground = vertex_ground && !real_cliffs_.instances.empty() && !std::getenv("SC2_NO_CLIFF_GROUND");
+            const std::vector<std::uint8_t> cliff_cells = cliff_ground ? app::cliff_ground_cells(real_cliffs_, *real_map_) : std::vector<std::uint8_t>{};
+            real_ground_ = vertex_ground ? formats::build_map_mesh_vertex(*real_map_, 1.0f, cliff_ground ? &cliff_cells : nullptr)
+                                         : formats::build_map_mesh_stepped(*real_map_, 1.0f, 128, true);
+            if (vertex_ground) app::flatten_adjusted_terrain(real_ground_, store_, models_, *real_map_);
+            if (cliff_ground) app::append_cliff_ground(real_ground_, real_cliffs_, *real_map_);
+            if (vertex_ground) append_terrain_material_doodads(real_ground_, store_, models_, *real_map_);
             if (texture_cb_) texture_cb_(real_ground_, *real_map_);
-            const auto water_heights = water_type_heights(store_);
+            const std::vector<std::uint8_t>* map_water_xml = real_map_->game_data_file("WaterData.xml");
+            const auto water_heights = water_type_heights(store_, map_water_xml);
             real_water_ = formats::build_map_water(*real_map_, 1.0f, 0.5f, &water_heights);
             real_water_rgba_ = {1.0f, 1.0f, 1.0f, 1.0f};
+            real_roads_ = !std::getenv("SC2_ROAD_TERRAIN_SPEC")
+                              ? build_map_roads(store_, *real_map_)
+                              : build_map_roads(store_, *real_map_, float(current_env_.param("TerrainSpecularExp", 100.0)),
+                                                float(current_env_.param("TerrainHDRSpecular", 1.0) / std::max(current_env_.param("HDRSpecMultiplier", 1.0), 1e-3)));
+            const double proj_spec_mult = current_env_.param("HDRSpecMultiplier", 1.0);
+            append_ground_overlay(real_roads_, build_map_projectors(store_, models_, *real_map_, float(current_env_.param("TerrainSpecularExp", 100.0)),
+                                                                    float(current_env_.param("TerrainHDRSpecular", 1.0) / (proj_spec_mult > 0.0 ? proj_spec_mult : 1.0))));
+            if (!std::getenv("SC2_ROAD_OVERHANG")) {
+                const float mw = float(real_map_->cell_width()), mh = float(real_map_->cell_height());
+                formats::Model& rm = real_roads_;
+                for (const formats::M3Region& rg : rm.regions)
+                    for (std::uint32_t t = rg.first_index; t + 2 < rg.first_index + rg.num_indices && t + 2 < rm.indices.size(); t += 3) {
+                        float cx = 0.0f, cy = 0.0f;
+                        bool ok = true;
+                        for (int k = 0; k < 3; ++k) {
+                            const std::size_t v = std::size_t(rg.first_vertex) + rm.indices[t + std::uint32_t(k)];
+                            if (v * 3 + 1 >= rm.positions.size()) { ok = false; break; }
+                            cx += rm.positions[v * 3];
+                            cy += rm.positions[v * 3 + 1];
+                        }
+                        if (!ok) continue;
+                        cx /= 3.0f;
+                        cy /= 3.0f;
+                        if (cx < 0.0f || cy < 0.0f || cx > mw || cy > mh) rm.indices[t + 1] = rm.indices[t + 2] = rm.indices[t];
+                    }
+            }
+            if (std::getenv("SC2_ENV_TRACE")) {
+                auto zr = [](const formats::Model& m, float& lo, float& hi) {
+                    lo = 1e9f; hi = -1e9f;
+                    for (std::size_t v = 2; v < m.positions.size(); v += 3) { lo = std::min(lo, m.positions[v]); hi = std::max(hi, m.positions[v]); }
+                };
+                float gl, gh, wl, wh;
+                zr(real_ground_, gl, gh); zr(real_water_, wl, wh);
+                std::fprintf(stderr, "env: ground z %.2f..%.2f  water z %.2f..%.2f (%zu planes, type %s)\n", gl, gh, wl, wh,
+                             real_map_->water.planes.size(), real_map_->water.planes.empty() ? "-" : real_map_->water.planes.front().type.c_str());
+            }
             if (!real_map_->water.planes.empty()) {
-                const auto mats = water_type_materials(store_);
+                const auto mats = water_type_materials(store_, map_water_xml);
                 const auto it = mats.find(real_map_->water.planes.front().type);
                 if (it != mats.end())
                     real_water_rgba_ = {it->second.color[0], it->second.color[1], it->second.color[2], it->second.color[3]};
@@ -1105,9 +2113,11 @@ bool FrontEnd::build_real_map_phase(int phase) {
                                       ? maps_[std::size_t(sel_map_)].name
                                       : std::string("the supplied archive");
         match_error_ = "cannot load \"" + which + "\": " + e.what();
+        fx_.toast(match_error_, true);
         real_map_.reset();
         real_cliffs_ = CliffField{};
         real_doodads_.clear();
+        real_fluff_.clear();
         api_map_bytes_.clear();
         pending_map_bytes_.clear();
         map_built_ = false;
@@ -1122,6 +2132,11 @@ bool FrontEnd::begin_match() {
     match_map_path_ = synthetic || !api_map_bytes_.empty() ? std::string() : maps_[sel_map_].path;
     invalidate_map_if_changed(match_map_path_);
     MeleeSetup setup;
+    {
+        std::array<int, 16> none;
+        none.fill(-1);
+        set_map_team_slots(none);
+    }
     const formats::Model* ground = nullptr;
     float map_w = 0, map_h = 0;
     const sim::NavGrid* nav = nullptr;
@@ -1170,12 +2185,18 @@ bool FrontEnd::begin_match() {
                 return false;
             }
         setup = melee_setup_for_map(*real_map_, cat_, p0_race_, p1_race_, -1, 8,
-                                    replay_pending_ ? replay_log_pending_.seed : MeleeGameConfig{}.seed);
+                                    replay_pending_ ? replay_log_pending_.seed : (match_seed_ ? match_seed_ : MeleeGameConfig{}.seed));
         ground = &real_ground_;
         map_w = float(real_map_->width);
         map_h = float(real_map_->height);
         nav = &real_map_->nav;
         placement = &real_map_->placement;
+        if (real_map_->info.has_players) {
+            std::array<int, 16> slots;
+            slots.fill(-1);
+            for (std::size_t pid = 1; pid < 16; ++pid) slots[pid - 1] = int(real_map_->info.player_color[pid]);
+            set_map_team_slots(slots);
+        }
         if (real_map_->info.has_playable_area()) {
             playable_x0 = float(real_map_->info.playable_x0);
             playable_y0 = float(real_map_->info.playable_y0);
@@ -1196,41 +2217,221 @@ bool FrontEnd::begin_match() {
     MeleeGameConfig cfg;
     cfg.human_player = 0;
     if (replay_pending_) cfg.seed = replay_log_pending_.seed;
+    else if (match_seed_) cfg.seed = match_seed_;
+    if (!replay_pending_) cfg.ai_difficulty = settings_.ai_difficulty();
     skirmish_ = std::make_unique<MeleeGame>(cfg);
+    if (!replay_pending_) apply_settings_to_match();
     skirmish_->set_ground_fog(ground_fog_);
+    skirmish_->set_reveal_map(reveal_map_);
+    if (real_map_ && !real_map_->info.fog_type.empty()) skirmish_->set_fog_type(real_map_->info.fog_type);
+    if (double_click_ms_ > 0.0) skirmish_->set_double_click_ms(double_click_ms_);
     if (console_renderer_) skirmish_->set_console_renderer(console_renderer_);
     if (portrait_renderer_) skirmish_->set_portrait_renderer(portrait_renderer_);
     skirmish_->set_ui_storage(&store_);
     skirmish_->set_build_verb(sim::BuildVerb::Committed);
     skirmish_->register_creep_masks(cat_);
     skirmish_->set_creep_diffuse(render::resolve_creep_diffuse(store_));
+    if (real_map_ && !std::getenv("SC2_CREEP_CORE_TEXTURE"))
+        if (auto v = cat_.scalar("CTerrain", real_map_->tileset, "CreepBaseTexture"); v && !v->empty()) {
+            std::string rel = *v;
+            for (char& c : rel)
+                if (c == '\\') c = '/';
+            skirmish_->set_creep_diffuse(rel);
+        }
     if (real_map_) {
         skirmish_->set_tier_heights(formats::tier_heights(*real_map_));
         skirmish_->set_air_floor(formats::air_floor_z(*real_map_));
         std::uint32_t gw = 0, gh = 0;
-        std::vector<float> gh_grid = formats::bake_ground_heights(*real_map_, gw, gh);
+        std::vector<float> gh_grid = !real_map_->cliff.empty() ? formats::bake_ground_heights_vertex(*real_map_, gw, gh)
+                                                                     : formats::bake_ground_heights(*real_map_, gw, gh);
         if (!gh_grid.empty()) skirmish_->set_ground_heights(std::move(gh_grid), gw, gh);
+        if (!real_map_->cliff.empty()) {
+            const std::vector<float> vth = formats::tier_heights(*real_map_);
+            const float voff = formats::engine_z_offset(*real_map_);
+            const std::uint32_t vw = real_map_->cliff.width + 1, vh = real_map_->cliff.height + 1;
+            std::vector<float> vgrid(std::size_t(vw) * vh, 0.0f);
+            for (std::uint32_t r = 0; r < vh; ++r)
+                for (std::uint32_t c = 0; c < vw; ++c) vgrid[std::size_t(r) * vw + c] = formats::vertex_ground_z(*real_map_, vth, voff, c, r);
+            if (const char* gt = std::getenv("SC2_GROUND_TRACE")) {
+                int bx0 = 0, bx1 = 0, by0 = 0, by1 = 0;
+                if (std::sscanf(gt, "%d,%d,%d,%d", &bx0, &bx1, &by0, &by1) == 4) {
+                    std::map<std::pair<int, int>, float> zs;
+                    for (std::size_t i = 0; i + 2 < real_ground_.positions.size(); i += 3) {
+                        const float px = real_ground_.positions[i], py = real_ground_.positions[i + 1];
+                        const int ix = int(std::lround(px)), iy = int(std::lround(py));
+                        if (std::fabs(px - float(ix)) > 1e-3f || std::fabs(py - float(iy)) > 1e-3f) continue;
+                        if (ix < bx0 || ix > bx1 || iy < by0 || iy > by1) continue;
+                        zs.emplace(std::make_pair(ix, iy), real_ground_.positions[i + 2] + voff);
+                    }
+                    float wmin = 1e9f, wmax = -1e9f;
+                    for (std::size_t i = 2; i < real_water_.positions.size(); i += 3) {
+                        wmin = std::min(wmin, real_water_.positions[i] + voff);
+                        wmax = std::max(wmax, real_water_.positions[i] + voff);
+                    }
+                    std::fprintf(stderr, "[ground] water plane z %.3f .. %.3f (offset %.3f)\n", double(wmin), double(wmax), double(voff));
+                    for (int y = by1; y >= by0; --y) {
+                        std::fprintf(stderr, "[ground] %3d", y);
+                        for (int x = bx0; x <= bx1; ++x) {
+                            auto it = zs.find({x, y});
+                            std::fprintf(stderr, " %5.2f", it == zs.end() ? -99.0 : double(it->second));
+                        }
+                        std::fprintf(stderr, "\n");
+                    }
+                }
+            }
+            skirmish_->set_vertex_heights(std::move(vgrid), vw, vh);
+        }
         skirmish_->set_minimap_image(real_map_->minimap_rgba, real_map_->minimap_w,
                                      real_map_->minimap_h);
     }
     skirmish_->setup(setup, &models_, ground, map_w, map_h, nav, placement, playable_x0,
                      playable_y0, playable_x1, playable_y1);
+    if (real_map_ && real_map_->scripted_camera.found && !std::getenv("SC2_NO_MAP_CAMERA")) {
+        const formats::ScriptedCamera& sc = real_map_->scripted_camera;
+        render::CameraControl& cc = skirmish_->camera_control();
+        cc.distance = sc.distance;
+        cc.max_distance = std::max(cc.max_distance, sc.distance);
+        cc.min_distance = std::min(cc.min_distance, sc.distance);
+        cc.pitch = sc.pitch_deg * render::kDegToRad;
+        cc.fovy = sc.fov_deg * render::kDegToRad;
+        cc.yaw = -1.5707963f + (sc.yaw_deg - 180.0f) * render::kDegToRad;
+        cc.height_offset = 0.0f;
+    }
     if (real_map_) skirmish_->set_water(&real_water_, real_water_rgba_);
+    if (real_map_)
+        if (const std::vector<std::uint8_t>* wx = real_map_->game_data_file("WaterData.xml")) skirmish_->set_map_water_xml(*wx);
+    if (real_map_) skirmish_->set_roads(&real_roads_);
     if (real_map_) {
         real_doodads_ = real_map_->objects.doodads;
         const auto& cm = real_map_->cliff;
         const std::vector<float> th = formats::tier_heights(*real_map_);
+        const float z_off = formats::engine_z_offset(*real_map_);
+        std::map<std::string, float> actor_scale;
+        const bool no_actor_scale = std::getenv("SC2_DOODAD_ACTOR_SCALE") == nullptr;
         for (formats::PlacedDoodad& d : real_doodads_) {
+            if (!no_actor_scale) {
+                auto it = actor_scale.find(d.type);
+                if (it == actor_scale.end()) {
+                    float s = 1.0f;
+                    if (cat_.find("CActorDoodad", d.type))
+                        for (const core::XmlNode& n : cat_.resolved("CActorDoodad", d.type)) {
+                            if (n.name != "RandomScaleRange") continue;
+                            const std::string* v = n.attr("value");
+                            float a = 1.0f, b = 1.0f;
+                            if (v && std::sscanf(v->c_str(), "%f,%f", &a, &b) == 2) s = (a == b && a > 0.0f) ? a : 1.0f;
+                        }
+                    it = actor_scale.emplace(d.type, s).first;
+                }
+                d.sx *= it->second;
+                d.sy *= it->second;
+                d.sz *= it->second;
+            }
             const int cx = int(d.x), cy = int(d.y);
             if (!th.empty() && !cm.empty() && cx >= 0 && cy >= 0 && std::uint32_t(cx) < cm.width &&
                 std::uint32_t(cy) < cm.height) {
                 const std::size_t L = std::size_t(cm.levels[std::size_t(cy) * cm.width + cx]);
-                d.z = th[L < th.size() ? L : th.size() - 1];
+                static const char* kZAuthored = std::getenv("SC2_DOODAD_Z_AUTHORED");
+                const bool z_authored = kZAuthored && d.type.compare(0, std::strlen(kZAuthored), kZAuthored) == 0;
+                if (z_authored) {
+                    static int shown = 0;
+                    if (shown++ < 6) std::fprintf(stderr, "[doodadz] %s at %.2f %.2f authored %.3f offset %.3f tier %.3f\n", d.type.c_str(), double(d.x), double(d.y), double(d.z), double(z_off), double(th[L < th.size() ? L : th.size() - 1]));
+                }
+                d.z = (d.height_absolute || z_authored) ? d.z - z_off : th[L < th.size() ? L : th.size() - 1];
             } else {
                 d.z = 0.0f;
             }
         }
+        if (std::getenv("SC2_SHORELINE") && !std::getenv("SC2_NO_SHORELINE")) {
+            const std::vector<std::uint8_t>* sw = real_map_->game_data_file("WaterData.xml");
+            static const float kShoreSpacing = std::getenv("SC2_SHORELINE_SPACING") ? float(std::atof(std::getenv("SC2_SHORELINE_SPACING"))) : 2.0f;
+            const auto shore = shoreline_placements(*real_map_, water_type_heights(store_, sw), store_, sw, kShoreSpacing);
+            real_doodads_.insert(real_doodads_.end(), shore.begin(), shore.end());
+            if (std::getenv("SC2_SHORELINE_TRACE")) {
+                std::fprintf(stderr, "[shoreline] %zu instances\n", shore.size());
+                for (std::size_t k = 0; k < shore.size() && k < 12; ++k)
+                    std::fprintf(stderr, "[shoreline]   %s at (%.2f, %.2f, z %.2f) facing %.2f\n", shore[k].type.c_str(), double(shore[k].x), double(shore[k].y),
+                                 double(shore[k].z), double(shore[k].rotation));
+            }
+        }
         skirmish_->set_doodads(&real_doodads_);
+        real_fluff_.clear();
+        if (!real_map_->fluff.empty() && !std::getenv("SC2_NO_FLUFF")) {
+            struct FluffRow { std::string model; float prob = 0.0f; bool random_rotation = false; int variations = 1; float smin = 1.0f, smax = 1.0f; };
+            std::vector<std::vector<FluffRow>> rows(real_map_->tileset_textures.size());
+            for (std::size_t s = 0; s < rows.size(); ++s) {
+                const std::string& tex = real_map_->tileset_textures[s];
+                if (tex.empty() || !cat_.find("CTerrainTex", tex)) continue;
+                for (const core::XmlNode& n : cat_.resolved("CTerrainTex", tex)) {
+                    if (n.name != "DoodadEntry") continue;
+                    FluffRow r;
+                    for (const core::XmlNode& c : n.children) {
+                        const std::string v = c.attr_or("value", "");
+                        if (c.name == "Model") r.model = v;
+                        else if (c.name == "Probability") r.prob = std::strtof(v.c_str(), nullptr);
+                        else if (c.name == "RandomRotation") r.random_rotation = v != "0";
+                    }
+                    if (r.model.empty() || r.prob <= 0.0f || !cat_.find("CModelFoliage", r.model)) continue;
+                    for (const core::XmlNode& f : cat_.resolved("CModelFoliage", r.model)) {
+                        const std::string v = f.attr_or("value", "");
+                        if (f.name == "VariationCount") r.variations = std::max(1, std::atoi(v.c_str()));
+                        else if (f.name == "ScaleMin") r.smin = std::strtof(v.c_str(), nullptr);
+                        else if (f.name == "ScaleMax") r.smax = std::strtof(v.c_str(), nullptr);
+                    }
+                    rows[s].push_back(std::move(r));
+                }
+                if (std::getenv("SC2_ENV_TRACE")) {
+                    std::fprintf(stderr, "fluff: slot %zu '%s' found %d rows %zu\n", s, tex.c_str(), int(cat_.find("CTerrainTex", tex) != nullptr), rows[s].size());
+                    for (const FluffRow& r : rows[s])
+                        std::fprintf(stderr, "fluff:   row '%s' probability %.3f variations %d scale %.3f .. %.3f\n", r.model.c_str(), double(r.prob), r.variations,
+                                     double(r.smin), double(r.smax));
+                }
+            }
+            const auto hash01 = [](std::uint32_t i, std::uint32_t salt) {
+                std::uint32_t h = i * 0x9E3779B1u ^ (salt * 0x85EBCA6Bu);
+                h ^= h >> 15; h *= 0x2C1B3C6Du; h ^= h >> 12; h *= 0x297A2D39u; h ^= h >> 15;
+                return float(h & 0xFFFFFFu) / float(0x1000000);
+            };
+            real_fluff_.reserve(real_map_->fluff.size());
+            for (std::size_t i = 0; i < real_map_->fluff.size(); ++i) {
+                const formats::LoadedMap::FluffDoodad& f = real_map_->fluff[i];
+                if (std::size_t(f.slot) >= rows.size() || rows[f.slot].empty()) continue;
+                const std::vector<FluffRow>& rs = rows[f.slot];
+                static const bool kWeights = std::getenv("SC2_FLUFF_WEIGHTS") != nullptr;
+                const FluffRow* row = nullptr;
+                if (kWeights) {
+                    float total = 0.0f;
+                    for (const FluffRow& r : rs) total += r.prob;
+                    float pick = hash01(std::uint32_t(i), 1) * total;
+                    row = &rs.back();
+                    for (const FluffRow& r : rs) {
+                        if (pick < r.prob) { row = &r; break; }
+                        pick -= r.prob;
+                    }
+                } else {
+                    for (std::size_t k = 0; k < rs.size(); ++k)
+                        if (hash01(std::uint32_t(i), 16 + std::uint32_t(k)) < rs[k].prob) { row = &rs[k]; break; }
+                }
+                if (!row) continue;
+                formats::PlacedDoodad d;
+                d.type = row->model;
+                d.x = f.x;
+                d.y = f.y;
+                d.z = formats::vertex_ground_bilinear(*real_map_, th, z_off, f.x, f.y);
+                d.rotation = row->random_rotation ? hash01(std::uint32_t(i), 2) * 6.2831853f : 0.0f;
+                d.variation = std::min(row->variations - 1, int(hash01(std::uint32_t(i), 3) * float(row->variations)));
+                d.sx = d.sy = d.sz = row->smin + (row->smax - row->smin) * hash01(std::uint32_t(i), 4);
+                real_fluff_.push_back(std::move(d));
+            }
+        }
+        if (std::getenv("SC2_ENV_TRACE"))
+            std::fprintf(stderr, "fluff: %zu records, %zu texture slots, %zu resolved\n", real_map_->fluff.size(), real_map_->tileset_textures.size(), real_fluff_.size());
+        skirmish_->set_fluff(&real_fluff_);
+        if (std::getenv("SC2_ENV_TRACE"))
+            std::fprintf(stderr, "bounds: map %u x %u cells, camera l %d b %d r %d t %d (has %d)\n", real_map_->cell_width(), real_map_->cell_height(),
+                         int(real_map_->info.camera_left), int(real_map_->info.camera_bottom), int(real_map_->info.camera_right), int(real_map_->info.camera_top),
+                         int(real_map_->info.has_camera_bounds));
+        if (real_map_->info.has_camera_bounds)
+            skirmish_->set_camera_bounds_x(float(real_map_->info.camera_left), float(real_map_->info.camera_right));
         skirmish_->set_cliffs(&real_cliffs_.instances);
     }
     if (!research_up_) {
@@ -1268,6 +2469,13 @@ bool FrontEnd::begin_match() {
 
 bool FrontEnd::step(const render::InputState& in, float dt_ms,
                     std::vector<render::SceneInstance>& scene, render::Camera& cam) {
+    cursor_x_ = in.mouse_x;
+    cursor_y_ = in.mouse_y;
+    if (!boot_screen_request().empty()) {
+        std::string name;
+        name.swap(boot_screen_request());
+        if (!enter_screen(name)) std::fprintf(stderr, "crafter-sc: --screen %s: not a screen the client can open on\n", name.c_str());
+    }
     if (!load_pending_path_.empty()) {
         const std::string path = load_pending_path_;
         load_pending_path_.clear();
@@ -1306,6 +2514,7 @@ bool FrontEnd::step(const render::InputState& in, float dt_ms,
     if ((router_.top() == ScreenId::InGame || router_.top() == ScreenId::PauseMenu) && skirmish_) {
         if (!skirmish_->step(in, dt_ms, scene, cam)) {
             record_match_replay();
+            remember_last_match();
             release_match();
             if (router_.top() == ScreenId::PauseMenu) router_.follow("Quit to Main Menu");
             else router_.unwind_to(ScreenId::GlueRoot);
@@ -1316,6 +2525,8 @@ bool FrontEnd::step(const render::InputState& in, float dt_ms,
             skirmish_->outcome() != MatchResult::Outcome::Ongoing) {
             last_outcome_ = skirmish_->outcome();
             record_match_replay();
+            if (!skirmish_->replay_active()) settings_.record_match(last_outcome_ == MatchResult::Outcome::Victory);
+            remember_last_match();
             release_match();
             router_.follow("win/lose condition met");
             prev_left_ = in.left_pressed;
@@ -1332,6 +2543,12 @@ bool FrontEnd::step(const render::InputState& in, float dt_ms,
         return true;
     }
     if (router_.top() == ScreenId::Loading) {
+        loading_ms_ = loading_frames_ < 1 && !load_plan_.planned ? 0.0f : loading_ms_ + dt_ms;
+        if (last_drawn_ != ScreenId::Loading) {
+            fx_.on_screen_change();
+            ui_.reset_screen();
+            last_drawn_ = ScreenId::Loading;
+        }
         if (in.quit) {
             router_.cancel();
             loading_frames_ = 0;
@@ -1353,100 +2570,72 @@ bool FrontEnd::step(const render::InputState& in, float dt_ms,
         return true;
     }
 
+    mouse_x_ = in.mouse_x;
+    mouse_y_ = in.mouse_y;
+    left_down_ = in.left_down;
     const bool click = in.left_pressed && !prev_left_ && in.view_w && in.view_h;
-    if (router_.top() == ScreenId::ReplayBrowse) {
-        if (in.quit) { router_.cancel(); }
-        else if (click)
-            for (const Button& b : replay_buttons(in.view_w, in.view_h)) {
-                if (!b.hit(in.mouse_x, in.mouse_y)) continue;
-                if (b.action >= kReplayRow0) sel_replay_ = b.action - kReplayRow0;
-                else if (b.action == kActBack) router_.follow("BackButton");
-                else if (b.action == kActWatch && sel_replay_ >= 0 && sel_replay_ < int(replays_.size())) {
-                    OrderLog log;
-                    if (read_order_log_file(replays_[std::size_t(sel_replay_)].path, log)) {
-                        replay_log_pending_ = std::move(log);
-                        replay_pending_ = true;
-                        replay_name_ = replays_[std::size_t(sel_replay_)].name;
-                        sel_map_ = 0;
-                        for (std::size_t i = 0; i < maps_.size(); ++i)
-                            if (!replay_log_pending_.map_id.empty() && maps_[i].path == replay_log_pending_.map_id) sel_map_ = int(i);
-                        if (replay_log_pending_.player_races.size() >= 2) {
-                            p0_race_ = Race(std::max(0, std::min(2, int(replay_log_pending_.player_races[0]))));
-                            p1_race_ = Race(std::max(0, std::min(2, int(replay_log_pending_.player_races[1]))));
-                        }
-                        match_error_.clear();
-                        loading_frames_ = 0;
-                        load_plan_.reset();
-                        router_.follow("Watch replay");
-                    } else {
-                        match_error_ = "cannot read replay " + replays_[std::size_t(sel_replay_)].name;
-                    }
-                }
-                break;
-            }
-        prev_left_ = in.left_pressed;
-        scene.clear();
-        cam = menu_ctl_.camera();
-        return true;
-    }
-    if (router_.top() != ScreenId::GlueRoot && router_.top() != ScreenId::Lobby) {
-        if (in.quit) {
-            if (!router_.cancel()) { prev_left_ = in.left_pressed; return false; }
-        } else if (click) {
-            click_glue_screen(router_.top(), in.mouse_x, in.mouse_y, in.view_w, in.view_h);
+    if (router_.top() != last_drawn_) {
+        fx_.on_screen_change();
+        ui_.reset_screen();
+        if (router_.top() == ScreenId::Lobby) {
+            if (!shell_v1()) p1_pick_ = settings_.opponent_race();
+            p0_pick_ = settings_.profile_race();
+            if (p0_pick_ != LobbyRace::Random) p0_race_ = Race(int(p0_pick_));
         }
-        if (router_.top() == ScreenId::Boot) { prev_left_ = in.left_pressed; return false; }
-        if (router_.top() == ScreenId::Loading) { loading_frames_ = 0; load_plan_.reset(); }
-        prev_left_ = in.left_pressed;
-        scene.clear();
-        cam = menu_ctl_.camera();
-        return true;
+        if (router_.top() != ScreenId::Profile) profile_editing_ = false;
+        last_drawn_ = router_.top();
     }
-    if (router_.top() == ScreenId::GlueRoot) {
-        if (click) {
-            const std::vector<Button> bs = menu_buttons(in.view_w, in.view_h);
-            for (auto it = bs.rbegin(); it != bs.rend(); ++it)
-                if (it->hit(in.mouse_x, in.mouse_y)) {
-                    router_.follow(trigger_for_control(ScreenId::GlueRoot, it->trigger));
-                    break;
-                }
-        } else if (in.quit)
-            router_.cancel();
-        if (router_.top() == ScreenId::Sandbox && !sandbox_) start_sandbox();
-        if (router_.top() == ScreenId::Boot) { prev_left_ = in.left_pressed; return false; }
-    } else if (router_.top() == ScreenId::Lobby) {
-        if (in.view_h) {
-            if (in.wheel != 0.0f) map_scroll_ -= int(in.wheel > 0.0f ? 1 : -1) * 3;
-            clamp_map_scroll(in.view_h);
-        }
-        if (in.quit) { router_.cancel(); }
-        else if (click)
-            for (const Button& b : lobby_buttons(in.view_w, in.view_h)) {
-                if (!b.hit(in.mouse_x, in.mouse_y)) continue;
-                if (b.action >= kMapRow0) { sel_map_ = b.action - kMapRow0; match_error_.clear(); }
-                else if (b.action == kActP0Race) {
-                    p0_pick_ = lobby_race_cycle(p0_pick_);
-                    if (p0_pick_ != LobbyRace::Random) p0_race_ = Race(int(p0_pick_));
-                } else if (b.action == kActP1Race) {
-                    p1_pick_ = lobby_race_cycle(p1_pick_);
-                    if (p1_pick_ != LobbyRace::Random) p1_race_ = Race(int(p1_pick_));
-                }
-                else if (b.action == kActMapsFolder) { if (maps_folder_cb_) maps_folder_cb_(); }
-                else if (b.action == kActScrollUp) { map_scroll_ -= lobby_rows_per_page(in.view_h); clamp_map_scroll(in.view_h); }
-                else if (b.action == kActScrollDown) { map_scroll_ += lobby_rows_per_page(in.view_h); clamp_map_scroll(in.view_h); }
-                else if (b.action == kActBack) router_.follow("Back / leave lobby");
-                else if (b.action == kActStart) {
-                    const std::uint64_t match_seed = MeleeGameConfig{}.seed;
-                    p0_race_ = resolve_lobby_race(p0_pick_, match_seed, 0);
-                    p1_race_ = resolve_lobby_race(p1_pick_, match_seed, 1);
-                    match_error_.clear();
-                    loading_frames_ = 0;
-                    load_plan_.reset();
-                    router_.follow("StartButton -> countdown");
-                }
-                break;
+    {
+        bool esc = false;
+        if (run_shell_screen(shell::Pass::Input, in.view_w, in.view_h, &in, nullptr, dt_ms, nullptr, &esc)) {
+            fx_.tick(dt_ms, ui_.hot);
+            if (esc && !router_.cancel() && router_.top() != ScreenId::GlueRoot && router_.top() != ScreenId::Lobby) {
+                prev_left_ = in.left_pressed;
+                return false;
             }
+            if (router_.top() == ScreenId::Sandbox && !sandbox_) start_sandbox();
+            prev_left_ = in.left_pressed;
+            if (router_.top() == ScreenId::Boot) return false;
+            scene.clear();
+            cam = menu_ctl_.camera();
+            return true;
+        }
     }
+    std::vector<Button> bs = in.view_w && in.view_h ? screen_buttons(in.view_w, in.view_h) : std::vector<Button>{};
+    int hovered = -1;
+    for (std::size_t n = bs.size(); n-- > 0;)
+        if (bs[n].x1 > bs[n].x0 && bs[n].y1 > bs[n].y0 && bs[n].hit(in.mouse_x, in.mouse_y)) { hovered = int(n); break; }
+    fx_.tick(dt_ms, hovered >= 0 ? (bs[std::size_t(hovered)].trigger.empty() ? bs[std::size_t(hovered)].label : bs[std::size_t(hovered)].trigger)
+                                 : std::string());
+    if (hovered >= 0 && (in.mouse_dx != 0.0f || in.mouse_dy != 0.0f)) fx_.focus = hovered;
+
+    if (in.view_h && (router_.top() == ScreenId::Lobby || router_.top() == ScreenId::Custom)) {
+        int& scroll = router_.top() == ScreenId::Lobby ? map_scroll_ : custom_scroll_;
+        if (in.wheel != 0.0f) scroll -= int(in.wheel > 0.0f ? 1 : -1) * 3;
+        if (router_.top() == ScreenId::Lobby) clamp_map_scroll(in.view_h); else clamp_custom_scroll(in.view_h);
+    }
+
+    if (in.quit) {
+        if (router_.top() == ScreenId::GlueRoot && quit_confirm_) quit_confirm_ = false;
+        else if (router_.top() == ScreenId::Profile && profile_editing_) profile_editing_ = false;
+        else if (!router_.cancel() && router_.top() != ScreenId::GlueRoot && router_.top() != ScreenId::Lobby) {
+            prev_left_ = in.left_pressed;
+            return false;
+        }
+    } else if (click) {
+        if (hovered >= 0) {
+            const Button b = bs[std::size_t(hovered)];
+            fx_.focus = hovered;
+            activate(b, in.mouse_x, in.view_w, in.view_h);
+        } else if (router_.top() == ScreenId::Profile) {
+            profile_editing_ = false;
+        }
+    } else if (in.view_w && in.view_h) {
+        shell_keyboard(in, in.view_w, in.view_h);
+    }
+    if (router_.top() == ScreenId::Sandbox && !sandbox_) start_sandbox();
+    if (router_.top() == ScreenId::Boot) { prev_left_ = in.left_pressed; return false; }
+    if (router_.top() == ScreenId::Loading) { loading_frames_ = 0; load_plan_.reset(); }
     prev_left_ = in.left_pressed;
 
     scene.clear();
@@ -1508,41 +2697,49 @@ void FrontEnd::ensure_overlay_font() {
         } catch (const std::exception&) {
         }
     }
+    if (!load_face("MenuBarButton", overlay_font_bold_, face_path_[2])) {
+        for (const char* mod : kMods) {
+            const std::string path = std::string(mod) + "UI/Fonts/Eurostile-Bol.otf";
+            try {
+                const auto bytes = store_.read_by_name(path);
+                if (overlay_font_bold_.load(bytes)) { face_path_[2] = path; break; }
+            } catch (const std::exception&) {
+            }
+        }
+    }
+    if (!overlay_font_bold_.valid() && overlay_font_.valid() && !face_path_[0].empty()) {
+        try {
+            overlay_font_bold_.load(store_.read_by_name(face_path_[0]));
+        } catch (const std::exception&) {
+        }
+    }
     if (overlay_font_.valid()) draw::set_active_font(&overlay_font_);
 }
 
 std::vector<std::pair<std::string, ui::Rect>> FrontEnd::screen_controls(std::uint32_t view_w,
                                                                        std::uint32_t view_h) {
     std::vector<std::pair<std::string, ui::Rect>> out;
-    const ScreenId id = router_.top();
-    auto push_buttons = [&out](const std::vector<Button>& bs) {
-        for (const Button& b : bs)
-            out.push_back({b.trigger.empty() ? b.label : b.trigger,
-                           ui::Rect{float(b.x0), float(b.y0), float(b.x1 - b.x0),
-                                    float(b.y1 - b.y0)}});
-    };
-    if (id == ScreenId::GlueRoot) {
-        push_buttons(menu_buttons(view_w, view_h));
-        return out;
+    {
+        std::vector<shell::Control> cs;
+        if (run_shell_screen(shell::Pass::Collect, view_w, view_h, nullptr, nullptr, 0.0f, &cs, nullptr)) {
+            for (const shell::Control& c : cs)
+                if (!c.region)
+                    out.push_back({c.trigger.empty() || !c.enabled ? c.id : c.trigger,
+                                   ui::Rect{float(c.rect.x0), float(c.rect.y0), float(c.rect.w()), float(c.rect.h())}});
+            return out;
+        }
     }
-    if (id == ScreenId::Lobby) {
-        push_buttons(lobby_buttons(view_w, view_h));
-        return out;
-    }
-    if (id == ScreenId::ReplayBrowse) {
-        push_buttons(replay_buttons(view_w, view_h));
-        return out;
-    }
-    if (const GlueScreen* s = glue_screen(id, view_w, view_h))
-        for (std::size_t i = 0; i < s->controls().size(); ++i)
-            out.push_back({s->controls()[i].name, s->hit_rect(i)});
+    for (const Button& b : screen_buttons(view_w, view_h))
+        out.push_back({b.trigger.empty() ? b.label : b.trigger,
+                       ui::Rect{float(b.x0), float(b.y0), float(b.x1 - b.x0), float(b.y1 - b.y0)}});
     return out;
 }
 
 bool FrontEnd::current_screen_is_authored(std::uint32_t view_w, std::uint32_t view_h) {
     const ScreenId id = router_.top();
+    if (shell_v2_screen()) return false;
     if (id == ScreenId::GlueRoot) return real_menu(view_w, view_h) != nullptr;
-    if (id == ScreenId::Lobby) return false;
+    if (id == ScreenId::Lobby || id == ScreenId::VersusAI || id == ScreenId::Custom || id == ScreenId::Profile) return false;
     const GlueScreen* s = glue_screen(id, view_w, view_h);
     return s && !s->controls().empty();
 }
@@ -1562,6 +2759,11 @@ void FrontEnd::draw_glue_screen(ScreenId id, std::uint32_t view_w, std::uint32_t
         text_box(b, 0, ty, int(view_w), ty + draw::text_h_em(type_px(b, theme::kTypeLoadTitle)),
                  MatchResult::banner(last_outcome_), theme::kTypeLoadTitle,
                  won ? theme::kOk : theme::kErr);
+        const int sy = ty + draw::text_h_em(type_px(b, theme::kTypeLoadTitle)) + b.s(8);
+        text_box(b, 0, sy, int(view_w), sy + draw::text_h_em(type_px(b, theme::kTypeBody)),
+                 id == ScreenId::GameResult ? "CONTINUE opens the score screen; CLOSE returns to the main menu (Esc)"
+                                            : "SAVE REPLAY keeps the recording; CONTINUE returns to the main menu (Esc)",
+                 theme::kTypeBody, theme::kTextMuted);
     }
 
     const GlueScreen* s = glue_screen(id, view_w, view_h);
@@ -1580,6 +2782,7 @@ void FrontEnd::draw_glue_screen(ScreenId id, std::uint32_t view_w, std::uint32_t
         text_at(b, pad, y, why, theme::kTypeBody, theme::kWarn, int(view_w) - pad);
         text_at(b, pad, y + b.s(theme::kRowH), "nothing is drawn here rather than a made-up panel",
                 theme::kTypeMicro, theme::kTextMuted, int(view_w) - pad);
+        text_at(b, pad, y + b.s(theme::kRowH) * 2, "Esc goes back", theme::kTypeMicro, theme::kTextMuted, int(view_w) - pad);
         band_footer(b);
         return;
     }
@@ -1587,20 +2790,58 @@ void FrontEnd::draw_glue_screen(ScreenId id, std::uint32_t view_w, std::uint32_t
                             std::to_string(s->documents()) + " of " + std::to_string(docs.size()) +
                             " documents";
     text_at(b, pad, y, src, theme::kTypeCaption, theme::kTextFaint, int(view_w) - pad);
-    for (std::size_t i = 0; i < s->controls().size(); ++i) {
-        const ui::SolvedFrame& f = s->controls()[i];
-        const ui::Rect& r = s->hit_rect(i);
-        const int x0 = int(r.x), y0 = int(r.y);
-        const int x1 = int(r.x + r.w), y1 = int(r.y + r.h);
-        if (x1 <= x0 || y1 <= y0) continue;
-        button_menu(b, x0, y0, x1, y1, f.text.empty() ? f.name : f.text, false,
-                    router_.edge_for(trigger_for_control(id, f.name)) != nullptr);
-    }
     band_footer(b);
+}
+
+namespace {
+void fill_looks(std::vector<Ctl>& ctls, const ShellFx& fx, float mouse_x, float mouse_y, bool left_down) {
+    const float pulse = fx.pulse();
+    for (std::size_t i = 0; i < ctls.size(); ++i) {
+        Ctl& c = ctls[i];
+        c.look.hover = fx.hover(c.key);
+        c.look.focused = fx.focus == int(i);
+        c.look.pulse = pulse;
+        c.look.pressed = left_down && c.look.hover > 0.0f && mouse_x >= float(c.x0) && mouse_x < float(c.x1) &&
+                         mouse_y >= float(c.y0) && mouse_y < float(c.y1);
+    }
+}
 }
 
 void FrontEnd::build_overlay(std::uint32_t view_w, std::uint32_t view_h,
                              std::vector<std::uint8_t>& out) {
+    build_overlay_body(view_w, view_h, out);
+    cursor_drawn_ = false;
+    if (!software_cursor_ || !view_w || !view_h || cursor_x_ < 0.0f || cursor_y_ < 0.0f) return;
+    const bool in_match = skirmish_ && (router_.top() == ScreenId::InGame || router_.top() == ScreenId::ReplayControls);
+    std::string id = in_match ? skirmish_->cursor_id(skirmish_->cursor_state()) : std::string();
+    if (id.empty()) id = "Arrow";
+    const auto look = cat_.cursor_look(id);
+    if (!look) return;
+    const IconAtlas::Icon& ic = cursor_icons_.get(store_, look->texture);
+    if (!ic.ok()) return;
+    if (out.size() != std::size_t(view_w) * view_h * 4) out.assign(std::size_t(view_w) * view_h * 4, 0);
+    const int ox = int(cursor_x_) - look->hotspot_x, oy = int(cursor_y_) - look->hotspot_y;
+    for (int y = 0; y < int(ic.h); ++y)
+        for (int x = 0; x < int(ic.w); ++x) {
+            const int px = ox + x, py = oy + y;
+            if (px < 0 || py < 0 || px >= int(view_w) || py >= int(view_h)) continue;
+            const std::size_t si = (std::size_t(y) * ic.w + std::size_t(x)) * 4;
+            const float sa = float(ic.rgba[si + 3]) / 255.0f;
+            if (sa <= 0.0f) continue;
+            const std::size_t di = (std::size_t(py) * view_w + std::size_t(px)) * 4;
+            const float da = float(out[di + 3]) / 255.0f;
+            const float oa = sa + da * (1.0f - sa);
+            for (int c = 0; c < 3; ++c) {
+                const float v = (float(ic.rgba[si + c]) * sa + float(out[di + c]) * da * (1.0f - sa)) / oa;
+                out[di + c] = std::uint8_t(v + 0.5f);
+            }
+            out[di + 3] = std::uint8_t(oa * 255.0f + 0.5f);
+        }
+    cursor_drawn_ = true;
+}
+
+void FrontEnd::build_overlay_body(std::uint32_t view_w, std::uint32_t view_h,
+                                  std::vector<std::uint8_t>& out) {
     ensure_overlay_font();
     const ScreenId screen = router_.top();
     if (screen == ScreenId::ReplayControls && skirmish_) {
@@ -1608,7 +2849,7 @@ void FrontEnd::build_overlay(std::uint32_t view_w, std::uint32_t view_h,
         Board b{out, view_w, view_h};
         b.face[0] = &overlay_font_;
         b.face[1] = &overlay_font_ext_;
-    b.style_rgb = &style_rgb_;
+        b.style_rgb = &style_rgb_;
         const std::string cap = "REPLAY  " + replay_name_ + "  " + std::to_string(skirmish_->world().tick()) + " / " +
                                 std::to_string(skirmish_->replay_total_ticks()) + "   Esc leaves";
         text_at(b, b.s(theme::kScreenPad), b.s(theme::kPagePad), cap, theme::kTypeScreenTitle, theme::kTextHi);
@@ -1622,88 +2863,160 @@ void FrontEnd::build_overlay(std::uint32_t view_w, std::uint32_t view_h,
 
     out.assign(std::size_t(view_w) * view_h * 4, 0);
     if (!view_w || !view_h) return;
+    if (run_shell_screen(shell::Pass::Paint, view_w, view_h, nullptr, &out, 0.0f, nullptr, nullptr)) return;
     Board b{out, view_w, view_h};
     b.face[0] = &overlay_font_;
     b.face[1] = &overlay_font_ext_;
     b.style_rgb = &style_rgb_;
 
+    const float lit = fx_.fade();
     switch (screen) {
         case ScreenId::GlueRoot:
         case ScreenId::Home:
-            background(b, theme::kVignetteCore, theme::kGround);
+            background(b, mix_rgb(theme::kGround, theme::kVignetteCore, lit), theme::kGround);
             break;
         case ScreenId::Loading:
-            background(b, theme::kVignetteLoad, theme::kGround);
+            background(b, mix_rgb(theme::kGround, theme::kVignetteLoad, lit), theme::kGround);
             break;
         case ScreenId::PauseMenu:
-            background(b, theme::kVignettePause, theme::kGroundDeep);
+            background(b, mix_rgb(theme::kGroundDeep, theme::kVignettePause, lit), theme::kGroundDeep);
             break;
         default:
-            background(b, theme::kVignetteLobby, theme::kGround);
+            background(b, mix_rgb(theme::kGround, theme::kVignetteLobby, lit), theme::kGround);
             break;
     }
 
     std::vector<Ctl> ctls;
-    for (const std::pair<std::string, ui::Rect>& c : screen_controls(view_w, view_h)) {
+    const std::vector<Button> bs = screen_buttons(view_w, view_h);
+    for (const Button& bt : bs) {
         Ctl k;
-        k.x0 = int(c.second.x);
-        k.y0 = int(c.second.y);
-        k.x1 = int(c.second.x + c.second.w);
-        k.y1 = int(c.second.y + c.second.h);
-        k.label = c.first;
-        k.live = router_.edge_for(trigger_for_control(screen, c.first)) != nullptr;
-        if (screen == ScreenId::Options && k.label.size() > 8 && k.label.compare(k.label.size() - 8, 8, "CheckBox") == 0) {
+        k.x0 = bt.x0;
+        k.y0 = bt.y0;
+        k.x1 = bt.x1;
+        k.y1 = bt.y1;
+        k.label = bt.label;
+        k.key = bt.trigger.empty() ? bt.label : bt.trigger;
+        k.action = bt.action;
+        k.live = bt.action != 0 || router_.edge_for(trigger_for_control(screen, k.key)) != nullptr;
+        if (screen == ScreenId::Options && k.key.size() > 8 && k.key.compare(k.key.size() - 8, 8, "CheckBox") == 0) {
             k.live = true;
-            k.selected = option_checked(k.label);
+            k.selected = option_checked(k.key);
         }
+        if (screen == ScreenId::Options && k.key.size() > 6 && k.key.compare(k.key.size() - 6, 6, "Button") == 0 &&
+            k.action == 0)
+            k.live = true;
         ctls.push_back(std::move(k));
     }
-    if (screen == ScreenId::ReplayBrowse) {
-        const std::vector<Button> bs = replay_buttons(view_w, view_h);
-        for (std::size_t i = 0; i < ctls.size() && i < bs.size(); ++i) ctls[i].action = bs[i].action;
-    }
+    fill_looks(ctls, fx_, mouse_x_, mouse_y_, left_down_);
 
     if (screen == ScreenId::GlueRoot) {
-        const std::vector<Button> bs = menu_buttons(view_w, view_h);
-        for (std::size_t i = 0; i < ctls.size() && i < bs.size(); ++i) ctls[i].label = bs[i].label;
-        draw_shell_root(b, ctls);
-        return;
-    }
-    if (screen == ScreenId::Home) { draw_home(b, ctls); return; }
-    if (screen == ScreenId::Custom) { draw_custom(b, ctls); return; }
-    if (screen == ScreenId::ReplayBrowse) {
+        if (quit_confirm_) {
+            std::vector<Ctl> under;
+            for (const Button& bt : menu_buttons(view_w, view_h)) {
+                Ctl k;
+                k.x0 = bt.x0; k.y0 = bt.y0; k.x1 = bt.x1; k.y1 = bt.y1;
+                k.label = bt.label;
+                k.key = bt.trigger;
+                k.live = bt.action != 0 || router_.edge_for(trigger_for_control(screen, bt.trigger)) != nullptr;
+                under.push_back(std::move(k));
+            }
+            draw_shell_root(b, under);
+            draw_quit_dialog(b, ctls);
+        } else {
+            draw_shell_root(b, ctls);
+        }
+    } else if (screen == ScreenId::Home) {
+        draw_home(b, ctls);
+        for (const Ctl& c : ctls)
+            if (c.key == "PlayButton")
+                card(b, c.x0, c.y0, c.x1, c.y1, "PLAY", "Versus A.I., a custom map, or a replay.", "-> PLAY", c.look);
+    } else if (screen == ScreenId::VersusAI) {
+        draw_play_hub(b, ctls);
+    } else if (screen == ScreenId::Profile) {
+        ProfileInfo info;
+        info.name = settings_.profile_name();
+        info.editing = profile_editing_;
+        info.matches = settings_.get_int(ShellSettings::kProfileMatchesKey, 0);
+        info.wins = settings_.get_int(ShellSettings::kProfileWinsKey, 0);
+        info.caret = fx_.pulse();
+        draw_profile(b, ctls, info);
+    } else if (screen == ScreenId::Custom) {
+        for (Ctl& c : ctls) c.selected = c.action >= kMapRow0 && (c.action - kMapRow0) == sel_map_;
+        CustomInfo info;
+        info.selected = sel_map_ >= 0 && sel_map_ < int(maps_.size()) ? maps_[std::size_t(sel_map_)].name : std::string("-");
+        info.size_line = sel_map_ > 0 && sel_map_ < int(maps_.size())
+                             ? (maps_[std::size_t(sel_map_)].casc ? "Install map (CASC)" : maps_[std::size_t(sel_map_)].path)
+                             : std::string("Built-in arena: 72x72, no cliffs");
+        const int page = custom_rows_per_page(view_h);
+        const int last = std::min(int(maps_.size()), custom_scroll_ + page);
+        info.count_line = int(maps_.size()) > 1
+                              ? std::to_string(maps_.size() - 1) + " maps, showing " + std::to_string(custom_scroll_ + 1) + "-" + std::to_string(last)
+                              : std::string("no .SC2Map found - the built-in arena only");
+        info.error = match_error_;
+        info.preview = map_preview(sel_map_);
+        info.preview_pending = false;
+        draw_custom(b, ctls, info);
+    } else if (screen == ScreenId::ReplayBrowse) {
         band_flow_strip(b, "REPLAYS");
         for (Ctl& c : ctls) c.selected = c.action >= kReplayRow0 && c.action - kReplayRow0 == sel_replay_;
         for (const Ctl& c : ctls) {
-            if (c.action == kActWatch) button_primary(b, c.x0, c.y0, c.x1, c.y1, "WATCH", theme::kTypePrimaryLg);
-            else if (c.action == kActBack) button_secondary(b, c.x0, c.y0, c.x1, c.y1, "BACK", theme::kTypeSecondaryLg);
-            else if (c.action >= kReplayRow0) {
-                panel(b, c.x0, c.y0, c.x1, c.y1, c.selected ? theme::kSurfaceSel : theme::kSurfaceRow, theme::kAlphaPanelDim,
-                      c.selected ? theme::kAccent : theme::kBorderFaint);
-                text_left(b, c.x0 + b.s(theme::kMapRowPadX), c.y0, c.y1, c.label, theme::kTypeSmall, c.selected ? theme::kTextHi : theme::kTextCell,
-                          c.x1 - b.s(theme::kMapRowPadX));
-            }
+            if (c.action == kActWatch) button_primary(b, c.x0, c.y0, c.x1, c.y1, "WATCH", theme::kTypePrimaryLg, c.look);
+            else if (c.action == kActBack) button_secondary(b, c.x0, c.y0, c.x1, c.y1, "BACK", theme::kTypeSecondaryLg, c.look);
+            else if (c.action >= kReplayRow0) list_row(b, c.x0, c.y0, c.x1, c.y1, c.label, c.selected, c.look);
         }
         if (replays_.empty())
-            text_at(b, b.s(theme::kScreenPad), b.s(theme::kFlowStripH) + b.s(theme::kPagePad) * 2, replays_dir_.empty() ? "no replays folder" : "no replays in " + replays_dir_,
+            text_at(b, b.s(theme::kScreenPad), b.s(theme::kFlowStripH) + b.s(theme::kPagePad) * 2,
+                    replays_dir_.empty() ? "no replays folder is configured - every finished match would be recorded there"
+                                         : "no replays in " + replays_dir_ + " - a finished match is recorded there",
                     theme::kTypeBody, theme::kTextMuted);
+        else if (sel_replay_ < 0)
+            text_at(b, b.s(theme::kScreenPad), b.by(theme::kFooterH + theme::kPagePad + theme::kPrimaryH + theme::kPagePad),
+                    "select a recording, then WATCH", theme::kTypeCaption, theme::kTextMuted);
         if (!match_error_.empty())
             text_at(b, b.s(theme::kScreenPad), b.by(theme::kFooterH + theme::kPagePad), match_error_, theme::kTypeCaption, theme::kErr);
         band_footer(b);
-        return;
-    }
-    if (screen == ScreenId::Options) {
-        draw_options(b, ctls, int(screen_layouts(ScreenId::Options).size()), options_panel_ < 6 ? options_panel_ : options_panel_ + 1);
-        for (const Ctl& c : ctls) {
-            if (!c.selected || c.label.size() <= 8 || c.label.compare(c.label.size() - 8, 8, "CheckBox") != 0) continue;
-            const int inset = std::max(2, (c.x1 - c.x0) / 5);
-            draw::fill_a(b.out, b.w, b.h, c.x0 + inset, c.y0 + inset, c.x1 - inset, c.y1 - inset,
-                         theme::kAccent.r, theme::kAccent.g, theme::kAccent.b, 255);
+    } else if (screen == ScreenId::Options) {
+        OptionsInfo info;
+        info.engine_page = options_engine_page_;
+        info.selected_rail = options_engine_page_ ? kRailEngine : (options_panel_ < kRailHotkeys ? options_panel_ : options_panel_ + 1);
+        info.documents = int(screen_layouts(ScreenId::Options).size());
+        for (const EngineRow& r : engine_rows()) {
+            const std::string key = r.key;
+            std::string v;
+            float f = 0.0f;
+            bool bus_row = false;
+            for (const ShellSettings::Bus& bus : ShellSettings::buses())
+                if (std::string("opt/") + bus.key == key) {
+                    f = settings_.bus_gain(bus);
+                    v = std::to_string(int(f * 100.0f + 0.5f)) + " %";
+                    bus_row = true;
+                }
+            if (!bus_row) {
+                if (key == "opt/gameplay.unit_status") v = ShellSettings::unit_status_names()[std::size_t(settings_.unit_status_mode())];
+                else if (key == "opt/gameplay.game_speed") v = ShellSettings::speed_name(settings_.game_speed());
+                else if (key == "opt/hotkey.profile") v = ShellSettings::hotkey_profiles()[std::size_t(settings_.hotkey_profile())].name;
+                else if (key == "opt/display.mode") v = ShellSettings::display_mode_name(settings_.display_mode());
+                else if (key == "opt/display.vsync") { f = settings_.vsync() ? 1.0f : 0.0f; v = settings_.vsync() ? "On" : "Off"; }
+                else if (key == "opt/display.ui_scale") {
+                    const float s = settings_.ui_scale();
+                    f = (s - kUiScaleMin) / (kUiScaleMax - kUiScaleMin);
+                    v = format_ui_scale(s);
+                }
+            }
+            info.row_values.push_back(v);
+            info.row_fracs.push_back(f);
         }
-        return;
-    }
-    if (screen == ScreenId::PauseMenu) { draw_pause(b, ctls); return; }
-    if (screen == ScreenId::Loading) {
+        draw_options(b, ctls, info);
+        if (!options_engine_page_)
+            for (const Ctl& c : ctls) {
+                if (!c.selected || c.key.size() <= 8 || c.key.compare(c.key.size() - 8, 8, "CheckBox") != 0) continue;
+                const int inset = std::max(2, (c.x1 - c.x0) / 5);
+                draw::fill_a(b.out, b.w, b.h, c.x0 + inset, c.y0 + inset, c.x1 - inset, c.y1 - inset,
+                             theme::kAccent.r, theme::kAccent.g, theme::kAccent.b, 255);
+            }
+    } else if (screen == ScreenId::PauseMenu) {
+        draw_pause(b, ctls);
+    } else if (screen == ScreenId::Loading) {
         LoadInfo info;
         info.map_name = sel_map_ >= 0 && sel_map_ < int(maps_.size()) ? maps_[sel_map_].name
                                                                      : std::string("-");
@@ -1717,24 +3030,29 @@ void FrontEnd::build_overlay(std::uint32_t view_w, std::uint32_t view_h,
             };
             return theme::Rgb{ch(v[0]), ch(v[1]), ch(v[2])};
         };
-        if (tc.size() >= 2) {
-            info.p0_color = to_rgb(tc[0].diffuse);
-            info.p1_color = to_rgb(tc[1].diffuse);
+        static const bool raw_slots = std::getenv("SC2_SHELL_TEAM_SLOT_RAW") != nullptr;
+        const data::TeamColor* c0 = nullptr;
+        const data::TeamColor* c1 = nullptr;
+        for (const data::TeamColor& t : tc) {
+            if (t.slot == (raw_slots ? 0 : 1)) c0 = &t;
+            if (t.slot == (raw_slots ? 1 : 2)) c1 = &t;
+        }
+        if (c0 && c1) {
+            info.p0_color = to_rgb(c0->diffuse);
+            info.p1_color = to_rgb(c1->diffuse);
             info.have_colors = true;
         }
         info.done = int(load_plan_.done);
         info.total = int(load_plan_.steps.size());
         info.stage = load_plan_.label;
-        draw_loading(b, info);
-        return;
-    }
-    if (screen == ScreenId::Lobby) {
-        const std::vector<Button> bs = lobby_buttons(view_w, view_h);
-        for (std::size_t i = 0; i < ctls.size() && i < bs.size(); ++i) {
-            ctls[i].label = bs[i].label;
-            ctls[i].action = bs[i].action;
-            ctls[i].selected = bs[i].action >= kMapRow0 && (bs[i].action - kMapRow0) == sel_map_;
+        info.pulse = fx_.pulse();
+        if (!replay_pending_) {
+            info.difficulty = ShellSettings::difficulty_name(settings_.ai_difficulty());
+            info.speed = ShellSettings::speed_name(settings_.game_speed());
         }
+        draw_loading(b, info);
+    } else if (screen == ScreenId::Lobby) {
+        for (Ctl& c : ctls) c.selected = c.action >= kMapRow0 && (c.action - kMapRow0) == sel_map_;
         LobbyInfo info;
         info.selected = sel_map_ >= 0 && sel_map_ < int(maps_.size()) ? maps_[sel_map_].name
                                                                      : std::string("-");
@@ -1745,11 +3063,353 @@ void FrontEnd::build_overlay(std::uint32_t view_w, std::uint32_t view_h,
                                     std::to_string(map_scroll_ + 1) + "-" + std::to_string(last)
                               : std::string("no .SC2Map found - the built-in arena only");
         info.error = match_error_;
+        info.host_name = settings_.profile_name();
+        info.preview = map_preview(sel_map_);
         draw_lobby(b, ctls, info, kActStart, kActBack, kActMapsFolder, kMapRow0);
-        return;
+    } else {
+        draw_glue_screen(screen, view_w, view_h, out);
+        for (const Ctl& c : ctls) {
+            if (c.x1 <= c.x0 || c.y1 <= c.y0) continue;
+            button_menu(b, c.x0, c.y0, c.x1, c.y1, c.label, false, c.live, c.look);
+        }
+        if (screen == ScreenId::Score) draw_score_table(view_w, view_h, out);
     }
-    draw_glue_screen(screen, view_w, view_h, out);
-    if (screen == ScreenId::Score) draw_score_table(view_w, view_h, out);
+
+    draw_toasts(b, fx_.toasts());
+    if (fx_.tip_due() && !fx_.tip_key.empty()) {
+        std::string tip = shell_tooltip(fx_.tip_key);
+        if (tip.empty() && screen == ScreenId::Lobby) {
+            for (const Ctl& c : ctls)
+                if (c.key == fx_.tip_key) {
+                    if (c.action == kActP0Race) tip = shell_tooltip("Player race");
+                    else if (c.action == kActP1Race) tip = shell_tooltip("AI race");
+                    else if (c.action == kActAiDiff) tip = shell_tooltip("AI difficulty");
+                    else if (c.action == kActSpeed) tip = shell_tooltip("Game speed");
+                    else if (c.action >= kMapRow0) tip = maps_[std::size_t(c.action - kMapRow0)].casc ? "An install map, read from the CASC store" : maps_[std::size_t(c.action - kMapRow0)].path;
+                }
+        }
+        if (tip.empty() && screen == ScreenId::Custom)
+            for (const Ctl& c : ctls)
+                if (c.key == fx_.tip_key && c.action >= kMapRow0)
+                    tip = maps_[std::size_t(c.action - kMapRow0)].casc ? "An install map, read from the CASC store" : maps_[std::size_t(c.action - kMapRow0)].path;
+        draw_tooltip(b, int(mouse_x_), int(mouse_y_), tip);
+    }
+}
+
+void FrontEnd::request_boot_screen(const std::string& name) { boot_screen_request() = name; }
+
+bool FrontEnd::enter_screen(const std::string& boot_name) {
+    const ScreenId id = screen_from_boot_name(boot_name);
+    switch (id) {
+        case ScreenId::Count:
+        case ScreenId::Boot:
+        case ScreenId::Login:
+        case ScreenId::Loading:
+        case ScreenId::InGame:
+        case ScreenId::PauseMenu:
+        case ScreenId::ReplayControls:
+            return false;
+        case ScreenId::Sandbox:
+            start_sandbox();
+            return true;
+        case ScreenId::Options:
+        case ScreenId::Profile:
+            router_.unwind_to(ScreenId::GlueRoot);
+            router_.push(id);
+            return true;
+        case ScreenId::Hotkeys:
+            router_.unwind_to(ScreenId::GlueRoot);
+            router_.push(ScreenId::Options);
+            router_.push(id);
+            return true;
+        case ScreenId::Portraits:
+            router_.unwind_to(ScreenId::GlueRoot);
+            router_.push(ScreenId::Profile);
+            router_.push(id);
+            return true;
+        default:
+            router_.unwind_to(id);
+            return true;
+    }
+}
+
+bool FrontEnd::run_shell_screen(shell::Pass pass, std::uint32_t view_w, std::uint32_t view_h, const render::InputState* in,
+                                std::vector<std::uint8_t>* out, float dt_ms, std::vector<shell::Control>* controls, bool* escape) {
+    if (shell_v1() || !view_w || !view_h) return false;
+    const shell::ScreenFn fn = shell::screen_fn(router_.top());
+    if (!fn) return false;
+    shell::Faces faces;
+    faces.face[0] = &overlay_font_;
+    faces.face[1] = &overlay_font_ext_;
+    faces.face[2] = &overlay_font_bold_;
+    shell::ShellCtx ctx{*this, settings_, fx_, router_};
+    shell::Ui ui(pass, view_w, view_h, in, out, fx_, ui_, faces, dt_ms, double_click_ms_ > 0.0 ? double_click_ms_ : 500.0);
+    ui.paste = clipboard_cb_;
+    if (!fn(ui, ctx)) return false;
+    ui.finish();
+    if (controls) *controls = ui.controls();
+    if (escape) *escape = ui.escape_pending();
+    return true;
+}
+
+bool FrontEnd::shell_v2_screen() { return run_shell_screen(shell::Pass::Collect, 1280, 720, nullptr, nullptr, 0.0f, nullptr, nullptr); }
+
+std::vector<shell::Control> FrontEnd::shell_controls(std::uint32_t view_w, std::uint32_t view_h) {
+    std::vector<shell::Control> cs;
+    run_shell_screen(shell::Pass::Collect, view_w, view_h, nullptr, nullptr, 0.0f, &cs, nullptr);
+    return cs;
+}
+
+void FrontEnd::remember_last_match() {
+    if (shell_v1() || !skirmish_ || skirmish_->replay_active()) return;
+    const MatchResult::Outcome o = skirmish_->outcome();
+    if (o == MatchResult::Outcome::Ongoing) return;
+    ShellSettings::LastMatch m;
+    m.outcome = o == MatchResult::Outcome::Victory ? "victory" : "defeat";
+    for (const platform::MapEntry& e : maps_)
+        if (e.path == match_map_path_) {
+            m.map = e.name;
+            break;
+        }
+    m.race[0] = int(p0_race_);
+    m.race[1] = int(p1_race_);
+    m.ticks = static_cast<long long>(skirmish_->world().tick());
+    m.replay = last_recorded_replay_;
+    m.tier = settings_.ai_difficulty();
+    const auto now = std::chrono::system_clock::to_time_t(std::chrono::system_clock::now());
+    char stamp[32];
+    std::tm tmv{};
+#ifdef _WIN32
+    localtime_s(&tmv, &now);
+#else
+    localtime_r(&now, &tmv);
+#endif
+    std::strftime(stamp, sizeof stamp, "%Y%m%d-%H%M%S", &tmv);
+    m.time = stamp;
+    settings_.set_last_match(m);
+}
+
+namespace shell {
+
+const std::vector<platform::MapEntry>& ShellCtx::maps() const { return fe.maps_; }
+int ShellCtx::selected_map() const { return fe.sel_map_; }
+
+void ShellCtx::select_map(int index) {
+    if (index < 0 || index >= int(fe.maps_.size())) return;
+    fe.sel_map_ = index;
+    fe.match_error_.clear();
+    settings.set_lobby_map(fe.maps_[std::size_t(index)].path);
+}
+
+const IconAtlas::Icon* ShellCtx::map_preview(int index) { return fe.map_preview(index); }
+
+const IconAtlas::Icon* ShellCtx::map_thumb(int index) {
+    if (index <= 0 || index >= int(fe.maps_.size())) return nullptr;
+    const auto it = fe.thumb_cache_.find(fe.maps_[std::size_t(index)].path);
+    return it != fe.thumb_cache_.end() && it->second.ok() ? &it->second : nullptr;
+}
+
+void ShellCtx::warm_map_thumbs(int budget) {
+    for (; budget > 0 && fe.thumb_cursor_ < fe.maps_.size(); ++fe.thumb_cursor_) {
+        const platform::MapEntry& e = fe.maps_[fe.thumb_cursor_];
+        if (e.path.empty() || fe.thumb_cache_.count(e.path)) continue;
+        --budget;
+        IconAtlas::Icon small;
+        try {
+            std::vector<std::uint8_t> bytes;
+            if (e.casc) bytes = fe.store_.read_by_name(e.path);
+            else {
+                std::ifstream in(e.path, std::ios::binary);
+                bytes.assign(std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>());
+            }
+            formats::Mpq arc = formats::Mpq::open(std::move(bytes));
+            if (arc.contains("Minimap.tga")) {
+                formats::TgaInfo ti;
+                const std::vector<std::uint8_t> px = formats::decode_tga(arc.read_file("Minimap.tga"), ti);
+                if (ti.width && ti.height && px.size() == std::size_t(ti.width) * ti.height * 4) {
+                    const std::uint32_t side = 64;
+                    small.w = small.h = side;
+                    small.rgba.assign(std::size_t(side) * side * 4, 0);
+                    draw::blit_fit(small.rgba, side, side, 0, 0, int(side), int(side), px.data(), std::uint32_t(ti.width), std::uint32_t(ti.height));
+                }
+            }
+        } catch (const std::exception&) {
+        }
+        fe.thumb_cache_[e.path] = std::move(small);
+    }
+}
+
+void ShellCtx::pick_maps_folder() {
+    if (fe.maps_folder_cb_) fe.maps_folder_cb_();
+}
+
+bool ShellCtx::team_color(int slot, theme::Rgb& out) {
+    if (!fe.team_colors_read_) {
+        fe.team_colors_read_ = true;
+        fe.team_colors_ = data::team_colors(fe.cat_);
+    }
+    static const bool raw = std::getenv("SC2_SHELL_TEAM_SLOT_RAW") != nullptr;
+    const int want = raw ? slot : slot + 1;
+    auto ch = [](float f) {
+        const int n = int(f * 255.0f + 0.5f);
+        return std::uint8_t(n < 0 ? 0 : (n > 255 ? 255 : n));
+    };
+    for (const data::TeamColor& tc : fe.team_colors_) {
+        if (tc.slot != want) continue;
+        out = theme::Rgb{ch(tc.diffuse[0]), ch(tc.diffuse[1]), ch(tc.diffuse[2])};
+        return true;
+    }
+    return false;
+}
+
+int ShellCtx::first_real_map() const {
+    for (std::size_t i = 0; i < fe.maps_.size(); ++i)
+        if (!fe.maps_[i].path.empty()) return int(i);
+    return -1;
+}
+
+int ShellCtx::setup_map() const {
+    const std::string stored = settings.lobby_map();
+    if (!stored.empty())
+        for (std::size_t i = 0; i < fe.maps_.size(); ++i)
+            if (fe.maps_[i].path == stored) return int(i);
+    return first_real_map();
+}
+
+std::string ShellCtx::map_title(int index) const {
+    return index >= 0 && index < int(fe.maps_.size()) ? fe.maps_[std::size_t(index)].name : std::string();
+}
+
+std::string ShellCtx::stored_map_label() const {
+    std::string p = settings.lobby_map();
+    const std::size_t slash = p.find_last_of("/\\");
+    if (slash != std::string::npos) p = p.substr(slash + 1);
+    const std::size_t dot = p.find_last_of('.');
+    if (dot != std::string::npos && dot > 0) p = p.substr(0, dot);
+    return p.empty() ? std::string("The stored map") : p;
+}
+
+int ShellCtx::map_by_title(const std::string& title) const {
+    for (std::size_t i = 0; i < fe.maps_.size(); ++i)
+        if (fe.maps_[i].name == title) return int(i);
+    return -1;
+}
+
+bool ShellCtx::start_match(const char* via) {
+    const std::string stored = settings.lobby_map();
+    int index = -1;
+    if (!stored.empty()) {
+        for (std::size_t i = 0; i < fe.maps_.size(); ++i)
+            if (fe.maps_[i].path == stored) index = int(i);
+        if (index < 0) return false;
+    } else {
+        index = first_real_map();
+    }
+    if (index < 0) return false;
+    fe.sel_map_ = index;
+    return start_selected_match(via);
+}
+
+bool ShellCtx::start_selected_match(const char* via) {
+    if (fe.sel_map_ < 0 || fe.sel_map_ >= int(fe.maps_.size()) || !router.edge_for(via)) return false;
+    fe.replay_pending_ = false;
+    fe.p0_pick_ = settings.profile_race();
+    fe.p1_pick_ = settings.opponent_race();
+    fe.match_seed_ = new_match_seed();
+    const std::uint64_t match_seed = fe.match_seed_ ? fe.match_seed_ : MeleeGameConfig{}.seed;
+    fe.p0_race_ = resolve_lobby_race(fe.p0_pick_, match_seed, 0);
+    fe.p1_race_ = resolve_lobby_race(fe.p1_pick_, match_seed, 1);
+    fe.match_error_.clear();
+    fe.loading_frames_ = 0;
+    fe.load_plan_.reset();
+    return router.follow(via);
+}
+
+const std::string& ShellCtx::match_error() const { return fe.match_error_; }
+
+bool ShellCtx::watch_replay(const std::string& path, const char* via) {
+    if (!router.edge_for(via)) return false;
+    OrderLog log;
+    if (!read_order_log_file(path, log)) return false;
+    fe.replay_log_pending_ = std::move(log);
+    fe.replay_pending_ = true;
+    fe.replay_name_ = std::filesystem::path(path).stem().string();
+    fe.sel_map_ = 0;
+    for (std::size_t i = 0; i < fe.maps_.size(); ++i)
+        if (!fe.replay_log_pending_.map_id.empty() && fe.maps_[i].path == fe.replay_log_pending_.map_id) fe.sel_map_ = int(i);
+    if (fe.replay_log_pending_.player_races.size() >= 2) {
+        fe.p0_race_ = Race(std::max(0, std::min(2, int(fe.replay_log_pending_.player_races[0]))));
+        fe.p1_race_ = Race(std::max(0, std::min(2, int(fe.replay_log_pending_.player_races[1]))));
+    }
+    fe.match_error_.clear();
+    fe.loading_frames_ = 0;
+    fe.load_plan_.reset();
+    return router.follow(via);
+}
+
+int ShellCtx::ticks_per_second() const { return sim::World::kTicksPerSecond; }
+
+ShellCtx::LoadView ShellCtx::loading() const {
+    LoadView v;
+    v.map_index = fe.sel_map_;
+    if (fe.sel_map_ >= 0 && fe.sel_map_ < int(fe.maps_.size()))
+        v.map = fe.maps_[std::size_t(fe.sel_map_)].path.empty() ? std::string("TEST ARENA") : fe.maps_[std::size_t(fe.sel_map_)].name;
+    v.race[0] = fe.p0_race_;
+    v.race[1] = fe.p1_race_;
+    v.replay = fe.replay_pending_;
+    v.done = fe.load_plan_.done;
+    v.total = fe.load_plan_.steps.size();
+    v.stage = fe.load_plan_.label;
+    v.elapsed_ms = fe.loading_ms_;
+    return v;
+}
+
+ShellCtx::ResultView ShellCtx::result() const {
+    ResultView v;
+    v.decided = fe.last_outcome_ != MatchResult::Outcome::Ongoing;
+    v.victory = fe.last_outcome_ == MatchResult::Outcome::Victory;
+    const ShellSettings::LastMatch last = settings.last_match();
+    v.map = last.map;
+    v.replay = last.replay;
+    v.ticks = last.ticks;
+    v.race[0] = Race(last.race[0]);
+    v.race[1] = Race(last.race[1]);
+    v.tier = last.tier;
+    v.score = &fe.last_score_;
+    return v;
+}
+std::string ShellCtx::player_name() const { return settings.profile_name(); }
+
+Race ShellCtx::player_default_race() const {
+    const LobbyRace r = settings.profile_race();
+    return r == LobbyRace::Random ? Race::Terran : Race(int(r));
+}
+
+const IconAtlas::Icon* ShellCtx::player_portrait() { return portrait(PortraitRef::parse(settings.profile_portrait())); }
+const IconAtlas::Icon* ShellCtx::portrait(const PortraitRef& ref) { return fe.portraits_.image(fe.cat_, fe.store_, ref, player_default_race()); }
+const IconAtlas::Icon* ShellCtx::portrait_texture(const std::string& name) { return fe.portraits_.texture(fe.store_, name); }
+const IconAtlas::Icon* ShellCtx::ai_avatar() { return fe.portraits_.ai_avatar(fe.store_); }
+const IconAtlas::Icon* ShellCtx::race_mark(LobbyRace race) { return fe.portraits_.race_mark(fe.store_, race); }
+PortraitCatalog& ShellCtx::portraits() { return fe.portraits_; }
+bool ShellCtx::scan_portraits(int budget) { return fe.portraits_.scan(fe.cat_, fe.store_, budget); }
+
+void ShellCtx::quit() { router.follow("Esc / close client"); }
+const char* ShellCtx::version() const { return sc2::kVersion; }
+bool ShellCtx::has_maps_folder_picker() const { return bool(fe.maps_folder_cb_); }
+
+ShellCtx::GameData ShellCtx::game_data() {
+    if (!fe.game_data_probed_) {
+        fe.game_data_probed_ = true;
+        const std::string root = settings.get("install_root");
+        if (!root.empty()) fe.game_data_ = probe_install(root);
+    }
+    GameData g;
+    g.version = fe.game_data_.version;
+    g.valid = fe.game_data_.valid;
+    g.verified = fe.game_data_.valid && fe.game_data_.compatible;
+    return g;
+}
+
 }
 
 }

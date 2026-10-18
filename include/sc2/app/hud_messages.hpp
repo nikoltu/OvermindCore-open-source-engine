@@ -17,6 +17,7 @@ struct HudMessage {
     MsgZone zone;
     std::string text;
     float ttl = 0;
+    float ttl0 = 0;
     int count = 1;
     bool has_target = false;
     float tx = 0, ty = 0;
@@ -30,6 +31,7 @@ public:
         for (HudMessage& m : msgs_) {
             if (m.zone == zone && m.text == text) {
                 m.ttl = std::max(m.ttl, ttl);
+                m.ttl0 = m.ttl;
                 ++m.count;
                 m.has_target = has_target;
                 m.tx = tx;
@@ -37,7 +39,7 @@ public:
                 return;
             }
         }
-        msgs_.push_back({zone, text, ttl, 1, has_target, tx, ty, std::string()});
+        msgs_.push_back({zone, text, ttl, ttl, 1, has_target, tx, ty, std::string()});
     }
 
     void advance(float dt) {

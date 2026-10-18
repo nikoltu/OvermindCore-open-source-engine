@@ -15,6 +15,9 @@ std::string pick_folder(const std::string& title);
 void alert(const std::string& title, const std::string& message);
 
 bool attach_parent_console();
+double double_click_ms();
+std::string clipboard_text();
+bool open_folder(const std::string& path);
 
 struct MapEntry {
     std::string path;

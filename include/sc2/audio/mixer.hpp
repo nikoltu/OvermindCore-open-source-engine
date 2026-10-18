@@ -13,6 +13,7 @@ struct Voice {
     std::uint32_t src_rate = 0;
     int channels = 1;
     float gain = 1.0f;
+    float pan = 0.0f;
     bool loop = false;
     double cursor = 0.0;
     bool active = true;

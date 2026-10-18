@@ -34,7 +34,8 @@ public:
         return world.ability_cooldown_left(caster, ability);
     }
     bool ready(const World& world, std::uint32_t caster, int32_t ability) const {
-        return world.ability_cooldown_left(caster, ability).raw() <= 0;
+        if (ability < 0 || std::size_t(ability) >= specs_.size()) return false;
+        return world.ability_cooldown_left(caster, specs_[ability].effect).raw() <= 0;
     }
 
     bool try_cast(World& world, std::uint32_t caster, int32_t ability, std::uint32_t target) {
@@ -52,8 +53,8 @@ public:
         }
         if (s.life_cost.raw() > 0 && !world.spend_life(caster, s.life_cost)) return false;
         if (s.energy_cost.raw() > 0 && !world.spend_energy(caster, s.energy_cost)) return false;
-        world.arm_ability_cooldown(caster, ability, s.cooldown);
         world.cast(caster, s.effect, target);
+        world.arm_ability_cooldown(caster, s.effect, s.cooldown);
         return true;
     }
 
@@ -63,8 +64,8 @@ public:
         if (!ready(world, caster, ability)) return false;
         const AbilitySpec& s = specs_[ability];
         if (s.energy_cost.raw() > 0 && !world.spend_energy(caster, s.energy_cost)) return false;
-        world.arm_ability_cooldown(caster, ability, s.cooldown);
         world.cast(caster, s.effect, tx, ty);
+        world.arm_ability_cooldown(caster, s.effect, s.cooldown);
         return true;
     }
 

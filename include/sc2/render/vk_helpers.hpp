@@ -128,13 +128,14 @@ inline Image make_image(VkPhysicalDevice pd, VkDevice dev, VkFormat fmt, VkImage
 }
 
 inline Image make_image_array(VkPhysicalDevice pd, VkDevice dev, VkFormat fmt,
-                              VkImageUsageFlags usage, uint32_t w, uint32_t h, uint32_t layers) {
+                              VkImageUsageFlags usage, uint32_t w, uint32_t h, uint32_t layers,
+                              uint32_t mips = 1) {
     VkImageCreateInfo ii{};
     ii.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
     ii.imageType = VK_IMAGE_TYPE_2D;
     ii.format = fmt;
     ii.extent = {w, h, 1};
-    ii.mipLevels = 1;
+    ii.mipLevels = mips;
     ii.arrayLayers = layers;
     ii.samples = VK_SAMPLE_COUNT_1_BIT;
     ii.tiling = VK_IMAGE_TILING_OPTIMAL;
@@ -159,7 +160,7 @@ inline Image make_image_array(VkPhysicalDevice pd, VkDevice dev, VkFormat fmt,
     vi.image = raw;
     vi.viewType = VK_IMAGE_VIEW_TYPE_2D_ARRAY;
     vi.format = fmt;
-    vi.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, layers};
+    vi.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, mips, 0, layers};
     VkImageView rawview = VK_NULL_HANDLE;
     check(vkCreateImageView(dev, &vi, nullptr, &rawview), "vkCreateImageView(array)");
     out.view = Unique<VkImageView>(rawview, [dev](VkImageView v) { vkDestroyImageView(dev, v, nullptr); });

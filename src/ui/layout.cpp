@@ -38,13 +38,37 @@ const std::string* Layout::constant(const std::string& name) const {
     return nullptr;
 }
 
-std::string Layout::resolve(const std::string& value) const {
-    if (value.size() >= 2 && value[0] == '#' && value[1] == '#')
-        return value.substr(1);
-    if (value.size() >= 2 && value[0] == '#') {
-        if (const std::string* v = constant(value.substr(1))) return *v;
+template <typename Find>
+static std::string scoped_constant(const std::string& name, int hashes, const ConstScope& scope,
+                                   Find find, const std::string& original) {
+    if (hashes >= 3 && !scope.skin.empty())
+        if (const std::string* v = find(name + "_" + scope.skin)) return *v;
+    if (hashes >= 2 && !scope.race.empty())
+        if (const std::string* v = find(name + "_" + scope.race)) return *v;
+    if (const std::string* v = find(name)) return *v;
+    return original;
+}
+
+static int hash_depth(const std::string& v) {
+    int n = 0;
+    while (n < 3 && std::size_t(n) < v.size() && v[std::size_t(n)] == '#') ++n;
+    return n;
+}
+
+const char* layout_race_suffix(int race) {
+    switch (race) {
+        case 0: return "Terr";
+        case 1: return "Prot";
+        case 2: return "Zerg";
+        default: return "";
     }
-    return value;
+}
+
+std::string Layout::resolve(const std::string& value, const ConstScope& scope) const {
+    const int h = hash_depth(value);
+    if (h == 0 || value.size() <= std::size_t(h)) return value;
+    return scoped_constant(value.substr(std::size_t(h)), h, scope,
+                           [this](const std::string& n) { return constant(n); }, value);
 }
 
 std::size_t Layout::frame_count() const {
@@ -169,11 +193,10 @@ const std::string* LayoutSet::constant(const std::string& name) const {
 }
 
 std::string LayoutSet::resolve(const std::string& value) const {
-    if (value.size() >= 2 && value[0] == '#' && value[1] == '#')
-        return value.substr(1);
-    if (value.size() >= 2 && value[0] == '#')
-        if (const std::string* v = constant(value.substr(1))) return *v;
-    return value;
+    const int h = hash_depth(value);
+    if (h == 0 || value.size() <= std::size_t(h)) return value;
+    return scoped_constant(value.substr(std::size_t(h)), h, scope,
+                           [this](const std::string& n) { return constant(n); }, value);
 }
 
 const Frame* LayoutSet::find_template(const std::string& path) const {
@@ -340,6 +363,7 @@ struct GlobalResolve {
     std::unordered_map<const Frame*, Rect>* cur;
     const TextResolver* text = nullptr;
     const FrameCollapsed* collapsed = nullptr;
+    const StyleHeight* style_height = nullptr;
 };
 
 bool declares_collapse(const Frame& f) {
@@ -356,6 +380,19 @@ Rect collapse_rect(const Rect& r, bool haveL, bool haveR, bool haveT, bool haveB
     c.y = (haveB && !haveT) ? r.y + r.h : r.y;
     c.h = 0.0f;
     return c;
+}
+
+bool relative_is_collapsed(const std::string& rel, const std::vector<const Frame*>& ancestorsF,
+                           const GlobalResolve* g) {
+    if (!g || !g->collapsed || !*g->collapsed) return false;
+    const std::string name = sibling_ref_name(rel);
+    if (name.empty() || ancestorsF.empty()) return false;
+    const Frame* parent = ancestorsF.back();
+    for (const Frame& c : parent->children) {
+        if (c.name != name) continue;
+        return declares_collapse(c) && (*g->collapsed)(c);
+    }
+    return false;
 }
 
 Rect anchor_target(const std::string& rel, const Rect& parent,
@@ -424,9 +461,9 @@ Rect solve_one(const Frame& f, const Rect& parent,
                 continue;
             }
             std::string pos = p.attr_or("pos", "Min");
-            float off = attr_f(p, "offset", 0);
-            Rect base = anchor_target(normalise_rel(p.attr_or("relative", "")), parent, siblings, ancestors, f,
-                                      ancestorsF, g);
+            const std::string rel = normalise_rel(p.attr_or("relative", ""));
+            float off = relative_is_collapsed(rel, ancestorsF, g) ? 0.0f : attr_f(p, "offset", 0);
+            Rect base = anchor_target(rel, parent, siblings, ancestors, f, ancestorsF, g);
             bool horiz = (side == "Left" || side == "Right");
             float c = anchor_base(base, horiz, pos) + off;
             if (side == "Left") { L = c; haveL = true; }
@@ -440,6 +477,12 @@ Rect solve_one(const Frame& f, const Rect& parent,
         if (!label.empty()) {
             if (!haveW && !(haveL && haveR)) { W = float(measure_text(label, 1)); haveW = W > 0; }
             if (!haveH && !(haveT && haveB)) { H = float(kFontH); haveH = H > 0; }
+        }
+    }
+    if (!haveH && !(haveT && haveB) && g && g->style_height && *g->style_height) {
+        if (const XmlNode* sp = f.prop("Style")) {
+            const int sh = (*g->style_height)(sp->attr_or("val", ""));
+            if (sh > 0) { H = float(sh); haveH = true; }
         }
     }
     Rect r;
@@ -923,6 +966,14 @@ std::vector<SolvedFrame> solve_layout(const Frame& root, const Rect& canvas,
                                       const TextResolver& resolve_text,
                                       const FrameCollapsed& collapsed,
                                       const DataResolver& data) {
+    return solve_layout(root, canvas, resolve_text, collapsed, data, StyleHeight{});
+}
+
+std::vector<SolvedFrame> solve_layout(const Frame& root, const Rect& canvas,
+                                      const TextResolver& resolve_text,
+                                      const FrameCollapsed& collapsed,
+                                      const DataResolver& data,
+                                      const StyleHeight& style_height) {
     Frame tree = root;
     apply_state_groups(tree, canvas.h > 0.0f ? canvas.w / canvas.h : 0.0f);
     if (data) bind_data_properties(tree, data);
@@ -932,7 +983,7 @@ std::vector<SolvedFrame> solve_layout(const Frame& root, const Rect& canvas,
     std::vector<SolvedFrame> out;
     for (int pass = 0; pass < kMaxPasses; ++pass) {
         std::unordered_map<const Frame*, Rect> cur;
-        GlobalResolve g{pass == 0 ? nullptr : &prev, &cur, &resolve_text, &collapsed};
+        GlobalResolve g{pass == 0 ? nullptr : &prev, &cur, &resolve_text, &collapsed, &style_height};
         std::vector<SolvedFrame> next = solve_pass(tree, canvas, g);
         const bool stable = pass > 0 && rects_equal(next, out);
         out = std::move(next);
@@ -1109,6 +1160,7 @@ FontStyle StyleSet::resolve(const std::string& name) const {
     FontStyle out;
     out.name = name;
     std::vector<std::pair<std::string, std::string>> merged;
+    std::vector<std::string> flag_chain;
     std::string cur = name;
     for (int depth = 0; depth < 16 && !cur.empty(); ++depth) {
         auto it = styles_.find(cur);
@@ -1116,6 +1168,7 @@ FontStyle StyleSet::resolve(const std::string& name) const {
         std::string next;
         for (const auto& kv : it->second.attrs) {
             if (kv.first == "template") { next = kv.second; continue; }
+            if (kv.first == "styleflags") flag_chain.push_back(kv.second);
             bool have = false;
             for (const auto& m : merged)
                 if (m.first == kv.first) { have = true; break; }
@@ -1144,8 +1197,21 @@ FontStyle StyleSet::resolve(const std::string& name) const {
         } catch (...) {
         }
     }
-    const std::string flags = get("styleflags");
-    out.shadow = flags.find("Shadow") != std::string::npos;
+    for (auto lvl = flag_chain.rbegin(); lvl != flag_chain.rend(); ++lvl) {
+        const std::string s = expand(*lvl);
+        std::size_t i = 0;
+        while (i < s.size()) {
+            const std::size_t b = s.find_first_not_of(", |\t\r\n", i);
+            if (b == std::string::npos) break;
+            std::size_t e = s.find_first_of(", |\t\r\n", b);
+            if (e == std::string::npos) e = s.size();
+            std::string tok = s.substr(b, e - b);
+            i = e;
+            const bool off = !tok.empty() && tok[0] == '!';
+            if (off) tok.erase(0, 1);
+            if (tok == "Shadow") out.shadow = !off;
+        }
+    }
     out.vjustify = get("vjustify");
     out.hjustify = get("hjustify");
     {

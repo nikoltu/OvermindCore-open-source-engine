@@ -132,18 +132,19 @@ struct MeleeZoomStep {
     float height_offset;
 };
 inline constexpr MeleeZoomStep kMeleeZoomTable[5] = {
-    {30.0f, 54.0f, -1.75f},
-    {26.0f, 50.0f, -1.00f},
-    {22.0f, 46.0f, -0.25f},
-    {18.0f, 42.0f, 0.00f},
-    {14.0f, 42.0f, 0.50f},
+    {34.0f, 56.0f, 0.0f},
+    {30.0f, 52.0f, 0.0f},
+    {26.0f, 48.0f, 0.0f},
+    {22.0f, 44.0f, 0.0f},
+    {18.0f, 40.0f, 0.0f},
 };
 inline constexpr int kMeleeZoomSteps = 5;
-inline constexpr float kMeleeRestPitch = 54.0f * kDegToRad;
-inline constexpr float kMeleeFovY = 37.5f * kDegToRad;
-inline constexpr float kMeleeRestDistance = 30.0f;
-inline constexpr float kMeleeMinDistance = 14.0f;
-inline constexpr float kMeleeMaxScrollRate = 68.5f;
+inline constexpr float kMeleeRestPitch = 56.0f * kDegToRad;
+inline constexpr float kMeleeFovY = 27.799999f * kDegToRad;
+inline constexpr float kMeleeRestDistance = 34.0f;
+inline constexpr float kMeleeMinDistance = 18.0f;
+inline constexpr float kMeleeFarClip = 600.0f;
+inline constexpr float kMeleeMaxScrollRate = 128.0f;
 
 inline int apply_melee_zoom(CameraControl& c, int step) {
     step = std::clamp(step, 0, kMeleeZoomSteps - 1);
@@ -157,6 +158,7 @@ inline int apply_melee_zoom(CameraControl& c, int step) {
 inline void apply_melee_rest_frame(CameraControl& c) {
     apply_melee_zoom(c, 0);
     c.fovy = kMeleeFovY;
+    c.zfar = kMeleeFarClip;
     c.min_distance = kMeleeMinDistance;
     c.max_distance = kMeleeRestDistance;
 }

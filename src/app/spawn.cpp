@@ -9,6 +9,7 @@
 
 #include "sc2/app/ability.hpp"
 #include "sc2/data/abil_charge.hpp"
+#include "sc2/data/requirements.hpp"
 #include "sc2/data/economy.hpp"
 #include "sc2/sim/weapon.hpp"
 
@@ -107,13 +108,19 @@ static uint32_t parse_target_filter(const std::string& filters) {
     return bits == 0 ? 3u : bits;
 }
 
+static bool parse_acquire_no_structure(const std::string& filters) {
+    const size_t semi = filters.find(';');
+    if (semi == std::string::npos) return false;
+    return has_token(filters.substr(semi + 1), "Structure");
+}
+
 static void read_attributes(const data::Catalog& cat, const std::string& unit_id,
                             sim::Unit& u) {
     for (const core::XmlNode& n : cat.resolved("CUnit", unit_id)) {
         if (n.name != "Attributes") continue;
         const std::string* idx = n.attr("index");
         if (!idx) continue;
-        const std::string& val = n.attr_or("value", "1");
+        const std::string val = n.attr_or("value", "1");
         const bool set = truthy(val);
         if (*idx == "Heroic") { u.heroic = set; continue; }
         if (set) u.attributes |= attribute_bit(*idx);
@@ -234,13 +241,60 @@ sim::Unit make_unit(const data::Catalog& cat, const std::string& unit_id,
         }
         if (u.build_charges >= 0) break;
     }
+    for (const std::string& ab : cat.array_links("CUnit", unit_id, "AbilArray")) {
+        const data::Catalog::Entry* ae = ab.empty() ? nullptr : cat.find("CAbil", ab);
+        if (!ae || ae->tag != "CAbilAugment") continue;
+        std::string eff;
+        if (auto s = cat.scalar("CAbil", ab, "Effect"); s && !s->empty()) eff = *s;
+        else if (auto d = cat.tag_default_scalar("CAbilAugment", "Effect"); d && !d->empty()) eff = *d;
+        for (size_t p; (p = eff.find("##id##")) != std::string::npos;) eff.replace(p, 6, ab);
+        const auto beh = cat.effect_apply_behavior(eff);
+        const auto bb = beh ? cat.behavior_buff(*beh) : std::nullopt;
+        if (!bb) continue;
+        u.charge_augment = true;
+        u.charge_duration = Fixed::from_double(bb->duration);
+        u.charge_speed_mult = Fixed::from_double(bb->move_speed_mult);
+        for (const std::string& val : cat.array_links("CEffect", eff, "ValidatorArray")) {
+            const data::Catalog::Entry* ve = cat.find("CValidator", val);
+            if (!ve) continue;
+            if (ve->tag == "CValidatorLocationCompareRange") u.charge_range = field(cat, "CValidator", val, "Range");
+            else if (ve->tag == "CValidatorUnitCompareOrderTargetRange") u.charge_min = field(cat, "CValidator", val, "Value");
+        }
+        for (const core::XmlNode& n : cat.resolved("CAbil", ab)) {
+            if (n.name != "Cost") continue;
+            for (const core::XmlNode& cd : n.children)
+                if (cd.name == "Cooldown")
+                    if (const std::string* tu = cd.attr("TimeUse"); tu && !tu->empty()) u.charge_cd = Fixed::parse(*tu);
+        }
+        for (const core::XmlNode& n : cat.resolved("CAbil", ab)) {
+            if (n.name != "CmdButtonArray" || n.attr_or("index", "") != "Execute") continue;
+            const std::string* req = n.attr("Requirements");
+            if (!req || req->empty()) continue;
+            const data::RequirementNodeRef node = data::requirement_node(cat, *req, "Use");
+            if (!node.has_node || node.link.empty()) continue;
+            for (const core::XmlNode& c : cat.resolved("CRequirement", node.link))
+                if (c.name == "Count")
+                    if (const std::string* link = c.attr("Link"); link && !link->empty()) u.charge_requirement = *link;
+        }
+        break;
+    }
     u.load_range = Fixed::from_double(cat.transport_load_range(unit_id));
+    u.build_verb = worker_build_verb(cat, unit_id);
+    if (auto ox = cat.scalar("CUnit", unit_id, "AddOnOffsetX"); ox && !ox->empty()) u.addon_slot_host = true;
+    u.unload_period = Fixed::from_double(cat.transport_field(unit_id, "UnloadPeriod"));
+    u.unload_initial_delay = Fixed::from_double(cat.transport_field(unit_id, "InitialUnloadDelay"));
+    u.max_cargo_size = int32_t(cat.transport_field(unit_id, "MaxCargoSize"));
     u.player_hold = cat.transport_player_hold(unit_id);
 
     u.sight = field(cat, "CUnit", unit_id, "Sight");
+    u.vision_height = field(cat, "CUnit", unit_id, "VisionHeight");
     u.death_reveal_radius = field(cat, "CUnit", unit_id, "DeathRevealRadius", Fixed::from_int(2));
+    u.minimap_radius = field_or_class_default(cat, "CUnit", unit_id, "MinimapRadius", Fixed::from_double(0.5));
     u.target_priority = int(field(cat, "CUnit", unit_id, "AttackTargetPriority", Fixed()).round());
     u.life_regen = field(cat, "CUnit", unit_id, "LifeRegenRate");
+    u.life_regen_delay = field(cat, "CUnit", unit_id, "LifeRegenDelay");
+    u.dual_rally = cat.unit_has_worker_rally(unit_id);
+    u.rally_exempt = unit_id == "Queen";
     for (const std::string& ab : cat.array_links("CUnit", unit_id, "AbilArray")) {
         if (ab.empty()) continue;
         if (auto ms = cat.morph_spec(ab); ms && !ms->target.empty()) {
@@ -270,7 +324,10 @@ sim::Unit make_unit(const data::Catalog& cat, const std::string& unit_id,
         const Fixed damage = Fixed::from_int(*dmg);
         const Fixed period = field(cat, "CWeapon", w, "Period", Fixed::from_double(0.8332));
         const Fixed range = field(cat, "CWeapon", w, "Range", Fixed::from_int(5));
-        const Fixed min_range = field(cat, "CWeapon", w, "MinimumRange");
+        static const bool keep_dead_zone = [] { const char* e = std::getenv("SC2_QUEEN_DEAD_ZONE"); return e && e[0] == '1'; }();
+        const Fixed min_range = (!keep_dead_zone && cat.hidden_sibling_covers_min_range(unit_id, w))
+                                    ? Fixed()
+                                    : field(cat, "CWeapon", w, "MinimumRange");
         uint32_t filter = 3;
         if (auto tf = cat.scalar("CWeapon", w, "TargetFilters"); tf && !tf->empty())
             filter = parse_target_filter(*tf);
@@ -282,8 +339,10 @@ sim::Unit make_unit(const data::Catalog& cat, const std::string& unit_id,
                 const std::string ks = kd ? *kd : std::string();
                 const std::uint8_t kb = ks == "Melee" ? sim::kDamageKindMelee : ks == "Splash" ? sim::kDamageKindSplash : ks == "Spell" ? sim::kDamageKindSpell : sim::kDamageKindRanged;
                 u.wpn_kind = kb;
+                u.wpn_death = sim::death_code_of(cat.scalar("CEffect", dmg_id ? *dmg_id : cat.weapon_effect_id(w), "Death").value_or(""));
             }
             u.wpn_damage = damage;
+            u.wpn_tag = app::behavior_id_hash(w);
             u.wpn_period = period;
             u.wpn_range = range;
             u.wpn_min_range = min_range;
@@ -292,16 +351,34 @@ sim::Unit make_unit(const data::Catalog& cat, const std::string& unit_id,
             u.wpn_damage_point = field(cat, "CWeapon", w, "DamagePoint", Fixed::from_double(0.1670));
             u.wpn_backswing = field(cat, "CWeapon", w, "Backswing", Fixed::from_double(0.5));
             u.wpn_fire_arc = Fixed::from_double(cat.weapon_fire_arc_deg(w));
+            u.wpn_range_slop = Fixed::from_double(cat.weapon_range_slop(w));
+            if (auto ap = cat.scalar("CWeapon", w, "AcquirePrioritization"); ap && !ap->empty()) {
+                if (*ap == "ByAngle") u.acquire_sort = sim::kAcquireSortByAngle;
+                else if (*ap == "ByDistanceFromTarget") u.acquire_sort = sim::kAcquireSortByDistanceFromTarget;
+            }
+            u.wpn_teleport_reset = field(cat, "CWeapon", w, "TeleportResetRange", Fixed::from_int(500));
             const auto rd = cat.weapon_random_delay(w);
             u.wpn_random_delay_min = Fixed::from_double(rd.first);
             u.wpn_random_delay_max = Fixed::from_double(rd.second);
             u.wpn_armor_reduction = Fixed::from_double(cat.weapon_armor_reduction(w));
             u.wpn_hits = cat.weapon_hit_count(w).value_or(1);
             if (auto ps = cat.missile_speed(w)) u.wpn_projectile_speed = Fixed::from_double(*ps);
-            if (auto am = cat.scalar("CWeapon", w, "AllowedMovement"); am && *am == "Moving")
-                u.fire_while_moving = true;
+            {
+                const auto movers = cat.effect_missile_movers(cat.weapon_effect_id(w));
+                u.wpn_mover_count = std::uint8_t(std::min<std::size_t>(movers.size(), 2));
+                for (std::size_t k = 0; k < u.wpn_mover_count; ++k)
+                    u.wpn_movers[k] = {sim::Fixed::from_double(movers[k].range_lte), sim::Fixed::from_double(movers[k].speed),
+                                     sim::Fixed::from_double(movers[k].accel), sim::Fixed::from_double(movers[k].max_speed)};
+            }
+            if (auto am = cat.scalar("CWeapon", w, "AllowedMovement"); am && (*am == "Moving" || *am == "Slowing")) {
+                u.fire_slowing = *am == "Slowing";
+                u.fire_while_moving = !u.fire_slowing;
+            }
             const Fixed scan = field(cat, "CWeapon", w, "MinScanRange");
-            u.acquire_range = scan.raw() > 0 ? scan : range;
+            const Fixed sight_scan = u.sight - Fixed::from_double(3.5);
+            u.acquire_range = scan.raw() > 0 ? scan : (sight_scan.raw() > 0 ? sight_scan : range);
+            if (auto af = cat.scalar("CWeapon", w, "AcquireFilters"); af && !af->empty())
+                u.wpn_acquire_no_structure = parse_acquire_no_structure(*af);
             auto lsplash = cat.effect_persistent(cat.weapon_effect_id(w));
             auto arcs = cat.weapon_arc_splash(w);
             if (lsplash && lsplash->line_count >= 2 && lsplash->radius > 0) {
@@ -367,25 +444,42 @@ sim::Unit make_unit(const data::Catalog& cat, const std::string& unit_id,
                 const std::string ks = kd ? *kd : std::string();
                 const std::uint8_t kb = ks == "Melee" ? sim::kDamageKindMelee : ks == "Splash" ? sim::kDamageKindSplash : ks == "Spell" ? sim::kDamageKindSpell : sim::kDamageKindRanged;
                 u.wpn2_kind = kb;
+                u.wpn2_death = sim::death_code_of(cat.scalar("CEffect", dmg_id ? *dmg_id : cat.weapon_effect_id(w), "Death").value_or(""));
             }
             u.wpn2_damage = damage;
+            u.wpn2_tag = app::behavior_id_hash(w);
             u.wpn2_period = period;
             u.wpn2_range = range;
             u.wpn2_min_range = min_range;
+            static const bool close_missile = [] { const char* e = std::getenv("SC2_QUEEN_CLOSE_MISSILE"); return e && e[0] == '1'; }();
+            if (!close_missile && min_range.raw() == 0 && cat.hidden_sibling_covers_min_range(unit_id, w))
+                u.wpn2_close_range = field(cat, "CWeapon", w, "MinimumRange");
             u.wpn2_target_filter = filter;
             weapon_attribute_bonus(cat, w, u.wpn2_bonus_attr, u.wpn2_bonus_amount);
             u.wpn2_damage_point = field(cat, "CWeapon", w, "DamagePoint", Fixed::from_double(0.1670));
             u.wpn2_backswing = field(cat, "CWeapon", w, "Backswing", Fixed::from_double(0.5));
             u.wpn2_fire_arc = Fixed::from_double(cat.weapon_fire_arc_deg(w));
+            u.wpn2_range_slop = Fixed::from_double(cat.weapon_range_slop(w));
+            u.wpn2_teleport_reset = field(cat, "CWeapon", w, "TeleportResetRange", Fixed::from_int(500));
             const auto rd2 = cat.weapon_random_delay(w);
             u.wpn2_random_delay_min = Fixed::from_double(rd2.first);
             u.wpn2_random_delay_max = Fixed::from_double(rd2.second);
             u.wpn2_armor_reduction = Fixed::from_double(cat.weapon_armor_reduction(w));
             u.wpn2_hits = cat.weapon_hit_count(w).value_or(1);
             if (auto ps = cat.missile_speed(w)) u.wpn2_projectile_speed = Fixed::from_double(*ps);
+            {
+                const auto movers = cat.effect_missile_movers(cat.weapon_effect_id(w));
+                u.wpn2_mover_count = std::uint8_t(std::min<std::size_t>(movers.size(), 2));
+                for (std::size_t k = 0; k < u.wpn2_mover_count; ++k)
+                    u.wpn2_movers[k] = {sim::Fixed::from_double(movers[k].range_lte), sim::Fixed::from_double(movers[k].speed),
+                                     sim::Fixed::from_double(movers[k].accel), sim::Fixed::from_double(movers[k].max_speed)};
+            }
             const Fixed scan2 = field(cat, "CWeapon", w, "MinScanRange");
-            const Fixed acq2 = scan2.raw() > 0 ? scan2 : range;
+            const Fixed sight_scan2 = u.sight - Fixed::from_double(3.5);
+            const Fixed acq2 = scan2.raw() > 0 ? scan2 : (sight_scan2.raw() > 0 ? sight_scan2 : range);
             if (acq2 > u.acquire_range) u.acquire_range = acq2;
+            if (auto af2 = cat.scalar("CWeapon", w, "AcquireFilters"); af2 && !af2->empty())
+                u.wpn2_acquire_no_structure = parse_acquire_no_structure(*af2);
         }
         if (++filled == 2) break;
     }
@@ -499,12 +593,15 @@ sim::Unit make_unit(const data::Catalog& cat, const std::string& unit_id,
     for (const auto& [dx, dy] : cat.near_resources_check_offsets(unit_id))
         u.near_resources_check_offsets.emplace_back(int16_t(dx), int16_t(dy));
     u.requires_vespene = cat.structure_requires_vespene(unit_id);
-    if (const double pr = cat.power_source_radius(unit_id); pr > 0)
+    if (const double pr = cat.power_source_radius(unit_id); pr > 0) {
         u.power_radius = Fixed::from_double(pr);
+        u.power_reaches_higher = cat.power_source_reaches_higher(unit_id);
+    }
     u.needs_power = cat.requires_power(unit_id);
     u.turn_rate = field_or_class_default(cat, "CUnit", unit_id, "TurningRate");
     u.stationary_turn_rate =
         field_or_class_default(cat, "CUnit", unit_id, "StationaryTurningRate");
+    if (const double yr = cat.weapon_turret_yaw_rate(unit_id); yr > 0.0) u.turret_rate = Fixed::from_double(yr);
     {
         Fixed sep_default;
         if (auto d = cat.tag_default_scalar("CUnit", "SeparationRadius"); d && !d->empty())
@@ -516,7 +613,22 @@ sim::Unit make_unit(const data::Catalog& cat, const std::string& unit_id,
     u.allied_push_priority =
         int32_t(field(cat, "CUnit", unit_id, "AlliedPushPriority", Fixed()).round());
     u.collide_flags = read_collide(cat, unit_id);
+    u.armor_disabled_constructing = cat.unit_flag(unit_id, "ArmorDisabledWhileConstructing");
+    u.turn_before_move = cat.unit_flag(unit_id, "TurnBeforeMove");
+    u.town_alert = cat.unit_flag(unit_id, "TownAlert");
+    u.race_index = std::int8_t(cat.unit_race_index(unit_id));
+    {
+        const data::Catalog::LoadRule lr = cat.transport_load_rule(unit_id);
+        u.load_require_race = std::int8_t(lr.require_race);
+        u.load_require_types = lr.require_types;
+        u.load_exclude_types = lr.exclude_types;
+        for (const std::string& b : lr.block_behaviors)
+            u.load_block_behaviors.push_back(app::behavior_id_hash(b));
+    }
     u.prevent_defeat = cat.unit_flag(unit_id, "PreventDefeat");
+    u.unselectable = cat.unit_flag(unit_id, "Unselectable");
+    u.invulnerable_flag = cat.unit_flag(unit_id, "Invulnerable");
+    u.magazine_ammo = cat.calldown_ammo_unit(unit_id);
     u.catalog_id = unit_id;
     u.yield_amount = cat.resource_harvest_amount(unit_id);
     if (auto rd = cat.resource_return_delay(unit_id))

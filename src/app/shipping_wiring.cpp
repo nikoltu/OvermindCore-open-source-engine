@@ -1,5 +1,6 @@
 #include "sc2/app/shipping_wiring.hpp"
 
+#include <cstdlib>
 #include <exception>
 #include <string>
 #include <utility>
@@ -127,6 +128,10 @@ void apply_shipping_wiring(MeleeGame& game, const data::Catalog& cat,
     game.world().set_train_affordability(true);
     game.world().set_attack_windup(true);
     game.world().set_projectile_travel(true);
+    game.world().set_accelerating_movers(std::getenv("SC2_MOVERS_CONSTANT") == nullptr);
+    game.world().set_turret_aim(std::getenv("SC2_TURRET_AIM_BODY") == nullptr);
+    game.world().set_exact_build_progress(std::getenv("SC2_BUILD_PROGRESS_TRUNCATED") == nullptr);
+    game.world().set_gather_dock_footprint(std::getenv("SC2_GATHER_DOCK_RADIUS") == nullptr);
     game.world().set_death_reveal(true);
     auto cgame = [&](const char* field) -> sim::Fixed {
         const auto v = cat.tag_default_scalar("CGame", field);

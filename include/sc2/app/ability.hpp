@@ -76,13 +76,25 @@ struct AbilityBuild {
     bool spawn_requires_creep = false;
     std::vector<sim::EffectNode> tree;
     int32_t tree_root = -1;
+    bool from_effect_tree = false;
+    bool target_rel_authored = false;
+    std::uint8_t target_exc_rel = 0;
+    bool full_tree = false;
+    std::vector<std::string> unbuilt;
+    std::vector<std::string> tolerated;
+    std::vector<std::pair<int32_t, std::string>> tree_spawns;
+    std::vector<int32_t> tree_salvage;
 };
+
+std::vector<std::string> effect_tree_gaps(const data::Catalog& cat, const std::string& abil_id);
 
 int32_t build_effect(const data::Catalog& cat, const std::string& effect_id, AbilityBuild& b);
 
 int32_t register_ability(sim::World& world, const AbilityBuild& b);
 
 std::optional<AbilityBuild> make_ability(const data::Catalog& cat, const std::string& abil_id);
+std::optional<AbilityBuild> make_ability_flat(const data::Catalog& cat, const std::string& abil_id);
+std::optional<AbilityBuild> make_ability_ai(const data::Catalog& cat, const std::string& abil_id);
 void parse_ability_autocast_validators(const data::Catalog& cat, const std::string& abil_id, AbilityBuild& b);
 
 sim::Fixed ability_energy_cost(const data::Catalog& cat, const std::string& abil_id);

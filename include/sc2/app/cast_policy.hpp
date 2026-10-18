@@ -6,7 +6,9 @@
 
 #include "sc2/app/ability.hpp"
 #include "sc2/app/spawn.hpp"
+#include "sc2/data/abil_charge.hpp"
 #include "sc2/data/catalog.hpp"
+#include "sc2/data/economy.hpp"
 #include "sc2/sim/ability_system.hpp"
 #include "sc2/sim/mule.hpp"
 #include "sc2/sim/world.hpp"
@@ -21,7 +23,7 @@ public:
 
     bool register_offensive(sim::World& world, const std::string& unit_id,
                             const std::string& abil_id) {
-        auto b = make_ability(*cat_, abil_id);
+        auto b = make_ability_ai(*cat_, abil_id);
         if (!b) return false;
         if (const auto* e = cat_->find("CAbil", abil_id); e && e->tag == "CAbilEffectInstant")
             return false;
@@ -58,7 +60,7 @@ public:
 
     bool register_selfcast(sim::World& world, const std::string& unit_id, const std::string& abil_id,
                            Fixed engage_range) {
-        auto b = make_ability(*cat_, abil_id);
+        auto b = make_ability_ai(*cat_, abil_id);
         if (!b) return false;
         const bool has_tree =
             !b->tree.empty() && b->tree_root >= 0 && b->tree_root < int32_t(b->tree.size());
@@ -74,12 +76,14 @@ public:
 
     bool register_support(sim::World& world, const std::string& unit_id, const std::string& abil_id,
                           Fixed range) {
-        auto b = make_ability(*cat_, abil_id);
+        auto b = make_ability_ai(*cat_, abil_id);
         if (!b) return false;
         const bool has_tree =
             !b->tree.empty() && b->tree_root >= 0 && b->tree_root < int32_t(b->tree.size());
         const sim::EffectKind eff_kind = has_tree ? b->tree[b->tree_root].kind : b->def.kind;
-        if (eff_kind != sim::EffectKind::CreateHealer && eff_kind != sim::EffectKind::Heal) return false;
+        const bool own_only_tree = b->from_effect_tree && b->target_rel_authored &&
+                                   (b->target_exc_rel & sim::kAffilEnemy) && !(b->target_exc_rel & sim::kAffilPlayer);
+        if (eff_kind != sim::EffectKind::CreateHealer && eff_kind != sim::EffectKind::Heal && !own_only_tree) return false;
         Entry e = book_entry(world, unit_id, *b);
         e.support = true;
         e.engage_range = range;
@@ -106,6 +110,21 @@ public:
         for (const Entry& e : autocast_entries(world, u.catalog_id))
             if (e.abil_id == abil_id) return autocast_on(unit, e.abil_id, e.autocast_default_on);
         return cat_->ability_autocast(abil_id).on_by_default;
+    }
+
+    float cooldown_fraction(const sim::World& world, std::uint32_t caster_id,
+                            const std::string& abil_id) const {
+        if (caster_id >= world.units().size() || abil_id.empty()) return 0.0f;
+        const std::string& unit_id = world.units()[caster_id].catalog_id;
+        if (unit_id.empty()) return 0.0f;
+        auto it = ondemand_.find(unit_id + '\x1f' + abil_id);
+        if (it == ondemand_.end()) return 0.0f;
+        const Entry& e = it->second;
+        if (e.slot < 0 || e.cooldown.raw() <= 0) return 0.0f;
+        const sim::Fixed left = world.ability_cooldown_left(caster_id, e.slot);
+        if (left.raw() <= 0) return 0.0f;
+        const float f = float(left.to_double() / e.cooldown.to_double());
+        return f > 1.0f ? 1.0f : f;
     }
 
     int run_autocast(sim::World& world, int player) {
@@ -170,7 +189,14 @@ public:
         const sim::Unit& c = world.units()[caster_id];
         const sim::Unit& t = world.units()[target_id];
         if (!c.alive || !t.alive) return false;
-        if (e->support) {
+        if (e->rel_authored) {
+            std::uint8_t rel = sim::kAffilEnemy;
+            if (caster_id == target_id) rel = sim::kAffilSelf;
+            else if (sim::World::is_neutral(t.player)) rel = sim::kAffilNeutral;
+            else if (t.player == c.player) rel = sim::kAffilPlayer;
+            else if (world.are_allied(c.player, t.player)) rel = sim::kAffilAlly;
+            if (e->exc_rel & rel) return false;
+        } else if (e->support) {
             if (t.player != c.player) return false;
         } else if (t.player == c.player && caster_id != target_id) {
             return false;
@@ -197,7 +223,20 @@ public:
             const Fixed reach = e->range + c.radius;
             if (dx * dx + dy * dy > reach * reach) return false;
         }
-        return abils_.try_cast_point(world, caster_id, e->slot, px, py);
+        static const bool no_pool = [] { const char* v = std::getenv("SC2_NO_CHARGE_POOL"); return v && v[0] == '1'; }();
+        const data::ChargeSpec ch = no_pool ? data::ChargeSpec{} : data::ability_cost_charge(*cat_, abil_id);
+        const bool pooled = ch.found && ch.location == "Player" && ch.count_max > 0.0;
+        const int32_t use = pooled ? std::max<int32_t>(1, int32_t(ch.count_use)) : 0;
+        auto ticks = [](double s) { return int(s * double(sim::World::kTicksPerSecond) + 0.5); };
+        const std::string link = ch.link.empty() ? abil_id : ch.link;
+        const int32_t start = ch.count_start > 0.0 ? int32_t(ch.count_start) : int32_t(ch.count_max);
+        if (pooled && world.charge_pool_count(c.player, link, start, int32_t(ch.count_max), ticks(ch.time_start),
+                                              ticks(ch.time_use)) < use)
+            return false;
+        if (!abils_.try_cast_point(world, caster_id, e->slot, px, py)) return false;
+        if (pooled)
+            world.charge_pool_take(c.player, link, start, int32_t(ch.count_max), ticks(ch.time_start), ticks(ch.time_use), use);
+        return true;
     }
 
     sim::AbilitySystem& system() { return abils_; }
@@ -216,12 +255,15 @@ private:
         bool support = false;
         sim::HealVital heal_vital = sim::HealVital::Life;
         Fixed engage_range;
+        sim::Fixed cooldown;
         std::string abil_id;
         bool autocast_default_on = false;
         std::vector<sim::VitalGate> autocast_caster_gates;
         std::vector<std::uint32_t> autocast_not_behaviors;
         bool requires_creep = false;
         bool requires_ground = false;
+        bool rel_authored = false;
+        std::uint8_t exc_rel = 0;
         bool requires_spawner = false;
     };
 
@@ -306,6 +348,7 @@ private:
         e.exc_attr = b.exc_attr_mask;
         e.req_energy = b.require_energy;
         e.requires_ground = b.requires_ground;
+        e.cooldown = b.cooldown;
         if (!b.tree.empty() && b.tree_root >= 0 && b.tree_root < int32_t(b.tree.size()))
             e.heal_vital = b.tree[b.tree_root].heal_vital;
         return e;
@@ -339,6 +382,17 @@ private:
             }
             b->def.spawn_proto = world.add_spawn_proto(std::move(proto));
         }
+        for (const auto& sp : b->tree_spawns)
+            if (sp.first >= 0 && sp.first < int32_t(b->tree.size()) && b->tree[std::size_t(sp.first)].spawn_proto < 0)
+                b->tree[std::size_t(sp.first)].spawn_proto = world.add_spawn_proto(make_unit(*cat_, sp.second, 0));
+        if (!b->tree_salvage.empty()) {
+            const data::UnitCost uc = data::unit_cost(*cat_, unit_id);
+            for (int32_t k : b->tree_salvage)
+                if (k >= 0 && k < int32_t(b->tree.size())) {
+                    b->tree[std::size_t(k)].mineral_cost = uc.minerals;
+                    b->tree[std::size_t(k)].gas_cost = uc.gas;
+                }
+        }
         Entry e = book_entry(world, unit_id, *b);
         e.requires_creep = b->spawn_requires_creep;
         e.requires_spawner = b->requires_spawner_target;
@@ -347,6 +401,10 @@ private:
         const sim::EffectKind kind = has_tree ? b->tree[b->tree_root].kind : b->def.kind;
         e.support = (kind == sim::EffectKind::Heal || kind == sim::EffectKind::CreateHealer ||
                      kind == sim::EffectKind::Inject);
+        if (b->from_effect_tree && b->target_rel_authored) {
+            e.rel_authored = true;
+            e.exc_rel = b->target_exc_rel;
+        }
         return &(ondemand_[key] = std::move(e));
     }
 

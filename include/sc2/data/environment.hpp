@@ -42,6 +42,9 @@ struct EnvLight {
 };
 
 EnvLight resolve_environment_light(const Catalog& cat, const std::string& tileset);
+EnvLight resolve_map_environment(const Catalog& cat, const std::string& tileset);
+void overlay_map_light(EnvLight& env, const std::vector<uint8_t>& light_xml);
+void overlay_map_terrain(EnvLight& env, const std::vector<uint8_t>& terrain_xml, const std::string& tileset);
 
 std::map<std::string, double> camera_params(const Catalog& cat, const std::string& camera_id);
 
@@ -49,6 +52,8 @@ struct TeamColor {
     int slot = -1;
     float diffuse[4] = {0, 0, 0, 1};
     float selected[4] = {0, 0, 0, 1};
+    float emissive[4] = {0, 0, 0, -1};
+    float attacked[4] = {1, 0, 0, 1};
 };
 
 std::vector<TeamColor> team_colors(const Catalog& cat);

@@ -16,8 +16,13 @@ inline std::string melee_camera_profile(const data::Catalog& cat) {
     return {};
 }
 
+inline std::string game_camera_profile(const data::Catalog& cat) {
+    if (cat.find("CCamera", "Dflt")) return "Dflt";
+    return melee_camera_profile(cat);
+}
+
 inline float melee_shadow_clip(const data::Catalog& cat) {
-    const std::string profile = melee_camera_profile(cat);
+    const std::string profile = game_camera_profile(cat);
     if (profile.empty()) return 0.0f;
     const std::map<std::string, double> params = data::camera_params(cat, profile);
     const auto it = params.find("ShadowClip");

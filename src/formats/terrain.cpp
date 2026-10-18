@@ -547,6 +547,46 @@ TextureInfo TextureInfo::parse(const std::vector<uint8_t>& d) {
     return ti;
 }
 
+VertexTint VertexTint::parse(const std::vector<uint8_t>& d) {
+    if (d.size() < 32 || d[0] != 'V' || d[1] != 'T' || d[2] != 'C' || d[3] != 'L')
+        throw std::runtime_error("terrain: not a VTCL t3VertCol");
+    auto f32 = [&d](size_t at) -> float {
+        uint32_t u = uint32_t(d[at]) | uint32_t(d[at + 1]) << 8 | uint32_t(d[at + 2]) << 16 |
+                     uint32_t(d[at + 3]) << 24;
+        float v;
+        std::memcpy(&v, &u, 4);
+        return v;
+    };
+    auto u32 = [&d](size_t at) -> uint32_t {
+        return uint32_t(d[at]) | uint32_t(d[at + 1]) << 8 | uint32_t(d[at + 2]) << 16 |
+               uint32_t(d[at + 3]) << 24;
+    };
+    VertexTint vt;
+    vt.version = u32(4);
+    const uint32_t count = u32(8);
+    if (size_t(count) * 36u > d.size()) throw std::runtime_error("terrain: VTCL record count too large");
+    vt.patches.reserve(count);
+    size_t off = 32;
+    for (uint32_t i = 0; i < count; ++i) {
+        if (off + 36 > d.size()) throw std::runtime_error("terrain: VTCL record past the end");
+        VertexTint::Patch p;
+        p.key = u32(off);
+        p.kind = u32(off + 4);
+        p.x0 = f32(off + 8);
+        p.y0 = f32(off + 12);
+        p.x1 = f32(off + 16);
+        p.y1 = f32(off + 20);
+        const uint32_t n = u32(off + 32);
+        off += 36;
+        if (off + n > d.size()) throw std::runtime_error("terrain: VTCL record body past the end");
+        p.data.assign(d.begin() + ptrdiff_t(off), d.begin() + ptrdiff_t(off + n));
+        off += n;
+        vt.patches.push_back(std::move(p));
+    }
+    if (off != d.size()) throw std::runtime_error("terrain: VTCL did not consume the file exactly");
+    return vt;
+}
+
 TextureMask TextureMask::parse(const std::vector<uint8_t>& d) {
     if (d.size() < 20 || d[0] != 'M' || d[1] != 'A' || d[2] != 'S' || d[3] != 'K')
         throw std::runtime_error("terrain: not a MASK t3TextureMasks");
@@ -574,13 +614,14 @@ TextureMask TextureMask::parse(const std::vector<uint8_t>& d) {
 
 uint8_t TextureMask::layer_weight(uint32_t layer, uint32_t x, uint32_t y) const {
     if (layer >= 8 || x >= mask_w || !planar_ok()) return 0;
-    const uint32_t qw = quad_w(), qh = quad_h();
+    const uint32_t qh = quad_h();
     if (y >= qh * 64) return 0;
     const uint32_t bx = x >> 1;
-    const uint32_t qx = bx >> 6, qy = y >> 6;
-    const uint32_t tX = (bx >> 5) & 1, tY = (y >> 5) & 1;
+    const uint32_t cols = (mask_w / 2 + 31) / 32;
+    const uint32_t cx = bx >> 5, qy = y >> 6;
+    const uint32_t tY = (y >> 5) & 1;
     const uint32_t px = bx & 31, py = y & 31;
-    const size_t tile = ((size_t(layer) * qh + qy) * qw + qx) * 4 + tX * 2 + tY;
+    const size_t tile = ((size_t(layer) * qh + qy) * cols + cx) * 2 + tY;
     const size_t off = tile * 1024 + py * 32 + px;
     if (off >= texels.size()) return 0;
     const uint8_t b = texels[off];

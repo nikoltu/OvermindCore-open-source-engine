@@ -45,17 +45,40 @@ void StringTable::load(const std::vector<uint8_t>& bytes) {
     load_text(std::string(bytes.begin(), bytes.end()));
 }
 
-std::string StringTable::resolve(const std::string& ref) const {
-    std::string key;
-    if (starts_with(ref, "@Text/"))
-        key = ref.substr(6);
-    else if (starts_with(ref, "@@"))
-        key = ref.substr(2);
-    else if (!ref.empty() && ref[0] == '@')
-        key = ref.substr(1);
-    else
-        key = ref;
+static std::string strip_ref_prefix(const std::string& ref, int* depth) {
+    if (starts_with(ref, "@Text/")) {
+        *depth = 1;
+        return ref.substr(6);
+    }
+    if (ref.empty() || ref[0] != '@') {
+        *depth = 0;
+        return ref;
+    }
+    std::size_t n = 0;
+    while (n < ref.size() && n < 3 && ref[n] == '@') ++n;
+    *depth = int(n);
+    return ref.substr(n);
+}
 
+std::string StringTable::resolve(const std::string& ref) const {
+    int depth = 0;
+    const std::string key = strip_ref_prefix(ref, &depth);
+    auto it = map_.find(key);
+    return (it != map_.end()) ? it->second : ref;
+}
+
+std::string StringTable::resolve(const std::string& ref, const std::string& race,
+                                 const std::string& skin) const {
+    int depth = 0;
+    const std::string key = strip_ref_prefix(ref, &depth);
+    if (depth >= 3 && !skin.empty()) {
+        auto it = map_.find(key + "_" + skin);
+        if (it != map_.end()) return it->second;
+    }
+    if (depth >= 2 && !race.empty()) {
+        auto it = map_.find(key + "_" + race);
+        if (it != map_.end()) return it->second;
+    }
     auto it = map_.find(key);
     return (it != map_.end()) ? it->second : ref;
 }

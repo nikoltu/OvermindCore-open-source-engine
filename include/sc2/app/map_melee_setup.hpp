@@ -7,6 +7,7 @@
 #include <cstdlib>
 #include <utility>
 
+#include <cstdio>
 #include <string>
 #include <vector>
 
@@ -124,8 +125,35 @@ inline MapMeleeStarts map_melee_starts_corner_layout(const formats::LoadedMap& m
     return {s0x, s0y, s1x, s1y, (minx + maxx) / 2, (miny + maxy) / 2};
 }
 
+inline bool map_startless_halls(const formats::LoadedMap& map) {
+    return std::getenv("SC2_STARTLESS_HALLS") != nullptr && map.objects.start_locations.size() < 2 &&
+           map.info.has_playable_area();
+}
+
 inline MapMeleeStarts map_melee_starts(const formats::LoadedMap& map, std::uint64_t start_seed = 0) {
     MapMeleeStarts st = map_melee_starts_corner_layout(map);
+    if (map_startless_halls(map)) {
+        st.s0x = int(map.info.playable_x0) + 6;
+        st.s0y = int(map.info.playable_y0) + 6;
+        st.s1x = int(map.info.playable_x1) - 6;
+        st.s1y = int(map.info.playable_y1) - 6;
+        const std::string spec = std::getenv("SC2_STARTLESS_HALLS");
+        const std::size_t semi = spec.find(';');
+        if (spec.find(',') != std::string::npos) {
+            const std::string part[2] = {spec.substr(0, semi), semi == std::string::npos ? std::string("-") : spec.substr(semi + 1)};
+            for (int side = 0; side < 2; ++side) {
+                float x = 0.0f, y = 0.0f;
+                if (std::sscanf(part[side].c_str(), "%f,%f", &x, &y) != 2) continue;
+                (side ? st.s1x : st.s0x) = int(std::floor(x));
+                (side ? st.s1y : st.s0y) = int(std::floor(y));
+            }
+        }
+        return st;
+    }
+    if (std::getenv("SC2_START_SWAP")) {
+        std::swap(st.s0x, st.s1x);
+        std::swap(st.s0y, st.s1y);
+    }
     if (start_seed == 0) return st;
     std::uint64_t z = start_seed + 0xD1B54A32D192ED03ull;
     z = (z ^ (z >> 30)) * 0xBF58476D1CE4E5B9ull;
@@ -280,7 +308,8 @@ inline MeleeSetup melee_setup_for_map(const formats::LoadedMap& map, const data:
         p.army_gas_cost = mcost.gas;
         p.army_build_time = secs("Marine", 18);
         p.army_threshold = 5;
-        p.wave_phases = {{10, 425}, {14, 336}, {18, 290}, {30, 279}};
+        for (int t = 0; t < 5; ++t) p.wave_ladders[std::size_t(t)] = low_tier_wave_ladder(0, t);
+        p.wave_phases = low_tier_wave_ladder(0, 2);
         if (const std::vector<std::string>* r = side == 0 ? researched_p0 : researched_p1;
             up && r && !r->empty()) {
             apply_unit_upgrades(cat, *up, "Marine", *r, p.army_unit);

@@ -19,7 +19,13 @@ inline bool footprint_clear_of_blockers(const World& world, const TerrainMap& te
         if (u.id == builder) continue;
         int ucx, ucy;
         terrain.to_cell(u.x, u.y, ucx, ucy);
-        if (!(ucx >= cx0 && ucx < cx0 + fw && ucy >= cy0 && ucy < cy0 + fh)) continue;
+        bool inside = ucx >= cx0 && ucx < cx0 + fw && ucy >= cy0 && ucy < cy0 + fh;
+        if (!inside && u.speed.raw() == 0 && !u.flying)
+            for (const std::pair<int16_t, int16_t>& o : u.footprint_offsets) {
+                const int bx = ucx + o.first, by = ucy + o.second;
+                if (bx >= cx0 && bx < cx0 + fw && by >= cy0 && by < cy0 + fh) { inside = true; break; }
+            }
+        if (!inside) continue;
         if (gas_exempt && u.is_gas && u.resource_left > 0) {
             if (saw_gas) *saw_gas = true;
             continue;

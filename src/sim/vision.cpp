@@ -42,7 +42,10 @@ void VisionGrid::compute(const World& world, int32_t player, Fixed sight_radius,
         if (!u.alive || u.player != player) continue;
 
         const Fixed sr = u.sight.raw() > 0 ? u.sight : sight_radius;
-        const int64_t r2 = int64_t(sr.raw()) * int64_t(sr.raw());
+        const Fixed reach = sr + half;
+        const int64_t r2 = int64_t(reach.raw()) * int64_t(reach.raw());
+        const Fixed eye_x = bounds_.min_x + cell_ * Fixed::from_int(((u.x - bounds_.min_x) / cell_).floor()) + half;
+        const Fixed eye_y = bounds_.min_y + cell_ * Fixed::from_int(((u.y - bounds_.min_y) / cell_).floor()) + half;
 
         constexpr Fixed kOverCliffVisionHeight = Fixed::from_int(15);
         const bool sees_over_cliffs =
@@ -50,10 +53,10 @@ void VisionGrid::compute(const World& world, int32_t player, Fixed sight_radius,
         const std::uint8_t viewer_level =
             sees_over_cliffs ? std::uint8_t(0xFF) : (terrain ? terrain->level_at(u.x, u.y) : 0);
 
-        int ix0 = ((u.x - sr - bounds_.min_x) / cell_).floor();
-        int ix1 = ((u.x + sr - bounds_.min_x) / cell_).floor();
-        int iy0 = ((u.y - sr - bounds_.min_y) / cell_).floor();
-        int iy1 = ((u.y + sr - bounds_.min_y) / cell_).floor();
+        int ix0 = ((eye_x - reach - bounds_.min_x) / cell_).floor();
+        int ix1 = ((eye_x + reach - bounds_.min_x) / cell_).floor();
+        int iy0 = ((eye_y - reach - bounds_.min_y) / cell_).floor();
+        int iy1 = ((eye_y + reach - bounds_.min_y) / cell_).floor();
         if (ix0 < 0) ix0 = 0;
         if (iy0 < 0) iy0 = 0;
         if (ix1 >= w_) ix1 = w_ - 1;
@@ -61,10 +64,10 @@ void VisionGrid::compute(const World& world, int32_t player, Fixed sight_radius,
 
         for (int cy = iy0; cy <= iy1; ++cy) {
             Fixed centre_y = bounds_.min_y + cell_ * Fixed::from_int(cy) + half;
-            int64_t dy = int64_t((centre_y - u.y).raw());
+            int64_t dy = int64_t((centre_y - eye_y).raw());
             for (int cx = ix0; cx <= ix1; ++cx) {
                 Fixed centre_x = bounds_.min_x + cell_ * Fixed::from_int(cx) + half;
-                int64_t dx = int64_t((centre_x - u.x).raw());
+                int64_t dx = int64_t((centre_x - eye_x).raw());
                 if (dx * dx + dy * dy > r2) continue;
                 if (terrain) {
                     int tx, ty;

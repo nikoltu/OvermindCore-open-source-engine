@@ -5,6 +5,7 @@
 #include <string>
 
 #include "sc2/ai/build_orders.hpp"
+#include "sc2/ai/hd_builds.hpp"
 #include "sc2/app/map_melee_setup.hpp"
 #include "sc2/app/sandbox_game.hpp"
 #include "sc2/sim/weapon.hpp"
@@ -99,9 +100,9 @@ inline void apply_race_costs(MeleePlayerSetup& p, const data::Catalog& cat, Race
     p.army_build_time = secs(u.army, 18);
     p.army_count = prod.train_count(u.army);
     p.army_threshold = 5;
-    p.wave_phases = r == Race::Terran    ? std::vector<std::pair<int, int>>{{10, 425}, {14, 336}, {18, 290}, {30, 279}}
-                    : r == Race::Protoss ? std::vector<std::pair<int, int>>{{6, 445}, {11, 371}, {10, 292}, {16, 268}}
-                                         : std::vector<std::pair<int, int>>{{20, 413}, {19, 367}, {23, 313}, {39, 278}};
+    const int race_ix = r == Race::Terran ? 0 : r == Race::Protoss ? 1 : 2;
+    for (int t = 0; t < 5; ++t) p.wave_ladders[std::size_t(t)] = low_tier_wave_ladder(race_ix, t);
+    p.wave_phases = low_tier_wave_ladder(race_ix, 2);
     const data::UnitCost hcost = data::unit_cost(cat, u.hall);
     p.town_hall_mineral_cost = hcost.minerals > 0 ? hcost.minerals : 300;
     p.town_hall_build_time = secs(u.hall, 100);
@@ -114,13 +115,10 @@ inline void apply_race_costs(MeleePlayerSetup& p, const data::Catalog& cat, Race
     p.has_tech = true;
 
     {
-        int n = 0;
-        const ai::StockEntry* rows = ai::stock_open_timing(r == Race::Protoss ? "protoss" : r == Race::Zerg ? "zerg" : "terran", n);
-        p.stock.clear();
-        for (int i = 0; i < n; ++i) {
+        auto classify = [&](const char* unit_id, int count) {
             ai::StockStep st;
-            st.id = rows[i].unit;
-            st.count = rows[i].count;
+            st.id = unit_id;
+            st.count = count;
             const std::string& id = st.id;
             const bool gas = id == "Refinery" || id == "Assimilator" || id == "Extractor";
             const bool addon = id.find("TechLab") != std::string::npos || id.find("Reactor") != std::string::npos;
@@ -155,7 +153,28 @@ inline void apply_race_costs(MeleePlayerSetup& p, const data::Catalog& cat, Race
                     }
                 }
             }
-            p.stock.push_back(std::move(st));
+            return st;
+        };
+        int n = 0;
+        const ai::StockEntry* rows = ai::stock_open_timing(r == Race::Protoss ? "protoss" : r == Race::Zerg ? "zerg" : "terran", n);
+        p.stock.clear();
+        for (int i = 0; i < n; ++i) p.stock.push_back(classify(rows[i].unit, rows[i].count));
+        p.race_index = r == Race::Protoss ? 1 : r == Race::Zerg ? 2 : 0;
+        p.hd_openings.clear();
+        p.hd_mids.clear();
+        if (const ai::hd::RaceTables* t = ai::hd::tables(p.race_index)) {
+            auto convert = [&](const ai::hd::Build& b) {
+                MeleePlayerSetup::HdBuildSteps h;
+                h.id = b.id;
+                h.style = b.style;
+                h.deadline_s = b.deadline_s;
+                for (int i = 0; i < b.n_rows; ++i) h.stock.push_back(classify(b.rows[i].unit, b.rows[i].count));
+                return h;
+            };
+            for (int i = 0; i < t->n_openings; ++i) p.hd_openings.push_back(convert(t->openings[i]));
+            for (int i = 0; i < t->n_mids; ++i) p.hd_mids.push_back(convert(t->mids[i]));
+            p.hd_lates.clear();
+            for (int i = 0; i < t->n_lates; ++i) p.hd_lates.push_back(convert(t->lates[i]));
         }
     }
 
@@ -258,6 +277,8 @@ inline MeleeSetup melee_setup_for_map(const formats::LoadedMap& map, const data:
     prod.build(cat);
 
     MeleeSetup s;
+    for (const auto& pu : map.objects.units)
+        if (pu.variation >= 0) s.placed_variations.push_back({pu.unit_type, double(pu.x), double(pu.y), pu.variation});
     const Race races[2] = {r0, r1};
     std::vector<char> consumed(map.objects.units.size(), 0);
     for (int side = 0; side < 2; ++side) {
@@ -267,6 +288,16 @@ inline MeleeSetup melee_setup_for_map(const formats::LoadedMap& map, const data:
         MeleePlayerSetup p = map_melee_player(pr, sx, sy, st.cx, st.cy,
                                               worker_count >= 0 ? worker_count : pr.worker_count, patches);
         snap_base_to_real_resources(map, cat, sx, sy, p, consumed);
+        if (std::getenv("SC2_ENV_TRACE"))
+            std::fprintf(stderr, "start: side %d cell %d,%d hall at %.2f,%.2f\n", side, sx, sy, p.start.x.to_double(), p.start.y.to_double());
+        if (map_startless_halls(map)) {
+            p.mineral_positions.clear();
+            p.mineral_protos.clear();
+            p.geyser_positions.clear();
+            p.geyser_protos.clear();
+            p.worker_count = 0;
+            p.start_extras.clear();
+        }
         apply_race_costs(p, cat, r, prod);
         s.players.push_back(p);
     }
@@ -290,6 +321,8 @@ inline MeleeSetup melee_setup_for_map(const formats::LoadedMap& map, const data:
                 n.is_gas = gas;
                 n.speed = Fixed();
             } else {
+                if (std::getenv("SC2_PLACED_DROP_TRACE") && !cat.find("CUnit", u.unit_type))
+                    std::fprintf(stderr, "[placed-unknown] %s at (%.2f, %.2f) player %d\n", u.unit_type.c_str(), u.x, u.y, u.player);
                 try {
                     n = make_unit(cat, u.unit_type, -1);
                 } catch (const std::exception&) {
@@ -302,7 +335,7 @@ inline MeleeSetup melee_setup_for_map(const formats::LoadedMap& map, const data:
             n.player = u.player > 0 ? u.player - 1 : -1;
             n.alive = true;
             s.neutral_facing.push_back(placed_facing(
-                (n.attributes & sim::kAttrStructure) != 0, gas || min || n.resource_left > 0,
+                (n.attributes & sim::kAttrStructure) != 0 && !n.flying, gas || min || n.resource_left > 0,
                 u.rotation, cat.unit_facing_radians(n.catalog_id)));
             s.neutrals.push_back(std::move(n));
         }

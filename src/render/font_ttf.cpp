@@ -192,12 +192,12 @@ int OverlayFont::raw_advance_units(char ch) const {
 
 int OverlayFont::ascent_px(int pixel_height) const {
     if (!valid_ || pixel_height <= 0) return 0;
-    return int(std::lround(double(ascent_) * pixel_height / units_per_em_));
+    return int(std::lround(double(ascent_) * height_px(pixel_height) / units_per_em_));
 }
 
 int OverlayFont::line_height_px(int pixel_height) const {
     if (!valid_ || pixel_height <= 0) return 0;
-    long h = std::lround(double(ascent_ - descent_ + line_gap_) * pixel_height / units_per_em_);
+    long h = std::lround(double(ascent_ - descent_ + line_gap_) * height_px(pixel_height) / units_per_em_);
     return int(h);
 }
 
@@ -336,7 +336,7 @@ const GlyphBitmap& OverlayFont::glyph(char ch, int pixel_height) const {
     if (!valid_ || pixel_height <= 0) return raster_cache_.emplace(key, std::move(bmp)).first->second;
 
     std::uint16_t gid = glyph_id(std::uint32_t(key_ch));
-    const double scale = double(pixel_height) / units_per_em_;
+    const double scale = height_px(pixel_height) / units_per_em_;
     bmp.advance = int(std::lround(advance_units(gid) * scale));
 
     const Outline& ol = outline(gid);

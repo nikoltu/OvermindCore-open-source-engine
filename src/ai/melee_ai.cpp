@@ -74,6 +74,7 @@ void MeleeAI::run_workers(sim::World& w) {
         Unit& u = w.unit(id);
         if (!u.alive || u.player != player_ || !u.is_worker) continue;
         if (id == scout_) continue;
+        if (w.worker_committed(id)) continue;
         if (u.orders.empty()) {
             if (!live_node(u.gather_target)) {
                 u.home_depot = base_.depot;
@@ -109,7 +110,8 @@ void MeleeAI::run_production(sim::World& w) {
         base_.producer = sim::kNoTarget;
         if (producer_pending_) {
             for (const Unit& u : w.units()) {
-                if (u.alive && u.player == player_ && u.speed.raw() == 0 &&
+                if (u.alive && u.player == player_ && u.speed.raw() == 0 && !u.constructing &&
+                    (producer_id_.empty() || u.catalog_id == producer_id_) &&
                     u.id != base_.depot) {
                     base_.producer = u.id;
                     producer_pending_ = false;
@@ -120,10 +122,10 @@ void MeleeAI::run_production(sim::World& w) {
         if (base_.producer == sim::kNoTarget) {
             if (cfg_.has_producer && !producer_pending_ && !stock_active() &&
                 base_.depot < w.units().size() && afford(w, cfg_.producer_unit)) {
-                if (w.queue_train(base_.depot, cfg_.producer_unit.proto,
-                                  cfg_.producer_unit.minerals, cfg_.producer_unit.gas,
-                                  cfg_.producer_unit.build_time))
+                if (make_item(w, base_.depot, cfg_.producer_unit)) {
                     producer_pending_ = true;
+                    if (cfg_.worker_builds) producer_id_ = cfg_.producer_unit.proto.catalog_id;
+                }
             }
             return;
         }
@@ -158,8 +160,7 @@ void MeleeAI::run_production(sim::World& w) {
                 w.begin_morph(base_.depot, idx, tb.build_time);
                 return;
             }
-            if (afford(w, tb) &&
-                w.queue_train(base_.depot, tb.proto, tb.minerals, tb.gas, tb.build_time))
+            if (afford(w, tb) && make_item(w, base_.depot, tb))
                 return;
             break;
         }
@@ -172,9 +173,7 @@ void MeleeAI::run_production(sim::World& w) {
             const bool morph_at_hall = base_.depot < w.units().size() &&
                                        w.unit(base_.depot).spawner_proto >= 0 &&
                                        cfg_.supply_unit.proto.speed.raw() > 0;
-            w.queue_train(morph_at_hall ? base_.depot : base_.producer, cfg_.supply_unit.proto,
-                          cfg_.supply_unit.minerals, cfg_.supply_unit.gas,
-                          cfg_.supply_unit.build_time);
+            make_item(w, morph_at_hall ? base_.depot : base_.producer, cfg_.supply_unit);
             return;
         }
     }
@@ -189,7 +188,7 @@ void MeleeAI::run_production(sim::World& w) {
                                    w.unit(base_.depot).spawner_proto >= 0 &&
                                    item.proto.speed.raw() > 0;
         const uint32_t train_from = morph_at_hall ? base_.depot : base_.producer;
-        if (w.queue_train(train_from, item.proto, item.minerals, item.gas, item.build_time, item.count)) {
+        if (make_item(w, train_from, item)) {
             if (in_order) ++build_idx_;
             else if (cfg_.has_army_unit2) army_alt_ = !army_alt_;
         }
@@ -229,6 +228,8 @@ void MeleeAI::run_army(sim::World& w) {
         if (wave_phase_start_tick_ < 0) wave_phase_start_tick_ = w.tick();
         const bool elapsed = w.tick() - wave_phase_start_tick_ >= ph.attack_duration_s * sim::World::kTicksPerSecond;
         launch_at = elapsed ? std::max(1, desired / 2) : desired;
+        const int since_combat = w.tick() - w.player(player_).last_combat_tick;
+        if (count > 0 && since_combat >= (600 - 2 * count) * sim::World::kTicksPerSecond) launch_at = std::min(launch_at, count);
     }
     if (!attacking_ && count >= launch_at) {
         int32_t enemy = -1;
@@ -380,7 +381,156 @@ int MeleeAI::owned_or_pending(const sim::World& w, const std::string& id) const 
     int n = 0;
     for (const Unit& u : w.units())
         if (u.alive && u.player == player_ && u.catalog_id == id) ++n;
+    for (const SiteBuild& sb : site_builds_)
+        if (sb.id == id) ++n;
     return n + w.pending_of_type(player_, id);
+}
+
+void MeleeAI::prune_site_builds(const sim::World& w) {
+    for (std::size_t i = 0; i < site_builds_.size();) {
+        const uint32_t b = site_builds_[i].builder;
+        const bool live = b < w.units().size() && w.units()[b].alive && w.worker_committed(b) &&
+                          w.units()[b].construct_target == sim::kNoTarget;
+        if (live) ++i;
+        else site_builds_.erase(site_builds_.begin() + long(i));
+    }
+}
+
+bool MeleeAI::make_item(sim::World& w, uint32_t from, const BuildItem& item) {
+    if (cfg_.worker_builds && item.proto.speed.raw() == 0 && !item.morph_self && !item.addon_self)
+        return place_structure(w, item);
+    if (w.queue_train(from, item.proto, item.minerals, item.gas, item.build_time, item.count)) return true;
+    if (!cfg_.worker_builds || item.proto.speed.raw() == 0 || from == base_.depot) return false;
+    const std::size_t U = w.units().size();
+    std::vector<std::pair<int32_t, uint32_t>> others;
+    for (uint32_t id = 0; id < U; ++id) {
+        const Unit& u = w.unit(id);
+        if (!u.alive || u.player != player_ || u.speed.raw() != 0 || u.constructing || u.flying) continue;
+        if (id == from || id == base_.depot || u.is_gas || u.addon_body_kind != 0) continue;
+        others.push_back({w.queue_count(id), id});
+    }
+    std::sort(others.begin(), others.end());
+    for (const std::pair<int32_t, uint32_t>& o : others)
+        if (w.queue_train(o.second, item.proto, item.minerals, item.gas, item.build_time, item.count)) return true;
+    return false;
+}
+
+bool MeleeAI::place_structure(sim::World& w, const BuildItem& item) {
+    const std::size_t U = w.units().size();
+    if (base_.depot >= U || !w.unit(base_.depot).alive) return false;
+    const Fixed hx = w.unit(base_.depot).x, hy = w.unit(base_.depot).y;
+    auto nearest_builder = [&](Fixed x, Fixed y) {
+        uint32_t best = sim::kNoTarget;
+        Fixed best_d2;
+        for (uint32_t id = 0; id < U; ++id) {
+            const Unit& u = w.unit(id);
+            if (!u.alive || u.player != player_ || !u.is_worker || u.loaded || id == scout_) continue;
+            if (w.worker_committed(id)) continue;
+            const Fixed dx = u.x - x, dy = u.y - y;
+            const Fixed d2 = dx * dx + dy * dy;
+            if (best == sim::kNoTarget || d2 < best_d2) { best = id; best_d2 = d2; }
+        }
+        return best;
+    };
+    if (item.proto.requires_vespene) {
+        uint32_t node = sim::kNoTarget;
+        Fixed node_d2;
+        for (uint32_t id = 0; id < U; ++id) {
+            const Unit& g = w.unit(id);
+            if (!g.alive || !g.is_gas || g.resource_left <= 0 || g.player >= 0) continue;
+            const Fixed dx = g.x - hx, dy = g.y - hy;
+            const Fixed d2 = dx * dx + dy * dy;
+            if (d2 > Fixed::from_int(14 * 14)) continue;
+            if (node == sim::kNoTarget || d2 < node_d2) { node = id; node_d2 = d2; }
+        }
+        if (node == sim::kNoTarget) return false;
+        const Fixed gx = w.unit(node).x, gy = w.unit(node).y;
+        const uint32_t builder = nearest_builder(gx, gy);
+        if (builder == sim::kNoTarget) return false;
+        Unit proto = item.proto;
+        proto.player = player_;
+        proto.is_gas = true;
+        proto.resource_left = w.unit(node).resource_left;
+        if (!w.issue_worker_build(builder, gx, gy, proto, item.minerals, item.gas, item.build_time,
+                                  Fixed::from_int(2), w.unit(builder).build_verb))
+            return false;
+        w.unit(node).resource_left = 0;
+        site_builds_.push_back({item.proto.catalog_id, builder});
+        return true;
+    }
+    Fixed mx, my;
+    bool has_mineral = false;
+    if (base_.mineral < U && w.unit(base_.mineral).alive) {
+        mx = w.unit(base_.mineral).x - hx;
+        my = w.unit(base_.mineral).y - hy;
+        has_mineral = true;
+    }
+    const uint32_t builder = nearest_builder(hx, hy);
+    if (builder == sim::kNoTarget) return false;
+    Unit proto = item.proto;
+    proto.player = player_;
+    const Fixed item_h = item.proto.footprint_offsets.empty() ? item.proto.radius : w.site_half_extent(item.proto);
+    auto boxes_meet = [](Fixed ax, Fixed ay, Fixed ah, Fixed bx, Fixed by, Fixed bh) {
+        const Fixed dx = ax > bx ? ax - bx : bx - ax, dy = ay > by ? ay - by : by - ay;
+        return dx < ah + bh && dy < ah + bh;
+    };
+    auto slot_conflict = [&](Fixed x, Fixed y) {
+        const Fixed one = Fixed::from_int(1);
+        for (const Unit& o : w.units()) {
+            if (!o.alive || o.speed.raw() != 0 || o.flying) continue;
+            if (o.player == player_ && o.addon_slot_host) {
+                Fixed sx, sy;
+                sim::World::addon_slot(o.x, o.y, sx, sy);
+                if (boxes_meet(x, y, item_h, sx, sy, one)) return true;
+            }
+            if (item.proto.addon_slot_host) {
+                Fixed sx, sy;
+                sim::World::addon_slot(x, y, sx, sy);
+                if (boxes_meet(sx, sy, one, o.x, o.y, w.site_half_extent(o))) return true;
+            }
+        }
+        return false;
+    };
+    const int r0 = int((w.unit(base_.depot).radius + item.proto.radius).to_double()) + 2;
+    for (int r = r0; r <= r0 + 14; ++r) {
+        for (int dy = -r; dy <= r; ++dy)
+            for (int dx = -r; dx <= r; ++dx) {
+                if (dx != -r && dx != r && dy != -r && dy != r) continue;
+                if ((dx & 1) || (dy & 1)) continue;
+                if (has_mineral && (Fixed::from_int(dx) * mx + Fixed::from_int(dy) * my).raw() > 0) continue;
+                const Fixed x = hx + Fixed::from_int(dx), y = hy + Fixed::from_int(dy);
+                if (x.raw() <= 0 || y.raw() <= 0) continue;
+                if (slot_conflict(x, y)) continue;
+                if (w.issue_worker_build(builder, x, y, proto, item.minerals, item.gas, item.build_time,
+                                         Fixed::from_int(2), w.unit(builder).build_verb)) {
+                    site_builds_.push_back({item.proto.catalog_id, builder});
+                    return true;
+                }
+            }
+    }
+    return false;
+}
+
+void MeleeAI::run_gas(sim::World& w) {
+    if (!cfg_.worker_builds || cfg_.gas_peons_per_geyser <= 0) return;
+    const std::size_t U = w.units().size();
+    for (uint32_t g = 0; g < U; ++g) {
+        const Unit& gs = w.unit(g);
+        if (!gs.alive || gs.player != player_ || !gs.is_gas || gs.constructing || gs.resource_left <= 0) continue;
+        int crew = 0;
+        for (const Unit& u : w.units())
+            if (u.alive && u.player == player_ && u.is_worker && u.gathers_gas && u.gather_target == g) ++crew;
+        for (uint32_t id = 0; id < U && crew < cfg_.gas_peons_per_geyser; ++id) {
+            Unit& u = w.unit(id);
+            if (!u.alive || u.player != player_ || !u.is_worker || u.gathers_gas || u.loaded) continue;
+            if (id == scout_ || w.worker_committed(id)) continue;
+            u.gathers_gas = true;
+            u.home_depot = base_.depot;
+            u.gather_target = g;
+            w.issue(id, Order{OrderType::Gather, Fixed(), Fixed(), sim::kNoTarget});
+            ++crew;
+        }
+    }
 }
 
 void MeleeAI::run_stock(sim::World& w) {
@@ -404,9 +554,10 @@ void MeleeAI::run_stock(sim::World& w) {
         else if (s.kind == StockKind::Supply) from = s.item.proto.speed.raw() > 0 && larva_hall ? base_.depot : (hall_ok ? base_.depot : sim::kNoTarget);
         else if (s.kind == StockKind::Army) from = larva_hall && s.item.proto.speed.raw() > 0 ? base_.depot : (prod_ok ? base_.producer : sim::kNoTarget);
         if (from == sim::kNoTarget) return;
-        if (w.queue_train(from, s.item.proto, s.item.minerals, s.item.gas, s.item.build_time, s.item.count) &&
-            s.kind == StockKind::Producer && base_.producer == sim::kNoTarget)
+        if (make_item(w, from, s.item) && s.kind == StockKind::Producer && base_.producer == sim::kNoTarget) {
             producer_pending_ = true;
+            if (cfg_.worker_builds) producer_id_ = s.item.proto.catalog_id;
+        }
         return;
     }
 }
@@ -490,7 +641,9 @@ void MeleeAI::run_scout(sim::World& w) {
 
 void MeleeAI::update(sim::World& w) {
     run_scout(w);
+    prune_site_builds(w);
     run_workers(w);
+    run_gas(w);
     run_stock(w);
     run_production(w);
     run_expansion(w);

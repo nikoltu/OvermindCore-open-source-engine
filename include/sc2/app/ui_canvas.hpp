@@ -4,7 +4,7 @@
 
 namespace sc2::app {
 
-inline constexpr float kRefHeight = 1080.0f;
+inline constexpr float kRefHeight = 1200.0f;
 
 inline constexpr float kAspectBands[] = {1.33f, 1.4f, 1.44f, 1.5f, 1.51f, 1.6f, 1.7f, 1.75f, 1.77f};
 inline constexpr int kAspectBandCount = int(sizeof(kAspectBands) / sizeof(kAspectBands[0]));

@@ -1,7 +1,7 @@
 cmake_minimum_required(VERSION 3.16)
 project(sc2engine VERSION 0.0.1 LANGUAGES CXX)
 
-set(SC2_ENGINE_BUILD "408")
+set(SC2_ENGINE_BUILD "617")
 set(SC2_ENGINE_STAGE "pre-alfa")
 configure_file(include/sc2/core/version.hpp.in
                ${CMAKE_BINARY_DIR}/generated/sc2/core/version.hpp @ONLY)
@@ -45,6 +45,19 @@ add_library(sc2core STATIC
     ${EMBED_OUT}/emblem.dds.h
     ${EMBED_OUT}/emblem_sm.dds.h
     src/app/shell_emblem.cpp
+    src/app/shell_ui.cpp
+    src/app/shell_widgets.cpp
+    src/app/shell_chrome.cpp
+    src/app/shell_screens_home.cpp
+    src/app/shell_screens_setup.cpp
+    src/app/shell_screens_loading.cpp
+    src/app/shell_screens_result.cpp
+    src/app/shell_screens_settings.cpp
+    src/app/shell_screens_profile.cpp
+    src/app/shell_screens_replays.cpp
+    src/app/shell_screens_about.cpp
+    src/app/shell_screens_widgets.cpp
+    src/app/portrait_catalog.cpp
   src/core/inflate.cpp
   src/core/xml.cpp
   src/formats/m3.cpp
@@ -105,6 +118,12 @@ add_library(sc2core STATIC
   src/app/hud.cpp
   src/app/hud_render.cpp
   src/app/hud_layout.cpp
+  src/app/hud_buttons.cpp
+  src/app/hud_menu_ui.cpp
+  src/app/hud_minimap_ui.cpp
+  src/app/hud_selection_ui.cpp
+  src/app/hud_topbar_ui.cpp
+  src/app/hud_chat_ui.cpp
   src/app/ui_layout_source.cpp
   src/app/console_panel.cpp
   src/app/menu.cpp
@@ -155,7 +174,7 @@ find_package(Vulkan COMPONENTS glslc QUIET)
 if(Vulkan_FOUND AND Vulkan_GLSLC_EXECUTABLE)
   set(SHADER_OUT ${CMAKE_BINARY_DIR}/shaders)
   file(MAKE_DIRECTORY ${SHADER_OUT})
-  foreach(shader mesh.vert mesh.frag scene.vert scene.frag terrain_splat.frag shadow.vert particle.vert particle.frag overlay.vert overlay.frag tonemap.frag)
+  foreach(shader mesh.vert mesh.frag scene.vert scene.frag terrain_splat.frag shadow.vert shadow.frag particle.vert particle.frag overlay.vert overlay.frag tonemap.frag ssao.frag bloom.frag)
     add_custom_command(
       OUTPUT ${SHADER_OUT}/${shader}.spv.h
       COMMAND ${Vulkan_GLSLC_EXECUTABLE} ${CMAKE_SOURCE_DIR}/shaders/${shader}
@@ -179,11 +198,14 @@ if(Vulkan_FOUND AND Vulkan_GLSLC_EXECUTABLE)
     ${SHADER_OUT}/scene.frag.spv.h
     ${SHADER_OUT}/terrain_splat.frag.spv.h
     ${SHADER_OUT}/shadow.vert.spv.h
+    ${SHADER_OUT}/shadow.frag.spv.h
     ${SHADER_OUT}/particle.vert.spv.h
     ${SHADER_OUT}/particle.frag.spv.h
     ${SHADER_OUT}/overlay.vert.spv.h
     ${SHADER_OUT}/overlay.frag.spv.h
-    ${SHADER_OUT}/tonemap.frag.spv.h)
+    ${SHADER_OUT}/tonemap.frag.spv.h
+    ${SHADER_OUT}/ssao.frag.spv.h
+    ${SHADER_OUT}/bloom.frag.spv.h)
   target_include_directories(sc2render PUBLIC include PRIVATE ${SHADER_OUT} src/render)
   target_link_libraries(sc2render PUBLIC sc2core Vulkan::Vulkan)
   add_executable(sc2view tools/sc2view.cpp)

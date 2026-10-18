@@ -16,9 +16,13 @@ struct AbilityCardEntry {
     std::string icon;
     std::string name;
     std::string hotkey;
+    float cooldown = 0.0f;
+    bool autocast = false;
     std::string ability;
     std::string command;
+    std::string face;
     bool requirement_met = true;
+    int charges = -1;
 };
 
 inline std::vector<AbilityCardEntry> build_ability_card_entries(
@@ -36,6 +40,7 @@ inline std::vector<AbilityCardEntry> build_ability_card_entries(
         AbilityCardEntry e;
         e.ability = b.ability;
         e.command = b.command;
+        e.face = b.face;
         e.name = b.face;
         if (auto nm = cat.button_display_name(b.face)) e.name = std::move(*nm);
         if (auto ic = cat.button_icon(b.face)) e.icon = std::move(*ic);

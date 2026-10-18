@@ -134,7 +134,34 @@ std::string to_lower(std::string s) {
 }
 }
 
+void Storage::set_overlay(std::unordered_map<std::string, std::vector<uint8_t>> files) {
+    overlay_ = std::move(files);
+    if (std::getenv("SC2_MAP_ASSETS_TRACE")) std::fprintf(stderr, "[mapassets] overlay set, %zu files\n", overlay_.size());
+    overlay_names_.clear();
+}
+
+const std::vector<uint8_t>* Storage::overlay_find(const std::string& path, std::string* key) const {
+    if (overlay_.empty()) return nullptr;
+    std::string p = to_lower(path);
+    for (char& c : p)
+        if (c == '\\') c = '/';
+    std::size_t at = p.rfind("/assets/");
+    if (at != std::string::npos) p = p.substr(at + 1);
+    else if (p.compare(0, 7, "assets/") != 0) return nullptr;
+    auto it = overlay_.find(p);
+    if (it == overlay_.end()) return nullptr;
+    if (key) *key = p;
+    return &it->second;
+}
+
 const std::string* Storage::resolve_name_ci(const std::string& path) const {
+    {
+        std::string key;
+        if (overlay_find(path, &key)) {
+            auto ins = overlay_names_.insert_or_assign(key, path);
+            return &ins.first->second;
+        }
+    }
     if (!has_mndx_) return nullptr;
     if (!ci_built_) {
         for (const auto& entry : mndx_.enumerate())
@@ -146,6 +173,12 @@ const std::string* Storage::resolve_name_ci(const std::string& path) const {
 }
 
 std::vector<uint8_t> Storage::read_by_name(const std::string& path) const {
+    if (const std::vector<uint8_t>* ov = overlay_find(path)) {
+        if (std::getenv("SC2_MAP_ASSETS_TRACE")) std::fprintf(stderr, "[mapassets] read %s from the map\n", path.c_str());
+        return *ov;
+    }
+    if (std::getenv("SC2_MAP_ASSETS_TRACE") && to_lower(path).find(".m3") != std::string::npos)
+        std::fprintf(stderr, "[mapassets] read %s from the stores\n", path.c_str());
     if (!has_mndx_) throw std::runtime_error("storage: MNDX names not loaded");
     const CKey* ck = mndx_.resolve(path);
     if (!ck) {

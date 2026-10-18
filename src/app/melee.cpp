@@ -5,6 +5,7 @@
 #include <utility>
 
 #include "sc2/app/spawn.hpp"
+#include "sc2/ai/hd_builds.hpp"
 
 namespace sc2::app {
 
@@ -237,14 +238,78 @@ MeleeLayout build_melee(sim::World& w, const MeleeSetup& s) {
         out.config.army_threshold = ps.army_threshold;
         for (const auto& ph : ps.wave_phases)
             out.config.wave_phases.push_back(ai::MeleeConfig::WavePhase{ph.first, ph.second});
+        for (std::size_t t = 0; t < ps.wave_ladders.size(); ++t)
+            for (const auto& ph : ps.wave_ladders[t])
+                out.config.wave_ladders[t].push_back(ai::MeleeConfig::WavePhase{ph.first, ph.second});
         out.config.stock = ps.stock;
+        if (!ps.hd_openings.empty())
+            if (const ai::hd::RaceTables* t = ai::hd::tables(ps.race_index)) {
+                std::uint64_t h = w.seed() * 0x9E3779B97F4A7C15ull + (std::uint64_t(p) + 1) * 0xD1B54A32D192ED03ull;
+                auto roll = [&](std::uint64_t mod) {
+                    h ^= h >> 29;
+                    h *= 0xBF58476D1CE4E5B9ull;
+                    h ^= h >> 32;
+                    return mod ? h % mod : 0;
+                };
+                const int enemy_race = enemy.race_index;
+                auto weight_of = [&](const ai::hd::Pick& pk) {
+                    return enemy_race == 1 ? pk.w_protoss : enemy_race == 2 ? pk.w_zerg : pk.w_terran;
+                };
+                auto pick_from = [&](const ai::hd::Menu* menus, int n_menus, const char* style) -> const char* {
+                    const ai::hd::Menu* menu = nullptr;
+                    for (int i = 0; i < n_menus; ++i)
+                        if (std::string(menus[i].style) == style) { menu = &menus[i]; break; }
+                    if (!menu || menu->n_picks <= 0) return nullptr;
+                    int total = 0;
+                    for (int i = 0; i < menu->n_picks; ++i) total += weight_of(menu->picks[i]);
+                    if (total <= 0) return menu->picks[0].build;
+                    int r = int(roll(std::uint64_t(total)));
+                    for (int i = 0; i < menu->n_picks; ++i) {
+                        r -= weight_of(menu->picks[i]);
+                        if (r < 0) return menu->picks[i].build;
+                    }
+                    return menu->picks[menu->n_picks - 1].build;
+                };
+                if (t->n_open_menus > 0) {
+                    const char* style = t->open_menus[roll(std::uint64_t(t->n_open_menus))].style;
+                    const char* open_id = pick_from(t->open_menus, t->n_open_menus, style);
+                    const char* mid_id = pick_from(t->mid_menus, t->n_mid_menus, style);
+                    auto find = [](const std::vector<MeleePlayerSetup::HdBuildSteps>& v, const char* id) -> const MeleePlayerSetup::HdBuildSteps* {
+                        if (!id) return nullptr;
+                        for (const auto& b : v)
+                            if (b.id == id) return &b;
+                        return nullptr;
+                    };
+                    const MeleePlayerSetup::HdBuildSteps* open = find(ps.hd_openings, open_id);
+                    const MeleePlayerSetup::HdBuildSteps* mid = find(ps.hd_mids, mid_id);
+                    const MeleePlayerSetup::HdBuildSteps* late = nullptr;
+                    if (t->n_late_menus > 0) {
+                        const char* lstyle = t->late_menus[roll(std::uint64_t(t->n_late_menus))].style;
+                        late = find(ps.hd_lates, pick_from(t->late_menus, t->n_late_menus, lstyle));
+                    }
+                    if (open) {
+                        out.config.hd_stock = open->stock;
+                        out.config.hd_build_id = open->id;
+                        if (mid) {
+                            out.config.hd_stock.insert(out.config.hd_stock.end(), mid->stock.begin(), mid->stock.end());
+                            out.config.hd_build_id += " + " + mid->id;
+                        }
+                        if (late) {
+                            out.config.hd_stock.insert(out.config.hd_stock.end(), late->stock.begin(), late->stock.end());
+                            out.config.hd_build_id += " + " + late->id;
+                        }
+                    }
+                }
+            }
         {
             Unit wproto = ps.worker;
             wproto.is_worker = true;
             out.config.worker_unit = ai::BuildItem{wproto, ps.worker_mineral_cost, 0,
                                                    ps.worker_build_time, false};
+            out.config.worker_builds = true;
             out.config.worker_target =
-                int(ps.mineral_positions.size()) * 2 + ps.gas_worker_count;
+                int(ps.mineral_positions.size()) * 2 + ps.gas_worker_count +
+                int(ps.geyser_positions.size()) * out.config.gas_peons_per_geyser;
         }
         out.config.rally_x = ps.start.x + step_toward(ps.start.x, enemy.start.x, 10);
         out.config.rally_y = ps.start.y + step_toward(ps.start.y, enemy.start.y, 10);
@@ -266,6 +331,19 @@ MeleeLayout build_melee(sim::World& w, const MeleeSetup& s) {
 
     if (layout.unit_type.size() < w.units().size())
         layout.unit_type.resize(w.units().size());
+    if (!s.placed_variations.empty()) {
+        layout.unit_variation.assign(w.units().size(), -1);
+        for (const Unit& u : w.units()) {
+            if (u.catalog_id.empty() || u.id >= layout.unit_variation.size()) continue;
+            const double ux = u.x.to_double(), uy = u.y.to_double();
+            for (const MeleeSetup::PlacedVariation& pv : s.placed_variations) {
+                const double dx = pv.x - ux, dy = pv.y - uy;
+                if (dx * dx + dy * dy > 0.01 || pv.type != u.catalog_id) continue;
+                layout.unit_variation[u.id] = pv.variation;
+                break;
+            }
+        }
+    }
     return layout;
 }
 

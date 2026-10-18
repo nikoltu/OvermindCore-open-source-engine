@@ -120,6 +120,16 @@ void AudioCatalog::build(const Catalog& cat) {
         s.chance = cat.scalar("CSound", id, "Chance");
         s.pitch = cat.scalar("CSound", id, "Pitch");
 
+        auto scalar_or_default = [&](const char* field, int fallback) {
+            if (auto v = cat.scalar("CSound", id, field); v && !v->empty()) return std::atoi(v->c_str());
+            if (auto d = cat.tag_default_scalar("CSound", field); d && !d->empty()) return std::atoi(d->c_str());
+            return fallback;
+        };
+        s.dupe_destroy = scalar_or_default("DupeDestroyCount", 16);
+        s.dupe_mute = scalar_or_default("DupeMuteCount", 10);
+        s.resource_priority = scalar_or_default("ResourcePriority", 32);
+        if (auto mm = cat.scalar("CSound", id, "DupeMaximumMethod")) s.dupe_prevent = *mm == "Prevent";
+
         for (const XmlNode& c : fields) {
             if (c.name == "VolumeRolloffFadeBlend") {
                 s.rolloff_blend = c.attr_or("value", "");

@@ -1,3 +1,4 @@
+#include "sc2/render/frame_prof.hpp"
 #include "sc2/app/melee_game.hpp"
 #include "sc2/app/ui_hotkeys.hpp"
 #include "sc2/data/environment.hpp"
@@ -16,6 +17,7 @@
 #include <unordered_map>
 
 #include "sc2/app/caster_composition.hpp"
+#include "sc2/app/splat_place.hpp"
 #include "sc2/app/command_bind.hpp"
 #include "sc2/app/control.hpp"
 #include "sc2/app/doodad_place.hpp"
@@ -28,10 +30,13 @@
 #include "sc2/app/ability.hpp"
 #include "sc2/app/spawn.hpp"
 #include "sc2/app/tooltip.hpp"
+#include "sc2/app/kill_rank.hpp"
+#include "sc2/data/abil_charge.hpp"
 #include "sc2/data/economy.hpp"
 #include "sc2/audio/mixer.hpp"
 #include "sc2/audio/vorbis.hpp"
 #include "sc2/audio/wasapi.hpp"
+#include "sc2/data/actor_model.hpp"
 #include "sc2/data/actor_catalog.hpp"
 #include "sc2/render/anim.hpp"
 #include "sc2/data/audio.hpp"
@@ -40,11 +45,47 @@
 #include "sc2/render/mat4.hpp"
 #include "sc2/sim/weapon.hpp"
 #include "sc2/render/creep_layer.hpp"
+#include "sc2/app/water_material.hpp"
 #include "sc2/sim/transport.hpp"
 #include "sc2/render/prim.hpp"
 #include "sc2/ui/font.hpp"
 
 namespace sc2::app {
+
+static int fog_ground_state(int state, bool type_hidden) {
+    static const bool black = std::getenv("SC2_FOG_BLACK_MASK") != nullptr;
+    return !black && !type_hidden && state == int(sim::Visibility::Hidden) ? int(sim::Visibility::Explored) : state;
+}
+static int fog_body_state(int player, int state, bool type_hidden) {
+    static const bool explored = std::getenv("SC2_FOG_EXPLORED") != nullptr;
+    if (player < 0) return fog_ground_state(state, type_hidden);
+    return explored && state == int(sim::Visibility::Hidden) ? int(sim::Visibility::Explored) : state;
+}
+
+static float selection_ring_radius(const data::Catalog* cat, const std::string& id, float body_radius) {
+    if (!cat || std::getenv("SC2_SELECTION_BODY_RADIUS")) return body_radius;
+    static std::unordered_map<std::string, float> authored;
+    auto it = authored.find(id);
+    if (it == authored.end()) it = authored.emplace(id, float(cat->scalar_num("CUnit", id, "Radius").value_or(0.0))).first;
+    return (it->second > 1e-3f ? it->second : body_radius) + 0.03f;
+}
+
+static std::array<float, 3> unit_draw_scale(const data::Catalog* cat, const std::string& id) {
+    if (!cat) return {1.0f, 1.0f, 1.0f};
+    static const bool off = std::getenv("SC2_NO_MODEL_SCALE") != nullptr;
+    static const data::Catalog* cached_for = nullptr;
+    static std::unordered_map<std::string, std::array<float, 3>> cache;
+    if (cached_for != cat) { cache.clear(); cached_for = cat; }
+    const auto it = cache.find(id);
+    if (it != cache.end()) return it->second;
+    std::array<float, 3> s = cat->unit_render_scale(data::unit_actor_id(*cat, id));
+    if (!off) {
+        const std::array<float, 3> m = data::resolve_unit_model_scale(*cat, id);
+        for (std::size_t i = 0; i < 3; ++i) s[i] *= m[i];
+    }
+    cache.emplace(id, s);
+    return s;
+}
 
 using sim::Unit;
 
@@ -127,6 +168,10 @@ const MeleeAudio::PcmClip* MeleeAudio::decode_cached(const std::string& path) {
 }
 
 static const float kCombatCueTrim = 0.85f;
+static const float kCloakOpacity = 0.45f;
+static const float kCloakDisplaceStrength = 5.0f;
+static const float kCloakUvPerStrength = 0.002f;
+static const int kPissedClicks = 4;
 static const float kUiCueTrim = 0.90f;
 
 int MeleeAudio::play_clip(const std::string& key, const PcmClip& clip, float gain, double rate_factor) {
@@ -151,10 +196,52 @@ int MeleeAudio::play_clip(const std::string& key, const PcmClip& clip, float gai
     if (rate_factor > 0.0 && rate_factor != 1.0) v.src_rate = std::uint32_t(double(v.src_rate) * rate_factor + 0.5);
     v.channels = stored->channels;
     v.gain = gain;
+    v.pan = pending_pan_;
+    pending_pan_ = 0.0f;
     const int id = mixer_->add_voice(v);
     recent_ids_.push_back(id);
     last_voice_id_ = id;
     return 1;
+}
+
+int MeleeAudio::play_clip_limited(const std::string& sound_id, int dupe_destroy, int dupe_mute, const std::string& key,
+                                  const PcmClip& clip, float gain, double rate_factor, bool dupe_prevent, int priority) {
+    {
+        std::lock_guard<std::mutex> lk(mtx_);
+        std::vector<LiveVoice> live;
+        live.reserve(voice_sounds_.size());
+        for (const LiveVoice& vs : voice_sounds_)
+            if (mixer_ && mixer_->is_active(vs.id)) live.push_back(vs);
+        voice_sounds_.swap(live);
+        int same = 0;
+        for (const LiveVoice& vs : voice_sounds_) same += vs.sound == sound_id;
+        if (dupe_mute > 0 && same >= dupe_mute) return 0;
+        if (dupe_destroy > 0 && same >= dupe_destroy) {
+            if (dupe_prevent || !mixer_) return 0;
+            for (auto it = voice_sounds_.begin(); it != voice_sounds_.end(); ++it)
+                if (it->sound == sound_id) {
+                    mixer_->stop(it->id);
+                    voice_sounds_.erase(it);
+                    break;
+                }
+        }
+        if (mixer_ && int(voice_sounds_.size()) >= max_active_voices_) {
+            auto lowest = voice_sounds_.end();
+            for (auto it = voice_sounds_.begin(); it != voice_sounds_.end(); ++it)
+                if (lowest == voice_sounds_.end() || it->priority < lowest->priority) lowest = it;
+            if (lowest != voice_sounds_.end() && lowest->priority < priority) {
+                mixer_->stop(lowest->id);
+                voice_sounds_.erase(lowest);
+            }
+        }
+        pending_priority_ = priority;
+    }
+    const int n = play_clip(key, clip, gain, rate_factor);
+    if (n > 0 && last_voice_id_ >= 0) {
+        std::lock_guard<std::mutex> lk(mtx_);
+        voice_sounds_.push_back(LiveVoice{last_voice_id_, sound_id, priority});
+    }
+    return n;
 }
 
 bool MeleeAudio::voice_active(int id) const {
@@ -260,6 +347,37 @@ double MeleeAudio::pitch_rate_factor(const std::string& pitch_pair, const std::s
     return std::pow(2.0, (lo + (hi - lo) * u) / 12.0);
 }
 
+static double play_unit_draw(const std::string& sound_id, std::uint64_t play_index) {
+    std::uint64_t h = 1099511628211ull;
+    for (char ch : sound_id) {
+        h ^= std::uint64_t(static_cast<unsigned char>(ch));
+        h *= 1469598103934665603ull;
+    }
+    h ^= play_index * 0x9E3779B97F4A7C15ull + 0x5851F42D4C957F2Dull;
+    h ^= h >> 33;
+    h *= 0xff51afd7ed558ccdull;
+    h ^= h >> 33;
+    return double(h >> 11) / double(1ull << 53);
+}
+
+float MeleeAudio::volume_db_pair_to_gain(const std::string& db_pair, const std::string& sound_id,
+                                         std::uint64_t play_index) {
+    if (db_pair.empty()) return 1.0f;
+    const std::size_t comma = db_pair.find(',');
+    double lo = 0.0, hi = 0.0;
+    try {
+        lo = std::stod(comma == std::string::npos ? db_pair : db_pair.substr(0, comma));
+        hi = comma == std::string::npos ? lo : std::stod(db_pair.substr(comma + 1));
+    } catch (const std::exception&) {
+        return 1.0f;
+    }
+    if (hi < lo) std::swap(lo, hi);
+    const double db = hi == lo ? lo : lo + (hi - lo) * play_unit_draw(sound_id + "|Volume", play_index);
+    if (db <= -96.0) return 0.0f;
+    if (db >= 12.0) return 4.0f;
+    return float(std::pow(10.0, db / 20.0));
+}
+
 float MeleeAudio::volume_db_pair_to_gain(const std::string& db_pair) {
     if (db_pair.empty()) return 1.0f;
     const std::size_t comma = db_pair.find(',');
@@ -341,18 +459,20 @@ int MeleeAudio::play_sound(const std::string& sound_id, float gain) {
         const PcmClip* clip = decode_cached(a.file);
         if (!clip || clip->empty()) continue;
         float g = gain;
-        if (def->volume) g *= volume_db_pair_to_gain(*def->volume);
+        if (def->volume) g *= volume_db_pair_to_gain(*def->volume, sound_id, play_index);
         if (def->category) g *= category_gain(*def->category);
-        if (a.volume) g *= volume_db_pair_to_gain(*a.volume);
+        if (a.volume) g *= volume_db_pair_to_gain(*a.volume, sound_id, play_index);
         const double rate = def->pitch ? pitch_rate_factor(*def->pitch, sound_id, play_index) : 1.0;
-        return play_clip(a.file, *clip, g, rate);
+        return play_clip_limited(sound_id, def->dupe_destroy, def->dupe_mute, a.file, *clip, g, rate, def->dupe_prevent, def->resource_priority);
     }
     return 0;
 }
 
-int MeleeAudio::play_event(const std::string& unit_catalog_id, data::UnitEvent ev, float gain, float listener_distance) {
+int MeleeAudio::play_event(const std::string& unit_catalog_id, data::UnitEvent ev, float gain, float listener_distance,
+                           float listener_pan) {
     if (!bound()) return 0;
     last_rolloff_gain_ = 1.0f;
+    pending_pan_ = listener_pan;
     std::vector<data::SoundCue> cues =
         data::resolve_sound_cues(*actors_, *audio_cat_, unit_catalog_id, ev);
     std::vector<std::string> order;
@@ -406,10 +526,11 @@ int MeleeAudio::play_event(const std::string& unit_catalog_id, data::UnitEvent e
         any_asset = true;
         float g = gain;
         if (def) {
-            if (def->volume) g *= volume_db_pair_to_gain(*def->volume);
+            if (def->volume) g *= volume_db_pair_to_gain(*def->volume, sid, play_index);
             if (def->category) g *= category_gain(*def->category);
-            if (const data::SoundAsset* a = asset_of(chosen); a && a->volume) g *= volume_db_pair_to_gain(*a->volume);
+            if (const data::SoundAsset* a = asset_of(chosen); a && a->volume) g *= volume_db_pair_to_gain(*a->volume, sid, play_index);
             const bool two_d = def->mode && *def->mode == "2D";
+            if (two_d) pending_pan_ = 0.0f;
             if (!two_d && listener_distance >= 0.0f && !def->rolloff.empty()) {
                 const float r = data::rolloff_gain(*def, listener_distance);
                 last_rolloff_gain_ = r;
@@ -418,7 +539,8 @@ int MeleeAudio::play_event(const std::string& unit_catalog_id, data::UnitEvent e
             }
         }
         const double rate = def && def->pitch ? pitch_rate_factor(*def->pitch, sid, play_index) : 1.0;
-        voices += play_clip(chosen->asset_path, *clip, g, rate);
+        voices += def ? play_clip_limited(sid, def->dupe_destroy, def->dupe_mute, chosen->asset_path, *clip, g, rate, def->dupe_prevent, def->resource_priority)
+                      : play_clip(chosen->asset_path, *clip, g, rate);
     }
     if (any_asset)
         resolved_[unit_catalog_id + "|" + std::string(data::to_string(ev))] = 1;
@@ -457,10 +579,19 @@ namespace {
 void alpha_over(std::vector<uint8_t>& base, const std::vector<uint8_t>& top) {
     size_t n = std::min(base.size(), top.size());
     for (size_t i = 0; i + 3 < n; i += 4) {
-        float a = top[i + 3] / 255.0f;
+        const uint8_t ta = top[i + 3];
+        if (ta == 0) continue;
+        if (ta == 255) {
+            base[i] = top[i];
+            base[i + 1] = top[i + 1];
+            base[i + 2] = top[i + 2];
+            base[i + 3] = 255;
+            continue;
+        }
+        float a = ta / 255.0f;
         for (int c = 0; c < 3; ++c)
             base[i + c] = uint8_t(float(top[i + c]) * a + float(base[i + c]) * (1.0f - a) + 0.5f);
-        base[i + 3] = uint8_t(std::min(255.0f, float(top[i + 3]) + float(base[i + 3]) * (1.0f - a) + 0.5f));
+        base[i + 3] = uint8_t(std::min(255.0f, float(ta) + float(base[i + 3]) * (1.0f - a) + 0.5f));
     }
 }
 
@@ -591,25 +722,52 @@ float cached_diameter(const formats::Model* m) {
 void draw_text_rgba(std::vector<std::uint8_t>& buf, std::uint32_t w, std::uint32_t h, int x,
                     int y, const std::string& text, int s, std::uint8_t r, std::uint8_t g,
                     std::uint8_t b) {
-    auto put = [&](int px, int py, std::uint8_t cr, std::uint8_t cg, std::uint8_t cb) {
-        if (px < 0 || py < 0 || px >= int(w) || py >= int(h)) return;
-        std::size_t i = (std::size_t(py) * w + px) * 4;
-        buf[i] = cr; buf[i + 1] = cg; buf[i + 2] = cb; buf[i + 3] = 255;
-    };
-    int pen = x;
-    for (char ch : text) {
-        for (int row = 0; row < ui::kFontH; ++row)
-            for (int col = 0; col < ui::kFontW; ++col)
-                if (ui::font_pixel(ch, col, row))
-                    for (int dy = 0; dy < s; ++dy)
-                        for (int dx = 0; dx < s; ++dx) {
-                            int px = pen + col * s + dx, py = y + row * s + dy;
-                            put(px + s, py + s, 0, 0, 0);
-                            put(px, py, r, g, b);
-                        }
-        pen += (ui::kFontW + 1) * s;
-    }
+    draw::text(buf, w, h, x, y, text, s, r, g, b);
 }
+
+struct LabelLook {
+    bool set = false;
+    std::uint8_t r = 255, g = 255, b = 255;
+    bool centred = false;
+    std::string font;
+    int height = 0;
+};
+struct FaceScope {
+    const render::OverlayFont* saved;
+    explicit FaceScope(const render::OverlayFont* f) : saved(draw::active_font()) {
+        if (f) draw::set_active_font(f);
+    }
+    ~FaceScope() { draw::set_active_font(saved); }
+    FaceScope(const FaceScope&) = delete;
+    FaceScope& operator=(const FaceScope&) = delete;
+};
+LabelLook resolve_label_style(const ui::StyleSet* styles, const std::string& authored, int race) {
+    LabelLook out;
+    if (!styles || authored.empty()) return out;
+    std::size_t at = 0;
+    while (at < authored.size() && authored[at] == '@') ++at;
+    const std::string bare = authored.substr(at);
+    if (bare.empty()) return out;
+    const char* suffix = ui::layout_race_suffix(race);
+    ui::FontStyle st;
+    if (suffix && *suffix) st = styles->resolve(bare + "_" + suffix);
+    if (!st.ok()) st = styles->resolve(bare);
+    if (!st.ok()) return out;
+    out.set = true;
+    out.centred = st.hjustify == "Center";
+    if (st.has_color) { out.r = st.r; out.g = st.g; out.b = st.b; }
+    out.font = st.font;
+    out.height = st.height;
+    if (std::getenv("SC2_LABEL_FACE_TRACE")) {
+        static std::set<std::string> seen;
+        if (seen.insert(bare).second)
+            std::fprintf(stderr, "[labelface] style %s font %s height %d vjustify %s hjustify %s\n", bare.c_str(), st.font.c_str(), st.height,
+                         st.vjustify.c_str(), st.hjustify.c_str());
+    }
+    return out;
+}
+
+int text_w_rgba(const std::string& text, int s) { return draw::text_w(text, s); }
 
 void draw_box_rgba(std::vector<std::uint8_t>& buf, std::uint32_t w, std::uint32_t h, int x0,
                    int y0, int x1, int y1, std::uint8_t r, std::uint8_t g, std::uint8_t b) {
@@ -626,8 +784,21 @@ void draw_box_rgba(std::vector<std::uint8_t>& buf, std::uint32_t w, std::uint32_
 
 }
 
+static std::array<int, 16> g_map_team_slot = {-1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1};
+void set_map_team_slots(const std::array<int, 16>& slots) {
+    g_map_team_slot = slots;
+    if (std::getenv("SC2_NO_MAP_TEAM_COLOR")) g_map_team_slot.fill(-1);
+}
+static int team_slot_of(int player) {
+    if (player < 0) return 0;
+    if (player < 16 && g_map_team_slot[std::size_t(player)] >= 0) return g_map_team_slot[std::size_t(player)];
+    return player + 1;
+}
+
 std::array<float, 4> team_colour_for(const data::Catalog* cat, int player, bool selected) {
-    if (player < 0) return {0, 0, 0, -1.0f};
+    static const bool neutral_slot = std::getenv("SC2_NO_NEUTRAL_TEAM") == nullptr;
+    if (player < 0 && !(cat && neutral_slot)) return {0, 0, 0, -1.0f};
+    if (player < 0) selected = false;
     if (cat) {
         static const data::Catalog* cached_for = nullptr;
         static std::vector<data::TeamColor> palette;
@@ -636,14 +807,26 @@ std::array<float, 4> team_colour_for(const data::Catalog* cat, int player, bool 
             cached_for = cat;
         }
         for (const data::TeamColor& tc : palette)
-            if (tc.slot == player + 1) {
-                std::array<float, 4> c = {tc.diffuse[0], tc.diffuse[1], tc.diffuse[2], 1.0f};
-                if (selected)
-                    for (int k = 0; k < 3; ++k) c[k] = std::min(1.0f, c[k] + 0.35f);
-                return c;
+            if (tc.slot == team_slot_of(player)) {
+                if (selected) return {tc.selected[0], tc.selected[1], tc.selected[2], 1.0f};
+                return {tc.diffuse[0], tc.diffuse[1], tc.diffuse[2], 1.0f};
             }
     }
     return team_colour(player, selected);
+}
+
+std::array<float, 4> team_emissive_for(const data::Catalog* cat, int player) {
+    if (!cat || std::getenv("SC2_NO_TEAM_EMISSIVE")) return {0, 0, 0, -1.0f};
+    static const data::Catalog* cached_for = nullptr;
+    static std::vector<data::TeamColor> palette;
+    if (cached_for != cat) {
+        palette = data::team_colors(*cat);
+        cached_for = cat;
+    }
+    const int slot = team_slot_of(player);
+    for (const data::TeamColor& tc : palette)
+        if (tc.slot == slot && tc.emissive[3] >= 0.0f) return {tc.emissive[0], tc.emissive[1], tc.emissive[2], 1.0f};
+    return {0, 0, 0, -1.0f};
 }
 
 MeleeGame::MeleeGame(MeleeGameConfig cfg) : cfg_(cfg), world_(cfg.seed) {
@@ -707,6 +890,7 @@ MeleeCommandContext MeleeGame::command_context() {
                 cell.slot = slot;
                 if (auto ic = cat_->button_icon(sl.face)) cell.icon = std::move(*ic);
                 if (auto nm = cat_->button_display_name(sl.face)) cell.name = std::move(*nm);
+                if (auto hk = cat_->button_hotkey(sl.face)) cell.hotkey = std::move(*hk);
             };
             const sim::Unit& lead_u = world_.unit(lead);
             std::string lead_id = lead_u.catalog_id;
@@ -726,7 +910,7 @@ MeleeCommandContext MeleeGame::command_context() {
                     if (sl.face == "Move") take(sl, ctx.univ_move);
                     else if (sl.face == "Stop") take(sl, ctx.univ_stop);
                     else if (sl.face == "MoveHoldPosition") take(sl, ctx.univ_hold);
-                    else if (sl.face == "Attack") take(sl, ctx.univ_attack);
+                    else if (sl.face == "Attack" || sl.face == "AttackWorker") take(sl, ctx.univ_attack);
                     else if (sl.face == "MovePatrol") take(sl, ctx.univ_patrol);
                     else if (!burrow_ab.empty() && sl.ability == burrow_ab) take(sl, ctx.univ_burrow);
                     else if (!unburrow_ab.empty() && sl.ability == unburrow_ab)
@@ -782,7 +966,10 @@ MeleeCommandContext MeleeGame::command_context() {
             if (burrow_command_allowed(id)) { ctx.burrow_requirement_met = true; break; }
     }
     if (cat_) {
-        if (selected_liftoff_structure(false) != sim::kNoTarget) ctx.liftoff_selected = true;
+        if (const std::uint32_t lid = selected_liftoff_structure(false); lid != sim::kNoTarget) {
+            ctx.liftoff_selected = true;
+            ctx.liftoff_busy = liftoff_busy(lid);
+        }
         if (selected_liftoff_structure(true) != sim::kNoTarget) ctx.land_selected = true;
     }
     if (cat_) {
@@ -849,6 +1036,13 @@ std::vector<std::uint32_t> MeleeGame::selected_merge_templar() const {
     }
     std::sort(out.begin(), out.end());
     return out;
+}
+
+bool MeleeGame::liftoff_busy(std::uint32_t id) const {
+    if (!cat_ || std::getenv("SC2_LIFTOFF_WHILE_TRAINING") || id >= world_.units().size()) return false;
+    sim::Fixed frac;
+    if (!world_.pending_progress(id, frac)) return false;
+    return cat_->ability_disables_class(cat_->liftoff_ability(world_.units()[id].catalog_id), "CAbilQueue");
 }
 
 std::uint32_t MeleeGame::selected_liftoff_structure(bool flying) const {
@@ -998,6 +1192,7 @@ void MeleeGame::setup(const MeleeSetup& setup, MeleeModels* models,
     world_.set_fire_while_moving(true);
     world_.enable_point_defense();
     world_.set_fog_acquire(true);
+    world_.enable_target_priority(true);
 
     models_ = models;
     driver_.default_model = models ? models->model_for("Marine") : nullptr;
@@ -1036,8 +1231,8 @@ void MeleeGame::setup(const MeleeSetup& setup, MeleeModels* models,
         ais_.push_back(std::move(ai));
     }
 
-    camctl_.yaw = 1.5707963f;
-    camctl_.mirror_x = true;
+    camctl_.yaw = -1.5707963f;
+    camctl_.mirror_x = false;
     render::apply_melee_rest_frame(camctl_);
 
     if (cfg_.human_player >= 0 && size_t(cfg_.human_player) < setup.players.size()) {
@@ -1082,6 +1277,8 @@ void MeleeGame::setup(const MeleeSetup& setup, MeleeModels* models,
     replay_log_.seed = world_.seed();
     replay_log_.initial_units.assign(world_.units().begin(), world_.units().end());
     replay_recorder_ = std::make_unique<LogRecorder>(replay_log_);
+    train_tap_.out = &train_events_;
+    world_.set_train_sink(&train_tap_);
     world_.set_order_sink(replay_recorder_.get());
 
     if (cfg_.human_player >= 0) start_music(race_music_id(human_race()));
@@ -1143,6 +1340,7 @@ void MeleeGame::bind_actor_rules(const data::Catalog& cat) {
             er.filters = r.filters;
             er.verb = r.verb;
             er.args = r.args;
+            er.target = r.target;
             out.push_back(std::move(er));
         }
         return out;
@@ -1150,9 +1348,38 @@ void MeleeGame::bind_actor_rules(const data::Catalog& cat) {
     driver_.unit_rules = [&cat, convert](const std::string& id) {
         static std::unordered_map<std::string, std::vector<render::ActorEventRule>> cache;
         auto it = cache.find(id);
-        if (it == cache.end()) it = cache.emplace(id, convert(cat.actor_rules(id))).first;
+        if (it == cache.end()) {
+            std::vector<render::ActorEventRule> rules = convert(cat.actor_rules(id));
+            if (rules.empty() && !std::getenv("SC2_NO_BIRTH_ACTOR_RULES"))
+                if (const std::string aid = data::unit_actor_id(cat, id); !aid.empty() && aid != id) rules = convert(cat.actor_rules(aid));
+            if (!std::getenv("SC2_NO_PROGRESS_ACTORS")) {
+                std::vector<render::ActorEventRule> extra;
+                for (render::ActorEventRule& r : rules) {
+                    if (r.verb != "Create" || r.args.size() != 1 || !cat.find("CActorProgress", r.args[0])) continue;
+                    const std::string pid = r.args[0];
+                    std::vector<std::string> stages;
+                    for (const core::XmlNode& n : cat.resolved("CActorProgress", pid))
+                        if (n.name == "StageArray")
+                            if (const std::string* ap = n.attr("AnimProps"); ap && !ap->empty()) stages.push_back(*ap);
+                    if (stages.size() != 3) continue;
+                    r.verb = "AnimBracketStart";
+                    r.args = {pid, stages[0], stages[1], stages[2]};
+                    for (const render::ActorEventRule& pr : convert(cat.actor_rules(pid, "CActorProgress"))) {
+                        if (pr.verb != "Destroy" || pr.sub == "Start") continue;
+                        render::ActorEventRule stop = pr;
+                        stop.verb = "AnimBracketStop";
+                        stop.args = {pid};
+                        extra.push_back(std::move(stop));
+                    }
+                }
+                rules.insert(rules.end(), extra.begin(), extra.end());
+            }
+            it = cache.emplace(id, std::move(rules)).first;
+        }
         return it->second;
     };
+    if (!std::getenv("SC2_MORPH_START_AT_FINISH"))
+        driver_.morph_target = [this](std::uint32_t id) { return world_.morph_target_id(id); };
     driver_.sub_actor_rules = [&cat, convert](const std::string& id) {
         static std::unordered_map<std::string, std::vector<render::ActorEventRule>> cache;
         auto it = cache.find(id);
@@ -1451,7 +1678,68 @@ bool MeleeGame::human_cast_point(const std::string& abil_id, sim::Fixed px, sim:
     if (!cast_policy_) return false;
     const std::uint32_t caster = human_lead_caster();
     if (caster == sim::kNoTarget) return false;
-    return cast_policy_->cast_now_point(world_, caster, abil_id, px, py);
+    if (!cast_policy_->cast_now_point(world_, caster, abil_id, px, py)) return false;
+    spawn_effect_doodads(abil_id, px, py, world_.units()[caster].player);
+    return true;
+}
+
+void MeleeGame::spawn_effect_doodads(const std::string& abil_id, sim::Fixed px, sim::Fixed py, int player) {
+    static const bool off = std::getenv("SC2_NO_EFFECT_DOODAD") != nullptr;
+    if (off || !cat_ || !models_ || !ui_store_) return;
+    std::string eff = cat_->scalar("CAbil", abil_id, "Effect").value_or("");
+    if (eff.empty()) eff = abil_id;
+    const std::vector<data::Catalog::ActorRule> rules = cat_->actor_rules(eff, "CActorDoodad");
+    bool creates = false;
+    for (const data::Catalog::ActorRule& r : rules)
+        if (r.head == "Effect" && r.subject == eff && r.sub == "Start" && r.verb == "Create" && r.args.empty() && r.target.empty())
+            creates = true;
+    static const bool no_sound = std::getenv("SC2_NO_EFFECT_SOUND") != nullptr;
+    if (!no_sound)
+        for (const data::Catalog::ActorRule& r : rules) {
+            if (r.head != "Effect" || r.subject != eff || r.sub != "Start" || r.verb != "Create" || r.args.size() != 1) continue;
+            std::string sound;
+            for (const core::XmlNode& n : cat_->resolved("CActorSound", r.args[0]))
+                if (n.name == "Sound") sound = n.attr_or("value", "");
+            if (sound.empty()) continue;
+            last_effect_sound_ = sound;
+            if (audio_) audio_->play_sound(sound, 1.0f);
+        }
+    if (!creates) return;
+    std::string model_id;
+    for (const data::Catalog::ActorRule& r : rules) {
+        if (r.head != "ActorCreation" || r.verb != "ModelSwap" || r.args.empty()) continue;
+        bool ok = true;
+        for (const auto& f : r.filters) {
+            if (f.first == "!PlayerHasReward") continue;
+            ok = false;
+        }
+        if (ok) { model_id = r.args[0]; break; }
+    }
+    if (model_id.empty()) return;
+    const formats::Model* m = models_->cmodel(*ui_store_, model_id);
+    if (!m || m->sequences.empty()) return;
+    EffectDoodad d;
+    d.model = m;
+    d.model_id = model_id;
+    const char* names[3] = {"Birth", "Stand", "Death"};
+    for (int k = 0; k < 3; ++k) d.seq[k] = render::select_sequence(*m, {names[k]}, 0);
+    d.phase = d.seq[0] >= 0 ? 0 : 1;
+    d.x = float(px.to_double());
+    d.y = float(py.to_double());
+    d.z = ground_z_at(d.x, d.y);
+    d.yaw = 1.5707963f;
+    d.player = player;
+    int standing = 0;
+    for (const EffectDoodad& o : effect_doodads_)
+        if (o.player == player && o.model_id == model_id && o.phase < 2) ++standing;
+    if (standing >= 7)
+        for (EffectDoodad& o : effect_doodads_)
+            if (o.player == player && o.model_id == model_id && o.phase < 2) {
+                o.phase = 2;
+                o.time_ms = 0.0f;
+                break;
+            }
+    effect_doodads_.push_back(d);
 }
 
 std::vector<AbilityCardEntry> MeleeGame::selection_ability_entries() const {
@@ -1462,11 +1750,65 @@ std::vector<AbilityCardEntry> MeleeGame::selection_ability_entries() const {
     if (type.empty()) return {};
     std::vector<AbilityCardEntry> out =
         build_ability_card_entries(*cat_, type, human_tech_state(lead));
+    if (lead < world_.units().size()) {
+        const std::vector<std::uint32_t> hold = world_.passengers(lead);
+        auto passenger_can_use = [&](const std::string& abil) {
+            const auto target = cat_->ability_redirect_target(abil);
+            if (!target) return false;
+            for (std::uint32_t pid : hold) {
+                if (pid >= world_.units().size() || !world_.units()[pid].alive) continue;
+                for (const auto& ac : cat_->unit_ability_commands(world_.units()[pid].catalog_id))
+                    if (ac.first == *target) return true;
+            }
+            return false;
+        };
+        std::vector<std::string> settled;
+        std::vector<AbilityCardEntry> kept;
+        kept.reserve(out.size());
+        for (std::size_t i = 0; i < out.size(); ++i) {
+            const auto set = cat_->ability_set_id(out[i].ability);
+            if (!set) { kept.push_back(out[i]); continue; }
+            if (std::find(settled.begin(), settled.end(), *set) != settled.end()) continue;
+            std::size_t pick = i;
+            for (std::size_t j = i; j < out.size(); ++j) {
+                const auto other = cat_->ability_set_id(out[j].ability);
+                if (!other || *other != *set) continue;
+                if (passenger_can_use(out[j].ability)) { pick = j; break; }
+            }
+            settled.push_back(*set);
+            kept.push_back(out[pick]);
+        }
+        out = std::move(kept);
+    }
     out.erase(std::remove_if(out.begin(), out.end(),
                              [&](const AbilityCardEntry& e) {
                                  return unpowered_offer_blocked(lead, e.ability);
                              }),
               out.end());
+    static const bool return_always = [] { const char* e = std::getenv("SC2_RETURN_CARGO_ALWAYS"); return e && e[0] == '1'; }();
+    if (!return_always) {
+        bool any_carry = false;
+        for (std::uint32_t id : selection_)
+            if (id < world_.units().size() && world_.units()[id].alive && world_.units()[id].carrying > 0) any_carry = true;
+        if (!any_carry)
+            out.erase(std::remove_if(out.begin(), out.end(),
+                                     [&](const AbilityCardEntry& e) {
+                                         return e.command == "Return" && cat_->is_harvest_ability(e.ability);
+                                     }),
+                      out.end());
+    }
+    static const bool no_badge = [] { const char* e = std::getenv("SC2_NO_CHARGE_BADGE"); return e && e[0] == '1'; }();
+    if (!no_badge) {
+        auto ticks = [](double s) { return int(s * double(sim::World::kTicksPerSecond) + 0.5); };
+        const int32_t owner = lead < world_.units().size() ? world_.units()[lead].player : -1;
+        for (AbilityCardEntry& e : out) {
+            const data::ChargeSpec c = data::ability_cost_charge(*cat_, e.ability);
+            if (!c.found || c.count_max <= 1.0) continue;
+            const int32_t start = c.count_start > 0.0 ? int32_t(c.count_start) : int32_t(c.count_max);
+            e.charges = world_.charge_pool_count(owner, c.link.empty() ? e.ability : c.link, start, int32_t(c.count_max),
+                                                 ticks(c.time_start), ticks(c.time_use));
+        }
+    }
     return out;
 }
 
@@ -1516,9 +1858,11 @@ std::vector<AbilityCardEntry> MeleeGame::merge_selection_abilities(CommandCard& 
         btn.icon = e.icon;
         btn.name = e.name;
         btn.hotkey = e.hotkey;
-        btn.hotkey = e.hotkey;
         btn.ability = 0;
-        btn.state = resolve_button_state(e.requirement_met, 0.0f);
+        btn.cooldown = e.cooldown;
+        btn.autocast = e.autocast;
+        btn.charges = e.charges;
+        btn.state = resolve_button_state(e.requirement_met, e.cooldown);
         card.slots[slot] = btn;
         out.push_back(e);
     }
@@ -1654,6 +1998,7 @@ std::vector<MeleeGame::SubmenuCardEntry> MeleeGame::merge_selection_submenus(Com
                 CommandButton btn;
                 btn.icon = e.icon;
                 btn.name = e.name;
+                btn.hotkey = e.hotkey;
                 btn.ability = 0;
                 btn.state = ButtonState::Enabled;
                 card.slots[e.slot] = btn;
@@ -1695,6 +2040,13 @@ CommandCard MeleeGame::compose_command_card(std::vector<BuildCardEntry>& builds,
         selected_training_producer() != sim::kNoTarget) {
         if (authored_cancel >= 0) card.slots[authored_cancel].is_cancel = true;
         else card.set_cancel(command_context().cancel_icon);
+    } else if (card_page_ == 0 && !std::getenv("SC2_IDLE_CANCEL_CELL")) {
+        bool morphing = false;
+        for (std::uint32_t id : selection_)
+            if (id < world_.units().size() && world_.is_morphing(id)) morphing = true;
+        if (!morphing)
+            for (int i = 0; i < CommandCard::kSlots; ++i)
+                if (card.slots[i].is_cancel) card.slots[i] = CommandButton{};
     }
     return card;
 }
@@ -1722,6 +2074,8 @@ std::optional<TooltipInfo> MeleeGame::hovered_card_tooltip(std::uint32_t view_w,
                 t.minerals = e.minerals;
                 t.gas = e.gas;
                 t.build_time = float(e.time.to_double());
+                if (cat_)
+                    if (auto d = cat_->button_tooltip(e.unit)) t.description = std::move(*d);
                 break;
             }
         for (const BuildCardEntry& e : builds)
@@ -1729,6 +2083,14 @@ std::optional<TooltipInfo> MeleeGame::hovered_card_tooltip(std::uint32_t view_w,
                 t.minerals = e.minerals;
                 t.gas = e.gas;
                 t.build_time = float(e.time.to_double());
+                if (cat_)
+                    if (auto d = cat_->button_tooltip(e.unit)) t.description = std::move(*d);
+                break;
+            }
+        for (const AbilityCardEntry& e : abils)
+            if (e.slot == i) {
+                if (cat_ && !e.face.empty())
+                    if (auto d = cat_->button_tooltip(e.face)) t.description = std::move(*d);
                 break;
             }
         if (btn.state == ButtonState::Disabled) {
@@ -1800,6 +2162,7 @@ data::TechState MeleeGame::tech_state_of(int player, std::uint32_t producer) con
                     ++st.at_unit_queued[bp.unit];
                     break;
                 }
+        world_.pending_at_producer(producer, st.at_unit_queued, st.at_unit);
         for (const sim::BehaviorInstance& b : p.behaviors) {
             if (b.src == 0) continue;
             const std::string id = behavior_id_of_tag(b.src);
@@ -1817,6 +2180,10 @@ void MeleeGame::wire_addon_bodies() {
 
 void MeleeGame::enable_ai_tech_gate(const data::Catalog& cat) {
     cat_ = &cat;
+    world_.set_requirement_gate([this](std::int32_t player, const std::string& req_id) {
+        if (!cat_ || player < 0) return true;
+        return data::eval_requirement(*cat_, req_id, "Use", tech_state_of(player));
+    });
     world_.set_train_gate([this](std::uint32_t producer, const std::string& unit_id) {
         if (!cat_ || producer >= world_.units().size()) return true;
         const sim::Unit& p = world_.units()[producer];
@@ -1826,6 +2193,47 @@ void MeleeGame::enable_ai_tech_gate(const data::Catalog& cat) {
                 return production_.can_produce(*cat_, tp.ability, unit_id, tech_state_of(p.player, producer));
         return true;
     });
+}
+
+const std::vector<std::pair<std::string, std::string>>& MeleeGame::upgrade_model_swaps(const std::string& unit_id) const {
+    auto it = upgrade_model_swaps_.find(unit_id);
+    if (it != upgrade_model_swaps_.end()) return it->second;
+    std::vector<std::pair<std::string, std::string>> out;
+    if (actor_cat_) {
+        if (const data::CActorUnit* a = actor_cat_->actor_for_unit(unit_id)) {
+            for (const data::ActorRule& r : a->on) {
+                if (r.verb != "ModelSwap" || r.args.empty() || r.event_head != "Upgrade") continue;
+                const std::size_t dot = r.event.find('.');
+                if (dot == std::string::npos) continue;
+                const std::size_t end = r.event.rfind('.');
+                if (end <= dot || r.event.compare(end, std::string::npos, ".Add") != 0) continue;
+                out.emplace_back(r.event.substr(dot + 1, end - dot - 1), r.args[0]);
+            }
+        }
+    }
+    return upgrade_model_swaps_.emplace(unit_id, std::move(out)).first->second;
+}
+
+static const std::string& option_model_swap(const data::ActorCatalog* ac, const std::string& unit_id) {
+    static std::map<std::string, std::string> cache;
+    auto it = cache.find(unit_id);
+    if (it != cache.end()) return it->second;
+    static const std::string level = std::getenv("SC2_SHADER_OPTION") ? std::getenv("SC2_SHADER_OPTION") : "Extreme";
+    std::string out;
+    if (ac)
+        if (const data::CActorUnit* a = ac->actor_for_unit(unit_id))
+            for (const data::ActorRule& r : a->on) {
+                if (r.verb != "ModelSwap" || r.args.empty() || r.event_head != "ActorCreation") continue;
+                for (const std::string& f : r.filters) {
+                    const std::size_t b = f.find_first_not_of(' '), e = f.find_last_not_of(' ');
+                    if (b != std::string::npos && f.substr(b, e - b + 1) == "Option Shader " + level) out = r.args[0];
+                }
+                if (std::getenv("SC2_SHADER_OPTION_TRACE"))
+                    std::fprintf(stderr, "[optswap] %s rule %s | %s -> %s\n", unit_id.c_str(), r.terms.c_str(), r.send.c_str(), out.c_str());
+            }
+    if (std::getenv("SC2_SHADER_OPTION_TRACE"))
+        std::fprintf(stderr, "[optswap] %s actor %s -> '%s'\n", unit_id.c_str(), (ac && ac->actor_for_unit(unit_id)) ? "found" : "none", out.c_str());
+    return cache.emplace(unit_id, std::move(out)).first->second;
 }
 
 const std::string& MeleeGame::behavior_id_of_tag(std::uint32_t tag) const {
@@ -2039,6 +2447,7 @@ std::vector<MeleeGame::BuildCardEntry> MeleeGame::selection_build_entries() cons
         e.name = "Build " + bp.unit;
         if (auto nm = cat_->button_display_name(bp.face)) e.name = std::move(*nm);
         if (auto ic = cat_->button_icon(bp.face)) e.icon = std::move(*ic);
+        if (auto hk = cat_->button_hotkey(bp.face)) e.hotkey = std::move(*hk);
         if (bp.row >= 0 && bp.col >= 0) e.slot = bp.row * 5 + bp.col;
         const data::UnitCost c = data::unit_cost(*cat_, bp.unit);
         e.minerals = c.minerals;
@@ -2093,6 +2502,35 @@ bool MeleeGame::lead_authors_card_page(int page) const {
         return false;
     }
     return false;
+}
+
+static int timed_ladder_stage(const formats::Model& model, const std::vector<std::vector<std::string>>& ladder, double p,
+                              double total_ms, int fallback) {
+    static const bool kEqualStages = std::getenv("SC2_PROGRESS_EQUAL_STAGES") != nullptr;
+    if (kEqualStages || !(total_ms > 0.0) || ladder.empty()) return fallback;
+    std::vector<double> len(ladder.size(), -1.0);
+    double fixed = 0.0;
+    int stands = 0;
+    for (std::size_t si = 0; si < ladder.size(); ++si) {
+        const std::vector<std::string>& sp = ladder[si];
+        const bool stand = std::find(sp.begin(), sp.end(), "Stand") != sp.end();
+        const int sq = stand ? -1 : render::select_sequence(model, sp, 0);
+        if (!stand && sq >= 0 && std::size_t(sq) < model.sequences.size()) {
+            len[si] = double(model.sequences[std::size_t(sq)].length_ms());
+            fixed += len[si];
+        } else {
+            ++stands;
+        }
+    }
+    if (stands <= 0 || fixed >= total_ms) return fallback;
+    const double each = (total_ms - fixed) / double(stands);
+    double at = 0.0;
+    const double now = p * total_ms;
+    for (std::size_t si = 0; si < ladder.size(); ++si) {
+        at += len[si] >= 0.0 ? len[si] : each;
+        if (now < at) return int(si);
+    }
+    return int(ladder.size()) - 1;
 }
 
 const std::vector<std::vector<std::string>>& MeleeGame::construction_ladder(const std::string& catalog_id) {
@@ -2507,7 +2945,7 @@ void MeleeGame::update_camera(const render::InputState& in, float dt_s) {
         refresh_hud_layout(in.view_w, in.view_h);
         const ConsolePanel console = console_view();
         const bool over_bar =
-            hud_covers_point(in.view_w, in.view_h, &console, in.mouse_x, in.mouse_y);
+            hud_covers_point(in.view_w, in.view_h, &console, in.mouse_x, in.mouse_y) || hud_buttons_.at(in.mouse_x, in.mouse_y);
         if (in.mouse_x <= cfg_.edge_margin) px -= 1;
         else if (in.mouse_x >= float(in.view_w) - cfg_.edge_margin) px += 1;
         if (in.mouse_y <= cfg_.edge_margin) py += 1;
@@ -2535,6 +2973,40 @@ void MeleeGame::update_camera(const render::InputState& in, float dt_s) {
     if (o != 0.0f) camctl_.orbit(o * cfg_.orbit_speed * dt_s);
     if (in.middle_down && (in.mouse_dx != 0.0f || in.mouse_dy != 0.0f))
         camctl_.pan(-in.mouse_dx * cfg_.pan_mouse, in.mouse_dy * cfg_.pan_mouse);
+    if (cam_right_ > cam_left_ && !std::getenv("SC2_NO_CAMERA_MARGIN")) {
+        static const float kMargin = std::getenv("SC2_CAMERA_MARGIN") ? float(std::atof(std::getenv("SC2_CAMERA_MARGIN"))) : 12.0f;
+        const float lo = cam_left_ + kMargin, hi = cam_right_ - kMargin;
+        if (hi > lo) camctl_.focus.x = std::clamp(camctl_.focus.x, lo, hi);
+    }
+    if (map_w_ > 0.0f && map_h_ > 0.0f) {
+        float sum = 0.0f;
+        int n = 0;
+        if (!air_layer_.empty()) {
+            camctl_.focus.z = air_z_at(camctl_.focus.x, camctl_.focus.y);
+        } else {
+            for (int dy = -2; dy <= 2; ++dy)
+                for (int dx = -2; dx <= 2; ++dx) {
+                    sum += ground_z_at(camctl_.focus.x + float(dx), camctl_.focus.y + float(dy));
+                    ++n;
+                }
+            camctl_.focus.z = sum / float(n);
+        }
+        if (const char* cf = std::getenv("SC2_CAM_FOCUS")) {
+            const float gz = ground_z_at(camctl_.focus.x, camctl_.focus.y);
+            if (cf[0] == 't') {
+                static float last_x = -1.0f, last_y = -1.0f;
+                if (last_x != camctl_.focus.x || last_y != camctl_.focus.y) {
+                    std::fprintf(stderr, "camfocus %.3f %.3f layer %.4f ground %.4f\n", camctl_.focus.x, camctl_.focus.y, camctl_.focus.z, gz);
+                    last_x = camctl_.focus.x;
+                    last_y = camctl_.focus.y;
+                }
+            } else if (cf[0] == 'a' && cf[1] == 'd' && cf[2] == 'd' && cf[3] == ':') {
+                camctl_.focus.z += float(std::atof(cf + 4));
+            } else {
+                camctl_.focus.z = gz;
+            }
+        }
+    }
 }
 
 void MeleeGame::build_actor_catalog(const data::Catalog& cat) {
@@ -2582,6 +3054,24 @@ const formats::Model* MeleeGame::splat_quad_for(const sim::Unit& u) {
     if (splat_none_.count(u.id)) return nullptr;
     const formats::Model* splat = (models_ && ui_store_) ? models_->unit_splat(*ui_store_, u.catalog_id) : nullptr;
     if (!splat || splat->materials.empty()) {
+        if (models_ && ui_store_ && cat_ && u.player >= 0 && u.speed.raw() == 0 && (u.attributes & sim::kAttrStructure) != 0 &&
+            !std::getenv("SC2_NO_PLAYER_DECAL")) {
+            if (const MeleeModels::GroundDecal* gd = models_->unit_ground_decal(*ui_store_, u.catalog_id)) {
+                const float fl = std::sqrt(gd->forward[0] * gd->forward[0] + gd->forward[1] * gd->forward[1]);
+                if (fl > 1e-6f) {
+                    const float ux = float(u.x.to_double()), uy = float(u.y.to_double());
+                    formats::PlacedDoodad dd{};
+                    dd.rotation = std::atan2(gd->forward[1], gd->forward[0]) + 1.5707963f;
+                    const float cr = std::cos(dd.rotation), sr = std::sin(dd.rotation);
+                    dd.x = cr * gd->offset[0] - sr * gd->offset[1];
+                    dd.y = sr * gd->offset[0] + cr * gd->offset[1];
+                    dd.sx = dd.sy = dd.sz = gd->scale;
+                    formats::Model only = build_projector_items(std::vector<ProjectorItem>{{&gd->model, dd}}, 0.0f,
+                                                                [&](float x, float y) { return ground_z_at(ux + x, uy + y); });
+                    if (only.vertex_count) return &splat_quads_.emplace(u.id, std::move(only)).first->second;
+                }
+            }
+        }
         splat_none_.insert(u.id);
         return nullptr;
     }
@@ -2595,6 +3085,75 @@ const formats::Model* MeleeGame::splat_quad_for(const sim::Unit& u) {
             y0 = std::min(y0, dy); y1 = std::max(y1, dy);
         }
         if (any) extent = float(std::max(x1 - x0, y1 - y0) + 1);
+    }
+    if (models_->unit_splat_from_actor(u.catalog_id) && !splat->projectors.empty() && !std::getenv("SC2_ACTOR_SPLAT_QUAD")) {
+        const float ux = float(u.x.to_double()), uy = float(u.y.to_double());
+        formats::PlacedDoodad d{};
+        d.rotation = float(u.facing.to_double());
+        d.sx = d.sy = d.sz = 1.0f;
+        formats::Model bed = build_projector_items(std::vector<ProjectorItem>{{splat, d}}, 100.0f,
+                                                   [&](float x, float y) { return ground_z_at(ux + x, uy + y); });
+        if (bed.vertex_count) return &splat_quads_.emplace(u.id, std::move(bed)).first->second;
+        splat_none_.insert(u.id);
+        return nullptr;
+    }
+    static const bool kPadFootprint = std::getenv("SC2_SPLAT_PAD_FOOTPRINT") != nullptr;
+    const bool burrow_ring = (u.id & 0x80000000u) != 0 && !std::getenv("SC2_BURROW_RING_FOOTPRINT");
+    if (!kPadFootprint && cat_ && u.player >= 0 && ((u.speed.raw() == 0 && (u.attributes & sim::kAttrStructure) != 0) || burrow_ring) && !splat->projectors.empty()) {
+        const formats::M3Projector& pj = splat->projectors.front();
+        if (pj.x_right - pj.x_left > 0.05f && pj.y_back - pj.y_front > 0.05f) {
+            const float ux = float(u.x.to_double()), uy = float(u.y.to_double());
+            static const float kRotAdd = std::getenv("SC2_SPLAT_PAD_ROT_ADD") ? float(std::atof(std::getenv("SC2_SPLAT_PAD_ROT_ADD"))) * 0.01745329252f : 0.0f;
+            formats::PlacedDoodad d{};
+            d.rotation = float(cat_->unit_facing_radians(u.catalog_id)) + 1.5707963f + kRotAdd;
+            d.sx = d.sy = d.sz = models_->unit_splat_scale(u.catalog_id);
+            std::vector<ProjectorItem> items{{splat, d}};
+            static const bool kNoDecal = std::getenv("SC2_NO_PLAYER_DECAL") != nullptr;
+            if (const MeleeModels::GroundDecal* gd = kNoDecal ? nullptr : models_->unit_ground_decal(*ui_store_, u.catalog_id)) {
+                const float fl = std::sqrt(gd->forward[0] * gd->forward[0] + gd->forward[1] * gd->forward[1]);
+                if (fl > 1e-6f) {
+                    formats::PlacedDoodad dd{};
+                    dd.rotation = std::atan2(gd->forward[1], gd->forward[0]) + 1.5707963f;
+                    const float cr = std::cos(dd.rotation), sr = std::sin(dd.rotation);
+                    dd.x = cr * gd->offset[0] - sr * gd->offset[1];
+                    dd.y = sr * gd->offset[0] + cr * gd->offset[1];
+                    dd.sx = dd.sy = dd.sz = gd->scale;
+                    items.push_back({&gd->model, dd});
+                }
+            }
+            formats::Model pad = build_projector_items(items, 0.0f,
+                                                       [&](float x, float y) { return ground_z_at(ux + x, uy + y); });
+            if (std::getenv("SC2_SPLAT_TRACE"))
+                for (std::size_t ri = 0; ri < pad.regions.size(); ++ri) {
+                    const formats::M3Region& rg = pad.regions[ri];
+                    float lo[3] = {1e30f, 1e30f, 1e30f}, hi[3] = {-1e30f, -1e30f, -1e30f};
+                    for (std::uint32_t v = rg.first_vertex; v < rg.first_vertex + rg.num_vertices; ++v)
+                        for (int a = 0; a < 3; ++a) { lo[a] = std::min(lo[a], pad.positions[v * 3 + a]); hi[a] = std::max(hi[a], pad.positions[v * 3 + a]); }
+                    std::uint32_t imax = 0;
+                    for (std::uint32_t k = rg.first_index; k < rg.first_index + rg.num_indices; ++k) imax = std::max<std::uint32_t>(imax, pad.indices[k]);
+                    std::fprintf(stderr, "[splatreg] %s region %zu material '%s' verts %u+%u indices %u+%u (max index %u) x[%.2f,%.2f] y[%.2f,%.2f] z[%.2f,%.2f]\n", u.catalog_id.c_str(), ri,
+                                 pad.region_material[ri] >= 0 ? pad.materials[std::size_t(pad.region_material[ri])].name.c_str() : "-", rg.first_vertex, rg.num_vertices, rg.first_index, rg.num_indices, imax,
+                                 double(lo[0]), double(hi[0]), double(lo[1]), double(hi[1]), double(lo[2]), double(hi[2]));
+                    if (pad.region_material[ri] >= 0) {
+                        const formats::M3Material& mt = pad.materials[std::size_t(pad.region_material[ri])];
+                        std::fprintf(stderr, "[splatreg]   flags 0x%08x blend %u\n", mt.flags, unsigned(mt.blend_mode));
+                        for (const formats::M3Layer& L : mt.layers)
+                            std::fprintf(stderr, "[splatreg]   layer %s '%s' w36 0x%x w40 0x%x w44 %u mult %.3f (id %u) add %.3f (id %u) uvoff %.3f,%.3f (id %u) uvang %.3f,%.3f,%.3f (id %u) tile %.3f,%.3f (id %u)\n", L.usage.c_str(),
+                                         L.image_path.c_str(), L.word36, L.word40, L.word44, double(L.anim.bright_mult), L.anim.bright_mult_id, double(L.anim.midtone_offset), L.anim.midtone_id,
+                                         double(L.anim.uv_offset[0]), double(L.anim.uv_offset[1]), L.anim.uv_offset_id, double(L.anim.uv_angle[0]), double(L.anim.uv_angle[1]), double(L.anim.uv_angle[2]),
+                                         L.anim.uv_angle_id, double(L.anim.uv_tiling[0]), double(L.anim.uv_tiling[1]), L.anim.uv_tiling_id);
+                    }
+                }
+            if (pad.vertex_count) return &splat_quads_.emplace(u.id, std::move(pad)).first->second;
+        }
+    }
+    if (!splat->projectors.empty()) {
+        const formats::M3Projector& pj = splat->projectors.front();
+        const float pw = pj.x_right - pj.x_left, pl = pj.y_back - pj.y_front;
+        if (std::getenv("SC2_SPLAT_TRACE"))
+            std::fprintf(stderr, "[splat] %s projector type %u x[%.2f,%.2f] y[%.2f,%.2f] z[%.2f,%.2f] footprint extent %.2f\n", u.catalog_id.c_str(), pj.type,
+                         double(pj.x_left), double(pj.x_right), double(pj.y_front), double(pj.y_back), double(pj.z_bottom), double(pj.z_top), double(extent));
+        if (pw > 0.05f && pl > 0.05f && (u.player < 0 || std::getenv("SC2_SPLAT_PROJ_BOX")) && !std::getenv("SC2_SPLAT_FOOTPRINT_BOX")) extent = std::max(pw, pl);
     }
     const std::uint32_t divs = 4;
     const float cx = float(u.x.to_double()), cy = float(u.y.to_double());
@@ -2627,6 +3186,37 @@ const formats::Model* MeleeGame::splat_quad_for(const sim::Unit& u) {
     quad.material_refs.assign(1, formats::M3MaterialRef{1, 0});
     quad.region_material.assign(quad.regions.size(), 0);
     return &splat_quads_.emplace(u.id, std::move(quad)).first->second;
+}
+
+const formats::Model* MeleeGame::power_quad_for(const sim::Unit& u) {
+    if (auto it = power_quads_.find(u.id); it != power_quads_.end()) return &it->second;
+    if (power_quad_none_.count(u.id)) return nullptr;
+    const formats::Model* splat = (models_ && ui_store_) ? models_->actor_splat(*ui_store_, "PowerVisual") : nullptr;
+    if (!splat || splat->materials.empty() || u.power_radius.raw() <= 0) {
+        power_quad_none_.insert(u.id);
+        return nullptr;
+    }
+    float scale = 1.0f;
+    if (cat_)
+        if (auto sm = cat_->scalar("CModel", "PowerVisual", "ScaleMax"); sm && !sm->empty()) {
+            const double v = std::strtod(sm->c_str(), nullptr);
+            if (v > 0.0) scale = float(v);
+        }
+    const float extent = 2.0f * float(u.power_radius.to_double()) * scale;
+    const std::uint32_t divs = 8;
+    const float cx = float(u.x.to_double()), cy = float(u.y.to_double());
+    std::vector<float> heights((divs + 1) * (divs + 1), 0.0f);
+    for (std::uint32_t r = 0; r <= divs; ++r)
+        for (std::uint32_t c = 0; c <= divs; ++c) {
+            const float lx = -extent * 0.5f + extent * float(c) / float(divs);
+            const float ly = -extent * 0.5f + extent * float(r) / float(divs);
+            heights[r * (divs + 1) + c] = ground_z_at(cx + lx, cy + ly);
+        }
+    formats::Model quad = flat_ground_quad(extent, divs, heights);
+    quad.materials = splat->materials;
+    quad.material_refs.assign(1, formats::M3MaterialRef{1, 0});
+    quad.region_material.assign(quad.regions.size(), 0);
+    return &power_quads_.emplace(u.id, std::move(quad)).first->second;
 }
 
 std::string MeleeGame::race_music_id(int race_index) const {
@@ -2753,15 +3343,62 @@ void MeleeGame::update_cursor(const render::InputState& in, Control& ctrl) {
                                       : CursorState::Normal;
 }
 
-std::vector<EquipmentEntry> MeleeGame::equipment_for(int player) const {
+std::vector<EquipmentEntry> MeleeGame::equipment_for(int player, const sim::Unit* body) const {
     std::vector<EquipmentEntry> out;
     if (player < 0 || !cat_) return out;
+    const data::UpgradeCatalog* ups = research_ ? research_->upgrades() : nullptr;
+    auto line_covers_body = [body, ups](const std::string& up_id) {
+        if (!body || !ups) return true;
+        for (const data::UpgradeEffect& e : ups->resolve(up_id)) {
+            if ((e.catalog == "Unit" || e.catalog == "Actor") && e.entry == body->catalog_id) return true;
+            if (e.catalog == "Weapon" && !e.entry.empty() &&
+                (e.entry == body->wpn_id || e.entry == body->wpn2_id))
+                return true;
+        }
+        return false;
+    };
+    auto base_cell = [&](const std::string& key, const std::optional<std::string>& icon) {
+        if (!icon || icon->empty()) return;
+        EquipmentEntry e;
+        e.line = key;
+        e.level = 0;
+        e.icon = *icon;
+        out.push_back(e);
+    };
+    if (body) {
+        base_cell("LifeArmor", cat_->scalar("CActorUnit", body->catalog_id, "LifeArmorIcon"));
+        if (body->shields_max.raw() > 0) base_cell("ShieldArmor", cat_->scalar("CActorUnit", body->catalog_id, "ShieldArmorIcon"));
+        if (!body->wpn_id.empty()) base_cell("Weapon:" + body->wpn_id, cat_->scalar("CWeapon", body->wpn_id, "Icon"));
+        if (!body->wpn2_id.empty() && body->wpn2_id != body->wpn_id)
+            base_cell("Weapon:" + body->wpn2_id, cat_->scalar("CWeapon", body->wpn2_id, "Icon"));
+    }
+    const std::size_t base_count = out.size();
     for (const std::string& id : world_.researched(player)) {
+        if (!line_covers_body(id)) continue;
         std::size_t end = id.size();
         while (end > 0 && id[end - 1] >= '0' && id[end - 1] <= '9') --end;
         int level = 0;
         for (std::size_t i = end; i < id.size(); ++i) level = level * 10 + (id[i] - '0');
         if (level <= 0) level = 1;
+        if (body && ups && base_count) {
+            bool raised = false;
+            for (const data::UpgradeEffect& e : ups->resolve(id)) {
+                std::string key;
+                if (e.catalog == "Actor" && e.entry == body->catalog_id && e.field == "LifeArmorIcon") key = "LifeArmor";
+                else if (e.catalog == "Actor" && e.entry == body->catalog_id && e.field == "ShieldArmorIcon") key = "ShieldArmor";
+                else if (e.catalog == "Weapon" && e.field == "Icon" && (e.entry == body->wpn_id || e.entry == body->wpn2_id)) key = "Weapon:" + e.entry;
+                if (key.empty()) continue;
+                for (std::size_t q = 0; q < base_count; ++q)
+                    if (out[q].line == key) {
+                        if (level > out[q].level) {
+                            out[q].level = level;
+                            if (!e.value.empty()) out[q].icon = e.value;
+                        }
+                        raised = true;
+                    }
+            }
+            if (raised) continue;
+        }
         std::string line = id.substr(0, end);
         if (line.size() > 5 && line.compare(line.size() - 5, 5, "Level") == 0) line.resize(line.size() - 5);
         auto it = out.begin();
@@ -2783,7 +3420,7 @@ std::vector<EquipmentEntry> MeleeGame::equipment_for(int player) const {
             it->icon = icon_of(id);
         }
     }
-    std::sort(out.begin(), out.end(), [](const EquipmentEntry& a, const EquipmentEntry& b) {
+    std::sort(out.begin() + std::ptrdiff_t(base_count), out.end(), [](const EquipmentEntry& a, const EquipmentEntry& b) {
         return a.line < b.line;
     });
     return out;
@@ -2805,12 +3442,42 @@ static bool worker_is_idle(const sim::Unit& u, int human_player) {
            u.construct_target == sim::kNoTarget && u.mine_cd.raw() <= 0;
 }
 
+std::vector<std::uint32_t> MeleeGame::army_units() const {
+    std::vector<std::uint32_t> army;
+    if (cfg_.human_player < 0 || !cat_) return army;
+    for (const Unit& u : world_.units())
+        if (u.alive && u.player == cfg_.human_player && !u.catalog_id.empty() &&
+            cat_->unit_flag(u.catalog_id, "ArmySelect"))
+            army.push_back(u.id);
+    return army;
+}
+
+std::vector<std::uint32_t> MeleeGame::ready_warp_gates() const {
+    std::vector<std::uint32_t> gates;
+    if (cfg_.human_player < 0 || !cat_) return gates;
+    for (const Unit& u : world_.units()) {
+        if (!u.alive || u.constructing || u.player != cfg_.human_player || u.catalog_id.empty()) continue;
+        if (cat_->unit_warp_products(u.catalog_id).empty()) continue;
+        if (!world_.warp_ready(u.id)) continue;
+        gates.push_back(u.id);
+    }
+    return gates;
+}
+
 int MeleeGame::idle_worker_count() const {
     if (cfg_.human_player < 0) return 0;
     int n = 0;
     for (const Unit& u : world_.units())
         if (worker_is_idle(u, cfg_.human_player)) ++n;
     return n;
+}
+
+std::vector<std::uint32_t> MeleeGame::idle_workers() const {
+    std::vector<std::uint32_t> ids;
+    if (cfg_.human_player < 0) return ids;
+    for (const Unit& u : world_.units())
+        if (worker_is_idle(u, cfg_.human_player)) ids.push_back(u.id);
+    return ids;
 }
 
 std::uint32_t MeleeGame::select_next_idle_worker() {
@@ -2846,7 +3513,7 @@ std::string MeleeGame::error_sound_id(sim::CmdError e) const {
     return cat_->find("CSound", id) ? id : std::string();
 }
 
-std::string MeleeGame::alert_sound_id(AlertKind kind) const {
+std::string MeleeGame::alert_sound_id(AlertKind kind, const std::string& alert_override) const {
     if (!cat_) return {};
     const char* base = nullptr;
     switch (kind) {
@@ -2854,7 +3521,9 @@ std::string MeleeGame::alert_sound_id(AlertKind kind) const {
         case AlertKind::AttackTown: base = "AttackTown"; break;
         case AlertKind::UpgradeComplete: base = "UpgradeComplete"; break;
         case AlertKind::BuildComplete: base = "BuildComplete"; break;
-        case AlertKind::ResourceExhausted: base = "ResourceExhausted_Mineral"; break;
+        case AlertKind::ResourceExhausted:
+            base = alert_override.empty() ? "ResourceExhausted_Mineral" : alert_override.c_str();
+            break;
     }
     if (!base) return {};
     const int race = human_race();
@@ -2870,8 +3539,13 @@ void MeleeGame::spawn_corpse(const sim::Unit& u) {
     if (actor_cat_ && !u.catalog_id.empty()) {
         if (const data::CActorUnit* actor = actor_cat_->actor_for_unit(u.catalog_id)) {
             const data::ActorDeath* row = nullptr;
-            for (const data::ActorDeath& d : actor->death_array)
-                if (d.index == "Normal" || d.index.empty()) { row = &d; break; }
+            const std::string want = sim::death_name_of(u.death_code);
+            if (u.death_code != 0)
+                for (const data::ActorDeath& d : actor->death_array)
+                    if (d.index == want) { row = &d; break; }
+            if (!row)
+                for (const data::ActorDeath& d : actor->death_array)
+                    if (d.index == "Normal" || d.index.empty()) { row = &d; break; }
             if (!row && !actor->death_array.empty()) row = &actor->death_array.front();
             if (row) {
                 if (!row->anim_props.empty()) {
@@ -2886,13 +3560,19 @@ void MeleeGame::spawn_corpse(const sim::Unit& u) {
                 }
                 if (models_ && ui_store_ && !row->model_link.empty())
                     model = models_->death_model(*ui_store_, row->model_link);
+                if (audio_ && !row->sound_link.empty()) audio_->play_sound(row->sound_link, 1.0f);
             }
         }
     }
+    const bool own_model = !model;
     if (!model && u.id < driver_.actors.size()) model = driver_.actors[u.id].model;
+    int seq = model ? render::select_sequence(*model, props, u.id) : -1;
+    if (model && seq < 0 && props != std::vector<std::string>{"Death"}) seq = render::select_sequence(*model, {"Death"}, u.id);
+    if (std::getenv("SC2_CORPSE_TRACE"))
+        std::fprintf(stderr, "[corpse] tick %d at (%.1f, %.1f) %s death '%s' -> %s model (%u verts, %zu emitters), clip %d '%s'\n", world_.tick(), u.x.to_double(), u.y.to_double(), u.catalog_id.c_str(), sim::death_name_of(u.death_code),
+                     model ? (own_model ? "its own" : "the death row's") : "NO", model ? model->vertex_count : 0u, model ? model->particles.size() : std::size_t(0), seq,
+                     model && seq >= 0 && std::size_t(seq) < model->sequences.size() ? model->sequences[std::size_t(seq)].name.c_str() : "-");
     if (!model) return;
-    int seq = render::select_sequence(*model, props, u.id);
-    if (seq < 0 && props != std::vector<std::string>{"Death"}) seq = render::select_sequence(*model, {"Death"}, u.id);
     if (seq < 0 || std::size_t(seq) >= model->sequences.size()) return;
     Corpse c;
     c.model = model;
@@ -2902,9 +3582,13 @@ void MeleeGame::spawn_corpse(const sim::Unit& u) {
     c.x = float(u.x.to_double());
     c.y = float(u.y.to_double());
     c.z = cat_ ? cat_->unit_display_height(u.catalog_id) : 0.0f;
-    c.scale = cat_ ? cat_->unit_render_scale(u.catalog_id) : std::array<float, 3>{1.0f, 1.0f, 1.0f};
+    static const bool kCorpseAtZero = std::getenv("SC2_CORPSE_AT_ZERO") != nullptr;
+    if (!kCorpseAtZero) c.z += ground_z_at(c.x, c.y);
+    c.scale = unit_draw_scale(cat_, u.catalog_id);
     c.player = u.player;
     c.fog_visibility = u.fog_visibility;
+    static const bool kUnturned = std::getenv("SC2_CORPSE_UNTURNED") != nullptr;
+    if (!kUnturned && u.id < driver_.actors.size()) c.orient = driver_.actors[u.id].orient();
     corpses_.push_back(c);
 }
 
@@ -2950,7 +3634,8 @@ bool MeleeGame::consume_modal_target(sim::Fixed wx, sim::Fixed wy) {
         }
         world_.issue(id, o);
     }
-    audio_ui_event(human_lead_caster(), data::UnitEvent::Confirm, kUiCueTrim);
+    audio_ui_event(human_lead_caster(), pending_attack_ ? data::UnitEvent::AttackOrder : data::UnitEvent::Confirm,
+                   kUiCueTrim);
     pending_attack_ = pending_patrol_ = pending_move_ = false;
     return true;
 }
@@ -2961,15 +3646,16 @@ void MeleeGame::handle_commands(const render::InputState& in, float aspect) {
     Control ctrl = make_control(mvp, in.view_w, in.view_h, cfg_.human_player);
     update_cursor(in, ctrl);
 
-    ensure_console_texture();
+    ensure_console_texture(in.view_w, in.view_h);
     refresh_hud_layout(in.view_w, in.view_h);
     const ConsolePanel console = console_view();
+    refresh_hud_buttons(in.view_w, in.view_h);
 
     const HudRect mm = hud_minimap_rect(in.view_w, in.view_h, console_tex_.ok() ? &console : nullptr);
     const bool over_minimap = in.mouse_x >= float(mm.x0) && in.mouse_x < float(mm.x1) &&
                               in.mouse_y >= float(mm.y0) && in.mouse_y < float(mm.y1);
     const bool over_bar =
-        hud_covers_point(in.view_w, in.view_h, &console, in.mouse_x, in.mouse_y);
+        hud_covers_point(in.view_w, in.view_h, &console, in.mouse_x, in.mouse_y) || hud_buttons_.at(in.mouse_x, in.mouse_y);
     auto minimap_world = [&](float& wx, float& wy) {
         hud_minimap_pixel_to_world(mm, minimap_extent(), in.mouse_x, in.mouse_y, wx, wy);
     };
@@ -3013,6 +3699,16 @@ void MeleeGame::handle_commands(const render::InputState& in, float aspect) {
     if (pending_build_ || pending_refinery_) {
         sim::Fixed wx, wy;
         if (!over_bar && ctrl.ground_point(world_, ScreenPoint{in.mouse_x, in.mouse_y}, wx, wy)) {
+            if (cat_ && !build_proto_.catalog_id.empty()) {
+                double sfx = 0.5, sfy = 0.5;
+                if (cat_->unit_placement_grid_phase(build_proto_.catalog_id, sfx, sfy)) {
+                    auto snap = [](sim::Fixed v, double phase) {
+                        return sim::Fixed::from_double(std::floor(v.to_double() - phase + 0.5) + phase);
+                    };
+                    wx = snap(wx, sfx);
+                    wy = snap(wy, sfy);
+                }
+            }
             build_px_ = wx;
             build_py_ = wy;
             bool clear = wx.to_double() >= 0.0 && wy.to_double() >= 0.0 &&
@@ -3062,11 +3758,27 @@ void MeleeGame::handle_commands(const render::InputState& in, float aspect) {
         dragging_ = false;
         return;
     }
-    if (in.left_pressed && idle_worker_count() > 0) {
-        const HudRect ib = hud_idle_button_rect(in.view_w, in.view_h, console_tex_.ok() ? &console : nullptr);
-        if (ib.w() > 2 && ib.h() > 2 && in.mouse_x >= float(ib.x0) && in.mouse_x < float(ib.x1) &&
-            in.mouse_y >= float(ib.y0) && in.mouse_y < float(ib.y1)) {
-            select_next_idle_worker();
+    if (const std::optional<HudPress> hp = hud_buttons_.route(in)) {
+        on_hud_button(*hp);
+        dragging_ = false;
+        return;
+    }
+    if ((in.left_pressed || in.right_pressed) && (hud_ui_.minimap.ping_armed || in.key_alt)) {
+        float pwx = 0.0f, pwy = 0.0f;
+        bool have_point = false;
+        if (over_minimap && map_w_ > 0.0f && map_h_ > 0.0f) {
+            minimap_world(pwx, pwy);
+            have_point = true;
+        } else if (!over_bar) {
+            sim::Fixed fx, fy;
+            if (ctrl.ground_point(world_, ScreenPoint{in.mouse_x, in.mouse_y}, fx, fy)) {
+                pwx = float(fx.to_double());
+                pwy = float(fy.to_double());
+                have_point = true;
+            }
+        }
+        if (hud_minimap_take_click(in, have_point, pwx, pwy)) {
+            dragging_ = false;
             return;
         }
     }
@@ -3334,7 +4046,7 @@ void MeleeGame::handle_commands(const render::InputState& in, float aspect) {
                         case kMeleeAbilLiftOff:
                             if (cat_)
                                 if (const std::uint32_t id = selected_liftoff_structure(false);
-                                    id != sim::kNoTarget) {
+                                    id != sim::kNoTarget && !liftoff_busy(id)) {
                                     const auto ls = cat_->liftoff_spec(cat_->liftoff_ability(world_.units()[id].catalog_id));
                                     world_.lift_off(id, ls ? sim::Fixed::from_double(ls->lock) : sim::Fixed(),
                                                     ls ? sim::Fixed::from_double(ls->rise_delay) : sim::Fixed(),
@@ -3514,8 +4226,11 @@ void MeleeGame::handle_commands(const render::InputState& in, float aspect) {
             dragging_ = false;
             sim::Fixed wx, wy;
             if (pending_unload_unit_ < world_.units().size() && world_.unit(pending_unload_unit_).alive &&
-                ctrl.ground_point(world_, ScreenPoint{in.mouse_x, in.mouse_y}, wx, wy))
-                world_.unload_all_at(pending_unload_unit_, wx, wy);
+                ctrl.ground_point(world_, ScreenPoint{in.mouse_x, in.mouse_y}, wx, wy)) {
+                const bool mobile = world_.unit(pending_unload_unit_).speed.raw() > 0;
+                if (mobile) world_.issue(pending_unload_unit_, sim::Order{sim::OrderType::Move, wx, wy, sim::kNoTarget});
+                world_.issue(pending_unload_unit_, sim::Order{sim::OrderType::Unload, wx, wy, sim::kNoTarget}, mobile);
+            }
             pending_unload_ = false;
             pending_unload_unit_ = sim::kNoTarget;
         } else if ((pending_attack_ || pending_patrol_ || pending_move_) && !selection_.empty()) {
@@ -3561,6 +4276,7 @@ void MeleeGame::handle_commands(const render::InputState& in, float aspect) {
         }
         const std::vector<std::uint32_t> prev_selection = selection_;
         set_selection(ctrl.box_select(world_, ScreenRect{x0, y0, x1, y1}, marquee));
+        select_click_ = !marquee;
         if (!marquee && selection_.size() > 1) {
             sim::Fixed wx, wy;
             if (ctrl.ground_point(world_, ScreenPoint{in.mouse_x, in.mouse_y}, wx, wy)) {
@@ -3760,7 +4476,14 @@ void MeleeGame::handle_commands(const render::InputState& in, float aspect) {
     if (lead != audio_sel_lead_) {
         if (lead != sim::kNoTarget) audio_ui_event(lead, data::UnitEvent::Select, 1.0f);
         audio_sel_lead_ = lead;
+        audio_sel_repeat_ = 0;
+    } else if (select_click_ && lead != sim::kNoTarget && selection_.size() == 1) {
+        if (++audio_sel_repeat_ >= kPissedClicks) {
+            audio_ui_event(lead, data::UnitEvent::Pissed, 1.0f);
+            audio_sel_repeat_ = 0;
+        }
     }
+    select_click_ = false;
 }
 
 std::uint32_t MeleeGame::spawn(sim::Unit proto, const std::string& token,
@@ -3775,6 +4498,58 @@ std::uint32_t MeleeGame::spawn(sim::Unit proto, const std::string& token,
     return id;
 }
 
+bool MeleeGame::debug_create(const std::string& unit_id_in, float x, float y, float facing) {
+    const bool enemy = !unit_id_in.empty() && unit_id_in[0] == '!';
+    const std::string unit_in = enemy ? unit_id_in.substr(1) : unit_id_in;
+    const bool founding = !unit_in.empty() && unit_in[0] == '~';
+    const std::string unit_id = founding ? unit_in.substr(1) : unit_in;
+    if (!cat_ || cfg_.human_player < 0 || !cat_->find("CUnit", unit_id)) return false;
+    const int owner = enemy ? (cfg_.human_player == 0 ? 1 : 0) : cfg_.human_player;
+    sim::Unit proto = make_unit(*cat_, unit_id, owner);
+    if (facing > -100.0f) proto.facing = sim::Fixed::from_double(double(facing));
+    proto.x = sim::Fixed::from_double(double(x));
+    proto.y = sim::Fixed::from_double(double(y));
+    if (founding) proto.speed = sim::Fixed();
+    if (proto.needs_power && !std::getenv("SC2_DEBUG_CREATE_UNMANAGED_POWER")) proto.power_managed = true;
+    const std::uint32_t id = world_.add_unit(proto);
+    if (layout_.unit_type.size() <= id) layout_.unit_type.resize(id + 1);
+    layout_.unit_type[id] = unit_id;
+    if (facing > -100.0f && !std::getenv("SC2_DEBUG_CREATE_NO_SPAWN_FACING")) driver_.set_spawn_facing(id, facing);
+    if (founding) {
+        double secs = 0.0;
+        for (const char* worker : {"Drone", "Probe", "SCV"})
+            for (const auto& bp : cat_->unit_build_products(worker))
+                if (bp.unit == unit_id && bp.time > 0) secs = bp.time;
+        if (secs <= 0.0) return false;
+        sim::Fixed start_hp = sim::Fixed::from_raw(world_.units()[id].hp_max.raw() / 10);
+        if (start_hp.raw() <= 0) start_hp = sim::Fixed::from_int(1);
+        world_.start_construction(id, sim::Fixed::from_double(secs), start_hp);
+    }
+    return true;
+}
+
+bool MeleeGame::debug_morph(const std::string& from_unit, const std::string& morph_abil) {
+    if (!cat_ || cfg_.human_player < 0) return false;
+    world_.player(cfg_.human_player).minerals += 5000;
+    world_.player(cfg_.human_player).gas += 5000;
+    if (const auto ms = cat_->morph_spec(morph_abil)) {
+        std::string chain;
+        for (const std::string& c : ms->chain) chain += c + " ";
+        std::fprintf(stderr, "[morph] spec %s: time %.2f target %s chain %s\n", morph_abil.c_str(), ms->morph_time, ms->target.c_str(), chain.c_str());
+    }
+    const bool burrow_down = morph_abil.rfind("Burrow", 0) == 0 && morph_abil.size() > 4 && morph_abil.compare(morph_abil.size() - 4, 4, "Down") == 0;
+    const bool burrow_up = morph_abil.rfind("Burrow", 0) == 0 && morph_abil.size() > 2 && morph_abil.compare(morph_abil.size() - 2, 2, "Up") == 0;
+    for (const Unit& u : world_.units())
+        if (u.alive && u.player == cfg_.human_player && u.catalog_id == from_unit) {
+            if (burrow_down || burrow_up) {
+                sim::set_burrowed(world_, u.id, burrow_down);
+                return true;
+            }
+            return human_morph(u.id, morph_abil);
+        }
+    return false;
+}
+
 void MeleeGame::snapshot_positions(std::vector<render::Vec3>& out) const {
     const std::vector<Unit>& units = world_.units();
     if (out.size() < units.size()) out.resize(units.size());
@@ -3782,7 +4557,93 @@ void MeleeGame::snapshot_positions(std::vector<render::Vec3>& out) const {
         out[u.id] = {float(u.x.to_double()), float(u.y.to_double()), 0.0f};
 }
 
+static void emit_range_ring(std::vector<render::SceneInstance>& scene, float x, float y, float z, float radius) {
+    if (radius <= 0.0f) return;
+    const float band = 0.09f;
+    const float inner = radius > band ? (radius - band) / radius : 0.0f;
+    const int key = int(inner * 2000.0f + 0.5f);
+    static std::map<int, formats::Model> ring_cache;
+    auto it = ring_cache.find(key);
+    if (it == ring_cache.end()) it = ring_cache.emplace(key, render::make_ring_model(inner, 128)).first;
+    render::SceneInstance ring;
+    ring.model = &it->second;
+    ring.world = render::translation(x, y, z + 0.05f) * render::scaling(radius, radius, 1.0f);
+    ring.team = {1.0f, 1.0f, 1.0f, 2.0f};
+    ring.seq = -1;
+    scene.push_back(ring);
+}
+
+static void emit_beam(std::vector<render::SceneInstance>& scene, const float a[3], const float b[3],
+                      float width) {
+    static formats::Model quad = render::make_beam_model();
+    render::SceneInstance s;
+    s.model = &quad;
+    s.world = render::beam_transform(a[0], a[1], a[2], b[0], b[1], b[2], width);
+    s.team = {1.0f, 1.0f, 1.0f, 2.0f};
+    s.seq = -1;
+    scene.push_back(s);
+}
+
+bool MeleeGame::unit_attach_world(const sim::Unit& u, const char* first, const char* second, float out[3]) {
+    out[0] = float(u.x.to_double());
+    out[1] = float(u.y.to_double());
+    out[2] = (u.flying ? air_z_at(out[0], out[1]) : ground_z_at(out[0], out[1]));
+    if (cat_) {
+        float h = cat_->unit_display_height(u.catalog_id);
+        if (u.flying && h <= 0.0f) h = cat_->unit_display_height(u.catalog_id + "Flying");
+        if (h > 0.0f) out[2] = air_z_at(out[0], out[1]) + h;
+    }
+    if (u.id >= driver_.actors.size()) return false;
+    render::ActorInstance& a = driver_.actors[u.id];
+    const int seq = a.model ? a.current_sequence() : -1;
+    if (seq < 0) return false;
+    render::Mat4 att;
+    if (!(first && render::attachment_transform(*a.model, first, std::uint32_t(seq), a.current_time(), att)) &&
+        !(second && render::attachment_transform(*a.model, second, std::uint32_t(seq), a.current_time(), att)))
+        return false;
+    const float c = std::cos(a.facing + 1.5707963f), s = std::sin(a.facing + 1.5707963f);
+    out[0] += att.m[12] * c - att.m[13] * s;
+    out[1] += att.m[12] * s + att.m[13] * c;
+    out[2] += att.m[14];
+    return true;
+}
+
+void MeleeGame::beam_refresh(std::uint32_t attacker, std::uint32_t target, std::uint8_t slot, const std::string& key,
+                             bool heal, float keep_ms) {
+    if (!models_ || !ui_store_ || attacker >= world_.units().size()) return;
+    for (BeamFx& b : beams_)
+        if (b.attacker == attacker && b.slot == slot && b.heal == heal && b.phase < 2) {
+            b.idle_ms = 0.0f;
+            if (b.continuous) { b.target = target; return; }
+            if (b.target == target) return;
+        }
+    const MeleeModels::BeamModel bm = heal ? models_->actor_beam_model(*ui_store_, key) : models_->beam_model(*ui_store_, key);
+    if (!bm.model) return;
+    BeamFx b;
+    b.model = bm.model;
+    b.attacker = attacker;
+    b.target = target;
+    b.slot = slot;
+    b.heal = heal;
+    b.continuous = bm.continuous;
+    b.scale = bm.scale;
+    b.keep_ms = keep_ms;
+    b.seq[0] = render::select_sequence(*bm.model, {"Birth"}, attacker);
+    b.seq[1] = render::select_sequence(*bm.model, {"Stand"}, attacker);
+    b.seq[2] = render::select_sequence(*bm.model, {"Death"}, attacker);
+    if (b.seq[1] < 0) b.seq[1] = b.seq[0] >= 0 ? b.seq[0] : (bm.model->sequences.empty() ? -1 : 0);
+    b.phase = b.seq[0] >= 0 ? 0 : 1;
+    for (std::size_t i = 0; i < bm.model->bones.size(); ++i)
+        if (bm.model->bones[i].name == "Attacher") { b.beam_bone = int(i); break; }
+    b.player = world_.units()[attacker].player;
+    if (beams_.size() < 256) beams_.push_back(b);
+}
+
 void MeleeGame::emit_scene(std::vector<render::SceneInstance>& scene) {
+    SC2_PROF_SCOPE("emit_scene");
+    rebuild_subgroups();
+    const data::Catalog::SelectionLook sel_look = cat_ ? cat_->selection_look()
+                                                       : data::Catalog::SelectionLook{};
     scene.clear();
     if (ground_) {
         render::SceneInstance g;
@@ -3792,40 +4653,180 @@ void MeleeGame::emit_scene(std::vector<render::SceneInstance>& scene) {
         g.seq = -1;
         scene.push_back(g);
     }
+    if (roads_ && !roads_->regions.empty() && roads_->vertex_count) {
+        render::SceneInstance r;
+        r.model = roads_;
+        r.world = render::Mat4::identity();
+        r.team = {0.0f, 0.0f, 0.0f, -1.0f};
+        r.seq = -1;
+        scene.push_back(r);
+    }
     if (water_ && !water_->regions.empty() && water_->vertex_count) {
         render::SceneInstance w;
         w.model = water_;
         w.world = render::Mat4::identity();
         w.team = {water_rgba_[0], water_rgba_[1], water_rgba_[2], 2.0f};
         w.seq = -1;
+        if (ui_store_ && !water_look_.resolved) {
+            water_look_.resolved = true;
+            for (const auto& kv : water_type_materials(*ui_store_, map_water_xml_.empty() ? nullptr : &map_water_xml_)) {
+                const WaterMaterial& wm = kv.second;
+                if (!wm.has || std::fabs(wm.color[0] - water_rgba_[0]) > 1e-4f || std::fabs(wm.color[1] - water_rgba_[1]) > 1e-4f ||
+                    std::fabs(wm.color[2] - water_rgba_[2]) > 1e-4f)
+                    continue;
+                water_look_.has = true;
+                water_look_.color_falloff = wm.color_falloff;
+                water_look_.specularity = wm.specularity;
+                water_look_.specular_scaler = wm.specular_scaler;
+                water_look_.reflectivity_power = wm.reflectivity_power;
+                water_look_.min_reflection = wm.min_reflection;
+                water_look_.reflection_distortion = wm.reflection_distortion;
+                water_look_.refraction_distortion = wm.refraction_distortion;
+                water_look_.uv_rotate = wm.uv_rotate;
+                water_look_.receive_shadows = wm.receive_shadows;
+                break;
+            }
+        }
+        if (water_look_.has) {
+            if (water_fx_source_ != water_) {
+                water_fx_source_ = water_;
+                water_fx_model_ = *water_;
+                formats::M3Material mat;
+                mat.name = "CWater";
+                formats::M3Layer nl;
+                nl.usage = "Normal";
+                nl.image_path = "Assets/Textures/DefaultWater.dds";
+                mat.layers.push_back(nl);
+                water_fx_model_.materials.assign(1, mat);
+                water_fx_model_.region_material.assign(water_fx_model_.regions.size(), 0);
+            }
+            w.model = &water_fx_model_;
+            static const bool shadow_always = std::getenv("SC2_WATER_SHADOW_ALWAYS") != nullptr;
+            w.team = {(water_look_.receive_shadows || shadow_always) ? 1.0f : 0.0f, 0.0f, 0.0f, -1.0f};
+            w.fx.kind = render::FxKind::Water;
+            w.fx.t = float(clock_ms_ * 0.001);
+            for (int k = 0; k < 4; ++k) w.fx.p0[k] = water_rgba_[std::size_t(k)];
+            w.fx.p1[0] = water_look_.specularity;
+            w.fx.p1[1] = water_look_.specular_scaler;
+            w.fx.p1[2] = water_look_.reflectivity_power;
+            w.fx.p1[3] = water_look_.min_reflection;
+            w.fx.aux = water_look_.color_falloff;
+            w.fx.uv_tiling[0] = water_look_.tiling[0];
+            w.fx.uv_tiling[1] = water_look_.tiling[1];
+            w.fx.ext[0] = water_look_.refraction_distortion;
+            w.fx.ext[1] = water_look_.reflection_distortion;
+            w.fx.uv_angle = water_look_.uv_rotate;
+            for (int k = 0; k < 4; ++k) w.fx.team_emissive[k] = water_look_.scroll[k];
+        }
         scene.push_back(w);
     }
     const bool splat_fog_ready = cfg_.human_player >= 0 && vision_.width() > 0;
     if (models_ && ui_store_)
         for (const Unit& u : world_.units()) {
-            if (!u.alive || u.player < 0 || u.speed.raw() != 0 || u.flying) continue;
+            static const bool kNeutralSplats = std::getenv("SC2_NO_ACTOR_SPLAT") == nullptr;
+            static const bool kBurrowSplat = std::getenv("SC2_NO_BIRTH_SPLAT") == nullptr;
+            const bool dug = kBurrowSplat && u.burrowed && cat_;
+            if (!dug) splat_quads_.erase(u.id | 0x80000000u);
+            if (!u.alive || (u.player < 0 && !kNeutralSplats) || (u.speed.raw() != 0 && !dug) || u.flying) continue;
             if (splat_fog_ready && u.player != cfg_.human_player &&
-                !hud_fog_body_drawn(int(vision_.state_at(u.x, u.y)), FogVisibility(u.fog_visibility)))
+                !hud_fog_body_drawn(fog_body_state(u.player, int(vision_.state_at(u.x, u.y)), fog_hidden_black_), FogVisibility(u.fog_visibility)))
                 continue;
-            const formats::Model* q = splat_quad_for(u);
+            const formats::Model* q = nullptr;
+            if (dug) {
+                sim::Unit v = u;
+                v.catalog_id = cat_->burrowed_variant(u.catalog_id);
+                v.id = u.id | 0x80000000u;
+                if (!v.catalog_id.empty()) q = splat_quad_for(v);
+            } else {
+                q = splat_quad_for(u);
+            }
             if (!q) continue;
             render::SceneInstance inst;
             inst.model = q;
             inst.world = render::translation(float(u.x.to_double()), float(u.y.to_double()), 0.03f);
             inst.team = {0.0f, 0.0f, 0.0f, -1.0f};
+            static const bool kSplatTeam = std::getenv("SC2_SPLAT_NO_TEAM") == nullptr;
+            if (kSplatTeam && u.player >= 0 && (u.attributes & sim::kAttrStructure) != 0) inst.team = team_colour_for(cat_, u.player, false);
             inst.seq = -1;
             scene.push_back(inst);
         }
 
+    if (models_ && ui_store_ && cfg_.human_player >= 0) {
+        bool show = pending_build_ && cat_ && !build_proto_.catalog_id.empty() &&
+                    cat_->unit_race_index(build_proto_.catalog_id) == 1;
+        if (!show)
+            for (uint32_t s : selection_)
+                if (s < world_.units().size() && world_.units()[s].power_radius.raw() > 0) { show = true; break; }
+        if (show)
+            for (const Unit& u : world_.units()) {
+                if (!u.alive || u.constructing || u.player != cfg_.human_player || u.speed.raw() != 0 ||
+                    u.power_radius.raw() <= 0)
+                    continue;
+                const formats::Model* q = power_quad_for(u);
+                if (!q) continue;
+                render::SceneInstance inst;
+                inst.model = q;
+                inst.world = render::translation(float(u.x.to_double()), float(u.y.to_double()), 0.04f);
+                inst.team = {0.0f, 0.0f, 0.0f, -1.0f};
+                inst.seq = -1;
+                scene.push_back(inst);
+            }
+    }
+
     {
-        constexpr float kCreepDrawLift = 0.05f;
+        static const float kCreepDrawLift = std::getenv("SC2_CREEP_LIFT") ? float(std::atof(std::getenv("SC2_CREEP_LIFT"))) : 0.01f;
         constexpr float kCreepUvTilesPerCell = 1.0f;
         const sim::CreepGrid& cg = world_.creep().grid();
         const std::uint64_t sum = cg.checksum();
         if (!creep_model_built_ || sum != creep_drawn_checksum_) {
+            static const bool kCreepPerCell = std::getenv("SC2_CREEP_UV_PER_CELL") != nullptr;
+            static const float kCreepUvAngle = (std::getenv("SC2_CREEP_UV_ANGLE") ? float(std::atof(std::getenv("SC2_CREEP_UV_ANGLE"))) : -15.0f) * 0.01745329252f;
+            static const float kCreepUvSpan = std::getenv("SC2_CREEP_UV_SPAN") ? float(std::atof(std::getenv("SC2_CREEP_UV_SPAN"))) : 91.5f;
+            static const bool kCreepCentre = std::getenv("SC2_CREEP_CENTRE_HEIGHTS") != nullptr;
             creep_model_ = render::build_creep_model(
-                cg, [this](float wx, float wy) { return ground_z_at(wx, wy); }, kCreepDrawLift,
-                kCreepUvTilesPerCell, creep_diffuse_);
+                cg, [this](float wx, float wy) { return kCreepCentre ? ground_z_at(wx, wy) : vertex_ground_at(wx, wy); }, kCreepDrawLift,
+                kCreepPerCell ? kCreepUvTilesPerCell : 10.0f, creep_diffuse_,  1,
+                kCreepPerCell ? 0.0f : kCreepUvSpan, kCreepPerCell ? 0.0f : kCreepUvSpan, kCreepUvAngle);
+            if (!creep_model_.materials.empty() && cat_) {
+                const auto slot = [&](const char* field, const char* usage) {
+                    auto v = cat_->tag_default_scalar("CTerrain", field);
+                    if (!v || v->empty()) return;
+                    formats::M3Layer L;
+                    L.usage = usage;
+                    L.image_path = *v;
+                    for (char& c : L.image_path)
+                        if (c == '\\') c = '/';
+                    creep_model_.materials[0].layers.push_back(L);
+                };
+                slot("CreepEdgeNormalMap", "Normal");
+                slot("CreepBaseSpecularMap", "Specular");
+                slot("CreepNoiseMap", "AlphaMask");
+                slot("CreepHeightMap", "AlphaMask2");
+            }
+            creep_coverage_.w = std::uint32_t(std::max(0, cg.width()));
+            creep_coverage_.h = std::uint32_t(std::max(0, cg.height()));
+            creep_coverage_.world_w = float(cg.cell_size().to_double()) * float(cg.width());
+            creep_coverage_.world_h = float(cg.cell_size().to_double()) * float(cg.height());
+            creep_coverage_.alpha.assign(std::size_t(creep_coverage_.w) * creep_coverage_.h, 0);
+            for (int cy = 0; cy < cg.height(); ++cy)
+                for (int cx = 0; cx < cg.width(); ++cx)
+                    if (cg.is_creep_cell(cx, cy)) creep_coverage_.alpha[std::size_t(cy) * creep_coverage_.w + std::size_t(cx)] = 255;
+            if (std::getenv("SC2_CREEP_TRACE")) {
+                std::string hex;
+                static const char* kHex = "0123456789abcdef";
+                std::uint32_t acc = 0, nb = 0, cells = 0;
+                for (int cy = 0; cy < cg.height(); ++cy)
+                    for (int cx = 0; cx < cg.width(); ++cx) {
+                        const bool on = cg.is_creep_cell(cx, cy);
+                        cells += on ? 1u : 0u;
+                        acc = (acc << 1) | (on ? 1u : 0u);
+                        if (++nb == 8) { hex.push_back(kHex[(acc >> 4) & 15]); hex.push_back(kHex[acc & 15]); acc = 0; nb = 0; }
+                    }
+                if (nb) { acc <<= (8 - nb); hex.push_back(kHex[(acc >> 4) & 15]); hex.push_back(kHex[acc & 15]); }
+                if (!creep_model_.materials.empty())
+                    for (const formats::M3Layer& L : creep_model_.materials[0].layers) std::fprintf(stderr, "[creeptex] %s = %s\n", L.usage.c_str(), L.image_path.c_str());
+                std::fprintf(stderr, "[creep] tick %llu w %d h %d cells %u hex %s\n", static_cast<unsigned long long>(world_.tick()), cg.width(), cg.height(), cells, hex.c_str());
+            }
             creep_drawn_checksum_ = sum;
             creep_model_built_ = true;
             ++creep_model_gen_;
@@ -3837,19 +4838,50 @@ void MeleeGame::emit_scene(std::vector<render::SceneInstance>& scene) {
             c.world = render::Mat4::identity();
             c.team = {0, 0, 0, -1.0f};
             c.seq = -1;
+            if (creep_coverage_.valid()) {
+                c.fx.kind = render::FxKind::Creep;
+                c.fx.p0[0] = float(cg.origin_x().to_double());
+                c.fx.p0[1] = float(cg.origin_y().to_double());
+                c.fx.p0[2] = creep_coverage_.world_w;
+                c.fx.p0[3] = creep_coverage_.world_h;
+                c.fx.p1[0] = 0.45f;
+                static const bool kCreepStatic = std::getenv("SC2_CREEP_STATIC") != nullptr;
+                static const float kCreepHeightStrength = std::getenv("SC2_CREEP_HEIGHT_STRENGTH") ? float(std::atof(std::getenv("SC2_CREEP_HEIGHT_STRENGTH"))) : 15.0f;
+                static const float kCreepNoiseRate = std::getenv("SC2_CREEP_NOISE_RATE") ? float(std::atof(std::getenv("SC2_CREEP_NOISE_RATE"))) : 0.0255f;
+                static const bool kCreepModelLambert = std::getenv("SC2_CREEP_MODEL_LAMBERT") != nullptr;
+                c.fx.t = float(clock_ms_ * 0.001);
+                c.fx.team_emissive[0] = kCreepNoiseRate;
+                c.fx.team_emissive[1] = kCreepStatic ? 0.0f : kCreepHeightStrength;
+                c.fx.team_emissive[2] = 0.45f;
+                c.fx.team_emissive[3] = kCreepModelLambert ? 0.0f : 0.25f;
+                static const bool kCreepNoiseRim = std::getenv("SC2_CREEP_NOISE_RIM") != nullptr;
+                c.fx.p1[1] = (kCreepNoiseRim || std::getenv("SC2_CREEP_UV_PER_CELL")) ? 0.0f : 1.0f;
+                c.fx.p1[2] = 0.2f;
+                c.fx.p1[3] = 0.0f;
+                c.coverage = &creep_coverage_;
+            }
             scene.push_back(c);
         }
     }
     const float tick_ms =
         (1000.0f / float(sim::World::kTicksPerSecond)) / float(clock_.multiplier(clock_.speed()));
     const float alpha = tick_ms > 0.0f ? std::min(1.0f, accum_ms_ / tick_ms) : 0.0f;
-    const bool fog_ready = cfg_.human_player >= 0 && vision_.width() > 0;
+    const bool fog_ready = ground_fog_ && cfg_.human_player >= 0 && vision_.width() > 0;
     for (const Unit& u : world_.units()) {
         if (!u.alive) continue;
         if (fog_ready && u.player != cfg_.human_player &&
-            !hud_fog_body_drawn(int(vision_.state_at(u.x, u.y)),
+            !hud_fog_body_drawn(fog_body_state(u.player, int(vision_.state_at(u.x, u.y)), fog_hidden_black_),
                                 FogVisibility(u.fog_visibility)))
             continue;
+        float body_opacity = 1.0f;
+        bool cloak_fx = false;
+        if ((u.cloaked_effective() || u.burrowed) && cfg_.human_player >= 0) {
+            const bool own_side = u.player == cfg_.human_player || world_.are_allied(u.player, cfg_.human_player);
+            if (!own_side && !world_.revealed_to(cfg_.human_player, u.id)) continue;
+            static const bool kBurrowShimmer = std::getenv("SC2_BURROW_SHIMMER") != nullptr;
+            if (u.cloaked_effective() && (kBurrowShimmer || !u.burrowed)) cloak_fx = true;
+            if (const char* bo = std::getenv("SC2_BURROW_OPACITY"); bo && u.burrowed && own_side) body_opacity = float(std::atof(bo));
+        }
         if (u.gathers_gas && u.mine_cd.raw() > 0 && u.gather_target != sim::kNoTarget &&
             u.gather_target < world_.units().size() && world_.units()[u.gather_target].is_gas)
             continue;
@@ -3857,8 +4889,7 @@ void MeleeGame::emit_scene(std::vector<render::SceneInstance>& scene) {
         const formats::Model* m =
             (u.id < driver_.actors.size()) ? driver_.actors[u.id].model : nullptr;
         inst.model = m;
-        const std::array<float, 3> ms =
-            cat_ ? cat_->unit_render_scale(u.catalog_id) : std::array<float, 3>{1.0f, 1.0f, 1.0f};
+        const std::array<float, 3> ms = unit_draw_scale(cat_, u.catalog_id);
         const float footprint_scale = std::max(ms[0], ms[1]);
         const float native_span = cached_diameter(m);
         const float visual_r =
@@ -3899,12 +4930,25 @@ void MeleeGame::emit_scene(std::vector<render::SceneInstance>& scene) {
             inst.seq = a.current_sequence();
             if (u.constructing) {
                 const auto& ladder = construction_ladder(u.catalog_id);
-                if (!ladder.empty()) {
+                if (u.warp_forming) {
+                    if (a.construction_stage != 0) {
+                        a.anim_play("Construction", {"Birth"},  false,  1);
+                        a.construction_stage = 0;
+                    }
+                    inst.seq = a.current_sequence();
+                    if (inst.seq >= 0 && std::size_t(inst.seq) < m->sequences.size()) {
+                        double p = u.build_progress.to_double();
+                        if (!(p >= 0.0)) p = 0.0;
+                        if (p > 1.0) p = 1.0;
+                        inst.time_ms = float(p) * float(m->sequences[std::size_t(inst.seq)].length_ms());
+                    }
+                } else if (!ladder.empty()) {
                     double p = u.build_progress.to_double();
                     if (!(p >= 0.0)) p = 0.0;
                     if (p > 1.0) p = 1.0;
                     int stage = int(p * double(ladder.size()));
                     if (stage >= int(ladder.size())) stage = int(ladder.size()) - 1;
+                    stage = timed_ladder_stage(*m, ladder, p, u.build_time.to_double() * 1000.0, stage);
                     if (a.construction_stage != stage) {
                         const std::vector<std::string>& props = ladder[std::size_t(stage)];
                         const bool transition = std::find(props.begin(), props.end(), "Start") != props.end() ||
@@ -3932,12 +4976,204 @@ void MeleeGame::emit_scene(std::vector<render::SceneInstance>& scene) {
                 inst.seq = a.current_sequence();
             }
             inst.time_ms = a.current_time();
+            inst.global_layers = a.global_layers();
+            if (std::getenv("SC2_GLOBAL_LAYER_TRACE") && !inst.global_layers.empty()) {
+                static int ng = 0;
+                if (ng++ < 24)
+                    std::fprintf(stderr, "[gl] tick %d unit %u %s seq %d t %.0f | layers %zu first seq %u t %.0f\n", world_.tick(), unsigned(u.id), u.catalog_id.c_str(),
+                                 inst.seq, double(inst.time_ms), inst.global_layers.size(), unsigned(inst.global_layers[0].seq), double(inst.global_layers[0].time_ms));
+            }
         }
         bool selected = false;
         for (uint32_t s : selection_)
             if (s == u.id) { selected = true; break; }
+        bool in_active_subgroup = false;
+        if (selected && sel_groups_.active < sel_groups_.subgroups.size())
+            for (uint32_t s : sel_groups_.subgroups[sel_groups_.active].units)
+                if (s == u.id) { in_active_subgroup = true; break; }
+        if (u.id < driver_.actors.size() && m) {
+            render::ActorInstance& ba = driver_.actors[u.id];
+            if (!ba.blend_time_set) {
+                ba.blend_time_set = true;
+                if (cat_)
+                    if (const auto bt = cat_->unit_anim_blend_time(u.catalog_id)) ba.blend_time_ms = *bt * 1000.0f;
+            }
+            ba.note_pose(inst.seq, inst.time_ms);
+            inst.blend_seq = ba.prev_seq;
+            inst.blend_time_ms = ba.prev_time_ms;
+            inst.blend_weight = ba.blend_weight();
+            if (!ba.turret_bound) {
+                ba.turret_bound = true;
+                if (cat_ && !u.catalog_id.empty() && !u.wpn_id.empty()) {
+                    const std::string tid = cat_->weapon_turret(u.catalog_id, u.wpn_id);
+                    if (const auto ts = tid.empty() ? std::nullopt : cat_->turret(tid)) {
+                        const int att = render::attachment_index(*m, "TurretZ");
+                        if (att >= 0 && std::size_t(att) < m->attachments.size()) {
+                            ba.turret_bone = int(m->attachments[std::size_t(att)].bone);
+                            const float d2r = 3.1415927f / 180.0f;
+                            ba.turret_rate_rad = float(ts->yaw_rate) * d2r;
+                            ba.turret_arc_rad = float(ts->yaw_arc) * d2r;
+                            ba.turret_start_rad = float(ts->yaw_start) * d2r;
+                            ba.turret_idle_rate_rad = float(ts->yaw_idle_rate) * d2r;
+                            ba.turret_spin = ts->idle == "Spin";
+                            ba.turret_hold = ts->idle == "Hold" && !std::getenv("SC2_TURRET_HOLD_RESETS");
+                            if (!std::getenv("SC2_NO_TURRET_FIDGET")) {
+                                ba.turret_fidget_min_s = float(ts->fidget_delay_min);
+                                ba.turret_fidget_max_s = float(ts->fidget_delay_max);
+                                ba.turret_fidget_turn_rad = float(ts->fidget_turn_angle) * d2r;
+                                ba.turret_fidget_rate_rad = float(ts->fidget_turning_rate) * d2r;
+                                ba.turret_fidget_chance = float(ts->fidget_turn_chance);
+                            }
+                            ba.turret_yaw = ba.turret_start_rad;
+                        }
+                    }
+                }
+            }
+            if (ba.turret_bone >= 0) {
+                ba.turret_has_goal = false;
+                if (u.target < world_.units().size() && world_.units()[u.target].alive) {
+                    const Unit& t = world_.units()[u.target];
+                    const float tx = float(t.x.to_double()) - wx, ty = float(t.y.to_double()) - wy;
+                    if (tx != 0.0f || ty != 0.0f) {
+                        ba.turret_goal = std::atan2(ty, tx) - ba.facing;
+                        ba.turret_has_goal = true;
+                    }
+                }
+                inst.turret_bone = ba.turret_bone;
+                inst.turret_yaw = ba.turret_yaw;
+            }
+        }
         inst.team = team_colour_for(cat_, u.player, selected);
+        inst.team_emissive = team_emissive_for(cat_, u.player);
+        inst.opacity = body_opacity;
+        if (cat_ && u.player >= 0 && !u.catalog_id.empty()) {
+            const bool unpowered = sim::power_disabled(u);
+            const bool depleted = u.is_gas && u.resource_left <= 0 && u.speed.raw() == 0;
+            if (unpowered || depleted) {
+                const std::string key = u.catalog_id + (unpowered ? "#unpowered" : "#depleted");
+                auto tit = tint_cache_.find(key);
+                if (tit == tint_cache_.end()) {
+                    static const bool kTintAny = std::getenv("SC2_UNPOWERED_TINT_ANY_ROW") != nullptr;
+                    const auto t = unpowered ? cat_->actor_tint(u.catalog_id, "BehaviorLevel.PowerUser", kTintAny ? "Level 0" : ".Start; Level 0")
+                                             : cat_->actor_tint(u.catalog_id, "Behavior.Harvestable", ".Deplete");
+                    tit = tint_cache_.emplace(key, t).first;
+                }
+                if (tit->second) inst.tint = *tit->second;
+            }
+            if (u.id < driver_.actors.size() && driver_.actors[u.id].bus_tint_set)
+                for (int k = 0; k < 3; ++k) inst.tint[std::size_t(k)] = driver_.actors[u.id].bus_tint[k];
+            if (!halluc_look_resolved_) {
+                halluc_look_resolved_ = true;
+                halluc_look_ = cat_->hallucination_look();
+                if (halluc_look_) halluc_tag_ = behavior_id_hash(halluc_look_->behavior);
+            }
+            if (halluc_look_ && !u.behaviors.empty()) {
+                bool illusion = false;
+                for (const sim::BehaviorInstance& b : u.behaviors)
+                    if (b.src == halluc_tag_) { illusion = true; break; }
+                if (illusion) {
+                    const bool own_side = cfg_.human_player < 0 || u.player == cfg_.human_player ||
+                                          world_.are_allied(u.player, cfg_.human_player);
+                    if (own_side || world_.revealed_to(cfg_.human_player, u.id)) {
+                        inst.tint = halluc_look_->tint;
+                        if (halluc_look_->opacity < inst.opacity) inst.opacity = halluc_look_->opacity;
+                    }
+                }
+            }
+        }
+        std::vector<render::SceneInstance> burn_flames;
+        if (models_ && ui_store_ && m && u.player >= 0 && u.speed.raw() == 0 && !u.catalog_id.empty() && u.hp_max.raw() > 0) {
+            const auto& bstates = models_->burn_states(*ui_store_, u.catalog_id);
+            int want = -1;
+            if (!bstates.empty() && !u.constructing) {
+                const double life = u.hp.to_double() / u.hp_max.to_double();
+                const double sh = u.shields_max.raw() > 0 ? u.shields.to_double() / u.shields_max.to_double() : 1.0;
+                for (std::size_t bi = 0; bi < bstates.size(); ++bi) {
+                    const std::string& sname = bstates[bi].state;
+                    const bool on = sname == "LightSmoke"   ? (life < 0.666 && life >= 0.5)
+                                    : sname == "HeavySmoke" ? (life < 0.5 && life >= 0.333)
+                                    : sname == "Fire"       ? (life < 0.333)
+                                    : sname == "ProtossFire" ? (sh < 0.25 && life < 0.75)
+                                                             : false;
+                    if (on) want = int(bi);
+                }
+            }
+            auto bit = burning_.find(u.id);
+            if (want < 0) {
+                if (bit != burning_.end()) burning_.erase(bit);
+            } else {
+                if (bit == burning_.end() || bit->second.state != want) {
+                    BurnFx bf;
+                    bf.state = want;
+                    bf.start_ms = clock_ms_;
+                    std::vector<int> pts;
+                    for (std::size_t ai = 0; ai < m->attachments.size(); ++ai)
+                        if (m->attachments[ai].name.find("Damage") != std::string::npos) pts.push_back(int(ai));
+                    std::uint64_t h = 0x9E3779B97F4A7C15ull * (u.id + 1) + std::uint64_t(want);
+                    for (std::size_t k = pts.size(); k > 1; --k) {
+                        h ^= h >> 33; h *= 0xff51afd7ed558ccdull; h ^= h >> 33;
+                        std::swap(pts[k - 1], pts[std::size_t(h % k)]);
+                    }
+                    const std::size_t keep = std::min(pts.size(), std::max<std::size_t>(2, std::size_t(double(pts.size()) * 0.25 + 0.5)));
+                    pts.resize(keep);
+                    bf.points = std::move(pts);
+                    bit = burning_.insert_or_assign(u.id, std::move(bf)).first;
+                }
+                const formats::Model* fm = bstates[std::size_t(want)].model;
+                const int bseq = render::select_sequence(*fm, {"Birth"}, u.id);
+                const int sseq = render::select_sequence(*fm, {"Stand"}, u.id);
+                const float blen = (bseq >= 0 && std::size_t(bseq) < fm->sequences.size()) ? float(fm->sequences[std::size_t(bseq)].length_ms()) : 0.0f;
+                const float slen = (sseq >= 0 && std::size_t(sseq) < fm->sequences.size()) ? float(fm->sequences[std::size_t(sseq)].length_ms()) : 0.0f;
+                const float t = float(clock_ms_ - bit->second.start_ms);
+                for (int ai : bit->second.points) {
+                    render::Mat4 att;
+                    if (inst.seq < 0 || !render::attachment_transform(*m, m->attachments[std::size_t(ai)].name,
+                                                                     std::uint32_t(inst.seq), inst.time_ms, att))
+                        continue;
+                    render::SceneInstance fl;
+                    fl.model = fm;
+                    const render::Mat4 hw = inst.world * att;
+                    fl.world = render::translation(hw.m[12], hw.m[13], hw.m[14]);
+                    if (t < blen && bseq >= 0) { fl.seq = bseq; fl.time_ms = t; }
+                    else { fl.seq = sseq >= 0 ? sseq : bseq; fl.time_ms = slen > 0.0f ? std::fmod(t - blen, slen) : 0.0f; }
+                    fl.team = {0, 0, 0, -1.0f};
+                    burn_flames.push_back(fl);
+                }
+            }
+        }
+        inst.trail_id = u.id + 1;
+        inst.trail_time_s = float(clock_ms_ * 0.001);
+        if (cloak_fx) {
+            inst.fx.kind = render::FxKind::Cloak;
+            inst.fx.t = float(clock_ms_ * 0.001);
+            inst.fx.p0[0] = kCloakOpacity;
+            inst.fx.p0[1] = kCloakDisplaceStrength * kCloakUvPerStrength;
+        } else if (u.constructing && u.warp_forming) {
+            double p = u.build_progress.to_double();
+            if (!(p >= 0.0)) p = 0.0;
+            if (p > 1.0) p = 1.0;
+            inst.fx.kind = render::FxKind::Dissolve;
+            inst.fx.p0[0] = float(p);
+            inst.fx.p0[1] = inst.team[0];
+            inst.fx.p0[2] = inst.team[1];
+            inst.fx.p0[3] = inst.team[2];
+        }
+        const bool targeting = pending_attack_ || has_pending_ability_cast();
+        if (targeting && u.id == hover_unit_) {
+            const float leg = 0.15f;
+            float ph = std::fmod(float(clock_ms_ * 0.001), 2.0f * leg) / leg;
+            if (ph > 1.0f) ph = 2.0f - ph;
+            const float a[3] = {1.0f, 192.0f / 255.0f, 192.0f / 255.0f}, b[3] = {1.0f, 128.0f / 255.0f, 128.0f / 255.0f};
+            for (int k = 0; k < 3; ++k) inst.tint[std::size_t(k)] *= a[k] + (b[k] - a[k]) * ph;
+        }
+        if (u.player >= 0 && std::size_t(u.player) < upg_flash_s_.size() && upg_flash_s_[std::size_t(u.player)] > 0.0f &&
+            u.speed.raw() != 0) {
+            const float f = upg_flash_s_[std::size_t(u.player)] / 0.5f;
+            const float hdr = 1.0f + 9.0f * f;
+            for (int k = 0; k < 3; ++k) inst.tint[std::size_t(k)] *= hdr;
+        }
         scene.push_back(inst);
+        scene.insert(scene.end(), burn_flames.begin(), burn_flames.end());
         if (u.id < driver_.actors.size() && models_ && ui_store_ && cat_) {
             render::ActorInstance& host = driver_.actors[u.id];
             for (std::size_t ci = 0; ci < host.children.size();) {
@@ -3945,6 +5181,20 @@ void MeleeGame::emit_scene(std::vector<render::SceneInstance>& scene) {
                 if (!ch.rig) {
                     float sc3[3] = {1.0f, 1.0f, 1.0f};
                     const formats::Model* sm = models_->scaffold_model(*ui_store_, ch.name, sc3);
+                    if (std::getenv("SC2_CHILD_TRACE")) {
+                        static std::set<std::string> told;
+                        if (told.insert(ch.name).second) {
+                            std::fprintf(stderr, "[child] %s of %s: model %s (verts %u particles %zu seqs %zu)\n", ch.name.c_str(), u.catalog_id.c_str(), sm ? "yes" : "NO",
+                                         sm ? sm->vertex_count : 0u, sm ? sm->particles.size() : std::size_t(0), sm ? sm->sequences.size() : std::size_t(0));
+                            for (const render::ActorEventRule& r : ch.rules) {
+                                std::fprintf(stderr, "[child]   %s.%s -> %s", r.head.c_str(), r.sub.c_str(), r.verb.c_str());
+                                for (const std::string& a : r.args) std::fprintf(stderr, " %s", a.c_str());
+                                std::fprintf(stderr, "\n");
+                            }
+                            if (sm)
+                                for (const auto& sq : sm->sequences) std::fprintf(stderr, "[child]   seq '%s' %u ms flags %u\n", sq.name.c_str(), unsigned(sq.length_ms()), unsigned(sq.flags));
+                        }
+                    }
                     if (!sm) { ++ci; continue; }
                     ch.rig = std::make_shared<render::ActorInstance>();
                     ch.rig->model = sm;
@@ -3952,11 +5202,42 @@ void MeleeGame::emit_scene(std::vector<render::SceneInstance>& scene) {
                     ch.rig->has_oneshot = false;
                     for (int k = 0; k < 3; ++k) ch.scale[k] = sc3[k];
                     if (auto f = cat_->actor_host_forward(ch.name)) ch.yaw = std::atan2(f->second, f->first);
+                    static const bool kChildQuarter = std::getenv("SC2_CHILD_YAW_NO_QUARTER") == nullptr;
+                    if (kChildQuarter && cat_->actor_host_forward(ch.name)) ch.yaw += 1.5707963f;
+                    static const bool kChildHostScale = std::getenv("SC2_CHILD_HOST_SCALE") != nullptr;
+                    if (kChildHostScale && sc3[0] == 1.0f && sc3[1] == 1.0f && sc3[2] == 1.0f) {
+                        const std::array<float, 3> hs = data::resolve_unit_model_scale(*cat_, data::unit_actor_id(*cat_, u.catalog_id));
+                        for (int k = 0; k < 3; ++k) ch.scale[k] = hs[std::size_t(k)];
+                    }
                     for (const render::ActorEventRule& r : ch.rules)
                         if (r.head == "ActorCreation" && r.verb == "Create" && !r.args.empty()) {
                             auto ladder = cat_->actor_progress_stages(r.args[0]);
                             if (!ladder.empty()) ch.ladder = std::move(ladder);
                         }
+                    static const bool kEffectChild = std::getenv("SC2_NO_EFFECT_CHILD") == nullptr;
+                    if (kEffectChild && ch.ladder.empty() && !u.constructing)
+                        for (const render::ActorEventRule& r : ch.rules)
+                            if (r.head == "ActorCreation" && r.verb == "AnimPlay" && r.args.size() >= 2) {
+                                std::vector<std::string> props;
+                                for (std::size_t k = 1; k < r.args.size(); ++k) {
+                                    std::size_t s0 = 0;
+                                    const std::string& a = r.args[k];
+                                    while (s0 <= a.size()) {
+                                        const std::size_t e = a.find(',', s0);
+                                        const std::string tok = a.substr(s0, e == std::string::npos ? std::string::npos : e - s0);
+                                        if (!tok.empty()) props.push_back(tok);
+                                        if (e == std::string::npos) break;
+                                        s0 = e + 1;
+                                    }
+                                }
+                                const bool forever = std::find(props.begin(), props.end(), "PlayForever") != props.end();
+                                if (forever) props.erase(std::remove(props.begin(), props.end(), "PlayForever"), props.end());
+                                ch.rig->anim_play(r.args[0], props, forever, 2);
+                                const int eseq = ch.rig->current_sequence();
+                                ch.finish_len_ms = forever ? 1e30f : (eseq >= 0 && std::size_t(eseq) < sm->sequences.size()) ? float(sm->sequences[std::size_t(eseq)].length_ms()) : 0.0f;
+                                ch.finishing = true;
+                                break;
+                            }
                 }
                 render::ActorInstance& rig = *ch.rig;
                 if (u.constructing && u.alive) {
@@ -3966,6 +5247,7 @@ void MeleeGame::emit_scene(std::vector<render::SceneInstance>& scene) {
                         if (p > 1.0) p = 1.0;
                         int stage = int(p * double(ch.ladder.size()));
                         if (stage >= int(ch.ladder.size())) stage = int(ch.ladder.size()) - 1;
+                        if (rig.model) stage = timed_ladder_stage(*rig.model, ch.ladder, p, u.build_time.to_double() * 1000.0, stage);
                         if (ch.construction_stage != stage) {
                             const std::vector<std::string>& props = ch.ladder[std::size_t(stage)];
                             const bool transition = std::find(props.begin(), props.end(), "Start") != props.end() ||
@@ -4007,11 +5289,15 @@ void MeleeGame::emit_scene(std::vector<render::SceneInstance>& scene) {
                 }
                 render::SceneInstance c;
                 c.model = rig.model;
-                c.world = render::translation(wx, wy, wz) * render::rotation_z(ch.yaw) *
-                          render::scaling(ch.scale[0], ch.scale[1], ch.scale[2]);
+                static const float kChildYawAdd = std::getenv("SC2_CHILD_YAW_ADD") ? float(std::atof(std::getenv("SC2_CHILD_YAW_ADD"))) * 0.01745329252f : 0.0f;
+                static const float kChildScale = std::getenv("SC2_CHILD_SCALE") ? float(std::atof(std::getenv("SC2_CHILD_SCALE"))) : 1.0f;
+                c.world = render::translation(wx, wy, wz) * render::rotation_z(ch.yaw + kChildYawAdd) *
+                          render::scaling(ch.scale[0] * kChildScale, ch.scale[1] * kChildScale, ch.scale[2] * kChildScale);
                 c.seq = rig.current_sequence();
                 c.time_ms = rig.current_time();
                 c.team = inst.team;
+                static const bool kChildEmissive = std::getenv("SC2_CHILD_NO_TEAM_EMISSIVE") == nullptr;
+                if (kChildEmissive) c.team_emissive = inst.team_emissive;
                 scene.push_back(c);
                 ++ci;
             }
@@ -4036,8 +5322,10 @@ void MeleeGame::emit_scene(std::vector<render::SceneInstance>& scene) {
                                                       att)) {
                 const float lx = att.m[12] * ms[0], ly = att.m[13] * ms[1];
                 oz = att.m[14] * ms[2];
-                const float cf = fl > 1e-3f ? fx / fl : 1.0f;
-                const float sf = fl > 1e-3f ? fy / fl : 0.0f;
+                float cf = fl > 1e-3f ? fx / fl : 1.0f;
+                float sf = fl > 1e-3f ? fy / fl : 0.0f;
+                static const bool kOffsetQuarter = std::getenv("SC2_CARRY_OFFSET_NO_QUARTER") == nullptr;
+                if (kOffsetQuarter) { const float t = cf; cf = -sf; sf = t; }
                 ox = lx * cf - ly * sf;
                 oy = lx * sf + ly * cf;
             } else {
@@ -4045,7 +5333,8 @@ void MeleeGame::emit_scene(std::vector<render::SceneInstance>& scene) {
                 ox = fl > 1e-3f ? fx / fl * off : off;
                 oy = fl > 1e-3f ? fy / fl * off : 0.0f;
             }
-            const float cs = 0.14f;
+            float cs = ms[0];
+            if (const char* e = std::getenv("SC2_CARRY_SCALE")) cs = float(std::atof(e));
             const formats::Model* cm = nullptr;
             if (models_ && ui_store_ && u.carry_source != sim::kNoTarget &&
                 u.carry_source < world_.units().size()) {
@@ -4053,50 +5342,312 @@ void MeleeGame::emit_scene(std::vector<render::SceneInstance>& scene) {
                 if (!src.empty()) cm = models_->carry_model(*ui_store_, src);
             }
             if (!cm) continue;
+            if (std::getenv("SC2_CARRY_TRACE")) {
+                static int carry_traced = 0;
+                if (carry_traced < 24) {
+                    ++carry_traced;
+                    std::fprintf(stderr, "[carry] unit %u %s at (%.2f, %.2f) facing (%.2f, %.2f) scale %.3f off %.3f %.3f %.3f verts %u bounds z %.3f..%.3f x %.3f..%.3f\n",
+                                 unsigned(u.id), u.catalog_id.c_str(), double(wx), double(wy), double(fx), double(fy), double(cs), double(ox), double(oy), double(oz), unsigned(cm->vertex_count),
+                                 double(cm->bounds_min[2]), double(cm->bounds_max[2]), double(cm->bounds_min[0]), double(cm->bounds_max[0]));
+                    std::fprintf(stderr, "[carry]   hardpoint axes |x| %.3f |y| %.3f |z| %.3f  x=(%.2f,%.2f,%.2f) z=(%.2f,%.2f,%.2f)  body scale %.3f %.3f %.3f\n",
+                                 double(std::sqrt(att.m[0] * att.m[0] + att.m[1] * att.m[1] + att.m[2] * att.m[2])),
+                                 double(std::sqrt(att.m[4] * att.m[4] + att.m[5] * att.m[5] + att.m[6] * att.m[6])),
+                                 double(std::sqrt(att.m[8] * att.m[8] + att.m[9] * att.m[9] + att.m[10] * att.m[10])), double(att.m[0]), double(att.m[1]), double(att.m[2]),
+                                 double(att.m[8]), double(att.m[9]), double(att.m[10]), double(ms[0]), double(ms[1]), double(ms[2]));
+                }
+            }
             render::SceneInstance chunk;
             chunk.model = cm;
             chunk.world = render::translation(wx + ox, wy + oy, wz + oz) *
                           render::scaling(cs, cs, cs);
+            static const bool kCarryTurn = std::getenv("SC2_CARRY_UNTURNED") == nullptr;
+            if (kCarryTurn && fl > 1e-3f) {
+                render::Mat4 hp = att;
+                const bool has_hp = std::fabs(hp.m[0]) + std::fabs(hp.m[1]) + std::fabs(hp.m[2]) > 1e-3f;
+                if (!has_hp) hp = render::scaling(1.0f, 1.0f, 1.0f);
+                hp.m[12] = 0.0f; hp.m[13] = 0.0f; hp.m[14] = 0.0f;
+                static const float kCarryQuarter = std::getenv("SC2_CARRY_YAW_NO_QUARTER") ? 0.0f : 1.5707963f;
+                chunk.world = render::translation(wx + ox, wy + oy, wz + oz) * render::rotation_z(std::atan2(fy, fx) + kCarryQuarter) * hp *
+                              render::scaling(cs, cs, cs);
+            }
             chunk.team = {0, 0, 0, -1.0f};
-            chunk.seq = -1;
+            chunk.seq = (!cm->sequences.empty() && std::getenv("SC2_CARRY_SEQ")) ? render::select_sequence(*cm, {"Stand"}, u.id) : -1;
+            chunk.time_ms = float(clock_ms_);
             scene.push_back(chunk);
         }
 
+        constexpr std::array<float, 3> kSelectedRingRgb = {0.0f, 168.0f / 255.0f, 90.0f / 255.0f};
+        constexpr std::array<float, 3> kSubgroupRingRgb = {0.0f, 250.0f / 255.0f, 25.0f / 255.0f};
+        constexpr std::array<float, 3> kEnemyRingRgb = {230.0f / 255.0f, 0.0f, 0.0f};
+        constexpr std::array<float, 3> kAllyRingRgb = {1.0f, 1.0f, 0.0f};
+        std::array<float, 3> sel_rgb = kSelectedRingRgb, sub_rgb = kSubgroupRingRgb;
+        std::array<float, 3> ally_rgb = kAllyRingRgb, foe_rgb = kEnemyRingRgb;
+        if (cat_) {
+            auto to_f = [](const std::array<std::uint8_t, 3>& c) {
+                return std::array<float, 3>{float(c[0]) / 255.0f, float(c[1]) / 255.0f,
+                                            float(c[2]) / 255.0f};
+            };
+            sel_rgb = to_f(sel_look.selected);
+            sub_rgb = to_f(sel_look.subgroup);
+            ally_rgb = to_f(sel_look.ally);
+            foe_rgb = to_f(sel_look.enemy);
+        }
+        const std::array<float, 3>& own = in_active_subgroup ? sub_rgb : sel_rgb;
+        const std::array<float, 3>& foreign =
+            world_.are_allied(u.player, cfg_.human_player) ? ally_rgb : foe_rgb;
+        const std::array<float, 3>& rel = u.player == cfg_.human_player ? own : foreign;
+        std::array<float, 4> ring_rc = u.player >= 0
+                                      ? std::array<float, 4>{rel[0], rel[1], rel[2], 1.0f}
+                                      : std::array<float, 4>{0.9f, 0.85f, 0.30f, 1.0f};
+        ring_rc[3] = 2.0f;
         if (selected) {
-            const float rr = visual_r + 0.12f;
-            const float band = 0.09f;
-            float inner = rr > band ? (rr - band) / rr : 0.0f;
-            const int key = int(inner * 200.0f + 0.5f);
+            const float kOuterWidth = sel_look.width;
+            const float kInnerBoundary = sel_look.inner_boundary;
+            const float kInnerFallOff = sel_look.inner_falloff;
+            const float ring_r = selection_ring_radius(cat_, u.catalog_id, float(u.radius.to_double()));
+            const float rr = ring_r > 1e-3f ? ring_r : visual_r;
+            const float kLineWorld = std::getenv("SC2_SELECTION_LINE_003") ? kOuterWidth : 0.05f;
+            const float line_frac = std::getenv("SC2_SELECTION_WIDTH_RATIO") ? kOuterWidth : std::min(0.5f, kLineWorld / std::max(rr, 1e-3f));
+            const float inner = 1.0f - line_frac;
+            const int key = int(inner * 2000.0f + 0.5f);
             static std::map<int, formats::Model> ring_cache;
             auto rit = ring_cache.find(key);
             if (rit == ring_cache.end()) rit = ring_cache.emplace(key, render::make_ring_model(inner)).first;
             const formats::Model* rm = &rit->second;
-            constexpr std::array<float, 3> kSelectedRingRgb = {0.0f, 168.0f / 255.0f, 90.0f / 255.0f};
-            std::array<float, 4> rc = u.player >= 0
-                                          ? std::array<float, 4>{kSelectedRingRgb[0], kSelectedRingRgb[1],
-                                                                 kSelectedRingRgb[2], 1.0f}
-                                          : std::array<float, 4>{0.9f, 0.85f, 0.30f, 1.0f};
-            rc[3] = 2.0f;
-            render::SceneInstance ring;
-            ring.model = rm;
-            ring.world = render::translation(wx, wy, wz + 0.05f) * render::scaling(rr, rr, 1.0f);
-            ring.team = rc;
-            ring.seq = -1;
-            scene.push_back(ring);
+            std::array<float, 4> rc = ring_rc;
+            if (std::getenv("SC2_SELECTION_RIM_UNIFORM") || std::getenv("SC2_SELECTION_BAND_FLAT") || std::getenv("SC2_SELECTION_BAND_RADIAL")) {
+                render::SceneInstance ring;
+                ring.model = rm;
+                ring.world = render::translation(wx, wy, wz + 0.05f) * render::scaling(rr, rr, 1.0f);
+                ring.team = rc;
+                ring.seq = -1;
+                scene.push_back(ring);
+            } else {
+                const int kRimLayers = 6;
+                const float d = 1.0f - kInnerBoundary, rad = kInnerBoundary;
+                const float layer_alpha = 1.0f - std::pow(1.0f - 0.50f, 1.0f / float(kRimLayers));
+                for (int li = 0; li < kRimLayers; ++li) {
+                    const float want = 2.0f * d * (float(li) + 0.5f) / float(kRimLayers);
+                    float lo_a = 0.0f, hi_a = 3.14159265f;
+                    for (int it = 0; it < 24; ++it) {
+                        const float mid = 0.5f * (lo_a + hi_a);
+                        const float th = 1.0f - (-d * std::cos(mid) + std::sqrt(rad * rad - d * d * std::sin(mid) * std::sin(mid)));
+                        (th > want ? lo_a : hi_a) = mid;
+                    }
+                    const float half = lo_a;
+                    const int akey = 300000 + key * 8 + li;
+                    auto ait = ring_cache.find(akey);
+                    if (ait == ring_cache.end())
+                        ait = ring_cache.emplace(akey, render::make_arc_ring_model(inner, 1, half / 3.14159265f, 64)).first;
+                    render::SceneInstance arc;
+                    arc.model = &ait->second;
+                    arc.world = render::translation(wx, wy, wz + 0.05f) * render::rotation_z(-1.57079633f - half) * render::scaling(rr, rr, 1.0f);
+                    arc.team = rc;
+                    arc.seq = -1;
+                    arc.opacity = layer_alpha;
+                    scene.push_back(arc);
+                }
+            }
+            if (std::getenv("SC2_SELECTION_BAND_FLAT")) {
+                const float band_outer = rr * (1.0f - kOuterWidth);
+                const float band_inner = kInnerBoundary / (1.0f - kOuterWidth);
+                const int bkey = int(band_inner * 200.0f + 0.5f);
+                auto bit = ring_cache.find(bkey);
+                if (bit == ring_cache.end()) bit = ring_cache.emplace(bkey, render::make_ring_model(band_inner)).first;
+                render::SceneInstance band;
+                band.model = &bit->second;
+                band.world = render::translation(wx, wy, wz + 0.05f) * render::scaling(band_outer, band_outer, 1.0f);
+                band.team = rc;
+                band.seq = -1;
+                band.opacity = kInnerFallOff;
+                scene.push_back(band);
+            } else if (!std::getenv("SC2_SELECTION_BAND_RADIAL")) {
+                const int kLayers = 8;
+                const float max_off = 1.0f - kInnerBoundary;
+                const float peak = 0.30f;
+                for (int st = 0; st < kLayers; ++st) {
+                    const float shrink = 2.0f * max_off * float(st) / float(kLayers);
+                    const int ckey = 200000 + int(max_off * 1000.0f + 0.5f) * 100 + st;
+                    auto bit = ring_cache.find(ckey);
+                    if (bit == ring_cache.end()) bit = ring_cache.emplace(ckey, render::make_crescent_model(max_off, shrink)).first;
+                    render::SceneInstance band;
+                    band.model = &bit->second;
+                    band.world = render::translation(wx, wy, wz + 0.05f) * render::scaling(rr * inner, rr * inner, 1.0f);
+                    band.team = rc;
+                    band.seq = -1;
+                    band.opacity = peak / float(kLayers);
+                    scene.push_back(band);
+                }
+            } else {
+                const int kSteps = 4;
+                const float lo = kInnerBoundary, hi = std::max(kInnerBoundary + 0.01f, inner);
+                for (int st = 0; st < kSteps; ++st) {
+                    const float r0 = lo + (hi - lo) * float(st) / float(kSteps), r1 = lo + (hi - lo) * float(st + 1) / float(kSteps);
+                    const float hole = r0 / r1;
+                    const int bkey = 100000 + int(hole * 2000.0f + 0.5f);
+                    auto bit = ring_cache.find(bkey);
+                    if (bit == ring_cache.end()) bit = ring_cache.emplace(bkey, render::make_ring_model(hole)).first;
+                    render::SceneInstance band;
+                    band.model = &bit->second;
+                    band.world = render::translation(wx, wy, wz + 0.05f) * render::scaling(rr * r1, rr * r1, 1.0f);
+                    band.team = rc;
+                    band.seq = -1;
+                    band.opacity = 0.16f * (float(st) + 0.5f) / float(kSteps);
+                    scene.push_back(band);
+                }
+            }
         }
+        if (!selected && u.id == hover_unit_ && u.player >= 0) {
+            const float kPreOuterWidth = sel_look.width;
+            constexpr float kPreInnerWidth = 0.09f;
+            const int kPreSegments = sel_look.pre_segments;
+            const float kPreSolid = sel_look.pre_solid;
+            const float kPreAlpha = sel_look.pre_alpha;
+            const float kPreRotPerSec = sel_look.pre_rotation;
+            const float hole = 1.0f - (kPreOuterWidth + kPreInnerWidth);
+            const int pkey = int(hole * 1000.0f) * 10000 + kPreSegments * 100 + int(kPreSolid * 99.0f);
+            static std::map<int, formats::Model> pre_cache;
+            auto pit = pre_cache.find(pkey);
+            if (pit == pre_cache.end())
+                pit = pre_cache.emplace(pkey, render::make_arc_ring_model(hole, kPreSegments, kPreSolid)).first;
+            const formats::Model& pre_ring = pit->second;
+            const float ring_r = selection_ring_radius(cat_, u.catalog_id, float(u.radius.to_double()));
+            const float rr = ring_r > 1e-3f ? ring_r : visual_r;
+            const float spin = float(clock_ms_ * 0.001) * kPreRotPerSec * 6.2831853071795864f;
+            render::SceneInstance hov;
+            hov.model = &pre_ring;
+            hov.world = render::translation(wx, wy, wz + 0.05f) * render::rotation_z(spin) *
+                        render::scaling(rr, rr, 1.0f);
+            hov.team = ring_rc;
+            hov.seq = -1;
+            hov.opacity = kPreAlpha;
+            scene.push_back(hov);
+        }
+        if (selected && cat_ && u.player == cfg_.human_player && !u.catalog_id.empty()) {
+            std::vector<double> radii;
+            for (const data::Catalog::RangeRing& rr : cat_->unit_range_rings(u.catalog_id))
+                if (rr.on_selection) radii.push_back(rr.radius);
+            if (!pending_cast_abil_.empty())
+                if (const auto r = cat_->ability_range_ring(pending_cast_abil_)) radii.push_back(*r);
+            for (double rad : radii) emit_range_ring(scene, wx, wy, wz, float(rad) + float(u.radius.to_double()));
+        }
+        for (const sim::BehaviorInstance& bi : u.behaviors) {
+            if (!bi.lift || bi.caster == sim::kNoTarget) continue;
+            if (bi.caster >= world_.units().size()) continue;
+            const sim::Unit& src = world_.units()[bi.caster];
+            if (!src.alive) continue;
+            float pa[3], pb[3];
+            unit_attach_world(src, nullptr, nullptr, pa);
+            unit_attach_world(u, nullptr, nullptr, pb);
+            emit_beam(scene, pa, pb, 0.25f);
+        }
+    }
+
+    for (const sim::HealerInstance& h : world_.healers()) {
+        if (h.caster >= world_.units().size() || h.target >= world_.units().size()) continue;
+        const sim::Unit& src = world_.units()[h.caster];
+        const sim::Unit& dst = world_.units()[h.target];
+        if (!src.alive || !dst.alive) continue;
+        float pa[3], pb[3];
+        unit_attach_world(src, nullptr, nullptr, pa);
+        unit_attach_world(dst, nullptr, nullptr, pb);
+        emit_beam(scene, pa, pb, 0.18f);
+    }
+
+    if (models_ && ui_store_ && cat_ && cfg_.human_player >= 0)
+        for (uint32_t sid : selection_) {
+            if (sid >= world_.units().size()) continue;
+            const Unit& su = world_.units()[sid];
+            if (!su.alive || su.player != cfg_.human_player || !su.has_rally || su.catalog_id.empty()) continue;
+            const int race = cat_->unit_race_index(su.catalog_id);
+            const char* rid = race == 1 ? "CommandUIHarnessRallyProtoss" : race == 2 ? "CommandUIHarnessRallyZerg" : "CommandUIHarnessRallyTerran";
+            const formats::Model* rm = models_->cmodel(*ui_store_, rid);
+            if (!rm) continue;
+            const float rx = float(su.rally_x.to_double()), ry = float(su.rally_y.to_double());
+            render::SceneInstance ri;
+            ri.model = rm;
+            ri.world = render::translation(rx, ry, ground_z_at(rx, ry));
+            ri.seq = render::select_sequence(*rm, {"Stand"}, sid);
+            if (ri.seq >= 0 && std::size_t(ri.seq) < rm->sequences.size()) {
+                const float len = float(rm->sequences[std::size_t(ri.seq)].length_ms());
+                ri.time_ms = len > 0.0f ? float(std::fmod(clock_ms_, double(len))) : 0.0f;
+            }
+            ri.team = team_colour_for(cat_, su.player, false);
+            ri.team_emissive = team_emissive_for(cat_, su.player);
+            scene.push_back(ri);
+        }
+
+    if ((pending_build_ || pending_refinery_) && cat_ && !build_proto_.catalog_id.empty()) {
+        const float gx = float(build_px_.to_double()), gy = float(build_py_.to_double());
+        for (const data::Catalog::RangeRing& rr : cat_->unit_range_rings(build_proto_.catalog_id))
+            if (rr.on_placement)
+                emit_range_ring(scene, gx, gy, ground_z_at(gx, gy), float(rr.radius) + float(build_proto_.radius.to_double()));
     }
 
     for (const Corpse& c : corpses_) {
         if (!c.model) continue;
         if (fog_ready && c.player != cfg_.human_player &&
-            !hud_fog_body_drawn(int(vision_.state_at(sim::Fixed::from_double(c.x), sim::Fixed::from_double(c.y))), FogVisibility(c.fog_visibility)))
+            !hud_fog_body_drawn(fog_body_state(c.player, int(vision_.state_at(sim::Fixed::from_double(c.x), sim::Fixed::from_double(c.y))), fog_hidden_black_), FogVisibility(c.fog_visibility)))
             continue;
         render::SceneInstance inst;
         inst.model = c.model;
-        inst.world = render::translation(c.x, c.y, c.z) * render::scaling(c.scale[0], c.scale[1], c.scale[2]);
+        inst.world = render::translation(c.x, c.y, c.z) * c.orient * render::scaling(c.scale[0], c.scale[1], c.scale[2]);
         inst.seq = c.seq;
         inst.time_ms = c.time_ms;
         inst.team = team_colour_for(cat_, c.player, false);
+        inst.team_emissive = team_emissive_for(cat_, c.player);
+        scene.push_back(inst);
+    }
+    for (const ImpactFx& f : impact_fx_) {
+        if (!f.model) continue;
+        if (fog_ready && f.player != cfg_.human_player &&
+            vision_.state_at(sim::Fixed::from_double(f.x), sim::Fixed::from_double(f.y)) != sim::Visibility::Visible)
+            continue;
+        render::SceneInstance inst;
+        inst.model = f.model;
+        inst.world = render::translation(f.x, f.y, f.z) * render::rotation_z(f.yaw + 1.5707963f) *
+                     render::scaling(f.scale, f.scale, f.scale);
+        inst.seq = f.seq;
+        inst.time_ms = f.time_ms;
+        inst.team = {0, 0, 0, -1.0f};
+        scene.push_back(inst);
+    }
+
+    for (const EffectDoodad& d : effect_doodads_) {
+        if (!d.model) continue;
+        if (fog_ready && d.player != cfg_.human_player &&
+            vision_.state_at(sim::Fixed::from_double(d.x), sim::Fixed::from_double(d.y)) != sim::Visibility::Visible)
+            continue;
+        const int sq = d.seq[d.phase] >= 0 ? d.seq[d.phase] : (d.seq[1] >= 0 ? d.seq[1] : 0);
+        render::SceneInstance inst;
+        inst.model = d.model;
+        inst.world = render::translation(d.x, d.y, d.z) * render::rotation_z(d.yaw + 1.5707963f);
+        inst.seq = sq;
+        inst.time_ms = d.time_ms;
+        inst.team = {0, 0, 0, -1.0f};
+        scene.push_back(inst);
+    }
+
+    for (BeamFx& b : beams_) {
+        if (!b.model || b.attacker >= world_.units().size()) continue;
+        const Unit& from = world_.units()[b.attacker];
+        if (fog_ready && from.player != cfg_.human_player && vision_.state_at(from.x, from.y) != sim::Visibility::Visible)
+            continue;
+        float a[3];
+        unit_attach_world(from, b.heal ? "Ref_Center" : "Ref_Weapon", "Ref_Center", a);
+        if (b.target < world_.units().size() && world_.units()[b.target].alive)
+            unit_attach_world(world_.units()[b.target], "Ref_Center", nullptr, b.to);
+        const float dx = b.to[0] - a[0], dy = b.to[1] - a[1];
+        const float yaw = (dx != 0.0f || dy != 0.0f) ? std::atan2(dy, dx) : 0.0f;
+        render::SceneInstance inst;
+        inst.model = b.model;
+        inst.world = render::translation(a[0], a[1], a[2]) * render::rotation_z(yaw + 1.5707963f) *
+                     render::scaling(b.scale, b.scale, b.scale);
+        inst.seq = b.seq[b.phase];
+        inst.time_ms = b.time_ms;
+        inst.team = {0, 0, 0, -1.0f};
+        inst.beam_bone = b.beam_bone;
+        inst.beam_target = {b.to[0], b.to[1], b.to[2]};
         scene.push_back(inst);
     }
 
@@ -4106,6 +5657,11 @@ void MeleeGame::emit_scene(std::vector<render::SceneInstance>& scene) {
             const sim::Unit& shooter = world_.units()[sv.attacker];
             const std::string& wid = sv.slot == 1 ? shooter.wpn2_id : shooter.wpn_id;
             const formats::Model* mm = models_->missile_model(*ui_store_, wid);
+            if (std::getenv("SC2_SHOT_TRACE")) {
+                static std::set<std::string> told;
+                if (told.insert(shooter.catalog_id + "/" + wid).second)
+                    std::fprintf(stderr, "[shot] %s weapon '%s' slot %d in flight -> %s\n", shooter.catalog_id.c_str(), wid.c_str(), int(sv.slot), mm ? "a missile model" : "NO MODEL");
+            }
             if (!mm) continue;
             if (fog_ready && shooter.player != cfg_.human_player &&
                 vision_.state_at(sv.x, sv.y) != sim::Visibility::Visible)
@@ -4127,22 +5683,90 @@ void MeleeGame::emit_scene(std::vector<render::SceneInstance>& scene) {
                         sz = ground_z_at(tx, ty) + att.m[14];
                 }
             }
+            float shot_launch_z = sz;
+            {
+                const float impact_z = sz;
+                float launch_z = ground_z_at(float(shooter.x.to_double()), float(shooter.y.to_double()));
+                if (shooter.id < driver_.actors.size()) {
+                    render::ActorInstance& sa = driver_.actors[shooter.id];
+                    render::Mat4 latt;
+                    const int sseq = sa.model ? sa.current_sequence() : -1;
+                    if (sseq >= 0 &&
+                        (render::attachment_transform(*sa.model, "Ref_Weapon", std::uint32_t(sseq), sa.current_time(), latt) ||
+                         render::attachment_transform(*sa.model, "Ref_Center", std::uint32_t(sseq), sa.current_time(), latt)))
+                        launch_z += latt.m[14];
+                    if (shooter.flying && cat_) launch_z += cat_->unit_display_height(shooter.catalog_id);
+                }
+                const float prog = std::min(1.0f, std::max(0.0f, float(sv.progress.to_double())));
+                sz = launch_z + (impact_z - launch_z) * prog;
+                shot_launch_z = launch_z;
+            }
             render::SceneInstance shot;
             shot.model = mm;
             shot.world = render::translation(sx, sy, sz) * render::rotation_z(yaw + 1.5707963f);
             shot.team = {0, 0, 0, -1.0f};
             shot.seq = -1;
+            static const bool kShotPath = std::getenv("SC2_SHOT_NO_PATH") == nullptr;
+            if (kShotPath && sv.speed.raw() > 0) {
+                shot.path_from = {float(sv.launch_x.to_double()), float(sv.launch_y.to_double()), shot_launch_z};
+                shot.path_speed = float(sv.speed.to_double());
+                float trail_s = 0.0f;
+                for (const formats::M3Particle& pe : mm->particles)
+                    if (pe.trailing_flag) trail_s = std::max(trail_s, std::max(pe.lifetime, pe.rand_life2 ? pe.lifetime2 : 0.0f));
+                const std::string key = std::to_string(sv.attacker) + "/" + std::to_string(int(sv.slot)) + "/" + std::to_string(sv.launch_x.raw()) + "/" + std::to_string(sv.launch_y.raw());
+                if (trail_s > 0.0f) shots_seen_[key] = SeenShot{shot, clock_ms_, trail_s};
+            }
             scene.push_back(shot);
+        }
+        for (auto it = shots_seen_.begin(); it != shots_seen_.end();) {
+            if (it->second.last_ms >= clock_ms_) { ++it; continue; }
+            const float gone = float((clock_ms_ - it->second.last_ms) * 0.001);
+            if (gone > it->second.trail_s || gone < 0.0f) { it = shots_seen_.erase(it); continue; }
+            render::SceneInstance spent = it->second.inst;
+            spent.path_ended_s = gone;
+            scene.push_back(spent);
+            ++it;
         }
     }
 
+    if (fluff_ && models_ && ui_store_) {
+        static const float kFluffRange = std::getenv("SC2_FLUFF_RANGE") ? float(std::atof(std::getenv("SC2_FLUFF_RANGE"))) : 40.0f;
+        const float fx = camctl_.focus.x, fy = camctl_.focus.y;
+        for (const formats::PlacedDoodad& d : *fluff_) {
+            const float dx = d.x - fx, dy = d.y - fy;
+            if (dx * dx + dy * dy > kFluffRange * kFluffRange) continue;
+            const formats::Model* fm = models_->foliage_model(*ui_store_, d.type, d.variation);
+            if (!fm) continue;
+            render::SceneInstance inst;
+            inst.model = fm;
+            inst.world = app::doodad_world_matrix(d);
+            inst.team = {0, 0, 0, -2.0f};
+            inst.seq = -1;
+            scene.push_back(inst);
+        }
+    }
     if (doodads_ && models_ && ui_store_) {
         for (const formats::PlacedDoodad& d : *doodads_) {
-            const formats::Model* dm = models_->doodad_model(*ui_store_, d.type, d.variation);
+            int dvar = d.variation;
+            if (const char* dv = std::getenv("SC2_DOODAD_VAR")) {
+                const std::string spec = dv;
+                const std::size_t c1 = spec.find(':');
+                if (c1 != std::string::npos && spec.compare(0, c1, d.type) == 0) dvar = std::atoi(spec.c_str() + c1 + 1);
+            }
+            if (const char* sk = std::getenv("SC2_DOODAD_SKIP"))
+                if (d.type == sk) continue;
+            const formats::Model* dm = models_->doodad_model(*ui_store_, d.type, dvar);
             if (!dm) continue;
             render::SceneInstance inst;
             inst.model = dm;
             inst.world = app::doodad_world_matrix(d);
+            if (const char* dx = std::getenv("SC2_DOODAD_XFORM")) {
+                const std::string spec = dx;
+                const std::size_t c1 = spec.find(':');
+                float sxy = 1.0f, sz = 1.0f, dz = 0.0f;
+                if (c1 != std::string::npos && spec.compare(0, c1, d.type) == 0 && std::sscanf(spec.c_str() + c1 + 1, "%f:%f:%f", &sxy, &sz, &dz) >= 1)
+                    inst.world = render::translation(0.0f, 0.0f, dz) * inst.world * render::scaling(sxy, sxy, sz);
+            }
             inst.team = {0, 0, 0, -2.0f};
             std::uint64_t dseed = 1469598103934665603ull;
             for (char ch : d.type) dseed = (dseed ^ std::uint64_t(std::uint8_t(ch))) * 1099511628211ull;
@@ -4152,6 +5776,38 @@ void MeleeGame::emit_scene(std::vector<render::SceneInstance>& scene) {
                 dseed = (dseed ^ std::uint64_t(bits)) * 1099511628211ull;
             }
             inst.seq = render::select_sequence(*dm, {"Stand"}, dseed);
+            static const bool kDoodadClock = std::getenv("SC2_DOODAD_FROZEN") == nullptr;
+            if (kDoodadClock && inst.seq >= 0 && std::size_t(inst.seq) < dm->sequences.size()) {
+                const double len = double(dm->sequences[std::size_t(inst.seq)].length_ms());
+                if (len > 0.0) inst.time_ms = float(std::fmod(clock_ms_, len));
+            }
+            static const bool kDoodadTakes = std::getenv("SC2_DOODAD_NO_VARIATIONS") == nullptr;
+            if (kDoodadTakes && kDoodadClock && inst.seq >= 0) {
+                float take_ms = 0.0f;
+                const int take = render::select_variation(*dm, "Stand", dseed, double(clock_ms_), &take_ms);
+                if (take >= 0) {
+                    inst.seq = take;
+                    inst.time_ms = take_ms;
+                }
+            }
+            if (const char* ds = std::getenv("SC2_DOODAD_SEQ")) {
+                const std::string spec = ds;
+                const std::size_t c1 = spec.find(':');
+                if (c1 != std::string::npos && spec.compare(0, c1, d.type) == 0) {
+                    static std::set<const formats::Model*> listed;
+                    if (listed.insert(dm).second) {
+                        std::fprintf(stderr, "[doodadseq] %s var %d picked %d bones %zu at %.2f %.2f %.2f rot %.3f scale %.3f %.3f %.3f verts %u\n", d.type.c_str(), int(d.variation), inst.seq,
+                                     dm->bones.size(), double(d.x), double(d.y), double(d.z), double(d.rotation), double(d.sx), double(d.sy), double(d.sz), dm->vertex_count);
+                        for (std::size_t qi = 0; qi < dm->sequences.size(); ++qi)
+                            std::fprintf(stderr, "[doodadseq]   %zu '%s' %u ms\n", qi, dm->sequences[qi].name.c_str(), dm->sequences[qi].length_ms());
+                    }
+                    const std::size_t c2 = spec.find(':', c1 + 1);
+                    const int want = std::atoi(spec.c_str() + c1 + 1);
+                    if (want >= 0 && std::size_t(want) < dm->sequences.size()) inst.seq = want;
+                    if (want == -2) inst.seq = -1;
+                    if (c2 != std::string::npos) inst.time_ms = float(std::atof(spec.c_str() + c2 + 1));
+                }
+            }
             scene.push_back(inst);
         }
     }
@@ -4172,6 +5828,7 @@ void MeleeGame::set_spawn_models(int player, const formats::Model* worker,
 
 bool MeleeGame::cancel_pending_modal() {
     if (has_pending_ability_cast()) { cancel_ability_cast(); return true; }
+    if (hud_ui_.minimap.ping_armed) { hud_ui_.minimap.ping_armed = false; return true; }
     if (pending_warp_) {
         pending_warp_ = false;
         pending_warp_gate_ = sim::kNoTarget;
@@ -4256,17 +5913,17 @@ void MeleeGame::audio_observe_events(std::vector<std::uint32_t>& played) {
         if (!audio_known_[i]) {
             audio_known_[i] = 1;
             if (audible && audio_seeded_ && u.player >= 0 && !u.catalog_id.empty())
-                if (audio_->play_event(u.catalog_id, data::UnitEvent::Ready, 1.0f, listener_distance_to(u)))
+                if (audio_->play_event(u.catalog_id, data::UnitEvent::Ready, 1.0f, listener_distance_to(u), listener_pan_to(u)))
                     mark(i, data::UnitEvent::Ready);
             audio_alive_[i] = u.alive ? 1 : 0;
             audio_cd_[i] = u.cooldown;
             continue;
         }
         if (audible && audio_alive_[i] && !u.alive && !u.catalog_id.empty())
-            if (audio_->play_event(u.catalog_id, data::UnitEvent::Death, 1.0f, listener_distance_to(u)))
+            if (audio_->play_event(u.catalog_id, data::UnitEvent::Death, 1.0f, listener_distance_to(u), listener_pan_to(u)))
                 mark(i, data::UnitEvent::Death);
         if (audible && u.alive && u.cooldown > audio_cd_[i] && audio_cd_[i] == zero && !u.catalog_id.empty())
-            if (audio_->play_event(u.catalog_id, data::UnitEvent::Attack, kCombatCueTrim, listener_distance_to(u)))
+            if (audio_->play_event(u.catalog_id, data::UnitEvent::Attack, kCombatCueTrim, listener_distance_to(u), listener_pan_to(u)))
                 mark(i, data::UnitEvent::Attack);
         audio_alive_[i] = u.alive ? 1 : 0;
         audio_cd_[i] = u.cooldown;
@@ -4278,14 +5935,91 @@ void MeleeGame::audio_ui_event(std::uint32_t unit_id, data::UnitEvent ev, float 
     if (!audio_ || unit_id == sim::kNoTarget || unit_id >= world_.units().size()) return;
     const Unit& u = world_.units()[unit_id];
     if (!u.alive || u.player != cfg_.human_player || u.catalog_id.empty()) return;
-    audio_->play_event(u.catalog_id, ev, gain, listener_distance_to(u));
+    audio_->play_event(u.catalog_id, ev, gain, listener_distance_to(u), listener_pan_to(u));
+}
+
+void MeleeGame::apply_start_grants() {
+    if (std::getenv("SC2_NO_START_GRANTS") || !cat_) return;
+    for (std::uint32_t h = 0; h < world_.units().size(); ++h) {
+        const sim::Unit& hall = world_.unit(h);
+        if (!hall.alive || hall.player < 0 || hall.catalog_id.empty() || !cat_->find("CUnit", hall.catalog_id)) continue;
+        std::string create_set;
+        for (const core::XmlNode& n : cat_->resolved("CUnit", hall.catalog_id))
+            if (n.name == "EffectArray" && n.attr_or("index", "") == "Create")
+                if (const std::string* v = n.attr("value"); v && !v->empty()) create_set = *v;
+        if (create_set.empty() || !cat_->find("CEffect", create_set)) continue;
+        for (const core::XmlNode& m : cat_->resolved("CEffect", create_set)) {
+            if (m.name != "EffectArray") continue;
+            const std::string* eff = m.attr("value");
+            if (!eff || eff->empty() || !cat_->find("CEffect", *eff)) continue;
+            for (const core::XmlNode& u : cat_->resolved("CEffect", *eff))
+                if (u.name == "Upgrades")
+                    if (const std::string* up = u.attr("Upgrade"); up && !up->empty() && u.attr_or("Count", "1") != "0") {
+                        world_.grant_upgrade(hall.player, *up);
+                        if (std::getenv("SC2_START_RALLY_TRACE"))
+                            std::fprintf(stderr, "[start-grant] %s %u (player %d): %s -> %s\n", hall.catalog_id.c_str(), h, hall.player, eff->c_str(), up->c_str());
+                    }
+        }
+    }
+}
+
+void MeleeGame::apply_start_rally() {
+    if (!std::getenv("SC2_NO_START_RALLY") && cat_) {
+        const sim::Fixed reach = sim::Fixed::from_ratio(13, 2);
+        const std::size_t n = world_.units().size();
+        for (std::uint32_t h = 0; h < n; ++h) {
+            const sim::Unit& hall = world_.unit(h);
+            if (std::getenv("SC2_START_RALLY_TRACE") && (hall.catalog_id == "CommandCenter" || hall.catalog_id == "Nexus" || hall.catalog_id == "Hatchery"))
+                std::fprintf(stderr, "[start-rally] candidate %s %u alive %d player %d dropoff %d has_rally %d worker_rally %d rally_abil '%s'\n", hall.catalog_id.c_str(), h,
+                             int(hall.alive), hall.player, int(hall.drop_off_ground), int(hall.has_rally), int(hall.has_worker_rally),
+                             cat_->unit_rally_ability(hall.catalog_id).c_str());
+            if (!hall.alive || hall.player < 0 || hall.is_worker || !hall.drop_off_ground || hall.catalog_id.empty() || hall.has_rally ||
+                hall.has_worker_rally || cat_->unit_rally_ability(hall.catalog_id).empty())
+                continue;
+            std::uint32_t best = sim::kNoTarget;
+            sim::Fixed best_d2;
+            for (std::uint32_t f = 0; f < n; ++f) {
+                const sim::Unit& fld = world_.unit(f);
+                if (!fld.alive || fld.resource_left <= 0 || fld.is_gas) continue;
+                const sim::Fixed dx = fld.x - hall.x, dy = fld.y - hall.y;
+                const sim::Fixed d2 = dx * dx + dy * dy;
+                const sim::Fixed one = sim::Fixed::from_int(1), half = sim::Fixed::from_ratio(1, 2);
+                sim::Fixed bx = (dx.raw() < 0 ? sim::Fixed() - dx : dx) - one, by = (dy.raw() < 0 ? sim::Fixed() - dy : dy) - half;
+                if (bx.raw() < 0) bx = sim::Fixed();
+                if (by.raw() < 0) by = sim::Fixed();
+                if (std::getenv("SC2_START_RALLY_TRACE"))
+                    std::fprintf(stderr, "[start-rally]   field %u at (%.2f, %.2f): centre %.2f, footprint %.2f\n", f, fld.x.to_double(), fld.y.to_double(),
+                                 std::sqrt(d2.to_double()), std::sqrt((bx * bx + by * by).to_double()));
+                if (bx * bx + by * by > reach * reach) continue;
+                if (best == sim::kNoTarget || d2 > best_d2) { best = f; best_d2 = d2; }
+            }
+            if (best == sim::kNoTarget) continue;
+            world_.set_rally(h, world_.unit(best).x, world_.unit(best).y);
+            if (std::getenv("SC2_START_RALLY_TRACE"))
+                std::fprintf(stderr, "[start-rally] %s %u at (%.2f, %.2f) -> field %u at (%.2f, %.2f), %.2f away (radius %.3f)\n", hall.catalog_id.c_str(), h,
+                             hall.x.to_double(), hall.y.to_double(), best, world_.unit(best).x.to_double(), world_.unit(best).y.to_double(),
+                             std::sqrt(best_d2.to_double()), world_.unit(best).radius.to_double());
+        }
+    }
 }
 
 bool MeleeGame::step(const render::InputState& in, float dt_ms,
                      std::vector<render::SceneInstance>& scene, render::Camera& cam) {
     ensure_audio();
     const float dt_s = dt_ms / 1000.0f;
+    fog_dt_s_ = dt_s;
     clock_ms_ += double(dt_ms);
+    {
+        const std::size_t np = layout_.players.size();
+        if (upg_seen_.size() != np) { upg_seen_.assign(np, 0); upg_flash_s_.assign(np, 0.0f);
+            for (std::size_t p = 0; p < np; ++p) upg_seen_[p] = world_.researched(int32_t(p)).size(); }
+        for (std::size_t p = 0; p < np; ++p) {
+            const std::size_t n = world_.researched(int32_t(p)).size();
+            if (n > upg_seen_[p]) upg_flash_s_[p] = 0.5f;
+            upg_seen_[p] = n;
+            if (upg_flash_s_[p] > 0.0f) upg_flash_s_[p] = std::max(0.0f, upg_flash_s_[p] - dt_s);
+        }
+    }
     user_scrolled_ = false;
     const float aspect = in.view_h ? float(in.view_w) / float(in.view_h) : 1.0f;
 
@@ -4295,13 +6029,22 @@ bool MeleeGame::step(const render::InputState& in, float dt_ms,
     }
     mouse_x_ = in.mouse_x;
     mouse_y_ = in.mouse_y;
+    alt_held_ = in.key_alt;
+    hud_ui_tick(dt_s);
 
     const bool esc_edge = in.quit && !prev_esc_;
     prev_esc_ = in.quit;
+    static const bool esc_opens = std::getenv("SC2_ESC_OPENS_MENU") != nullptr;
+    bool menu_key = false;
+    if (cat_ && !cat_->hotkeys().empty()) menu_key = ui_hotkey_fires(cat_->hotkeys(), "MenuGame", in);
+    else
+        for (const std::string& t : in.key_tokens) menu_key = menu_key || t == "F10";
     if (esc_edge) {
-        if (pause_menu_open_) { pause_menu_open_ = false; clock_.set_paused(false); }
+        if (pause_menu_open_) { pause_menu_open_ = false; clock_.set_paused(hud_ui_.menu.paused_by_key); }
         else if (cancel_pending_modal()) {   }
-        else { pause_menu_open_ = true; clock_.set_paused(true); }
+        else if (esc_opens) open_pause_menu();
+    } else if (menu_key && !pause_menu_open_) {
+        open_pause_menu();
     }
     if (pause_menu_open_) {
         if (in.left_pressed && in.view_w && in.view_h) {
@@ -4311,7 +6054,7 @@ bool MeleeGame::step(const render::InputState& in, float dt_ms,
                 return in.mouse_x >= float(r.x0) && in.mouse_x < float(r.x1) &&
                        in.mouse_y >= float(r.y0) && in.mouse_y < float(r.y1);
             };
-            if (hit(resume)) { pause_menu_open_ = false; clock_.set_paused(false); }
+            if (hit(resume)) { pause_menu_open_ = false; clock_.set_paused(hud_ui_.menu.paused_by_key); }
             else if (hit(quit)) {
                 if (cfg_.human_player >= 0) surrender(cfg_.human_player);
                 return false;
@@ -4414,15 +6157,7 @@ bool MeleeGame::step(const render::InputState& in, float dt_ms,
             prev_num_[d] = in.key_num[d];
         }
         const data::StringTable& hk = cat_->hotkeys();
-        auto steal = [&](int keep) {
-            for (int o = 0; o < 10; ++o) {
-                if (o == keep) continue;
-                std::vector<uint32_t> rest;
-                for (uint32_t id : groups_.recall(o))
-                    if (std::find(selection_.begin(), selection_.end(), id) == selection_.end()) rest.push_back(id);
-                set_control_group(o, rest);
-            }
-        };
+        auto steal = [&](int keep) { steal_control_groups(keep); };
         for (int d = 0; d < 10; ++d) {
             const std::string n = std::to_string(d);
             if (ui_hotkey_fires(hk, ("ControlGroupAssignAndSteal" + n).c_str(), kin)) {
@@ -4443,11 +6178,7 @@ bool MeleeGame::step(const render::InputState& in, float dt_ms,
         }
         if (ui_hotkey_fires(hk, "IdleWorker", kin)) select_next_idle_worker();
         if (ui_hotkey_fires(hk, "ArmySelect", kin)) {
-            std::vector<uint32_t> army;
-            for (const Unit& u : world_.units())
-                if (u.alive && u.player == cfg_.human_player && !u.catalog_id.empty() &&
-                    cat_->unit_flag(u.catalog_id, "ArmySelect"))
-                    army.push_back(u.id);
+            const std::vector<uint32_t> army = army_units();
             set_selection(army);
         }
         if (ui_hotkey_fires(hk, "TownCamera", kin)) {
@@ -4481,6 +6212,7 @@ bool MeleeGame::step(const render::InputState& in, float dt_ms,
         }
     }
 
+    if (!replay_drive_) hud_dispatch_hotkeys(in);
     if (cfg_.human_player >= 0 && cat_ && !cat_->hotkeys().empty()) {
         const data::StringTable& hk = cat_->hotkeys();
         if (ui_hotkey_fires(hk, "SubgroupNext", in) || ui_hotkey_fires(hk, "SubgroupPrev", in)) {
@@ -4531,7 +6263,26 @@ bool MeleeGame::step(const render::InputState& in, float dt_ms,
             inject_replay_orders(world_.tick());
         }
         prev_pos_ = curr_pos_;
+        if (!start_grants_done_) {
+            start_grants_done_ = true;
+            apply_start_grants();
+        }
+        if (!replay_drive_ && !start_rally_done_) {
+            start_rally_done_ = true;
+            apply_start_rally();
+        }
         world_.step();
+        if (const char* lt = std::getenv("SC2_LIFE_TRACE")) {
+            static std::map<std::uint32_t, double> last;
+            for (const sim::Unit& lu : world_.units()) {
+                if (!lu.alive || lu.catalog_id != lt) continue;
+                const double v = lu.hp.to_double() + lu.shields.to_double();
+                auto it = last.find(lu.id);
+                if (it == last.end() || it->second != v)
+                    std::fprintf(stderr, "[life] tick %d %s %u life %.1f shields %.1f\n", world_.tick(), lt, unsigned(lu.id), lu.hp.to_double(), lu.shields.to_double());
+                last[lu.id] = v;
+            }
+        }
         if (research_) research_->apply_completed();
         if (research_ && cfg_.human_player >= 0)
             for (const std::pair<std::int32_t, std::string>& done : research_->just_completed())
@@ -4578,6 +6329,22 @@ bool MeleeGame::step(const render::InputState& in, float dt_ms,
                     continue;
                 }
             }
+            bool swapped = false;
+            if (u.player >= 0)
+                for (const auto& sw : upgrade_model_swaps(u.catalog_id)) {
+                    if (!world_.has_upgrade(u.player, sw.first)) continue;
+                    if (const formats::Model* m = models_->cmodel(*ui_store_, sw.second)) {
+                        driver_.set_model(std::uint32_t(id), m);
+                        swapped = true;
+                        break;
+                    }
+                }
+            if (swapped) continue;
+            if (const std::string& osw = option_model_swap(actor_cat_.get(), u.catalog_id); !osw.empty())
+                if (const formats::Model* m = models_->cmodel(*ui_store_, osw)) {
+                    driver_.set_model(std::uint32_t(id), m);
+                    continue;
+                }
             if (const formats::Model* own = models_->ensure(*ui_store_, u.catalog_id)) {
                 driver_.set_model(std::uint32_t(id), own);
                 continue;
@@ -4615,12 +6382,23 @@ bool MeleeGame::step(const render::InputState& in, float dt_ms,
             bound_building_[id] = building;
             if (cid.empty()) continue;
             const formats::Model* m = building ? models_->ensure_build(*ui_store_, cid) : nullptr;
+            if (!m)
+                if (const std::string& osw = option_model_swap(actor_cat_.get(), cid); !osw.empty()) {
+                    m = models_->cmodel(*ui_store_, osw);
+                    if (std::getenv("SC2_SHADER_OPTION_TRACE"))
+                        std::fprintf(stderr, "[optswap] unit %zu %s -> %s: %s\n", id, cid.c_str(), osw.c_str(), m ? "bound" : "DID NOT RESOLVE");
+                }
+            static const bool kVarById = std::getenv("SC2_UNIT_VARIATION_BY_ID") != nullptr;
+            const int authored_var = (!kVarById && id < layout_.unit_variation.size()) ? layout_.unit_variation[id] : -1;
+            if (!m && !std::getenv("SC2_NO_UNIT_VARIATIONS"))
+                m = models_->ensure_variation(*ui_store_, cid, authored_var >= 0 ? unsigned(authored_var) : unsigned(id));
             if (!m) m = models_->ensure(*ui_store_, cid);
             if (m) driver_.set_model(std::uint32_t(id), m);
         }
     }
 
     driver_.observe(world_, dt_ms, ticked);
+    drain_train_events();
     if (audio_) {
         std::vector<std::uint32_t> played;
         if (ticked) audio_observe_events(played);
@@ -4655,12 +6433,28 @@ bool MeleeGame::step(const render::InputState& in, float dt_ms,
             last_alert_sound_ = sid;
             if (audio_) audio_->play_sound(sid, 1.0f);
         }
+        for (const sim::World::ResourceEmptyEvent& e : world_.take_resource_empty_events()) {
+            if (cfg_.human_player < 0 || e.player != cfg_.human_player) continue;
+            std::string family;
+            if (cat_ && e.node < world_.units().size())
+                family = cat_->resource_exhausted_alert(world_.units()[e.node].catalog_id);
+            messages_.emit(MsgZone::Alert, e.is_gas ? "Vespene geyser depleted" : "Mineral field depleted",
+                           10.0f, true, float(e.x.to_double()), float(e.y.to_double()));
+            const std::string sid = alert_sound_id(AlertKind::ResourceExhausted, family);
+            if (sid.empty()) continue;
+            last_alert_sound_ = sid;
+            if (audio_) audio_->play_sound(sid, 1.0f);
+        }
     }
     if (world_.last_error() != sim::CmdError::None) {
         if (cat_ && world_.last_error_player() == cfg_.human_player) {
             const char* key = sim::cmd_error_key(world_.last_error());
-            if (const std::string* text = cat_->strings().find(key); text && !text->empty())
-                messages_.emit(MsgZone::Error, *text);
+            if (const std::string* text = cat_->strings().find(key); text && !text->empty()) {
+                float ttl = 5.0f;
+                if (hud_authored_ && hud_authored_->error_timing.ok())
+                    ttl = hud_authored_->error_timing.duration_ms / 1000.0f;
+                messages_.emit(MsgZone::Error, *text, ttl);
+            }
             last_error_sound_ = error_sound_id(world_.last_error());
             if (audio_ && !last_error_sound_.empty()) audio_->play_sound(last_error_sound_, 1.0f);
         }
@@ -4683,6 +6477,157 @@ bool MeleeGame::step(const render::InputState& in, float dt_ms,
                 }
             }
         }
+    }
+    if (ticked && models_ && ui_store_) {
+        for (const sim::World::HitEvent& h : world_.take_hit_events()) {
+            if (h.attacker >= world_.units().size() || h.target >= world_.units().size()) continue;
+            const Unit& shooter = world_.units()[h.attacker];
+            const Unit& victim = world_.units()[h.target];
+            const std::string& wid = h.slot == 1 ? shooter.wpn2_id : shooter.wpn_id;
+            if (victim.shields_max.raw() > 0 && h.on_shields) {
+                if (const formats::Model* sm = models_->cmodel(*ui_store_, "ProtossShieldDamage"); sm && !sm->sequences.empty()) {
+                    int sseq = render::select_sequence(*sm, {"Birth"}, h.target);
+                    if (sseq < 0) sseq = render::select_sequence(*sm, {"Stand"}, h.target);
+                    if (sseq < 0) sseq = 0;
+                    ImpactFx sf;
+                    sf.model = sm;
+                    sf.seq = sseq;
+                    sf.length_ms = float(sm->sequences[std::size_t(sseq)].length_ms());
+                    float c3[3];
+                    unit_attach_world(victim, "Ref_Center", nullptr, c3);
+                    sf.x = c3[0]; sf.y = c3[1]; sf.z = c3[2];
+                    const float ax = float(shooter.x.to_double()) - sf.x, ay = float(shooter.y.to_double()) - sf.y;
+                    if (ax != 0.0f || ay != 0.0f) sf.yaw = std::atan2(ay, ax);
+                    const float dmg01 = std::min(1.0f, std::max(0.0f, (float(h.amount.to_double()) - 5.0f) / (45.0f - 5.0f)));
+                    sf.scale = 0.7f + (2.0f - 0.7f) * dmg01;
+                    sf.player = victim.player;
+                    if (impact_fx_.size() < 512) impact_fx_.push_back(sf);
+                }
+            }
+            const formats::Model* fm = models_->impact_model(*ui_store_, wid);
+            if (std::getenv("SC2_SHOT_TRACE")) {
+                static std::set<std::string> told_impact;
+                if (told_impact.insert(shooter.catalog_id + "/" + wid).second)
+                    std::fprintf(stderr, "[impact] %s weapon '%s' hit -> %s (%zu clips)\n", shooter.catalog_id.c_str(), wid.c_str(), fm ? "an impact model" : "NO IMPACT",
+                                 fm ? fm->sequences.size() : std::size_t(0));
+            }
+            if (!fm || fm->sequences.empty()) continue;
+            int seq = render::select_sequence(*fm, {"Birth"}, h.target);
+            if (seq < 0) seq = render::select_sequence(*fm, {"Stand"}, h.target);
+            if (seq < 0) seq = 0;
+            ImpactFx fx;
+            fx.model = fm;
+            fx.seq = seq;
+            fx.length_ms = float(fm->sequences[std::size_t(seq)].length_ms());
+            fx.x = float(h.x.to_double());
+            fx.y = float(h.y.to_double());
+            fx.z = ground_z_at(fx.x, fx.y);
+            if (victim.id < driver_.actors.size()) {
+                render::ActorInstance& ta = driver_.actors[victim.id];
+                render::Mat4 att;
+                const int tseq = ta.model ? ta.current_sequence() : -1;
+                if (tseq >= 0 && render::attachment_transform(*ta.model, "Ref_Center", std::uint32_t(tseq), ta.current_time(), att))
+                    fx.z += att.m[14];
+            }
+            if (victim.flying && cat_) fx.z += cat_->unit_display_height(victim.catalog_id);
+            fx.player = victim.player;
+            if (impact_fx_.size() < 512) impact_fx_.push_back(fx);
+        }
+        for (const sim::World::LaunchEvent& l : world_.take_launch_events()) {
+            if (l.attacker >= world_.units().size()) continue;
+            const Unit& shooter = world_.units()[l.attacker];
+            const std::string& wid = l.slot == 1 ? shooter.wpn2_id : shooter.wpn_id;
+            if (!wid.empty() && l.target < world_.units().size()) {
+                const float period_ms = float((l.slot == 1 ? shooter.wpn2_period : shooter.wpn_period).to_double()) * 1000.0f;
+                beam_refresh(l.attacker, l.target, l.slot, wid, false, std::max(250.0f, period_ms * 1.5f));
+            }
+            const formats::Model* fm = models_->launch_model(*ui_store_, wid);
+            if (!fm || fm->sequences.empty()) continue;
+            int seq = render::select_sequence(*fm, {"Birth"}, l.attacker);
+            if (seq < 0) seq = render::select_sequence(*fm, {"Stand"}, l.attacker);
+            if (seq < 0) seq = 0;
+            ImpactFx fx;
+            fx.model = fm;
+            fx.seq = seq;
+            fx.length_ms = float(fm->sequences[std::size_t(seq)].length_ms());
+            fx.x = float(shooter.x.to_double());
+            fx.y = float(shooter.y.to_double());
+            fx.z = ground_z_at(fx.x, fx.y);
+            if (shooter.flying && cat_) fx.z += cat_->unit_display_height(shooter.catalog_id);
+            if (shooter.id < driver_.actors.size()) {
+                render::ActorInstance& sa = driver_.actors[shooter.id];
+                render::Mat4 latt;
+                const int sseq = sa.model ? sa.current_sequence() : -1;
+                if (sseq >= 0 && (render::attachment_transform(*sa.model, "Ref_Weapon", std::uint32_t(sseq), sa.current_time(), latt) ||
+                                  render::attachment_transform(*sa.model, "Ref_Center", std::uint32_t(sseq), sa.current_time(), latt))) {
+                    const float c = std::cos(sa.facing + 1.5707963f), s = std::sin(sa.facing + 1.5707963f);
+                    fx.x += latt.m[12] * c - latt.m[13] * s;
+                    fx.y += latt.m[12] * s + latt.m[13] * c;
+                    fx.z += latt.m[14];
+                }
+                fx.yaw = sa.facing;
+            }
+            if (l.target < world_.units().size()) {
+                const Unit& t = world_.units()[l.target];
+                const float tx = float(t.x.to_double()), ty = float(t.y.to_double());
+                if (tx != fx.x || ty != fx.y) fx.yaw = std::atan2(ty - fx.y, tx - fx.x);
+            }
+            fx.player = shooter.player;
+            if (impact_fx_.size() < 512) impact_fx_.push_back(fx);
+        }
+    }
+    if (ticked)
+        for (const sim::HealerInstance& h : world_.healers()) {
+            if (h.vital != sim::HealVital::Life) continue;
+            if (h.caster >= world_.units().size() || h.target >= world_.units().size()) continue;
+            if (!world_.units()[h.caster].alive || !world_.units()[h.target].alive) continue;
+            beam_refresh(h.caster, h.target, 0, "MedivacHealBeam", true, 250.0f);
+        }
+    if (!beams_.empty()) {
+        for (BeamFx& b : beams_) {
+            b.time_ms += dt_s * 1000.0f;
+            b.idle_ms += dt_s * 1000.0f;
+            const auto len = [&](int ph) {
+                const int sq = b.seq[ph];
+                return (b.model && sq >= 0 && std::size_t(sq) < b.model->sequences.size())
+                           ? float(b.model->sequences[std::size_t(sq)].length_ms()) : 0.0f;
+            };
+            const bool lost = b.attacker >= world_.units().size() || !world_.units()[b.attacker].alive ||
+                              b.target >= world_.units().size() || !world_.units()[b.target].alive;
+            if (b.phase == 0 && b.time_ms >= len(0)) { b.phase = 1; b.time_ms = 0.0f; }
+            if (b.phase == 1) {
+                const bool close = b.continuous ? (lost || b.idle_ms > b.keep_ms) : (b.time_ms >= len(1));
+                if (close) { b.phase = 2; b.time_ms = 0.0f; }
+                else if (b.continuous && len(1) > 0.0f && b.time_ms >= len(1)) b.time_ms = std::fmod(b.time_ms, len(1));
+            }
+        }
+        beams_.erase(std::remove_if(beams_.begin(), beams_.end(), [](const BeamFx& b) {
+                         if (b.phase < 2) return false;
+                         const int sq = b.seq[2];
+                         const float l = (b.model && sq >= 0 && std::size_t(sq) < b.model->sequences.size())
+                                             ? float(b.model->sequences[std::size_t(sq)].length_ms()) : 0.0f;
+                         return b.time_ms >= l;
+                     }),
+                     beams_.end());
+    }
+    if (!effect_doodads_.empty()) {
+        for (EffectDoodad& d : effect_doodads_) {
+            d.time_ms += dt_s * 1000.0f;
+            const int sq = d.seq[d.phase];
+            const float len = (d.model && sq >= 0) ? float(d.model->sequences[std::size_t(sq)].length_ms()) : 0.0f;
+            if (d.phase == 0 && d.time_ms >= len) { d.phase = 1; d.time_ms = 0.0f; }
+            else if (d.phase == 1 && len > 0.0f && d.time_ms >= len) d.time_ms = std::fmod(d.time_ms, len);
+            else if (d.phase == 2 && (sq < 0 || d.time_ms >= len)) d.phase = 3;
+        }
+        effect_doodads_.erase(std::remove_if(effect_doodads_.begin(), effect_doodads_.end(),
+                                             [](const EffectDoodad& d) { return d.phase >= 3; }),
+                              effect_doodads_.end());
+    }
+    if (!impact_fx_.empty()) {
+        for (ImpactFx& f : impact_fx_) f.time_ms += dt_s * 1000.0f;
+        impact_fx_.erase(std::remove_if(impact_fx_.begin(), impact_fx_.end(),
+                                        [](const ImpactFx& f) { return f.length_ms <= 0.0f || f.time_ms >= f.length_ms; }),
+                         impact_fx_.end());
     }
     if (!corpses_.empty()) {
         for (Corpse& c : corpses_) c.time_ms += dt_s * 1000.0f;
@@ -4707,7 +6652,8 @@ bool MeleeGame::step(const render::InputState& in, float dt_ms,
     music_tick(dt_s);
     emit_scene(scene);
     cam = camctl_.camera();
-    return !in.quit;
+    static const bool esc_ends = std::getenv("SC2_ESC_FRAME_ENDS_MATCH") != nullptr;
+    return esc_ends ? !in.quit : true;
 }
 
 static std::uint32_t type_hash(const std::string& s) {
@@ -4793,8 +6739,25 @@ void MeleeGame::update_minimap_fog(int viewed) {
     if (map_w_ <= 0.0f || map_h_ <= 0.0f) { minimap_fog_.clear(); minimap_fw_ = minimap_fh_ = 0; return; }
     const sim::Bounds bounds{sim::Fixed(), sim::Fixed(),
                              sim::Fixed::from_double(map_w_), sim::Fixed::from_double(map_h_)};
+    if (fog_blend_speed_ < 0.0f) {
+        fog_blend_speed_ = 2.0f;
+        fog_hidden_black_ = false;
+        fog_veil_alpha_ = 165;
+        if (cat_) {
+            if (auto v = cat_->tag_default_scalar("CFoW", "BlendSpeed"); v && !v->empty())
+                fog_blend_speed_ = float(std::atof(v->c_str()));
+            if (auto v = cat_->scalar("CFoW", fog_type_, "BlendSpeed"); v && !v->empty())
+                fog_blend_speed_ = float(std::atof(v->c_str()));
+            if (auto v = cat_->scalar("CFoW", fog_type_, "Color"); v && !v->empty()) {
+                const int a = std::atoi(v->c_str());
+                fog_veil_alpha_ = std::uint8_t(a < 0 ? 0 : (a > 255 ? 255 : a));
+            }
+            if (auto v = cat_->scalar("CFoW", fog_type_, "Hidden"); v && !v->empty())
+                fog_hidden_black_ = std::atoi(v->c_str()) != 0;
+        }
+    }
     vision_.compute(world_, viewed,   sim::Fixed::from_int(10),
-                      sim::Fixed::from_int(2), bounds,
+                      sim::Fixed::from_int(1), bounds,
                     world_.placement().configured() ? &world_.placement() : nullptr);
     const int fw = vision_.width(), fh = vision_.height();
     if (fw <= 0 || fh <= 0) { minimap_fog_.clear(); minimap_fw_ = minimap_fh_ = 0; return; }
@@ -4804,13 +6767,159 @@ void MeleeGame::update_minimap_fog(int viewed) {
     for (int cy = 0; cy < fh; ++cy)
         for (int cx = 0; cx < fw; ++cx)
             minimap_fog_[std::size_t(cy) * std::size_t(fw) + std::size_t(cx)] =
-                std::uint8_t(vision_.state(cx, cy));
-    ground_fog_field_.w = std::uint32_t(fw);
-    ground_fog_field_.h = std::uint32_t(fh);
+                reveal_map_ ? std::uint8_t(sim::Visibility::Visible) : std::uint8_t(fog_ground_state(int(vision_.state(cx, cy)), fog_hidden_black_));
+    const int S = 2;
+    const int W = fw * S, H = fh * S;
+    ground_fog_field_.w = std::uint32_t(W);
+    ground_fog_field_.h = std::uint32_t(H);
     ground_fog_field_.world_w = map_w_;
     ground_fog_field_.world_h = map_h_;
-    ground_fog_field_.alpha.resize(minimap_fog_.size());
-    for (std::size_t i = 0; i < minimap_fog_.size(); ++i) ground_fog_field_.alpha[i] = hud_fog_veil_alpha(int(minimap_fog_[i]));
+    ground_fog_field_.alpha.resize(std::size_t(W) * std::size_t(H));
+    const bool snap = fog_blend_.size() != minimap_fog_.size() || fog_blend_speed_ <= 0.0f || fog_dt_s_ <= 0.0f;
+    if (snap) fog_blend_.assign(minimap_fog_.size(), 0.0f);
+    const float max_step = 255.0f * fog_blend_speed_ * fog_dt_s_;
+    for (std::size_t i = 0; i < minimap_fog_.size(); ++i) {
+        const int st = int(minimap_fog_[i]);
+        const float target = st == int(sim::Visibility::Explored) ? float(fog_veil_alpha_) : float(hud_fog_veil_alpha(st));
+        float& cur = fog_blend_[i];
+        if (snap) cur = target;
+        else if (cur < target) cur = std::min(target, cur + max_step);
+        else if (cur > target) cur = std::max(target, cur - max_step);
+        const std::uint8_t a = std::uint8_t(cur + 0.5f);
+        const int cx = int(i % std::size_t(fw)), cy = int(i / std::size_t(fw));
+        for (int sy = 0; sy < S; ++sy)
+            for (int sx = 0; sx < S; ++sx)
+                ground_fog_field_.alpha[std::size_t(cy * S + sy) * std::size_t(W) + std::size_t(cx * S + sx)] = a;
+    }
+    static const bool kRimBlurred = std::getenv("SC2_BOUNDS_VEIL_BLURRED") != nullptr;
+    const auto lay_rim = [&]() {
+        if (map_w_ > 0.0f && map_h_ > 0.0f && !std::getenv("SC2_NO_BOUNDS_VEIL")) {
+            const float cw = map_w_ / float(W), ch = map_h_ / float(H);
+            static const float kInset = std::getenv("SC2_BOUNDS_VEIL_INSET") ? float(std::atof(std::getenv("SC2_BOUNDS_VEIL_INSET"))) : 1.5f;
+            static bool traced = false;
+            if (!traced && std::getenv("SC2_BOUNDS_VEIL_TRACE")) {
+                traced = true;
+                std::fprintf(stderr, "[bounds] map %.1f x %.1f playable %.1f %.1f %.1f %.1f inset %.1f\n", double(map_w_), double(map_h_), double(playable_x0_), double(playable_y0_),
+                             double(playable_x1_), double(playable_y1_), double(kInset));
+            }
+            static const char* kRimPlay = std::getenv("SC2_RIM_PLAYABLE");
+            float rx0 = kInset, ry0 = kInset, rx1 = map_w_ - kInset, ry1 = map_h_ - kInset;
+            if (kRimPlay && playable_x1_ > playable_x0_ && playable_y1_ > playable_y0_) {
+                const float e = float(std::atof(kRimPlay));
+                rx0 = playable_x0_ - e; ry0 = playable_y0_ - e; rx1 = playable_x1_ + e; ry1 = playable_y1_ + e;
+            }
+            for (int y = 0; y < H; ++y)
+                for (int x = 0; x < W; ++x) {
+                    const float wx = (float(x) + 0.5f) * cw, wy = (float(y) + 0.5f) * ch;
+                    if (wx < rx0 || wx > rx1 || wy < ry0 || wy > ry1)
+                        ground_fog_field_.alpha[std::size_t(y) * std::size_t(W) + std::size_t(x)] = 255;
+                }
+        }
+    };
+    if (kRimBlurred) lay_rim();
+    if (const char* pv = std::getenv("SC2_PLAYABLE_VEIL"); pv && playable_x1_ > playable_x0_ && playable_y1_ > playable_y0_ && map_w_ > 0.0f && map_h_ > 0.0f) {
+        const int pa = std::min(255, std::max(0, std::atoi(pv)));
+        const float cw = map_w_ / float(W), ch = map_h_ / float(H);
+        for (int y = 0; y < H; ++y)
+            for (int x = 0; x < W; ++x) {
+                const float wx = (float(x) + 0.5f) * cw, wy = (float(y) + 0.5f) * ch;
+                if (wx < playable_x0_ || wx > playable_x1_ || wy < playable_y0_ || wy > playable_y1_) {
+                    static const char* kLow = std::getenv("SC2_PLAYABLE_VEIL_LOW");
+                    if (kLow && ground_z_at(wx, wy) >= float(std::atof(kLow))) continue;
+                    std::uint8_t& a = ground_fog_field_.alpha[std::size_t(y) * std::size_t(W) + std::size_t(x)];
+                    a = std::uint8_t(std::max(int(a), pa));
+                }
+            }
+    }
+    if (const char* pt = std::getenv("SC2_PIT_VEIL"); pt && world_.nav().configured() && world_.nav().has_levels() && playable_x1_ > playable_x0_ &&
+                                                      playable_y1_ > playable_y0_ && map_w_ > 0.0f && map_h_ > 0.0f) {
+        const int pa = std::min(255, std::max(0, std::atoi(pt)));
+        const sim::NavGrid& nv = world_.nav();
+        const float ncell = float(nv.cell_size().to_double());
+        int min_in = 255;
+        for (int cy = 0; cy < nv.height(); ++cy)
+            for (int cx = 0; cx < nv.width(); ++cx) {
+                const float wx = (float(cx) + 0.5f) * ncell, wy = (float(cy) + 0.5f) * ncell;
+                if (wx > playable_x0_ && wx < playable_x1_ && wy > playable_y0_ && wy < playable_y1_) min_in = std::min(min_in, int(nv.level_cell(cx, cy)));
+            }
+        const float cw = map_w_ / float(W), ch = map_h_ / float(H);
+        std::size_t veiled = 0;
+        for (int y = 0; y < H; ++y)
+            for (int x = 0; x < W; ++x) {
+                const float wx = (float(x) + 0.5f) * cw, wy = (float(y) + 0.5f) * ch;
+                if (wx >= playable_x0_ && wx <= playable_x1_ && wy >= playable_y0_ && wy <= playable_y1_) continue;
+                if (ncell <= 0.0f || int(nv.level_cell(int(wx / ncell), int(wy / ncell))) >= min_in) continue;
+                std::uint8_t& a = ground_fog_field_.alpha[std::size_t(y) * std::size_t(W) + std::size_t(x)];
+                a = std::uint8_t(std::max(int(a), pa));
+                ++veiled;
+            }
+        static bool told = false;
+        if (!told && std::getenv("SC2_BOUNDS_VEIL_TRACE")) {
+            told = true;
+            std::fprintf(stderr, "[pit] lowest level inside the playable rectangle %d, %zu field cells veiled\n", min_in, veiled);
+        }
+    }
+    if (const char* lv = std::getenv("SC2_LEVEL_VEIL"); lv && world_.nav().configured() && map_w_ > 0.0f && map_h_ > 0.0f) {
+        int lvl = 0, pa = 0;
+        if (std::sscanf(lv, "%d:%d", &lvl, &pa) == 2) {
+            pa = std::min(255, std::max(0, pa));
+            const sim::NavGrid& nv = world_.nav();
+            const float ncell = float(nv.cell_size().to_double());
+            const float cw = map_w_ / float(W), ch = map_h_ / float(H);
+            std::size_t veiled = 0;
+            int hist[8] = {0, 0, 0, 0, 0, 0, 0, 0};
+            for (int y = 0; y < H; ++y)
+                for (int x = 0; x < W; ++x) {
+                    const float wx = (float(x) + 0.5f) * cw, wy = (float(y) + 0.5f) * ch;
+                    const int L = ncell > 0.0f ? int(nv.level_cell(int(wx / ncell), int(wy / ncell))) : 0;
+                    ++hist[std::min(L, 7)];
+                    if (L > lvl) continue;
+                    std::uint8_t& a = ground_fog_field_.alpha[std::size_t(y) * std::size_t(W) + std::size_t(x)];
+                    a = std::uint8_t(std::max(int(a), pa));
+                    ++veiled;
+                }
+            static bool told = false;
+            if (!told && std::getenv("SC2_BOUNDS_VEIL_TRACE")) {
+                told = true;
+                std::fprintf(stderr, "[level] cells by level %d %d %d %d %d %d %d %d, %zu veiled\n", hist[0], hist[1], hist[2], hist[3], hist[4], hist[5], hist[6], hist[7], veiled);
+            }
+        }
+    }
+    if (const char* pr = std::getenv("SC2_PLAYABLE_RAMP"); pr && playable_x1_ > playable_x0_ && playable_y1_ > playable_y0_ && map_w_ > 0.0f && map_h_ > 0.0f) {
+        float d0 = 0.0f, rr = 1.0f;
+        if (std::sscanf(pr, "%f:%f", &d0, &rr) == 2 && rr > 0.0f) {
+            const float cw = map_w_ / float(W), ch = map_h_ / float(H);
+            for (int y = 0; y < H; ++y)
+                for (int x = 0; x < W; ++x) {
+                    const float wx = (float(x) + 0.5f) * cw, wy = (float(y) + 0.5f) * ch;
+                    const float dx = std::max(std::max(playable_x0_ - wx, wx - playable_x1_), 0.0f);
+                    const float dy = std::max(std::max(playable_y0_ - wy, wy - playable_y1_), 0.0f);
+                    const float d = std::max(dx, dy);
+                    const int pa = int(255.0f * std::min(1.0f, std::max(0.0f, (d - d0) / rr)) + 0.5f);
+                    std::uint8_t& a = ground_fog_field_.alpha[std::size_t(y) * std::size_t(W) + std::size_t(x)];
+                    a = std::uint8_t(std::max(int(a), pa));
+                }
+        }
+    }
+    {
+        std::vector<std::uint8_t> tmp(ground_fog_field_.alpha.size());
+        for (int pass = 0; pass < 2; ++pass) {
+            const int R = pass == 0 ? 2 : 1;
+            for (int y = 0; y < H; ++y)
+                for (int x = 0; x < W; ++x) {
+                    int sum = 0, n = 0;
+                    for (int k = -R; k <= R; ++k) { const int xx = x + k; if (xx < 0 || xx >= W) continue; sum += ground_fog_field_.alpha[std::size_t(y) * W + xx]; ++n; }
+                    tmp[std::size_t(y) * W + x] = std::uint8_t(sum / n);
+                }
+            for (int y = 0; y < H; ++y)
+                for (int x = 0; x < W; ++x) {
+                    int sum = 0, n = 0;
+                    for (int k = -R; k <= R; ++k) { const int yy = y + k; if (yy < 0 || yy >= H) continue; sum += tmp[std::size_t(yy) * W + x]; ++n; }
+                    ground_fog_field_.alpha[std::size_t(y) * W + x] = std::uint8_t(sum / n);
+                }
+        }
+    }
+    if (!kRimBlurred) lay_rim();
 }
 
 void MeleeGame::ensure_overlay_font() {
@@ -4847,6 +6956,24 @@ void MeleeGame::ensure_overlay_font() {
     }
 }
 
+const render::OverlayFont* MeleeGame::style_face(const std::string& font_path) {
+    if (font_path.empty() || !ui_store_ || std::getenv("SC2_NO_HEADER_FACE")) return nullptr;
+    auto it = style_faces_.find(font_path);
+    if (it == style_faces_.end()) {
+        it = style_faces_.emplace(font_path, render::OverlayFont{}).first;
+        std::string p = font_path;
+        for (char& ch : p)
+            if (ch == '\\') ch = '/';
+        try {
+            auto bytes = ui_store_->read_by_name("mods/core.sc2mod/base.sc2data/" + p);
+            it->second.load(bytes);
+        } catch (const std::exception&) {   }
+        if (std::getenv("SC2_LABEL_FACE_TRACE"))
+            std::fprintf(stderr, "[labelface] %s loaded %d\n", p.c_str(), int(it->second.valid()));
+    }
+    return it->second.valid() ? &it->second : nullptr;
+}
+
 const ui::StyleSet* MeleeGame::hud_style_set() {
     if (!hud_style_tried_) {
         hud_style_tried_ = true;
@@ -4861,14 +6988,20 @@ const ui::StyleSet* MeleeGame::hud_style_set() {
     return hud_style_.style_count() ? &hud_style_ : nullptr;
 }
 
-void MeleeGame::ensure_console_texture() {
-    if (console_tried_) return;
+void MeleeGame::ensure_console_texture(std::uint32_t view_w, std::uint32_t view_h) {
+    const bool resized = console_renderer_ && cat_ && view_w && view_h && console_view_w_ && console_view_h_ &&
+                         (view_w != console_view_w_ || view_h != console_view_h_);
+    if (console_tried_ && !resized) return;
     console_tried_ = true;
     if (!ui_store_) return;
     if (console_renderer_ && cat_) {
         console_tex_ = console_renderer_(*ui_store_, *cat_,
-                                         console_skin_id_for_race(human_race()), kConsoleFrameWidth);
-        if (console_tex_.ok()) return;
+                                         console_skin_id_for_race(human_race()), view_w ? view_w : kConsoleFrameWidth, view_h);
+        if (console_tex_.ok()) {
+            console_view_w_ = view_w;
+            console_view_h_ = view_h;
+            return;
+        }
     }
     console_tex_ = load_console(*ui_store_, human_race(), cat_);
 }
@@ -4890,11 +7023,32 @@ void MeleeGame::refresh_hud_layout(std::uint32_t view_w, std::uint32_t view_h) {
     hud_authored_ = hud_authored_rects(*ui_store_, float(view_w) / float(view_h));
 }
 
+void MeleeGame::drain_train_events() {
+    if (train_events_.empty()) return;
+    for (const TrainEv& ev : train_events_) {
+        const std::uint32_t host = ev.egg != sim::kNoTarget ? ev.egg : ev.producer;
+        if (host >= driver_.actors.size()) continue;
+        std::string abil;
+        if (!ev.produced.empty()) {
+            const auto& mk = production_.producers_of(ev.produced);
+            for (const data::ProductInfo& pi : mk)
+                if (!pi.ability.empty()) { abil = pi.ability; break; }
+        }
+        if (abil.empty()) continue;
+        render::frame_prof_count("abiltrain.raised", 1.0);
+        driver_.actors[host].raise("AbilTrain", abil, ev.finish ? "Finish" : "Cancel",
+                                   {{"AbilTrainProduced", ev.produced}});
+    }
+    train_events_.clear();
+}
+
 void MeleeGame::build_overlay(std::uint32_t view_w, std::uint32_t view_h,
                               std::vector<std::uint8_t>& out) {
+    SC2_PROF_SCOPE("build_overlay");
     out.clear();
     if (!view_w || !view_h) return;
     hud_unit_pane_ = HudUnitPane{};
+    hud_equipment_.clear();
     hud_portrait_ = HudPortrait{};
     ensure_overlay_font();
     const int viewed = cfg_.human_player >= 0 ? cfg_.human_player : 0;
@@ -4929,29 +7083,226 @@ void MeleeGame::build_overlay(std::uint32_t view_w, std::uint32_t view_h,
     const bool authored_alert_panel = cfg_.human_player >= 0 && ui_store_ && cat_ && hud_authored_ && hud_authored_->alert.ok();
     content.game_seconds = world_.tick() / sim::World::kTicksPerSecond;
     content.idle_workers = idle_worker_count();
+    content.army_units = army_unit_count();
+    content.warp_gates_ready = ready_warp_gate_count();
     if (const std::uint32_t lead = cast_lead(); lead < world_.units().size()) {
         const Unit& lu = world_.unit(lead);
-        content.equipment = equipment_for(lu.player);
+        content.equipment = equipment_for(lu.player, &lu);
+        if (selection_.size() == 1 && !world_.queue_view(lead).empty()) content.equipment.clear();
+        if (selection_.size() > 1 && !std::getenv("SC2_NO_GROUP_PORTRAIT")) content.equipment.clear();
+        hud_equipment_ = content.equipment;
         content.lead_kills = lu.kills;
+        if (std::getenv("SC2_PORTRAIT_TRACE"))
+            std::fprintf(stderr, "equipment: lead %s cells %zu%s%s rect ok %d\n", lu.catalog_id.c_str(), content.equipment.size(),
+                         content.equipment.empty() ? "" : " first ", content.equipment.empty() ? "" : content.equipment[0].icon.c_str(),
+                         int(hud_authored_ && hud_authored_->equipment.ok()));
+    } else if (std::getenv("SC2_PORTRAIT_TRACE") && !selection_.empty()) {
+        std::fprintf(stderr, "equipment: no cast lead for a selection of %zu\n", selection_.size());
+    }
+    if (const ui::StyleSet* ss = hud_style_set()) {
+        auto fill_style = [&ss](const char* style_name, HudMessageStyle& out) {
+            const ui::FontStyle st = ss->resolve(style_name);
+            if (!st.ok()) return;
+            out.set = true;
+            out.height_pt = st.height;
+            out.centred = st.hjustify == "Center";
+            if (st.has_color) { out.r = st.r; out.g = st.g; out.b = st.b; }
+        };
+        fill_style("ErrorDisplay", content.error_style);
+        fill_style("WarningDisplay", content.warning_style);
     }
     for (const HudMessage& mm : messages_.all()) {
         if (authored_alert_panel && mm.zone == MsgZone::Alert) continue;
         std::string t = mm.text;
         if (mm.count > 1) t += " x" + std::to_string(mm.count);
-        content.messages.push_back({mm.zone, t});
+        content.messages.push_back({mm.zone, t, mm.ttl, mm.ttl0});
+    }
+    for (const HudMessage& mm : messages_.all()) {
+        if (mm.zone != MsgZone::Alert || !mm.has_target) continue;
+        HudContent::MinimapPing ping;
+        ping.x = mm.tx;
+        ping.y = mm.ty;
+        ping.age = std::max(0.0f, mm.ttl0 - mm.ttl);
+        if (cat_) {
+            if (const auto pt = cat_->scalar("CAlert", "Attack", "PingTime"); pt && !pt->empty())
+                ping.ping_time = float(std::atof(pt->c_str()));
+            if (const auto pc = cat_->scalar("CAlert", "Attack", "PingColor"); pc && !pc->empty()) {
+                int a = 255, r = 255, g = 0, b = 0;
+                if (std::sscanf(pc->c_str(), "%d,%d,%d,%d", &a, &r, &g, &b) == 4) {
+                    ping.r = std::uint8_t(r); ping.g = std::uint8_t(g); ping.b = std::uint8_t(b);
+                }
+            }
+        }
+        if (ping.age < ping.ping_time) content.pings.push_back(ping);
+    }
+
+    if (cfg_.human_player >= 0 && cat_) {
+        sim::SensorTowerSystem towers;
+        for (const sim::Unit& u : world_.units()) {
+            if (!u.alive || u.player != cfg_.human_player || u.catalog_id.empty()) continue;
+            const double r = cat_->radar_range(u.catalog_id);
+            if (r <= 0.0) continue;
+            if (u.constructing && cat_->radar_disabled_while_constructing(u.catalog_id)) continue;
+            towers.add(u.player, u.x, u.y, sim::Fixed::from_double(r));
+        }
+        if (towers.count() > 0)
+            for (const sim::Blip& b : towers.blips(world_, cfg_.human_player))
+                content.radar_blips.emplace_back(float(b.x.to_double()), float(b.y.to_double()));
+        const data::Catalog::MinimapColors mc = cat_->minimap_colors();
+        for (int k = 0; k < 3; ++k) content.blip_rgb[k] = mc.blip[std::size_t(k)];
+        content.blip_alpha = mc.radar_alpha;
+    }
+
+    if (cat_) {
+        const std::vector<std::string> order = cat_->minimap_priority_order();
+        if (!order.empty()) {
+            std::size_t normal_rank = 0;
+            for (std::size_t k = 0; k < order.size(); ++k)
+                if (order[k] == "Normal") { normal_rank = k; break; }
+            std::unordered_map<std::string, std::uint8_t> rank_of;
+            content.minimap_priority.assign(world_.units().size(), std::uint8_t(normal_rank));
+            for (const sim::Unit& u : world_.units()) {
+                if (u.id >= content.minimap_priority.size() || u.catalog_id.empty()) continue;
+                auto it = rank_of.find(u.catalog_id);
+                if (it == rank_of.end()) {
+                    std::uint8_t rank = std::uint8_t(normal_rank);
+                    const std::string cls = cat_->minimap_render_priority(u.catalog_id);
+                    if (!cls.empty())
+                        for (std::size_t k = 0; k < order.size(); ++k)
+                            if (order[k] == cls) { rank = std::uint8_t(k); break; }
+                    it = rank_of.emplace(u.catalog_id, rank).first;
+                }
+                content.minimap_priority[u.id] = it->second;
+            }
+        }
+    }
+
+    if (cat_) {
+        int max_player = -1;
+        for (const sim::Unit& u : world_.units())
+            if (u.player > max_player) max_player = u.player;
+        if (max_player >= 0) {
+            content.player_colors.assign(std::size_t(max_player) + 1, HudContent::MinimapTeamColor{});
+            for (int p = 0; p <= max_player; ++p) {
+                const std::array<float, 4> base = team_colour_for(cat_, p, false);
+                const std::array<float, 4> sel = team_colour_for(cat_, p, true);
+                if (base[3] < 0.0f) continue;
+                HudContent::MinimapTeamColor& tc = content.player_colors[std::size_t(p)];
+                for (int k = 0; k < 3; ++k) {
+                    tc.rgb[k] = std::uint8_t(base[std::size_t(k)] * 255.0f + 0.5f);
+                    tc.sel_rgb[k] = std::uint8_t(sel[std::size_t(k)] * 255.0f + 0.5f);
+                }
+                tc.set = true;
+            }
+            if (cfg_.human_player >= 0 && std::size_t(cfg_.human_player) < content.player_colors.size() &&
+                !std::getenv("SC2_MINIMAP_TEAM_COLOURS")) {
+                HudContent::MinimapTeamColor& own = content.player_colors[std::size_t(cfg_.human_player)];
+                own.rgb[0] = 0; own.rgb[1] = 140; own.rgb[2] = 0;
+                own.sel_rgb[0] = 0; own.sel_rgb[1] = 255; own.sel_rgb[2] = 0;
+                own.set = true;
+            }
+        }
+        content.minimap_selected = selection_;
+    }
+
+    if (cfg_.human_player >= 0) {
+        const std::size_t n = world_.units().size();
+        if (flash_hp_.size() < n) {
+            flash_hp_.resize(n, -1.0);
+            flash_ms_.resize(n, -1e9);
+        }
+        for (const sim::Unit& u : world_.units()) {
+            if (u.id >= flash_hp_.size()) continue;
+            const double now = u.alive ? u.hp.to_double() + u.shields.to_double() : -1.0;
+            const double was = flash_hp_[u.id];
+            if (was >= 0.0 && now >= 0.0 && now < was) flash_ms_[u.id] = clock_ms_;
+            flash_hp_[u.id] = now;
+        }
+        const double hold_ms = cat_ ? cat_->unit_damage_flash_ms() : 3000.0;
+        const std::vector<data::TeamColor> pal = cat_ ? data::team_colors(*cat_)
+                                                      : std::vector<data::TeamColor>{};
+        for (const sim::Unit& u : world_.units()) {
+            if (!u.alive || u.loaded || u.id >= flash_ms_.size()) continue;
+            if (u.minimap_radius.raw() <= 0) continue;
+            if (clock_ms_ - flash_ms_[u.id] > hold_ms) continue;
+            HudContent::MinimapFlash fl;
+            fl.unit = u.id;
+            const int slot = u.player + 1;
+            for (const data::TeamColor& tc : pal)
+                if (tc.slot == slot) {
+                    fl.r = std::uint8_t(tc.attacked[0] * 255.0f + 0.5f);
+                    fl.g = std::uint8_t(tc.attacked[1] * 255.0f + 0.5f);
+                    fl.b = std::uint8_t(tc.attacked[2] * 255.0f + 0.5f);
+                    break;
+                }
+            content.minimap_flashes.push_back(fl);
+        }
+    }
+
+    if (cat_) {
+        const data::Catalog::MinimapColors mc = cat_->minimap_colors();
+        for (int k = 0; k < 3; ++k) {
+            content.resource_rgb[k] = mc.resource[std::size_t(k)];
+            content.frustum_rgb[k] = mc.frustum[std::size_t(k)];
+            content.border_rgb[k] = mc.unit_border[std::size_t(k)];
+        }
+        content.border_px = int(mc.border_size + 0.5f);
+        content.min_dot_pt = mc.min_dot_size;
+    }
+
+    if (cat_ && ui_store_) {
+        for (const sim::Unit& u : world_.units()) {
+            if (!u.alive || u.loaded || u.catalog_id.empty()) continue;
+            if (u.minimap_radius.raw() <= 0) continue;
+            const auto look = cat_->unit_minimap_icon(u.catalog_id);
+            if (!look) continue;
+            const IconAtlas::Icon& ic = icons_.get(*ui_store_, look->icon);
+            if (!ic.ok()) continue;
+            HudContent::MinimapIcon mi;
+            mi.x = float(u.x.to_double());
+            mi.y = float(u.y.to_double());
+            mi.rgba = &ic.rgba;
+            mi.tw = int(ic.w);
+            mi.th = int(ic.h);
+            mi.scale = look->scale;
+            mi.unit = u.id;
+            content.minimap_icons.push_back(mi);
+        }
     }
 
     CameraFootprint cam;
     if (map_w_ > 0.0f && map_h_ > 0.0f) {
         Control ctrl = make_control(camctl_.view_proj(aspect), view_w, view_h, viewed);
+        if (!std::getenv("SC2_MINIMAP_QUAD_TERRAIN_HIT")) ctrl.set_ground_height(nullptr);
         const float cxs[4] = {0.0f, float(view_w), float(view_w), 0.0f};
-        const float cys[4] = {0.0f, 0.0f, float(view_h), float(view_h)};
+        const float quad_bottom = std::getenv("SC2_MINIMAP_QUAD_Z0") ? float(view_h) : float(view_h) * 0.75f;
+        const float cys[4] = {0.0f, 0.0f, quad_bottom, quad_bottom};
         cam.valid = true;
         for (int k = 0; k < 4 && cam.valid; ++k) {
             sim::Fixed wx, wy;
             if (ctrl.ground_point(world_, ScreenPoint{cxs[k], cys[k]}, wx, wy)) {
                 cam.x[k] = float(wx.to_double());
                 cam.y[k] = float(wy.to_double());
+                const render::Vec3 e = camctl_.eye();
+                const float gz = ground_z_at(camctl_.focus.x, camctl_.focus.y);
+                if (k == 0 && std::getenv("SC2_STATUS_ANCHOR_TRACE")) {
+                    static int quad_traced = 0;
+                    if (quad_traced++ < 2)
+                        std::fprintf(stderr, "[minimapquad] eye %.2f %.2f %.2f focus %.2f %.2f %.2f ground %.2f target z %.2f\n", double(e.x), double(e.y), double(e.z),
+                                     double(camctl_.focus.x), double(camctl_.focus.y), double(camctl_.focus.z), double(gz), double(camctl_.target().z));
+                }
+                if (!std::getenv("SC2_MINIMAP_QUAD_Z0") && e.z > gz + 1.0f && e.z > 1.0f) {
+                    const float x0 = cam.x[k], y0 = cam.y[k];
+                    float h = std::getenv("SC2_MINIMAP_QUAD_TERRAIN_HIT") ? gz : camctl_.target().z;
+                    if (std::getenv("SC2_MINIMAP_QUAD_TERRAIN"))
+                        for (int it = 0; it < 4; ++it) {
+                            const float tt = (e.z - h) / e.z;
+                            h = ground_z_at(e.x + (x0 - e.x) * tt, e.y + (y0 - e.y) * tt);
+                        }
+                    const float t = (e.z - h) / e.z;
+                    cam.x[k] = e.x + (x0 - e.x) * t;
+                    cam.y[k] = e.y + (y0 - e.y) * t;
+                }
             } else {
                 cam.valid = false;
             }
@@ -4962,18 +7313,52 @@ void MeleeGame::build_overlay(std::uint32_t view_w, std::uint32_t view_h,
     update_minimap_fog(viewed);
     MinimapBackdrop backdrop;
     backdrop.extent = minimap_extent();
+    if (std::getenv("SC2_ENV_TRACE")) {
+        static bool traced = false;
+        if (!traced) {
+            traced = true;
+            std::fprintf(stderr, "[minimap] map %.0f x %.0f playable (%.1f,%.1f)-(%.1f,%.1f) picture %d x %d authored %d\n", double(map_w_), double(map_h_),
+                         double(playable_x0_), double(playable_y0_), double(playable_x1_), double(playable_y1_), minimap_tw_, minimap_th_, int(minimap_terrain_authored_));
+        }
+    }
     if (!minimap_terrain_.empty()) {
         backdrop.terrain = &minimap_terrain_;
         backdrop.tw = minimap_tw_;
         backdrop.th = minimap_th_;
+        if (minimap_terrain_authored_ && !minimap_terrain_cropped_ && playable_x1_ > playable_x0_ && playable_y1_ > playable_y0_) {
+            minimap_terrain_cropped_ = true;
+            const int pw = int(playable_x1_ - playable_x0_ + 0.5f), ph = int(playable_y1_ - playable_y0_ + 0.5f);
+            if (!std::getenv("SC2_MINIMAP_TGA_PADDED") && pw > 0 && ph > 0 && (pw < minimap_tw_ || ph < minimap_th_) &&
+                minimap_terrain_.size() == std::size_t(minimap_tw_) * std::size_t(minimap_th_) * 3) {
+                const int cw = std::min(pw, minimap_tw_), ch = std::min(ph, minimap_th_);
+                const int ox = (minimap_tw_ - cw) / 2, oy = (minimap_th_ - ch) / 2;
+                std::vector<std::uint8_t> cut(std::size_t(cw) * std::size_t(ch) * 3);
+                for (int y = 0; y < ch; ++y)
+                    std::memcpy(&cut[std::size_t(y) * std::size_t(cw) * 3],
+                                &minimap_terrain_[(std::size_t(y + oy) * std::size_t(minimap_tw_) + std::size_t(ox)) * 3], std::size_t(cw) * 3);
+                minimap_terrain_ = std::move(cut);
+                minimap_tw_ = cw;
+                minimap_th_ = ch;
+                backdrop.terrain = &minimap_terrain_;
+                backdrop.tw = minimap_tw_;
+                backdrop.th = minimap_th_;
+            }
+        }
+        if (minimap_terrain_authored_ && playable_x1_ > playable_x0_ && playable_y1_ > playable_y0_) {
+            backdrop.terrain_extent.x0 = playable_x0_;
+            backdrop.terrain_extent.y0 = playable_y0_;
+            backdrop.terrain_extent.x1 = playable_x1_;
+            backdrop.terrain_extent.y1 = playable_y1_;
+        }
     }
+    hud_minimap_apply(content, backdrop);
     if (!minimap_fog_.empty()) {
         backdrop.fog = &minimap_fog_;
         backdrop.fw = minimap_fw_;
         backdrop.fh = minimap_fh_;
         backdrop.viewer_player = cfg_.human_player;
     }
-    ensure_console_texture();
+    ensure_console_texture(view_w, view_h);
     refresh_hud_layout(view_w, view_h);
     int forced_px = 0;
     if (const ui::StyleSet* ss = hud_style_set()) {
@@ -5006,17 +7391,159 @@ void MeleeGame::build_overlay(std::uint32_t view_w, std::uint32_t view_h,
                            world_.unit(selection_[0]).alive && world_.unit(selection_[0]).player == cfg_.human_player &&
                            console_panel.authored && console_panel.authored->info.ok() && MatchResult::banner(outcome_)[0] == '\0';
     if (unit_pane) content.selection_summary.clear();
+    content.widget_art = cfg_.human_player >= 0 && ui_store_ && console_panel.authored &&
+                         !std::getenv("SC2_NO_CONSOLE_WIDGET_ART");
     draw::set_forced_font_px(forced_px);
-    std::vector<std::uint8_t> hud =
+    std::vector<std::uint8_t> hud;
+    {
+        SC2_PROF_SCOPE("ov.hud_render");
+        hud =
         HudRender::render(content, world_, map_w_, map_h_, view_w, view_h, &cam, &backdrop,
                           console_tex_.ok() ? &console_panel : nullptr);
+    }
     draw::set_forced_font_px(0);
+    std::vector<float> status_anchor_z(world_.units().size(), 0.0f);
+    std::vector<float> status_bar_w(world_.units().size(), 0.0f);
+    std::vector<float> status_bar_off(world_.units().size(), 0.0f);
+    const bool bar_offset_rule = cat_ && !std::getenv("SC2_STATUS_ANCHOR_OVERHEAD");
+    for (const Unit& u : world_.units()) {
+        if (!u.alive) continue;
+        const float ux = float(u.x.to_double()), uy = float(u.y.to_double());
+        const formats::Model* m = (u.id < driver_.actors.size()) ? driver_.actors[u.id].model : nullptr;
+        static std::unordered_map<const formats::Model*, float> ref_z;
+        float top = m ? m->bounds_max[2] : float(u.radius.to_double());
+        if (m && !std::getenv("SC2_STATUS_ANCHOR_BOUNDS")) {
+            auto it = ref_z.find(m);
+            if (it == ref_z.end()) {
+                float z = -1.0f;
+                render::Mat4 att;
+                const int sseq = render::select_sequence(*m, {"Stand"}, 0);
+                if (render::attachment_index(*m, "Ref_Overhead") >= 0 &&
+                    render::attachment_transform(*m, "Ref_Overhead", std::uint32_t(sseq < 0 ? 0 : sseq), 0.0f, att))
+                    z = att.m[14];
+                if (std::getenv("SC2_STATUS_ANCHOR_TRACE")) {
+                    std::fprintf(stderr, "[statusanchor] ref_z=%.3f bounds_top=%.3f scale=%.3f %s\n", double(z),
+                                 double(m->bounds_max[2]), double(unit_draw_scale(cat_, u.catalog_id)[2]), m->name.c_str());
+                    for (const auto& a : m->attachments) {
+                        render::Mat4 t;
+                        if (render::attachment_transform(*m, a.name, std::uint32_t(sseq < 0 ? 0 : sseq), 0.0f, t))
+                            std::fprintf(stderr, "[statusanchor]   %s z=%.3f\n", a.name.c_str(), double(t.m[14]));
+                    }
+                }
+                it = ref_z.emplace(m, z).first;
+            }
+            if (it->second > 0.0f) top = it->second;
+        }
+        status_anchor_z[u.id] = ground_z_at(ux, uy) + (m ? top * unit_draw_scale(cat_, u.catalog_id)[2] : top);
+        if (bar_offset_rule) {
+            static std::unordered_map<std::string, float> authored_off;
+            auto oit = authored_off.find(u.catalog_id);
+            if (oit == authored_off.end())
+                oit = authored_off.emplace(u.catalog_id, float(cat_->scalar_num("CActorUnit", u.catalog_id, "BarOffset").value_or(100.0))).first;
+            status_bar_off[u.id] = oit->second;
+            status_anchor_z[u.id] = ground_z_at(ux, uy);
+            static const bool kAirOrigin = std::getenv("SC2_STATUS_AIR_ON_GROUND") == nullptr;
+            float dh = kAirOrigin ? cat_->unit_display_height(u.catalog_id) : 0.0f;
+            if (kAirOrigin && u.flying && dh <= 0.0f) {
+                const float fh = cat_->unit_display_height(u.catalog_id + "Flying");
+                dh = fh > 0.0f ? fh : 3.25f;
+            }
+            if (dh > 0.0f) status_anchor_z[u.id] = air_z_at(ux, uy) + dh;
+        }
+        if (cat_ && !std::getenv("SC2_BAR_WIDTH_BY_RADIUS")) {
+            static std::unordered_map<std::string, float> authored_w;
+            auto wit = authored_w.find(u.catalog_id);
+            if (wit == authored_w.end())
+                wit = authored_w.emplace(u.catalog_id, float(cat_->scalar_num("CActorUnit", u.catalog_id, "BarWidth").value_or(60.0))).first;
+            status_bar_w[u.id] = wit->second * float(view_h) / 900.0f;
+        }
+        static std::vector<std::uint32_t> traced_bodies;
+        if (std::getenv("SC2_STATUS_ANCHOR_TRACE") && u.player == viewed && u.cargo_space > 0 &&
+            std::find(traced_bodies.begin(), traced_bodies.end(), u.id) == traced_bodies.end() && (traced_bodies.push_back(u.id), true))
+            std::fprintf(stderr,"[statusbody] %s radius=%.3f bar_w=%.1f\n", u.catalog_id.c_str(), u.radius.to_double(), double(status_bar_w[u.id]));
+    }
+    std::vector<std::uint32_t> status_sel = selection_;
+    static const bool kNoHover = std::getenv("SC2_NO_HOVER") != nullptr;
+    if (!kNoHover && cfg_.human_player >= 0 && !hud_covers_point(view_w, view_h, console_tex_.ok() ? &console_panel : nullptr, mouse_x_, mouse_y_) && !hud_buttons_.at(mouse_x_, mouse_y_)) {
+        Control hctrl = make_control(camctl_.view_proj(aspect), view_w, view_h, viewed);
+        const ScreenPoint mp{mouse_x_, mouse_y_};
+        std::uint32_t hov = hctrl.pick_own(world_, mp);
+        if (hov == sim::kNoTarget) hov = hctrl.pick_target(world_, mp);
+        if (hov < world_.units().size() && !reveal_map_ && cfg_.human_player >= 0 && vision_.width() > 0) {
+            const Unit& hu = world_.units()[hov];
+            if (hu.player != cfg_.human_player &&
+                !hud_fog_body_drawn(fog_body_state(hu.player, int(vision_.state_at(hu.x, hu.y)), fog_hidden_black_), FogVisibility(hu.fog_visibility)))
+                hov = sim::kNoTarget;
+        }
+        if (hov < world_.units().size() && !world_.units()[hov].unselectable &&
+            std::find(status_sel.begin(), status_sel.end(), hov) == status_sel.end())
+            status_sel.push_back(hov);
+        hover_unit_ = hov < world_.units().size() ? hov : sim::kNoTarget;
+    } else {
+        hover_unit_ = sim::kNoTarget;
+    }
+    render::UnitOverlay::StatusBarOptions status_opts;
+    status_opts.mode = status_bar_mode_;
+    status_opts.reveal_all = alt_held_;
+    status_opts.own_rows = !std::getenv("SC2_NO_OWN_STATUS_ROWS");
+    status_opts.viewer_player = viewed;
+    status_opts.selection = &status_sel;
+    status_opts.anchor_z = &status_anchor_z;
+    status_opts.bar_width = &status_bar_w;
+    status_opts.bar_offset = &status_bar_off;
+    std::vector<std::uint8_t> status_cargo_ok(world_.units().size(), 1);
+    if (cat_ && !std::getenv("SC2_CARGO_ROW_ALWAYS"))
+        for (const Unit& u : world_.units()) {
+            if (!u.alive || u.cargo_space <= 0 || u.catalog_id.empty()) continue;
+            static std::unordered_map<std::string, std::string> load_req;
+            auto it = load_req.find(u.catalog_id);
+            if (it == load_req.end()) {
+                std::string req;
+                for (const std::string& ab : cat_->array_links("CUnit", u.catalog_id, "AbilArray")) {
+                    const data::Catalog::Entry* e = ab.empty() ? nullptr : cat_->find("CAbil", ab);
+                    if (!e || e->tag != "CAbilTransport") continue;
+                    req = cat_->button_requirement(ab, "Load");
+                    break;
+                }
+                it = load_req.emplace(u.catalog_id, req).first;
+            }
+            if (!it->second.empty() && !data::eval_requirement(*cat_, it->second, "Use", tech_state_of(u.player)))
+                status_cargo_ok[u.id] = 0;
+        }
+    status_opts.cargo_ok = &status_cargo_ok;
+    status_opts.px_scale = float(view_h) / 900.0f;
+    {
+        const std::size_t n = world_.units().size();
+        status_trail_life_.resize(n, -1.0f);
+        status_trail_shield_.resize(n, -1.0f);
+        status_rate_life_.resize(n, 0.0f);
+        status_rate_shield_.resize(n, 0.0f);
+        const int now = int(world_.tick());
+        const float dt = status_trail_tick_ < 0 ? 0.0f : float(now - status_trail_tick_) / float(sim::World::kTicksPerSecond);
+        status_trail_tick_ = now;
+        auto advance = [&](float cur, float& shown, float& rate) {
+            if (shown < 0.0f || cur >= shown) { shown = cur; rate = 0.0f; return; }
+            const float want = (shown - cur) / 1.0f;
+            if (want > rate) rate = want;
+            shown -= rate * dt;
+            if (shown <= cur) { shown = cur; rate = 0.0f; }
+        };
+        for (const Unit& su : world_.units()) {
+            if (!su.alive || su.hp_max.raw() <= 0) continue;
+            advance(float(su.hp.to_double() / su.hp_max.to_double()), status_trail_life_[su.id], status_rate_life_[su.id]);
+            if (su.shields_max.raw() > 0)
+                advance(float(su.shields.to_double() / su.shields_max.to_double()), status_trail_shield_[su.id], status_rate_shield_[su.id]);
+        }
+        status_opts.life_trail = &status_trail_life_;
+        status_opts.shield_trail = &status_trail_shield_;
+    }
     std::vector<std::uint8_t> units =
-        unit_overlay_.render(world_, camctl_.view_proj(aspect), view_w, view_h, {}, viewed);
+        unit_overlay_.render_status(world_, camctl_.view_proj(aspect), view_w, view_h, status_opts);
+    if (keep_status_layer_) status_layer_ = units;
 
-    out.assign(std::size_t(view_w) * view_h * 4, 0);
+    { SC2_PROF_SCOPE("ov.clear"); out.assign(std::size_t(view_w) * view_h * 4, 0); }
 
-    if (!ground_fog_ && cfg_.human_player >= 0 && map_w_ > 0.0f && map_h_ > 0.0f && !minimap_fog_.empty()) {
+    if (!ground_fog_ && !reveal_map_ && cfg_.human_player >= 0 && map_w_ > 0.0f && map_h_ > 0.0f && !minimap_fog_.empty()) {
         Control fctrl = make_control(camctl_.view_proj(aspect), view_w, view_h, viewed);
         constexpr int kStep = 6;
 
@@ -5107,13 +7634,18 @@ void MeleeGame::build_overlay(std::uint32_t view_w, std::uint32_t view_h,
         }
     }
 
-    alpha_over(out, units);
-    alpha_over(out, hud);
+    {
+        SC2_PROF_SCOPE("ov.alpha_over");
+        alpha_over(out, units);
+        alpha_over(out, hud);
+    }
 
     if (dragging_)
         draw_box_rgba(out, view_w, view_h, int(drag_x0_), int(drag_y0_), int(mouse_x_),
                       int(mouse_y_), 80, 235, 110);
 
+    struct HarvestLabel { int sx, sy, cur, ideal, res; };
+    std::vector<HarvestLabel> harvest_labels;
     {
         const render::Mat4 mvp = camctl_.view_proj(aspect);
         std::vector<int> assigned(world_.units().size(), 0);
@@ -5126,14 +7658,16 @@ void MeleeGame::build_overlay(std::uint32_t view_w, std::uint32_t view_h,
             const float x = float(n.x.to_double()), y = float(n.y.to_double());
             const formats::Model* nm =
                 (n.id < driver_.actors.size()) ? driver_.actors[n.id].model : nullptr;
-            const float top = nm ? nm->bounds_max[2] : float(n.radius.to_double());
+            const float top = nm ? nm->bounds_max[2] * unit_draw_scale(cat_, n.catalog_id)[2] : float(n.radius.to_double());
             float px = 0.0f, py = 0.0f;
             if (!cctrl.project(x, y, cctrl.ground_z(x, y) + top, px, py)) return false;
             sx = int(px);
             sy = int(py);
             return true;
         };
-        for (const MeleePlayerLayout& pl : layout_.players) {
+        for (std::size_t pli = 0; pli < layout_.players.size(); ++pli) {
+            const MeleePlayerLayout& pl = layout_.players[pli];
+            if (cfg_.human_player >= 0 && int(pli) != cfg_.human_player) continue;
             int total = 0, best_sx = 0, best_sy = 1 << 30, live_patches = 0;
             for (std::uint32_t nid : pl.minerals) {
                 if (nid >= world_.units().size() || !world_.unit(nid).alive) continue;
@@ -5143,9 +7677,12 @@ void MeleeGame::build_overlay(std::uint32_t view_w, std::uint32_t view_h,
                 if (proj(world_.unit(nid), sx, sy) && sy < best_sy) { best_sy = sy; best_sx = sx; }
             }
             if (live_patches > 0 && best_sy < (1 << 30)) {
-                char b[16];
-                std::snprintf(b, sizeof(b), "%d/%d", total, live_patches * 2);
-                draw_text_rgba(out, view_w, view_h, best_sx - 10, best_sy - 30, b, 2, 240, 236, 150);
+                int hx = best_sx, hy = best_sy;
+                if (pl.town_hall < world_.units().size() && world_.unit(pl.town_hall).alive) {
+                    int sx, sy;
+                    if (proj(world_.unit(pl.town_hall), sx, sy)) { hx = sx; hy = sy; }
+                }
+                harvest_labels.push_back({hx, hy, total, live_patches * 2, 0});
             }
             for (std::uint32_t gid : pl.geysers) {
                 if (gid >= world_.units().size() || !world_.unit(gid).alive) continue;
@@ -5158,11 +7695,7 @@ void MeleeGame::build_overlay(std::uint32_t view_w, std::uint32_t view_h,
                     }
                 if (!extractor) continue;
                 int sx, sy;
-                if (proj(g, sx, sy)) {
-                    char b[12];
-                    std::snprintf(b, sizeof(b), "%d/3", assigned[gid]);
-                    draw_text_rgba(out, view_w, view_h, sx - 8, sy - 30, b, 2, 150, 240, 170);
-                }
+                if (proj(g, sx, sy)) harvest_labels.push_back({sx, sy, assigned[gid], 3, 1});
             }
         }
     }
@@ -5293,8 +7826,42 @@ void MeleeGame::build_overlay(std::uint32_t view_w, std::uint32_t view_h,
                     if (auto col = cat_->ability_rally_color(ab)) {
                         rr = (*col)[0]; rg = (*col)[1]; rb = (*col)[2];
                     }
-                line(ux, uy, tx, ty, rr, rg, rb, 170);
-                marker(tx, ty, rr, rg, rb);
+                const IconAtlas::Icon* wpl = (ui_store_ && !std::getenv("SC2_RALLY_LINE_PLAIN")) ? &icons_.get(*ui_store_, "Assets/Textures/waypointline.dds") : nullptr;
+                const double seg_len = std::hypot(double(tx - ux), double(ty - uy));
+                if (wpl && wpl->ok() && seg_len > 1.0) {
+                    const double dxn = double(tx - ux) / seg_len, dyn = double(ty - uy) / seg_len;
+                    const double half = 2.0, tile = 26.0, strength = 0.6;
+                    const int bx0 = std::max(0, std::min(ux, tx) - 3), bx1 = std::min(int(view_w) - 1, std::max(ux, tx) + 3);
+                    const int by0 = std::max(0, std::min(uy, ty) - 3), by1 = std::min(int(view_h) - 1, std::max(uy, ty) + 3);
+                    for (int y = by0; y <= by1; ++y)
+                        for (int x = bx0; x <= bx1; ++x) {
+                            const double px_ = double(x - ux), py_ = double(y - uy);
+                            const double along = px_ * dxn + py_ * dyn, across = -px_ * dyn + py_ * dxn;
+                            if (along < 0.0 || along > seg_len || across < -half || across >= half) continue;
+                            const int sx = std::min(int(wpl->w) - 1, int((across + half) / (2.0 * half) * double(wpl->w)));
+                            const double v = std::fmod(seg_len - along, tile) / tile;
+                            const int sy = std::min(int(wpl->h) - 1, int(v * double(wpl->h)));
+                            const std::size_t si = (std::size_t(sy) * wpl->w + std::size_t(sx)) * 4;
+                            const double a = strength * double(wpl->rgba[si + 3]) / 255.0;
+                            if (a <= 0.0) continue;
+                            const std::size_t di = (std::size_t(y) * view_w + std::size_t(x)) * 4;
+                            const int tint[3] = {rr, rg, rb};
+                            if (out[di + 3] == 0) {
+                                for (int k = 0; k < 3; ++k)
+                                    out[di + k] = std::uint8_t(std::min(255.0, double(wpl->rgba[si + k]) / 255.0 * double(tint[k])) + 0.5);
+                                out[di + 3] = std::uint8_t(a * 255.0 + 0.5);
+                                continue;
+                            }
+                            for (int k = 0; k < 3; ++k) {
+                                const double src = double(wpl->rgba[si + k]) / 255.0 * double(tint[k]);
+                                out[di + k] = std::uint8_t(std::min(255.0, src * a + double(out[di + k])) + 0.5);
+                            }
+                            out[di + 3] = std::uint8_t(std::max(double(out[di + 3]), a * 255.0));
+                        }
+                } else {
+                    line(ux, uy, tx, ty, rr, rg, rb, 170);
+                }
+                if (std::getenv("SC2_RALLY_LINE_PLAIN")) marker(tx, ty, rr, rg, rb);
             }
 
     }
@@ -5306,15 +7873,33 @@ void MeleeGame::build_overlay(std::uint32_t view_w, std::uint32_t view_h,
         const float tint[3] = {tr, tg, tb};
         for (int y = 0; y < dh; ++y)
             for (int x = 0; x < dw; ++x) {
-                const int sx = x * int(ic.w) / dw, sy = y * int(ic.h) / dh;
-                const std::size_t si = (std::size_t(sy) * ic.w + sx) * 4;
-                const float a = ic.rgba[si + 3] / 255.0f;
+                static const bool tint_nearest = std::getenv("SC2_HUD_ICON_NEAREST") != nullptr;
+                float a = 0.0f, rgb[3] = {0.0f, 0.0f, 0.0f};
+                if (tint_nearest || (int(ic.w) <= dw && int(ic.h) <= dh)) {
+                    const int sx = x * int(ic.w) / dw, sy = y * int(ic.h) / dh;
+                    const std::size_t si = (std::size_t(sy) * ic.w + sx) * 4;
+                    a = ic.rgba[si + 3] / 255.0f;
+                    for (int c = 0; c < 3; ++c) rgb[c] = float(ic.rgba[si + c]);
+                } else {
+                    float wa = 0.0f;
+                    for (int j = 0; j < 4; ++j)
+                        for (int k = 0; k < 4; ++k) {
+                            const int sx = std::min(int(ic.w) - 1, int((float(x) + (float(k) + 0.5f) * 0.25f) * float(ic.w) / float(dw)));
+                            const int sy = std::min(int(ic.h) - 1, int((float(y) + (float(j) + 0.5f) * 0.25f) * float(ic.h) / float(dh)));
+                            const std::size_t si = (std::size_t(sy) * ic.w + std::size_t(sx)) * 4;
+                            const float sa = ic.rgba[si + 3] / 255.0f;
+                            wa += sa;
+                            for (int c = 0; c < 3; ++c) rgb[c] += float(ic.rgba[si + c]) * sa;
+                        }
+                    a = wa / 16.0f;
+                    if (wa > 0.0f) for (float& v : rgb) v /= wa;
+                }
                 if (a <= 0.0f) continue;
                 const int px = dx0 + x, py = dy0 + y;
                 if (px < 0 || py < 0 || px >= int(view_w) || py >= int(view_h)) continue;
                 const std::size_t di = (std::size_t(py) * view_w + px) * 4;
                 for (int c = 0; c < 3; ++c) {
-                    const float src = float(ic.rgba[si + c]) * tint[c];
+                    const float src = rgb[c] * tint[c];
                     out[di + c] = std::uint8_t(src * a + out[di + c] * (1 - a));
                 }
                 const float da = out[di + 3] / 255.0f;
@@ -5322,9 +7907,55 @@ void MeleeGame::build_overlay(std::uint32_t view_w, std::uint32_t view_h,
             }
     };
 
+    auto blit_icon_add = [&](const IconAtlas::Icon& ic, int dx0, int dy0, int dx1, int dy1, float strength, float tr, float tg, float tb) {
+        if (!ic.ok() || dx1 <= dx0 || dy1 <= dy0 || strength <= 0.0f) return;
+        const int dw = dx1 - dx0, dh = dy1 - dy0;
+        const float tint[3] = {tr, tg, tb};
+        for (int y = 0; y < dh; ++y)
+            for (int x = 0; x < dw; ++x) {
+                const int px = dx0 + x, py = dy0 + y;
+                if (px < 0 || py < 0 || px >= int(view_w) || py >= int(view_h)) continue;
+                const std::size_t si = (std::size_t(y * int(ic.h) / dh) * ic.w + std::size_t(x * int(ic.w) / dw)) * 4;
+                const float a = ic.rgba[si + 3] / 255.0f * strength;
+                if (a <= 0.0f) continue;
+                const std::size_t di = (std::size_t(py) * view_w + px) * 4;
+                for (int c = 0; c < 3; ++c) out[di + c] = std::uint8_t(std::min(255.0f, float(out[di + c]) + float(ic.rgba[si + c]) * tint[c] * a));
+            }
+    };
+
     auto blit_icon = [&](const IconAtlas::Icon& ic, int dx0, int dy0, int dx1, int dy1) {
         if (!ic.ok() || dx1 <= dx0 || dy1 <= dy0) return;
         const int dw = dx1 - dx0, dh = dy1 - dy0;
+        static const bool nearest_only = std::getenv("SC2_HUD_ICON_NEAREST") != nullptr;
+        if (!nearest_only && (int(ic.w) > dw || int(ic.h) > dh)) {
+            for (int y = 0; y < dh; ++y)
+                for (int x = 0; x < dw; ++x) {
+                    const int px = dx0 + x, py = dy0 + y;
+                    if (px < 0 || py < 0 || px >= int(view_w) || py >= int(view_h)) continue;
+                    const double fx0 = double(x) * ic.w / dw, fx1 = double(x + 1) * ic.w / dw;
+                    const double fy0 = double(y) * ic.h / dh, fy1 = double(y + 1) * ic.h / dh;
+                    double acc[3] = {0, 0, 0}, wa = 0.0, wsum = 0.0;
+                    for (int sy = int(fy0); sy < int(ic.h) && double(sy) < fy1; ++sy) {
+                        const double wy = std::min(fy1, double(sy + 1)) - std::max(fy0, double(sy));
+                        for (int sx = int(fx0); sx < int(ic.w) && double(sx) < fx1; ++sx) {
+                            const double w = wy * (std::min(fx1, double(sx + 1)) - std::max(fx0, double(sx)));
+                            if (w <= 0.0) continue;
+                            const std::size_t si = (std::size_t(sy) * ic.w + std::size_t(sx)) * 4;
+                            const double ta = ic.rgba[si + 3] / 255.0;
+                            for (int c = 0; c < 3; ++c) acc[c] += ic.rgba[si + c] * ta * w;
+                            wa += ta * w;
+                            wsum += w;
+                        }
+                    }
+                    if (wsum <= 0.0 || wa <= 0.0) continue;
+                    const float a = float(wa / wsum);
+                    const std::size_t di = (std::size_t(py) * view_w + px) * 4;
+                    for (int c = 0; c < 3; ++c) out[di + c] = std::uint8_t(std::min(255.0, acc[c] / wa * a + out[di + c] * (1.0 - a) + 0.5));
+                    const float da = out[di + 3] / 255.0f;
+                    out[di + 3] = std::uint8_t((a + da * (1.0f - a)) * 255.0f + 0.5f);
+                }
+            return;
+        }
         for (int y = 0; y < dh; ++y)
             for (int x = 0; x < dw; ++x) {
                 const int sx = x * int(ic.w) / dw, sy = y * int(ic.h) / dh;
@@ -5341,6 +7972,141 @@ void MeleeGame::build_overlay(std::uint32_t view_w, std::uint32_t view_h,
             }
     };
 
+    auto blit_nine = [&](const IconAtlas::Icon& t9, double fx0, double fy0, double fx1, double fy1, double corner, float mr, float mg, float mb, float add) {
+        if (!t9.ok() || fx1 <= fx0 || fy1 <= fy0 || corner <= 0.0) return;
+        const int x0 = int(std::floor(fx0)), y0 = int(std::floor(fy0)), x1 = int(std::ceil(fx1)), y1 = int(std::ceil(fy1));
+        const double w = fx1 - fx0, h = fy1 - fy0, hw = double(t9.w) * 0.5, hh = double(t9.h) * 0.5;
+        const double cw = std::min(corner, w * 0.5), ch = std::min(corner, h * 0.5);
+        auto src = [](double d, double len, double c, double half) {
+            if (d < c) return d * half / c;
+            if (d >= len - c) return 2.0 * half - (len - d) * half / c;
+            return half;
+        };
+        const float mul[3] = {mr, mg, mb};
+        for (int y = y0; y < y1; ++y)
+            for (int x = x0; x < x1; ++x) {
+                if (x < 0 || y < 0 || x >= int(view_w) || y >= int(view_h)) continue;
+                float rgb[3] = {0.0f, 0.0f, 0.0f}, a = 0.0f;
+                for (int sy = 0; sy < 6; ++sy)
+                    for (int sx = 0; sx < 6; ++sx) {
+                        const double dx = double(x) + (sx + 0.5) / 6.0 - fx0, dy = double(y) + (sy + 0.5) / 6.0 - fy0;
+                        if (dx < 0.0 || dy < 0.0 || dx >= w || dy >= h) continue;
+                        const int u = std::max(0, std::min(int(t9.w) - 1, int(src(dx, w, cw, hw))));
+                        const int v = std::max(0, std::min(int(t9.h) - 1, int(src(dy, h, ch, hh))));
+                        const std::size_t si = (std::size_t(v) * t9.w + std::size_t(u)) * 4;
+                        const float ta = t9.rgba[si + 3] / 255.0f;
+                        for (int c = 0; c < 3; ++c) rgb[c] += float(t9.rgba[si + c]) * ta;
+                        a += ta;
+                    }
+                if (a <= 0.0f) continue;
+                for (int c = 0; c < 3; ++c) rgb[c] /= a;
+                a /= 36.0f;
+                const std::size_t di = (std::size_t(y) * view_w + std::size_t(x)) * 4;
+                for (int c = 0; c < 3; ++c) out[di + c] = std::uint8_t(std::min(255.0f, (rgb[c] * mul[c] + add) * a + out[di + c] * (1.0f - a)));
+                const float da = out[di + 3] / 255.0f;
+                out[di + 3] = std::uint8_t((a + da * (1.0f - a)) * 255.0f + 0.5f);
+            }
+    };
+
+    auto draw_portrait = [&](const std::string& pid) {
+        if (models_ && ui_store_ && console_panel.authored && console_panel.authored->portrait.ok()) {
+            const double sc = double(view_h) / double(kRefHeight);
+            const HudAuthoredRects::R& pr = console_panel.authored->portrait;
+            if (const MeleeModels::Portrait* p = models_->portrait(*ui_store_, pid)) {
+                HudPortrait req;
+                req.unit = pid;
+                req.path = p->path;
+                req.fov_deg = p->fov_rad * 180.0f / 3.14159265f;
+                req.rect = {int(pr.x0 * sc + 0.5), int(pr.y0 * sc + 0.5), int(pr.x1 * sc + 0.5), int(pr.y1 * sc + 0.5)};
+                const std::uint32_t pw = std::uint32_t(std::max(1, req.rect.w())), ph = std::uint32_t(std::max(1, req.rect.h()));
+                if (portrait_renderer_) {
+                    std::vector<std::uint8_t> img;
+                    static std::uint32_t portrait_lead = 0xffffffffu;
+                    static double portrait_start_ms = 0.0;
+                    const std::uint32_t lead_now = selection_.empty() ? 0xffffffffu : selection_[0];
+                    if (lead_now != portrait_lead) {
+                        portrait_lead = lead_now;
+                        portrait_start_ms = double(clock_ms_);
+                    }
+                    static const bool match_clock = std::getenv("SC2_PORTRAIT_FROM_SELECTION") == nullptr;
+                    portrait_time_ms() = std::getenv("SC2_PORTRAIT_STILL") ? 0.0f
+                                         : match_clock ? float(clock_ms_) : float(std::max(1.0, double(clock_ms_) - portrait_start_ms));
+                    {
+                        PortraitDof& pd = portrait_dof();
+                        pd.focus = p->dof_focus;
+                        pd.start = p->dof_start;
+                        pd.end = p->dof_end;
+                        pd.amount = p->dof_amount;
+                    }
+                    try { img = portrait_renderer_(*ui_store_, p->model, p->fov_rad, p->cam_bone, p->znear, p->zfar, pw, ph, p->light.found ? &p->light : nullptr); } catch (const std::exception& e) {
+                        if (std::getenv("SC2_PORTRAIT_TRACE")) std::fprintf(stderr, "portrait: render threw %s\n", e.what());
+                    }
+                    if (std::getenv("SC2_PORTRAIT_TRACE")) {
+                        std::size_t covered = 0;
+                        for (std::size_t q = 3; q < img.size(); q += 4) covered += img[q] != 0;
+                        std::fprintf(stderr, "portrait: %s %ux%u -> %zu bytes, %zu covered, fov %.3f cam bone %d near %.3f far %.3f verts %u\n", p->path.c_str(), pw, ph,
+                                     img.size(), covered, double(p->fov_rad), p->cam_bone, double(p->znear), double(p->zfar), unsigned(p->model.vertex_count));
+                        std::fprintf(stderr, "portrait: light '%s' found %d exposure %.3f white %.3f ambient %.3f %.3f %.3f key %d (%.3f %.3f %.3f x %.3f) fill %d back %d materials %zu regions %zu\n",
+                                     p->light.light_id.c_str(), int(p->light.found), double(p->light.hdr_exposure), double(p->light.hdr_white_point),
+                                     double(p->light.ambient_color[0]), double(p->light.ambient_color[1]), double(p->light.ambient_color[2]), int(p->light.key.present),
+                                     double(p->light.key.color[0]), double(p->light.key.color[1]), double(p->light.key.color[2]), double(p->light.key.color_multiplier),
+                                     int(p->light.fill.present), int(p->light.back.present), p->model.materials.size(), p->model.regions.size());
+                    }
+                    if (img.size() == std::size_t(pw) * ph * 4) {
+                        for (std::uint32_t y = 0; y < ph; ++y)
+                            for (std::uint32_t x = 0; x < pw; ++x) {
+                                const int dx = req.rect.x0 + int(x), dy = req.rect.y0 + int(y);
+                                if (dx < 0 || dy < 0 || dx >= int(view_w) || dy >= int(view_h)) continue;
+                                const std::size_t si = (std::size_t(y) * pw + x) * 4, di = (std::size_t(dy) * view_w + std::size_t(dx)) * 4;
+                                const unsigned a = img[si + 3];
+                                if (!a) continue;
+                                for (int k = 0; k < 3; ++k) out[di + k] = std::uint8_t((img[si + k] * a + out[di + k] * (255 - a)) / 255);
+                                out[di + 3] = std::uint8_t(a + (out[di + 3] * (255 - a)) / 255);
+                            }
+                        req.drawn = true;
+                        if (std::getenv("SC2_PORTRAIT_TRACE"))
+                            std::fprintf(stderr, "portrait: console picture ok %d %ux%u view %ux%u\n", int(console_tex_.ok()), unsigned(console_tex_.w), unsigned(console_tex_.h), view_w, view_h);
+                        if (console_tex_.ok() && console_tex_.w == view_w && console_tex_.h <= view_h && !std::getenv("SC2_PORTRAIT_OVER_CONSOLE")) {
+                            const int coy = int(view_h) - int(console_tex_.h);
+                            const int ccx = (req.rect.x0 + req.rect.x1) / 2, ccy = (req.rect.y0 + req.rect.y1) / 2 - coy;
+                            const bool well_open = ccx >= 0 && ccy >= 0 && ccx < int(view_w) && ccy < int(console_tex_.h);
+                            const std::size_t wc = well_open ? (std::size_t(ccy) * view_w + std::size_t(ccx)) * 4 : 0;
+                            const int well_rgb[3] = {well_open ? int(console_tex_.rgba[wc]) : 0, well_open ? int(console_tex_.rgba[wc + 1]) : 0,
+                                                     well_open ? int(console_tex_.rgba[wc + 2]) : 0};
+                            if (std::getenv("SC2_PORTRAIT_TRACE")) {
+                                std::size_t clear = 0, total = 0;
+                                for (int dy = std::max(coy, req.rect.y0); dy < std::min(int(view_h), req.rect.y1); ++dy)
+                                    for (int dx = std::max(0, req.rect.x0); dx < std::min(int(view_w), req.rect.x1); ++dx) {
+                                        ++total;
+                                        clear += console_tex_.rgba[(std::size_t(dy - coy) * view_w + std::size_t(dx)) * 4 + 3] < 128;
+                                    }
+                                const std::size_t cc = (std::size_t(std::max(0, ccy)) * view_w + std::size_t(std::max(0, ccx))) * 4;
+                                std::fprintf(stderr, "portrait: console over it, well open %d, clear %zu of %zu, centre rgba %u %u %u %u\n", int(well_open), clear, total,
+                                             unsigned(console_tex_.rgba[cc]), unsigned(console_tex_.rgba[cc + 1]), unsigned(console_tex_.rgba[cc + 2]), unsigned(console_tex_.rgba[cc + 3]));
+                            }
+                            if (well_open)
+                                for (int dy = std::max(coy, req.rect.y0); dy < std::min(int(view_h), req.rect.y1); ++dy)
+                                    for (int dx = std::max(0, req.rect.x0); dx < std::min(int(view_w), req.rect.x1); ++dx) {
+                                        const std::size_t ci = (std::size_t(dy - coy) * view_w + std::size_t(dx)) * 4;
+                                        const std::size_t oi = (std::size_t(dy) * view_w + std::size_t(dx)) * 4;
+                                        const unsigned ca = console_tex_.rgba[ci + 3];
+                                        if (!ca) continue;
+                                        int far = 0;
+                                        for (int k = 0; k < 3; ++k) far = std::max(far, std::abs(int(console_tex_.rgba[ci + k]) - well_rgb[k]));
+                                        if (far <= 10) continue;
+                                        for (int k = 0; k < 3; ++k) out[oi + k] = std::uint8_t((console_tex_.rgba[ci + k] * ca + out[oi + k] * (255 - ca)) / 255);
+                                    }
+                        }
+                    }
+                }
+                hud_portrait_ = std::move(req);
+            }
+        }
+    };
+    if (!unit_pane && cfg_.human_player >= 0 && selection_.size() > 1 && selection_[0] < world_.units().size() &&
+        world_.unit(selection_[0]).alive && world_.unit(selection_[0]).player == cfg_.human_player &&
+        MatchResult::banner(outcome_)[0] == '\0' && !std::getenv("SC2_NO_GROUP_PORTRAIT"))
+        draw_portrait(world_.unit(selection_[0]).catalog_id);
     if (cfg_.human_player >= 0 && selection_.size() == 1 &&
         selection_[0] < world_.units().size() && world_.unit(selection_[0]).alive &&
         world_.unit(selection_[0]).player == cfg_.human_player) {
@@ -5363,8 +8129,52 @@ void MeleeGame::build_overlay(std::uint32_t view_w, std::uint32_t view_h,
         std::string wire_name = tok;
         if (cat_)
             if (auto nm = cat_->unit_display_name(su.catalog_id)) wire_name = std::move(*nm);
-        if (!wire_name.empty())
+        if (!wire_name.empty() && !unit_pane)
             draw_text_rgba(out, view_w, view_h, px0 + 3, py0 + 2, wire_name.c_str(), 1, 200, 208, 220);
+        if (console_panel.authored) {
+            const HudAuthoredRects* ar = console_panel.authored;
+            const LabelLook vl = resolve_label_style(hud_style_set(), ar->style_vital, human_race());
+            struct Row { const HudAuthoredRects::R& rect; double cur, max; };
+            const Row rows[3] = {{ar->vital_shield, su.shields.to_double(), su.shields_max.to_double()},
+                                 {ar->vital_life, su.hp.to_double(), su.hp_max.to_double()},
+                                 {ar->vital_energy, su.energy.to_double(), su.energy_max.to_double()}};
+            const bool vital_shuffle = !std::getenv("SC2_VITAL_ROWS_FIXED");
+            int vital_slot = 0;
+            for (const Row& row : rows) {
+                if (row.max <= 0.0 || !row.rect.ok()) continue;
+                const HudAuthoredRects::R& place = (vital_shuffle && rows[vital_slot].rect.ok()) ? rows[vital_slot].rect : row.rect;
+                ++vital_slot;
+                const double vsc = double(view_h) / double(kRefHeight);
+                const HudRect lr{int(place.x0 * vsc + 0.5), int(place.y0 * vsc + 0.5),
+                                 int(place.x1 * vsc + 0.5), int(place.y1 * vsc + 0.5)};
+                if (lr.w() <= 0 || lr.h() <= 0) continue;
+                char vt[48];
+                static const bool vital_no_gap = std::getenv("SC2_VITAL_NO_GAP") != nullptr;
+                std::snprintf(vt, sizeof(vt), vital_no_gap ? "%d/%d" : "%d/ %d", int(row.cur + 0.5), int(row.max + 0.5));
+                static const bool vital_whole_px = std::getenv("SC2_VITAL_WHOLE_PX") != nullptr;
+                draw::set_forced_font_px(vital_whole_px ? int(14.0 * vsc + 0.5) : render::OverlayFont::fractional(14.0 * vsc));
+                const FaceScope vital_face(style_face(vl.font));
+                const int vw = text_w_rgba(vt, 1);
+                const int vx = (!vl.set || vl.centred) ? lr.x0 + (lr.w() - vw) / 2 : lr.x0;
+                const int vy = lr.y0 + std::max(0, (lr.h() - ui::kFontH) / 2);
+                if (std::getenv("SC2_LABEL_FACE_TRACE") && &row == &rows[1])
+                    std::fprintf(stderr, "[labelface] vital rect %d %d %d %d text y %d px %d\n", lr.x0, lr.y0, lr.x1, lr.y1, vy, int(14.0 * vsc + 0.5));
+                int vr = vl.set ? vl.r : 220, vg = vl.set ? vl.g : 226, vb = vl.set ? vl.b : 235;
+                if (&row == &rows[1]) {
+                    const double lf = row.max > 0.0 ? row.cur / row.max : 1.0;
+                    if (std::getenv("SC2_VITAL_ROWS_FIXED")) hc(float(lf), vr, vg, vb);
+                    else if (lf >= 0.75) { vr = 22; vg = 229; vb = 0; }
+                    else if (lf >= 0.5) { vr = 229; vg = 221; vb = 0; }
+                    else if (lf >= 0.25) { vr = 229; vg = 129; vb = 0; }
+                    else { vr = 208; vg = 34; vb = 0; }
+                }
+                draw::text_shadow_off() = !vital_whole_px;
+                draw_text_rgba(out, view_w, view_h, vx, vy, vt, 1, vr, vg, vb);
+                draw::text_shadow_off() = false;
+                draw::set_forced_font_px(forced_px);
+            }
+        }
+
         if (unit_pane) {
             const double sc = double(view_h) / double(kRefHeight);
             const HudAuthoredRects::R& ip = console_panel.authored->info;
@@ -5372,13 +8182,21 @@ void MeleeGame::build_overlay(std::uint32_t view_w, std::uint32_t view_h,
             pane.name = wire_name;
             pane.pane = {int(ip.x0 * sc + 0.5), int(ip.y0 * sc + 0.5), int(ip.x1 * sc + 0.5), int(ip.y1 * sc + 0.5)};
             const int name_y = int((ip.y0 + 10.0f) * sc + 0.5);
-            const int name_w = int(pane.name.size()) * 12;
-            const int name_x = std::max(pane.pane.x0, (pane.pane.x0 + pane.pane.x1) / 2 - name_w / 2);
-            draw_text_rgba(out, view_w, view_h, name_x, name_y, pane.name.c_str(), 2, 230, 232, 236);
+            const LabelLook nl = resolve_label_style(hud_style_set(), hud_authored_
+                                                         ? hud_authored_->style_unit_name
+                                                         : std::string(),
+                                                     human_race());
+            const int unit_x0 = int((ip.x1 - 402.0f) * sc + 0.5), unit_x1 = pane.pane.x1;
+            draw::set_forced_font_px(int(24.0 * sc + 0.5));
+            const int name_w = text_w_rgba(pane.name, 1);
+            const int name_x = std::max(unit_x0, (unit_x0 + unit_x1) / 2 - name_w / 2);
+            draw_text_rgba(out, view_w, view_h, name_x, name_y, pane.name.c_str(), 1,
+                           nl.set ? nl.r : 230, nl.set ? nl.g : 232, nl.set ? nl.b : 236);
+            draw::set_forced_font_px(forced_px);
             const float bar_top = ip.y0 + 10.0f + 26.0f;
             pane.life_bar = {int(ip.x0 * sc + 0.5), int(bar_top * sc + 0.5), int((ip.x0 + 128.0f) * sc + 0.5), int((bar_top + 16.0f) * sc + 0.5)};
             pane.life_frac = hpf;
-            {
+            if (std::getenv("SC2_PANE_LIFE_BAR")) {
                 int r = 0, g = 0, b = 0;
                 hc(hpf, r, g, b);
                 const int fill_x1 = pane.life_bar.x0 + int((pane.life_bar.x1 - pane.life_bar.x0) * hpf + 0.5f);
@@ -5393,17 +8211,48 @@ void MeleeGame::build_overlay(std::uint32_t view_w, std::uint32_t view_h,
                     }
             }
             char info[96];
-            std::snprintf(info, sizeof info, "%d / %d", int(su.hp.to_double() + 0.5), int(su.hp_max.to_double() + 0.5));
+            const int armor_v = int(su.armor.to_double() + 0.5);
+            const int armor_l = int(su.armor_level.to_double() + 0.5);
+            std::string armor_word = "Armor";
+            if (cat_)
+                if (auto an = cat_->unit_life_armor_name(su.catalog_id)) armor_word = std::move(*an);
+            if (armor_l > 0)
+                std::snprintf(info, sizeof info, "%s %d (+%d)", armor_word.c_str(), armor_v, armor_l);
+            else
+                std::snprintf(info, sizeof info, "%s %d", armor_word.c_str(), armor_v);
             pane.info = info;
-            if (su.shields_max.raw() > 0) {
-                std::snprintf(info, sizeof info, "  + %d / %d shields", int(su.shields.to_double() + 0.5), int(su.shields_max.to_double() + 0.5));
-                pane.info += info;
+            const LabelLook fl = resolve_label_style(
+                hud_style_set(), hud_authored_ ? hud_authored_->style_unit_info : std::string(),
+                human_race());
+            if (std::getenv("SC2_PANE_LIFE_BAR"))
+                draw_text_rgba(out, view_w, view_h, pane.life_bar.x1 + 8, pane.life_bar.y0,
+                               pane.info.c_str(), 1, fl.set ? fl.r : 210, fl.set ? fl.g : 214,
+                               fl.set ? fl.b : 220);
+            const bool queue_pane = !world_.queue_view(selection_[0]).empty();
+            if (!(su.attributes & sim::kAttrStructure) && cat_ && !queue_pane) {
+                const std::string* ks = cat_->strings().find("e_gameUIStringKillsColon");
+                const std::string* rs = cat_->strings().find("e_gameUIStringRankColon");
+                const char* rsfx = race == 1 ? "Prot" : race == 2 ? "Zerg" : "Terr";
+                const std::string* rn = app::kill_rank_name(*cat_, su.catalog_id, content.lead_kills, rsfx);
+                const std::string lab[2] = {ks ? *ks : std::string("Kills: "), rs ? *rs : std::string("Rank: ")};
+                const std::string val[2] = {std::to_string(content.lead_kills), rn ? *rn : std::string()};
+                const FaceScope info_scope(style_face(fl.font));
+                const int ifpx = std::max(6, int((fl.height > 0 ? double(fl.height) : 16.0) * sc + 0.5));
+                draw::set_forced_font_px(ifpx);
+                const int bottom = int((ip.y0 + 110.0f) * sc + 0.5);
+                for (int li = 0; li < 2; ++li) {
+                    if (li == 1 && val[1].empty()) continue;
+                    const int lw = text_w_rgba(lab[li], 1), vw = text_w_rgba(val[li], 1);
+                    const int lx = (unit_x0 + unit_x1) / 2 - (lw + vw) / 2;
+                    static const bool info_low = std::getenv("SC2_PANE_INFO_LOW") != nullptr;
+                    const int ly = bottom - ifpx - (info_low ? 2 : 2 + int(5.0 * sc + 0.5)) - (li == 0 ? int(20.0 * sc + 0.5) : 0);
+                    draw_text_rgba(out, view_w, view_h, lx, ly, lab[li].c_str(), 1, race == 1 ? 110 : race == 2 ? 245 : 155,
+                                   race == 1 ? 170 : race == 2 ? 140 : 255, race == 1 ? 255 : race == 2 ? 70 : 190);
+                    const int vg = info_low ? 236 : 255;
+                    draw_text_rgba(out, view_w, view_h, lx + lw, ly, val[li].c_str(), 1, vg, info_low ? 238 : 255, info_low ? 240 : 255);
+                }
+                draw::set_forced_font_px(forced_px);
             }
-            if (su.energy_max.raw() > 0) {
-                std::snprintf(info, sizeof info, "  + %d / %d energy", int(su.energy.to_double() + 0.5), int(su.energy_max.to_double() + 0.5));
-                pane.info += info;
-            }
-            draw_text_rgba(out, view_w, view_h, pane.life_bar.x1 + 8, pane.life_bar.y0, pane.info.c_str(), 1, 210, 214, 220);
             static const std::pair<std::uint32_t, const char*> kAttr[] = {
                 {sim::kAttrLight, "Light"}, {sim::kAttrArmored, "Armored"}, {sim::kAttrBiological, "Biological"},
                 {sim::kAttrMechanical, "Mechanical"}, {sim::kAttrMassive, "Massive"}, {sim::kAttrPsionic, "Psionic"},
@@ -5413,40 +8262,30 @@ void MeleeGame::build_overlay(std::uint32_t view_w, std::uint32_t view_h,
                     if (!pane.type.empty()) pane.type += " - ";
                     pane.type += label;
                 }
-            if (!pane.type.empty())
-                draw_text_rgba(out, view_w, view_h, pane.pane.x0, int((ip.y0 + 176.0f) * sc + 0.5), pane.type.c_str(), 1, 190, 196, 208);
+            if (!pane.type.empty() && !queue_pane) {
+                const LabelLook tl = resolve_label_style(
+                    hud_style_set(), hud_authored_ ? hud_authored_->style_unit_type : std::string(),
+                    human_race());
+                draw::set_forced_font_px(int(18.0 * sc + 0.5));
+                const auto* body_face = draw::active_font();
+                if (const render::OverlayFont* hf = style_face(tl.font.empty() ? std::string("UI/Fonts/Eurostile-Bol.otf") : tl.font)) draw::set_active_font(hf);
+                const int type_w = text_w_rgba(pane.type, 1);
+                const int type_x = (tl.set && tl.centred) ? std::max(unit_x0, (unit_x0 + unit_x1) / 2 - type_w / 2) : unit_x0;
+                draw_text_rgba(out, view_w, view_h, type_x, int((ip.y0 + 176.0f) * sc + 0.5),
+                               pane.type.c_str(), 1, tl.set ? tl.r : 190, tl.set ? tl.g : 196,
+                               tl.set ? tl.b : 208);
+                draw::set_active_font(body_face);
+                draw::set_forced_font_px(forced_px);
+            }
             hud_unit_pane_ = std::move(pane);
         }
-        if (unit_pane && models_ && ui_store_ && console_panel.authored->portrait.ok()) {
-            const double sc = double(view_h) / double(kRefHeight);
-            const HudAuthoredRects::R& pr = console_panel.authored->portrait;
-            if (const MeleeModels::Portrait* p = models_->portrait(*ui_store_, su.catalog_id)) {
-                HudPortrait req;
-                req.unit = su.catalog_id;
-                req.path = p->path;
-                req.fov_deg = p->fov_rad * 180.0f / 3.14159265f;
-                req.rect = {int(pr.x0 * sc + 0.5), int(pr.y0 * sc + 0.5), int(pr.x1 * sc + 0.5), int(pr.y1 * sc + 0.5)};
-                const std::uint32_t pw = std::uint32_t(std::max(1, req.rect.w())), ph = std::uint32_t(std::max(1, req.rect.h()));
-                if (portrait_renderer_) {
-                    std::vector<std::uint8_t> img;
-                    try { img = portrait_renderer_(*ui_store_, p->model, p->fov_rad, p->cam_bone, p->znear, p->zfar, pw, ph); } catch (const std::exception&) {}
-                    if (img.size() == std::size_t(pw) * ph * 4) {
-                        for (std::uint32_t y = 0; y < ph; ++y)
-                            for (std::uint32_t x = 0; x < pw; ++x) {
-                                const int dx = req.rect.x0 + int(x), dy = req.rect.y0 + int(y);
-                                if (dx < 0 || dy < 0 || dx >= int(view_w) || dy >= int(view_h)) continue;
-                                const std::size_t si = (std::size_t(y) * pw + x) * 4, di = (std::size_t(dy) * view_w + std::size_t(dx)) * 4;
-                                const unsigned a = img[si + 3];
-                                if (!a) continue;
-                                for (int k = 0; k < 3; ++k) out[di + k] = std::uint8_t((img[si + k] * a + out[di + k] * (255 - a)) / 255);
-                                out[di + 3] = std::uint8_t(a + (out[di + 3] * (255 - a)) / 255);
-                            }
-                        req.drawn = true;
-                    }
-                }
-                hud_portrait_ = std::move(req);
-            }
-        }
+        if (std::getenv("SC2_PORTRAIT_TRACE"))
+            std::fprintf(stderr, "portrait: unit_pane %d models %d store %d rect ok %d (%.1f %.1f %.1f %.1f) renderer %d unit %s\n", int(unit_pane),
+                         int(models_ != nullptr), int(ui_store_ != nullptr), int(console_panel.authored && console_panel.authored->portrait.ok()),
+                         console_panel.authored ? double(console_panel.authored->portrait.x0) : 0.0, console_panel.authored ? double(console_panel.authored->portrait.y0) : 0.0,
+                         console_panel.authored ? double(console_panel.authored->portrait.x1) : 0.0, console_panel.authored ? double(console_panel.authored->portrait.y1) : 0.0,
+                         int(bool(portrait_renderer_)), su.catalog_id.c_str());
+        if (unit_pane) draw_portrait(su.catalog_id);
 
         bool drew_authored = false;
         if (ui_store_ && !su.catalog_id.empty()) {
@@ -5521,9 +8360,20 @@ void MeleeGame::build_overlay(std::uint32_t view_w, std::uint32_t view_h,
             float frac = -1.0f;
             sim::Fixed f;
             std::string rid;
-            if (world_.unit(sel).constructing) frac = float(world_.build_progress(sel).to_double());
-            else if (world_.pending_progress(sel, f)) frac = float(f.to_double());
-            else if (world_.research_progress(cfg_.human_player, f, rid)) frac = float(f.to_double());
+            std::string subject;
+            if (world_.unit(sel).constructing) {
+                frac = float(world_.build_progress(sel).to_double());
+                subject = world_.unit(sel).catalog_id;
+            } else if (world_.pending_progress(sel, f)) {
+                if (std::getenv("SC2_QUEUE_PROGRESS_PANE")) {
+                    frac = float(f.to_double());
+                    const std::vector<sim::World::QueueSlotView> q = world_.queue_view(sel);
+                    if (!q.empty()) subject = q.front().catalog_id;
+                }
+            } else if (world_.research_progress(cfg_.human_player, f, rid)) {
+                frac = float(f.to_double());
+                subject = rid;
+            }
             if (frac >= 0.0f) {
                 frac = frac < 0.0f ? 0.0f : (frac > 1.0f ? 1.0f : frac);
                 static const int kBorder[3][3] = {{40, 125, 75}, {35, 125, 255}, {230, 95, 5}};
@@ -5532,15 +8382,27 @@ void MeleeGame::build_overlay(std::uint32_t view_w, std::uint32_t view_h,
                                           sel < layout_.unit_type.size() ? layout_.unit_type[sel]
                                                                          : std::string());
                 const int rc = ri < 0 || ri > 2 ? 0 : ri;
+                int border[3] = {kBorder[rc][0], kBorder[rc][1], kBorder[rc][2]};
+                int fill[3] = {kFill[rc][0], kFill[rc][1], kFill[rc][2]};
+                if (ui_store_) {
+                    hud_console_color(*ui_store_, rc, "StandardProgressBorder", border);
+                    hud_console_color(*ui_store_, rc, "StandardProgressFill", fill);
+                }
                 for (int y = pb.y0; y < pb.y1 && y < int(view_h); ++y)
                     for (int x = pb.x0; x < pb.x1 && x < int(view_w); ++x) {
                         if (x < 0 || y < 0) continue;
                         const std::size_t i = (std::size_t(y) * view_w + x) * 4;
-                        out[i] = std::uint8_t(kBorder[rc][0]);
-                        out[i + 1] = std::uint8_t(kBorder[rc][1]);
-                        out[i + 2] = std::uint8_t(kBorder[rc][2]);
+                        out[i] = std::uint8_t(border[0]);
+                        out[i + 1] = std::uint8_t(border[1]);
+                        out[i + 2] = std::uint8_t(border[2]);
                         out[i + 3] = 255;
                     }
+                if (ui_store_ && cat_ && !subject.empty()) {
+                    const HudRect bt = hud_progress_button_rect(view_w, view_h, &console_panel);
+                    if (bt.w() > 0 && bt.h() > 0)
+                        if (auto ic = cat_->button_icon(subject); ic && !ic->empty())
+                            blit_icon(icons_.get(*ui_store_, ic->c_str()), bt.x0, bt.y0, bt.x1, bt.y1);
+                }
                 const float kFillInset = 0.03125f;
                 const int ix = int(float(pb.w()) * kFillInset + 0.5f);
                 const int iy = int(float(pb.h()) * kFillInset + 0.5f);
@@ -5550,9 +8412,9 @@ void MeleeGame::build_overlay(std::uint32_t view_w, std::uint32_t view_h,
                     for (int x = fx0; x < fx0 + fw && x < int(view_w); ++x) {
                         if (x < 0 || y < 0) continue;
                         const std::size_t i = (std::size_t(y) * view_w + x) * 4;
-                        out[i] = std::uint8_t(kFill[rc][0]);
-                        out[i + 1] = std::uint8_t(kFill[rc][1]);
-                        out[i + 2] = std::uint8_t(kFill[rc][2]);
+                        out[i] = std::uint8_t(fill[0]);
+                        out[i + 1] = std::uint8_t(fill[1]);
+                        out[i + 2] = std::uint8_t(fill[2]);
                         out[i + 3] = 255;
                     }
             }
@@ -5572,26 +8434,341 @@ void MeleeGame::build_overlay(std::uint32_t view_w, std::uint32_t view_h,
         for (int i = 0; i < 3; ++i) {
             const HudAuthoredRects::R& q = *kRects[i];
             if (!q.ok()) continue;
-            const std::string path = cat_->resolve_asset(std::string(kTokens[i]) + suffix);
+            std::string path = cat_->resolve_asset(std::string(kTokens[i]) + suffix);
+            if (i < 2 && !std::getenv("SC2_RESOURCE_ICON_PLATES")) {
+                const std::string bare = cat_->resolve_asset(std::string(i == 0 ? "@@UI/ResourceIconNoBackground0" : "@@UI/ResourceIconNoBackground1") + suffix);
+                if (!bare.empty() && bare[0] != '@' && icons_.get(*ui_store_, bare.c_str()).ok()) path = bare;
+            }
             if (path.empty() || path[0] == '@') continue;
             blit_icon(icons_.get(*ui_store_, path.c_str()), int(q.x0 * sc + 0.5),
                       int(q.y0 * sc + 0.5), int(q.x1 * sc + 0.5), int(q.y1 * sc + 0.5));
         }
     }
 
+    if (!harvest_labels.empty() && ui_store_ && cat_) {
+        const double hsc = double(view_h) / double(kRefHeight);
+        const std::string hsfx = ui::layout_race_suffix(console_panel.race);
+        const int saved_px = draw::forced_font_px();
+        const int fpx = std::max(6, int(16.0 * hsc + 0.5));
+        draw::set_forced_font_px(fpx);
+        const LabelLook tag_look = resolve_label_style(hud_style_set(), "TextTag", int(console_panel.race));
+        const FaceScope harvest_face(std::getenv("SC2_HARVEST_LABEL_DEFAULT_FACE")
+                                         ? nullptr
+                                         : style_face(tag_look.set && !tag_look.font.empty() ? tag_look.font : std::string("UI/Fonts/EurostileExt-Reg.otf")));
+        for (const HarvestLabel& hl : harvest_labels) {
+            const char* key = hl.res == 0 ? "UI/HarvesterCountMinerals" : "UI/HarvesterCountVespene";
+            std::string text = "Workers: %current%/%ideal%", icon_ref;
+            if (const std::string* s = cat_->strings().find(key)) {
+                text.clear();
+                for (std::size_t i = 0; i < s->size();) {
+                    if ((*s)[i] == '<') {
+                        const std::size_t e = s->find('>', i);
+                        if (e == std::string::npos) break;
+                        const std::string tag = s->substr(i, e - i + 1);
+                        const std::size_t p = tag.find("path=\"");
+                        if (tag.compare(0, 4, "<img") == 0 && p != std::string::npos) {
+                            const std::size_t q = tag.find('"', p + 6);
+                            if (q != std::string::npos) icon_ref = tag.substr(p + 6, q - p - 6);
+                        }
+                        i = e + 1;
+                    } else {
+                        text.push_back((*s)[i++]);
+                    }
+                }
+            }
+            auto subst = [&](const char* tok, int v) {
+                const std::size_t p = text.find(tok);
+                if (p != std::string::npos) text.replace(p, std::strlen(tok), std::to_string(v));
+            };
+            subst("%current%", hl.cur);
+            subst("%ideal%", hl.ideal);
+            while (!text.empty() && text.front() == ' ') text.erase(text.begin());
+            std::string icon_path;
+            if (!icon_ref.empty()) {
+                icon_path = cat_->resolve_asset(icon_ref, hsfx);
+                if (!icon_path.empty() && icon_path[0] == '@') icon_path.clear();
+            }
+            const int isz = icon_path.empty() ? 0 : int(20.0 * hsc + 0.5);
+            const int gap = isz > 0 ? int(6.0 * hsc + 0.5) : 0, pad = int(6.0 * hsc + 0.5);
+            const int tw = text_w_rgba(text, 1);
+            const int w = pad + isz + gap + tw + pad, h = std::max(isz, fpx) + int(8.0 * hsc + 0.5);
+            const int x0 = hl.sx - w / 2, y0 = hl.sy + h / 2;
+            for (int y = std::max(0, y0); y < std::min(int(view_h), y0 + h); ++y)
+                for (int x = std::max(0, x0); x < std::min(int(view_w), x0 + w); ++x) {
+                    if (hud_covers_point(view_w, view_h, &console_panel, float(x), float(y))) continue;
+                    const std::size_t di = (std::size_t(y) * view_w + std::size_t(x)) * 4;
+                    if (out[di + 3] == 0 && !std::getenv("SC2_HARVEST_PLATE_OPAQUE")) {
+                        out[di] = out[di + 1] = out[di + 2] = 0;
+                        out[di + 3] = 102;
+                        continue;
+                    }
+                    for (int c = 0; c < 3; ++c) out[di + c] = std::uint8_t(out[di + c] / 2);
+                    out[di + 3] = 255;
+                }
+            if (y0 >= 0 && y0 + h < int(view_h) && !hud_covers_point(view_w, view_h, &console_panel, float(hl.sx), float(y0 + h))) {
+                if (isz > 0)
+                    blit_icon(icons_.get(*ui_store_, icon_path.c_str()), x0 + pad, y0 + (h - isz) / 2, x0 + pad + isz, y0 + (h - isz) / 2 + isz);
+                draw_text_rgba(out, view_w, view_h, x0 + pad + isz + gap, y0 + (h - fpx) / 2 - int(2.5 * hsc + 0.5), text, 1, 232, 232, 232);
+            }
+        }
+        draw::set_forced_font_px(saved_px);
+    }
+
+    bool console_cell_art = false;
+    refresh_hud_buttons(view_w, view_h);
+    if (cfg_.human_player >= 0 && ui_store_ && console_panel.authored && !std::getenv("SC2_NO_CONSOLE_WIDGET_ART")) {
+        const int hr = human_race();
+        const char* skin = hr == 1 ? "defaultprotoss" : hr == 2 ? "defaultzerg" : "defaultterran";
+        const char* race3 = hr == 1 ? "prot" : hr == 2 ? "zerg" : "terr";
+        const double sc = double(view_h) / double(kRefHeight);
+        const double canvas_w = double(kRefHeight) * double(view_w) / double(view_h);
+        auto skin_tex = [&](const char* part) {
+            return std::string("Assets/Textures/ui_console_") + part + "_" + skin + ".dds";
+        };
+        auto px = [&](double pt) { return int(pt * sc + 0.5); };
+        auto style_font = [&](const char* style, const char* fallback) {
+            const LabelLook l = resolve_label_style(hud_style_set(), style, hr);
+            return style_face(l.set && !l.font.empty() ? l.font : std::string(fallback));
+        };
+        console_cell_art = icons_.get(*ui_store_, skin_tex("commandbutton_normal").c_str()).ok();
+        {
+            const std::string p = skin_tex("minimapbutton_normal");
+            const char* kIcons[3] = {"Assets/Textures/btn-minimap-ping.dds", "Assets/Textures/btn-minimap-toggleterrain.dds",
+                                     "Assets/Textures/btn-minimap-toggleallies.dds"};
+            const HudButtonId kIds[3] = {HudButtonId::MinimapPing, HudButtonId::MinimapTerrain, HudButtonId::MinimapColor};
+            const double kTop[3] = {1200.0 - 229.0 - 42.0, 1200.0 - 178.0 - 42.0, 1200.0 - 127.0 - 42.0};
+            const double bx = 395.0 - 9.0 - 42.0;
+            for (int i = 0; i < 3; ++i) {
+                const HudButton* hb = hud_buttons_.find(kIds[i]);
+                if (!hb) continue;
+                const IconAtlas::Icon& st = icons_.get(*ui_store_, skin_tex((std::string("minimapbutton_") + hud_look_suffix(hud_buttons_.look(*hb))).c_str()).c_str());
+                blit_icon(st.ok() ? st : icons_.get(*ui_store_, p.c_str()), hb->rect.x0, hb->rect.y0, hb->rect.x1, hb->rect.y1);
+                blit_icon_tinted(icons_.get(*ui_store_, kIcons[i]), px(bx - 3.0), px(kTop[i] - 3.0), px(bx + 45.0), px(kTop[i] + 45.0),
+                                 40.0f / 255.0f, 125.0f / 255.0f, 75.0f / 255.0f);
+            }
+        }
+        {
+            const std::string bg = skin_tex("helperbutton_background");
+            const std::string icon_w = std::string("Assets/Textures/ui_console_helperbutton_icon_worker_") + race3 + ".dds";
+            const std::string icon_a = std::string("Assets/Textures/ui_console_helperbutton_icon_army_") + race3 + ".dds";
+            const double kLeft[2] = {0.0, 87.0};
+            const std::string* kIcon[2] = {&icon_w, &icon_a};
+            const char* kKey[2] = {"F1", "F2"};
+            const double bottom = 1200.0 - 327.0 + 25.0;
+            const float kIconTint[3][3] = {{0.0f, 200.0f, 120.0f}, {100.0f, 180.0f, 255.0f}, {255.0f, 120.0f, 20.0f}};
+            const float kCountTint[3][3] = {{60.0f, 255.0f, 150.0f}, {40.0f, 100.0f, 255.0f}, {150.0f, 100.0f, 50.0f}};
+            const int ri = hr == 1 ? 1 : hr == 2 ? 2 : 0;
+            const int kCount[2] = {content.idle_workers, content.army_units};
+            const IconAtlas::Icon& counter = icons_.get(*ui_store_, "Assets/Textures/ui_console_menubutton_counter.dds");
+            for (int i = 0; i < 2; ++i) {
+                const bool on = kCount[i] > 0;
+                const double top = bottom - 72.0;
+                blit_icon(icons_.get(*ui_store_, bg.c_str()), px(kLeft[i]), px(bottom - 62.0), px(kLeft[i] + 92.0), px(bottom));
+                const float ig = 98.0f / 255.0f;
+                blit_icon_tinted(icons_.get(*ui_store_, kIcon[i]->c_str()), px(kLeft[i] + 9.0), px(bottom - 53.0), px(kLeft[i] + 81.0),
+                                 px(bottom - 11.0), on ? kIconTint[ri][0] / 255.0f : ig, on ? kIconTint[ri][1] / 255.0f : ig,
+                                 on ? kIconTint[ri][2] / 255.0f : ig);
+                if (i == 0 && on && !std::getenv("SC2_NO_HELPER_GLOW")) {
+                    const float gl = hud_helper_glow(hud_ui_.selection.glow_t);
+                    blit_icon_add(icons_.get(*ui_store_, bg.c_str()), px(kLeft[i]), px(bottom - 62.0), px(kLeft[i] + 92.0), px(bottom), gl, 1.0f, 1.0f, 1.0f);
+                    blit_icon_add(icons_.get(*ui_store_, kIcon[i]->c_str()), px(kLeft[i] + 9.0), px(bottom - 53.0), px(kLeft[i] + 81.0), px(bottom - 11.0),
+                                  gl * 200.0f / 255.0f, kIconTint[ri][0] / 255.0f, kIconTint[ri][1] / 255.0f, kIconTint[ri][2] / 255.0f);
+                }
+                draw_text_rgba(out, view_w, view_h, px(kLeft[i] + 50.0), px(bottom - 31.0), kKey[i], 1, 235, 240, 236);
+                if (counter.ok()) {
+                    const int cx0 = px(kLeft[i] + 48.0), cy0 = px(top), cx1 = px(kLeft[i] + 92.0), cy1 = px(top + 28.0);
+                    static const bool wide_corner = std::getenv("SC2_HELPER_COUNT_WIDE_CORNER") != nullptr;
+                    const int cs = 8, cd = std::max(1, px(8.0));
+                    if (!wide_corner) {
+                        const float dk = 0.5f;
+                        blit_nine(counter, (kLeft[i] + 48.0) * sc, top * sc, (kLeft[i] + 92.0) * sc, (top + 28.0) * sc, double(counter.w) * 0.5 * double(view_h) / 2160.0, on ? kCountTint[ri][0] / 255.0f : dk, on ? kCountTint[ri][1] / 255.0f : dk,
+                                  on ? kCountTint[ri][2] / 255.0f : dk, on ? 0.0f : 5.0f);
+                    } else
+                    for (int y = cy0; y < cy1; ++y)
+                        for (int x = cx0; x < cx1; ++x) {
+                            if (x < 0 || y < 0 || x >= int(view_w) || y >= int(view_h)) continue;
+                            const int lx = x - cx0, ly = y - cy0, w = cx1 - cx0, h = cy1 - cy0;
+                            const int sx = lx < cd ? lx * cs / cd : lx >= w - cd ? int(counter.w) - 1 - (w - 1 - lx) * cs / cd : int(counter.w) / 2;
+                            const int sy = ly < cd ? ly * cs / cd : ly >= h - cd ? int(counter.h) - 1 - (h - 1 - ly) * cs / cd : int(counter.h) / 2;
+                            const std::size_t si = (std::size_t(sy) * counter.w + std::size_t(sx)) * 4;
+                            const float a = counter.rgba[si + 3] / 255.0f;
+                            if (a <= 0.0f) continue;
+                            const std::size_t di = (std::size_t(y) * view_w + std::size_t(x)) * 4;
+                            for (int c = 0; c < 3; ++c) {
+                                const float src = on ? float(counter.rgba[si + c]) * kCountTint[ri][c] / 255.0f : float(counter.rgba[si + c]) * 0.24f + 5.0f;
+                                out[di + c] = std::uint8_t(src * a + out[di + c] * (1.0f - a));
+                            }
+                            const float da = out[di + 3] / 255.0f;
+                            out[di + 3] = std::uint8_t((a + da * (1.0f - a)) * 255.0f + 0.5f);
+                        }
+                    const std::string n = std::to_string(kCount[i]);
+                    const int fpx = std::max(6, px(16.0));
+                    const int saved_px = draw::forced_font_px();
+                    draw::set_forced_font_px(fpx);
+                    const FaceScope count_face(std::getenv("SC2_HELPER_COUNT_DEFAULT_FACE") ? nullptr : style_font("IdleButtonCharge", "UI/Fonts/Eurostile-Reg.otf"));
+                    const int nw = text_w_rgba(n, 1);
+                    const int g = on ? 235 : 112;
+                    const int dxy = wide_corner ? 1 : -1;
+                    draw_text_rgba(out, view_w, view_h, (cx0 + cx1) / 2 + dxy - nw / 2, (cy0 + cy1) / 2 + dxy - fpx / 2, n.c_str(), 1, g, g, g);
+                    draw::set_forced_font_px(saved_px);
+                }
+            }
+        }
+        {
+            const std::string clock = hud_clock_text(content.game_seconds);
+            const IconAtlas::Icon& plate = icons_.get(*ui_store_, skin_tex("timer_background").c_str());
+            if (!clock.empty()) {
+                const int fpx = std::max(6, px(20.0));
+                const int saved_px = draw::forced_font_px();
+                draw::set_forced_font_px(fpx);
+                const FaceScope clock_face(std::getenv("SC2_CLOCK_DEFAULT_FACE") ? nullptr : style_font("MissionTimePanel", "UI/Fonts/EurostileExt-Reg.otf"));
+                const int tw_digits = text_w_rgba(clock, 1);
+                const int tw = tw_digits + (std::getenv("SC2_CLOCK_LABEL_TIGHT") ? 0 : int(8.0 * sc + 0.5));
+                if (std::getenv("SC2_ENV_TRACE")) {
+                    static bool once = false;
+                    if (!once) {
+                        once = true;
+                        std::fprintf(stderr, "[clock] '%s' digits %d px, space %d px, em %d px\n", clock.c_str(), tw_digits, text_w_rgba(" ", 1), fpx);
+                    }
+                }
+                const int x0 = px(290.0), y0 = px(1200.0 - 302.0 - 44.0), y1 = px(1200.0 - 302.0);
+                const int tx = px(305.0);
+                const int x1 = tx + tw + px(10.0);
+                if (plate.ok() && plate.w >= 2 && plate.h >= 2) {
+                    const int w = x1 - x0, h = y1 - y0;
+                    const int half_src = int(plate.w) / 2, half_h = int(plate.h) / 2;
+                    const int cap = std::min(px(double(half_src)), w / 2);
+                    for (int y = 0; y < h; ++y)
+                        for (int x = 0; x < w; ++x) {
+                            const int dx = x0 + x, dy = y0 + y;
+                            if (dx < 0 || dy < 0 || dx >= int(view_w) || dy >= int(view_h)) continue;
+                            int sx = 0, sy = y * half_h / h;
+                            if (x < cap) sx = int(double(x) / sc);
+                            else if (x >= w - cap) sx = int(plate.w) - 1 - int(double(w - 1 - x) / sc);
+                            else { sx = half_src; sy += half_h; }
+                            sx = std::max(0, std::min(int(plate.w) - 1, sx));
+                            const std::size_t si = (std::size_t(sy) * plate.w + std::size_t(sx)) * 4;
+                            const float a = plate.rgba[si + 3] / 255.0f;
+                            if (a <= 0.0f) continue;
+                            const std::size_t di = (std::size_t(dy) * view_w + std::size_t(dx)) * 4;
+                            for (int c = 0; c < 3; ++c) out[di + c] = std::uint8_t(plate.rgba[si + c] * a + out[di + c] * (1.0f - a));
+                            const float da = out[di + 3] / 255.0f;
+                            out[di + 3] = std::uint8_t((a + da * (1.0f - a)) * 255.0f + 0.5f);
+                        }
+                }
+                const int lr = hr == 1 ? 110 : hr == 2 ? 245 : 155, lg = hr == 1 ? 170 : hr == 2 ? 140 : 255, lb = hr == 1 ? 255 : hr == 2 ? 70 : 190;
+                const int ink_dx = std::getenv("SC2_CLOCK_LABEL_TIGHT") ? 0 : int(2.0 * sc + 0.5);
+                draw_text_rgba(out, view_w, view_h, tx + ink_dx, (px(1200.0 - 302.0 - 37.0) + px(1200.0 - 302.0 - 4.0)) / 2 - fpx / 2 - px(3.0), clock.c_str(), 1, lr, lg, lb);
+                draw::set_forced_font_px(saved_px);
+            }
+        }
+        if (!std::getenv("SC2_NO_ALLIANCE_BUTTON")) {
+            const int ar = human_race();
+            const char* suf = ar == 1 ? "_protoss" : ar == 2 ? "_zerg" : "";
+            const HudButton* hb = hud_buttons_.find(HudButtonId::Alliance);
+            const HudButton* hov = hud_buttons_.hovered();
+            const bool over = hb && hov && hov->id == HudButtonId::Alliance;
+            const std::string ap = std::string("Assets/Textures/ui_alliance_button_") + (over ? "normaloverpressedover" : "normalpressed") + suf + ".dds";
+            const IconAtlas::Icon& both = icons_.get(*ui_store_, ap.c_str());
+            if (hb && both.ok() && both.h >= 2) {
+                IconAtlas::Icon half;
+                half.w = both.w;
+                half.h = both.h / 2;
+                const std::ptrdiff_t n = std::ptrdiff_t(std::size_t(half.w) * half.h * 4);
+                const std::ptrdiff_t off = hb->toggled ? n : 0;
+                half.rgba.assign(both.rgba.begin() + off, both.rgba.begin() + off + n);
+                blit_icon(half, hb->rect.x0, hb->rect.y0, hb->rect.x1, hb->rect.y1);
+            }
+        }
+        {
+            const std::string p = skin_tex("menubar_background");
+            const double bottom = 1200.0 - 267.0;
+            const double bx0 = canvas_w - 241.0, by0 = bottom - 56.0;
+            blit_icon(icons_.get(*ui_store_, p.c_str()), px(bx0), px(by0), px(canvas_w), px(bottom));
+            const std::string nb = skin_tex("menubutton_normal");
+            const double kBtnX[4] = {bx0 + 9.0, bx0 + 59.0, bx0 + 110.0, canvas_w - 10.0 - 70.0};
+            const double kBtnW[4] = {36.0, 36.0, 36.0, 70.0};
+            const char* kBtnIcon[3] = {"Assets/Textures/ui_console_icon_help.dds", "Assets/Textures/ui_console_icon_chat.dds",
+                                       "Assets/Textures/ui_console_icon_social.dds"};
+            for (int i = 0; i < 4; ++i) {
+                const double x0 = kBtnX[i], y0 = by0 + 9.0;
+                const HudButtonId kMenuIds[4] = {HudButtonId::MenuHelp, HudButtonId::MenuChat, HudButtonId::MenuSocial, HudButtonId::MenuMenu};
+                const HudButton* hb = hud_buttons_.find(kMenuIds[i]);
+                const IconAtlas::Icon& mst = icons_.get(*ui_store_, skin_tex((std::string("menubutton_") + hud_look_suffix(hb ? hud_buttons_.look(*hb) : HudLook::Normal)).c_str()).c_str());
+                blit_icon(mst.ok() ? mst : icons_.get(*ui_store_, nb.c_str()), px(x0), px(y0), px(x0 + kBtnW[i]), px(y0 + 36.0));
+                if (i < 3)
+                    blit_icon_tinted(icons_.get(*ui_store_, kBtnIcon[i]), px(x0 + 2.0), px(y0 + 2.0), px(x0 + 34.0), px(y0 + 34.0),
+                                     0.0f, 200.0f / 255.0f, 120.0f / 255.0f);
+                if (i == 2 && !std::getenv("SC2_NO_SOCIAL_BADGE")) {
+                    const IconAtlas::Icon& badge = icons_.get(*ui_store_, "Assets/Textures/ui_console_menubutton_counter.dds");
+                    const float kBadgeTint[3][3] = {{60.0f, 255.0f, 150.0f}, {40.0f, 100.0f, 255.0f}, {150.0f, 100.0f, 50.0f}};
+                    const int bri = hr == 1 ? 1 : hr == 2 ? 2 : 0;
+                    const double ftop = y0 + 36.0 - 51.0;
+                    const int cx0 = px(x0 + 50.0 - 2.0 - 28.0), cy0 = px(ftop + 1.0), cx1 = px(x0 + 48.0), cy1 = px(ftop + 26.0);
+                    if (badge.ok()) {
+                        blit_nine(badge, (x0 + 20.0) * sc, (ftop + 1.0) * sc, (x0 + 48.0) * sc, (ftop + 26.0) * sc, double(badge.w) * 0.5 * double(view_h) / 2160.0, kBadgeTint[bri][0] / 255.0f, kBadgeTint[bri][1] / 255.0f,
+                                  kBadgeTint[bri][2] / 255.0f, 0.0f);
+                        const int fpx = std::max(6, px(16.0));
+                        const int saved_px = draw::forced_font_px();
+                        draw::set_forced_font_px(fpx);
+                        const FaceScope count_face(style_font("IdleButtonCharge", "UI/Fonts/Eurostile-Reg.otf"));
+                        const int nw = text_w_rgba("0", 1);
+                        draw_text_rgba(out, view_w, view_h, (cx0 + cx1) / 2 - 1 - nw / 2, (cy0 + cy1) / 2 - 1 - fpx / 2, "0", 1, 235, 236, 236);
+                        draw::set_forced_font_px(saved_px);
+                    }
+                }
+                if (i == 3) {
+                    const int fpx = std::max(6, px(16.0));
+                    const int saved_px = draw::forced_font_px();
+                    draw::set_forced_font_px(fpx);
+                    const FaceScope menu_face(std::getenv("SC2_MENU_LABEL_DEFAULT_FACE") ? nullptr : style_font("MenuBarButton", "UI/Fonts/Eurostile-Bol.otf"));
+                    const int mw = text_w_rgba("Menu", 1);
+                    const int lr = hr == 1 ? 110 : hr == 2 ? 245 : 155, lg = hr == 1 ? 170 : hr == 2 ? 140 : 255, lb = hr == 1 ? 255 : hr == 2 ? 70 : 190;
+                    draw_text_rgba(out, view_w, view_h, (px(x0) + px(x0 + kBtnW[i])) / 2 - mw / 2, (px(y0) + px(y0 + 36.0)) / 2 - fpx / 2 - 1, "Menu", 1, lr, lg, lb);
+                    draw::set_forced_font_px(saved_px);
+                }
+            }
+        }
+    }
+
     hud_group_buttons_.clear();
+    hud_empty_group_tab_ = HudRect{0, 0, 0, 0};
     if (cfg_.human_player >= 0 && ui_store_ && cat_ && console_panel.authored &&
         console_panel.authored->control_group.ok()) {
         const double sc = double(view_h) / double(kRefHeight);
         const HudAuthoredRects::R& panel = console_panel.authored->control_group;
-        const std::string normal = cat_->resolve_asset("@@UI/Game_Console_Buttons_ControlGroup_Normal");
+        const std::string race_sfx = ui::layout_race_suffix(console_panel.race);
+        std::string normal =
+            cat_->resolve_asset("@@@UI/Game_Console_Buttons_ControlGroup_Normal", race_sfx, race_sfx);
+        if (normal.empty() || normal[0] == '@') {
+            const int hr2 = human_race();
+            const std::string skinned = std::string("Assets/Textures/ui_console_controlgroupbutton_normal_") +
+                                        (hr2 == 1 ? "defaultprotoss" : hr2 == 2 ? "defaultzerg" : "defaultterran") + ".dds";
+            if (icons_.get(*ui_store_, skinned.c_str()).ok()) normal = skinned;
+        }
+        if (normal.empty() || normal[0] == '@')
+            normal = cat_->resolve_asset("@@UI/ControlGroupButtonNormal", race_sfx);
         const bool have_normal = !normal.empty() && normal[0] != '@';
         const float bw = 82.0f, bh = 64.0f, step = bw - 6.0f;
         float bx = panel.x0;
         const float by = panel.y1 - bh;
         const int order[10] = {1, 2, 3, 4, 5, 6, 7, 8, 9, 0};
+        bool any_group = false;
+        for (int slot : order)
+            if (!groups_.recall(slot).empty()) any_group = true;
+        const bool bare_tab = !any_group && !std::getenv("SC2_NO_EMPTY_GROUP_TAB");
         for (int slot : order) {
             const std::vector<std::uint32_t> ids = groups_.recall(slot);
+            if (ids.empty() && bare_tab && slot == 1) {
+                const int rx0 = int(bx * sc + 0.5), ry0 = int(by * sc + 0.5), rx1 = int((bx + bw) * sc + 0.5), ry1 = int((by + bh) * sc + 0.5);
+                if (have_normal) blit_icon(icons_.get(*ui_store_, normal.c_str()), rx0, ry0, rx1, ry1);
+                hud_empty_group_tab_ = HudRect{rx0, ry0, rx1, ry1};
+                const LabelLook il = resolve_label_style(hud_style_set(), hud_authored_ ? hud_authored_->style_group_index : std::string(), human_race());
+                const FaceScope index_face(style_face(il.font));
+                draw_text_rgba(out, view_w, view_h, int((bx + bw * 0.5f) * sc + 0.5) - text_w_rgba("1", 1) / 2,
+                               int((by + bh - 6.0f - 20.0f) * sc + 0.5), "1", 1, il.set ? il.r : 200, il.set ? il.g : 208, il.set ? il.b : 220);
+                continue;
+            }
             if (ids.empty()) continue;
             if (bx + bw > panel.x1 + 0.5f) break;
             HudGroupButton b;
@@ -5609,10 +8786,22 @@ void MeleeGame::build_overlay(std::uint32_t view_w, std::uint32_t view_h,
                           int((bx + 37.0f) * sc + 0.5), int((by + 37.0f) * sc + 0.5));
             char count[16];
             std::snprintf(count, sizeof count, "%d", b.count);
-            draw_text_rgba(out, view_w, view_h, int((bx + 44.0f) * sc + 0.5), int((by + 10.0f) * sc + 0.5), count, 2, 230, 232, 236);
+            const LabelLook cl = resolve_label_style(
+                hud_style_set(), hud_authored_ ? hud_authored_->style_group_count : std::string(),
+                human_race());
+            draw_text_rgba(out, view_w, view_h, int((bx + 44.0f) * sc + 0.5),
+                           int((by + 10.0f) * sc + 0.5), count, 2, cl.set ? cl.r : 230,
+                           cl.set ? cl.g : 232, cl.set ? cl.b : 236);
             char index[4];
             std::snprintf(index, sizeof index, "%d", slot);
-            draw_text_rgba(out, view_w, view_h, int((bx + bw * 0.5f - 4.0f) * sc + 0.5), int((by + bh - 6.0f - 12.0f) * sc + 0.5), index, 1, 200, 208, 220);
+            const LabelLook il = resolve_label_style(
+                hud_style_set(), hud_authored_ ? hud_authored_->style_group_index : std::string(),
+                human_race());
+            const FaceScope index_face(style_face(il.font));
+            draw_text_rgba(out, view_w, view_h,
+                           int((bx + bw * 0.5f) * sc + 0.5) - text_w_rgba(index, 1) / 2,
+                           int((by + bh - 6.0f - 20.0f) * sc + 0.5), index, 1,
+                           il.set ? il.r : 200, il.set ? il.g : 208, il.set ? il.b : 220);
             hud_group_buttons_.push_back(std::move(b));
             bx += step;
         }
@@ -5646,20 +8835,44 @@ void MeleeGame::build_overlay(std::uint32_t view_w, std::uint32_t view_h,
     }
 
     hud_page_buttons_.clear();
-    if (group_pages > 1 && ui_store_ && cat_ && console_panel.authored && console_panel.authored->page_buttons_ok) {
+    const int page_buttons = (group_pages < 1 && !group_pane.empty() && !std::getenv("SC2_NO_GROUP_PORTRAIT")) ? 1 : group_pages;
+    if ((group_pages > 1 || page_buttons == 1) && ui_store_ && cat_ && console_panel.authored && console_panel.authored->page_buttons_ok) {
         const double sc = double(view_h) / double(kRefHeight);
         const std::string normal = cat_->resolve_asset("@@UI/GroupPageButtonNormal");
         const std::string hover = cat_->resolve_asset("@@UI/GroupPageButtonHover");
-        for (int p = 0; p < group_pages; ++p) {
+        for (int p = 0; p < std::max(group_pages, page_buttons); ++p) {
             const HudAuthoredRects::R& q = console_panel.authored->page_buttons[p];
             HudPageButton pb;
             pb.page = p;
             pb.rect = {int(q.x0 * sc + 0.5), int(q.y0 * sc + 0.5), int(q.x1 * sc + 0.5), int(q.y1 * sc + 0.5)};
             const std::string& img = p == group_page_ ? hover : normal;
-            if (!img.empty() && img[0] != '@') blit_icon(icons_.get(*ui_store_, img.c_str()), pb.rect.x0, pb.rect.y0, pb.rect.x1, pb.rect.y1);
+            if (!img.empty() && img[0] != '@') {
+                const IconAtlas::Icon& tab = icons_.get(*ui_store_, img.c_str());
+                if (tab.ok() && tab.h >= 2 && pb.rect.w() > 0 && pb.rect.h() > 0 && !std::getenv("SC2_NO_GROUP_PORTRAIT")) {
+                    int tc[3] = {40, 125, 75};
+                    hud_console_color(*ui_store_, console_panel.race, "StandardBorder", tc);
+                    const int half = int(tab.h) / 2;
+                    for (int y = pb.rect.y0; y < pb.rect.y1 && y < int(view_h); ++y)
+                        for (int x = pb.rect.x0; x < pb.rect.x1 && x < int(view_w); ++x) {
+                            if (x < 0 || y < 0) continue;
+                            const int sx = (x - pb.rect.x0) * int(tab.w) / pb.rect.w(), sy = (y - pb.rect.y0) * half / pb.rect.h();
+                            const std::size_t si = (std::size_t(sy) * tab.w + std::size_t(sx)) * 4;
+                            const float a = tab.rgba[si + 3] / 255.0f;
+                            if (a <= 0.0f) continue;
+                            const std::size_t di = (std::size_t(y) * view_w + std::size_t(x)) * 4;
+                            for (int k = 0; k < 3; ++k)
+                                out[di + k] = std::uint8_t(float(tab.rgba[si + k]) / 255.0f * float(tc[k]) * a + out[di + k] * (1.0f - a) + 0.5f);
+                            out[di + 3] = 255;
+                        }
+                } else {
+                    blit_icon(tab, pb.rect.x0, pb.rect.y0, pb.rect.x1, pb.rect.y1);
+                }
+            }
             char label[4];
             std::snprintf(label, sizeof label, "%d", p + 1);
-            draw_text_rgba(out, view_w, view_h, (pb.rect.x0 + pb.rect.x1) / 2 - 3, (pb.rect.y0 + pb.rect.y1) / 2 - 6, label, 1, 220, 224, 232);
+            draw_text_rgba(out, view_w, view_h,
+                           (pb.rect.x0 + pb.rect.x1) / 2 - text_w_rgba(label, 1) / 2,
+                           (pb.rect.y0 + pb.rect.y1) / 2 - 6, label, 1, 220, 224, 232);
             hud_page_buttons_.push_back(pb);
         }
     }
@@ -5669,6 +8882,48 @@ void MeleeGame::build_overlay(std::uint32_t view_w, std::uint32_t view_h,
             if (s.w() <= 0) continue;
             const std::uint32_t id = group_pane[i];
             const Unit& gu = world_.unit(id);
+            if (console_cell_art && cat_) {
+                const std::string wf_name = cat_->unit_wireframe_image(gu.catalog_id).value_or(std::string());
+                const IconAtlas::Icon& gwf = icons_.get(*ui_store_, wf_name);
+                if (!wf_name.empty() && gwf.ok()) {
+                    const int ghr = human_race();
+                    const std::string cellp = std::string("Assets/Textures/ui_console_commandbutton_normal_") +
+                                              (ghr == 1 ? "defaultprotoss" : ghr == 2 ? "defaultzerg" : "defaultterran") + ".dds";
+                    bool framed = false;
+                    if (!std::getenv("SC2_NO_GROUP_PORTRAIT")) {
+                        const std::string fpath = cat_->resolve_asset("@@UI/ButtonBorderQueueActiveNormal", ui::layout_race_suffix(console_panel.race));
+                        const IconAtlas::Icon* ft = (!fpath.empty() && fpath[0] != '@') ? &icons_.get(*ui_store_, fpath.c_str()) : nullptr;
+                        if (ft && ft->ok() && ft->h >= 2 && s.w() > 0 && s.h() > 0) {
+                            int fc[3] = {155, 255, 190};
+                            hud_console_color(*ui_store_, console_panel.race, "StandardButtonIcon", fc);
+                            const int fhalf = int(ft->h) / 2;
+                            for (int y = s.y0; y < s.y1 && y < int(view_h); ++y)
+                                for (int x = s.x0; x < s.x1 && x < int(view_w); ++x) {
+                                    if (x < 0 || y < 0) continue;
+                                    const int sx = (x - s.x0) * int(ft->w) / s.w(), sy = (y - s.y0) * fhalf / s.h();
+                                    const std::size_t si = (std::size_t(sy) * ft->w + std::size_t(sx)) * 4;
+                                    const float a = ft->rgba[si + 3] / 255.0f;
+                                    if (a <= 0.0f) continue;
+                                    const std::size_t di = (std::size_t(y) * view_w + std::size_t(x)) * 4;
+                                    for (int k = 0; k < 3; ++k)
+                                        out[di + k] = std::uint8_t(float(ft->rgba[si + k]) / 255.0f * float(fc[k]) * a + out[di + k] * (1.0f - a) + 0.5f);
+                                    out[di + 3] = 255;
+                                }
+                            framed = true;
+                        }
+                    }
+                    if (!framed) blit_icon(icons_.get(*ui_store_, cellp.c_str()), s.x0, s.y0, s.x1, s.y1);
+                    float glf = gu.hp_max.raw() > 0 ? float(gu.hp.to_double() / gu.hp_max.to_double()) : 1.0f;
+                    float tr = 0.0f, tg = 1.0f, tb = 0.0f;
+                    if (glf <= 0.3f) { tr = 0.88f; tg = 0.29f; tb = 0.24f; }
+                    else if (glf <= 0.6f) { tr = 0.90f; tg = 0.82f; tb = 0.27f; }
+                    const bool mask = cat_->unit_race_index(gu.catalog_id) != 2;
+                    const int inset = framed ? std::max(1, s.w() / 20) : std::max(2, s.w() / 10);
+                    blit_icon_tinted(gwf, s.x0 + inset, s.y0 + inset, s.x1 - inset, s.y1 - inset,
+                                     mask ? tr : 1.0f, mask ? tg : 1.0f, mask ? tb : 1.0f);
+                    continue;
+                }
+            }
             for (int y = s.y0; y < s.y1 && y < int(view_h); ++y)
                 for (int x = s.x0; x < s.x1 && x < int(view_w); ++x) {
                     if (x < 0 || y < 0) continue;
@@ -5715,6 +8970,219 @@ void MeleeGame::build_overlay(std::uint32_t view_w, std::uint32_t view_h,
         }
     }
 
+    if (ui_store_ && cat_ && selection_.size() == 1 && selection_[0] < world_.units().size() &&
+        world_.unit(selection_[0]).alive) {
+        std::vector<std::uint32_t> shown;
+        int slot = 0;
+        for (const sim::BehaviorInstance& bi : world_.unit(selection_[0]).behaviors) {
+            if (slot >= 6) break;
+            if (!bi.src || std::find(shown.begin(), shown.end(), bi.src) != shown.end()) continue;
+            shown.push_back(bi.src);
+            const std::string& bid = behavior_id_of_tag(bi.src);
+            if (bid.empty()) continue;
+            const auto ic = cat_->behavior_info_icon(bid);
+            if (!ic || ic->empty()) continue;
+            const HudRect s = hud_behavior_slot(view_w, view_h, slot, &console_panel);
+            if (s.w() <= 0) break;
+            blit_icon(icons_.get(*ui_store_, ic->c_str()), s.x0, s.y0, s.x1, s.y1);
+            ++slot;
+        }
+    }
+
+    if (ui_store_ && cat_ && selection_.size() == 1 && selection_[0] < world_.units().size() &&
+        world_.unit(selection_[0]).alive && world_.unit(selection_[0]).player == cfg_.human_player) {
+        const std::uint32_t sel = selection_[0];
+        auto slot_backdrop = [&](const HudRect& s) {
+            for (int y = s.y0; y < s.y1 && y < int(view_h); ++y)
+                for (int x = s.x0; x < s.x1 && x < int(view_w); ++x) {
+                    if (x < 0 || y < 0) continue;
+                    const std::size_t di = (std::size_t(y) * view_w + x) * 4;
+                    out[di] = std::uint8_t(22 * 0.55f + out[di] * 0.45f);
+                    out[di + 1] = std::uint8_t(28 * 0.55f + out[di + 1] * 0.45f);
+                    out[di + 2] = std::uint8_t(40 * 0.55f + out[di + 2] * 0.45f);
+                    out[di + 3] = 255;
+                }
+        };
+        auto slot_bar = [&](const HudRect& s, float f, std::uint8_t r, std::uint8_t g, std::uint8_t b) {
+            const int bx0 = s.x0 + 3, bx1 = s.x1 - 3, by1 = s.y1 - 3, by0 = by1 - 9;
+            f = f < 0.0f ? 0.0f : (f > 1.0f ? 1.0f : f);
+            const int fillw = int(float(bx1 - bx0) * f + 0.5f);
+            for (int y = by0; y < by1 && y < int(view_h); ++y)
+                for (int x = bx0; x < bx1 && x < int(view_w); ++x) {
+                    if (x < 0 || y < 0) continue;
+                    const std::size_t di = (std::size_t(y) * view_w + x) * 4;
+                    const bool on = x < bx0 + fillw;
+                    out[di] = on ? r : 12;
+                    out[di + 1] = on ? g : 14;
+                    out[di + 2] = on ? b : 18;
+                    out[di + 3] = 255;
+                }
+        };
+        auto slot_icon = [&](const HudRect& s, const std::string& unit_id) {
+            if (unit_id.empty()) return;
+            if (auto ic = cat_->button_icon(unit_id))
+                if (!ic->empty()) blit_icon(icons_.get(*ui_store_, ic->c_str()), s.x0 + 1, s.y0 + 1, s.x1 - 1, s.y1 - 1);
+        };
+        int slot_border[3] = {60, 70, 88};
+        if (ui_store_) hud_console_color(*ui_store_, console_panel.race, "StandardButtonBorder", slot_border);
+        const std::vector<sim::World::QueueSlotView> queue = world_.queue_view(sel);
+        auto queue_border = [&](const HudRect& s, int slot_no, const int* tint) {
+            if (!cat_ || std::getenv("SC2_QUEUE_SLOT_BOXES") || s.w() <= 0 || s.h() <= 0) return false;
+            char key[64];
+            if (slot_no <= 1) std::snprintf(key, sizeof key, "@@UI/ButtonBorderQueueActiveNormal");
+            else std::snprintf(key, sizeof key, "@@UI/ButtonBorderQueueInactive%02dNormal", slot_no);
+            const std::string path = cat_->resolve_asset(key, ui::layout_race_suffix(console_panel.race));
+            if (path.empty() || path[0] == '@') return false;
+            const IconAtlas::Icon& tex = icons_.get(*ui_store_, path.c_str());
+            if (!tex.ok() || tex.h < 2) return false;
+            const int half = int(tex.h) / 2;
+            for (int y = s.y0; y < s.y1 && y < int(view_h); ++y)
+                for (int x = s.x0; x < s.x1 && x < int(view_w); ++x) {
+                    if (x < 0 || y < 0) continue;
+                    const int sx = (x - s.x0) * int(tex.w) / s.w(), sy = (y - s.y0) * half / s.h();
+                    const std::size_t si = (std::size_t(sy) * tex.w + std::size_t(sx)) * 4;
+                    const float a = tex.rgba[si + 3] / 255.0f;
+                    if (a <= 0.0f) continue;
+                    const std::size_t di = (std::size_t(y) * view_w + std::size_t(x)) * 4;
+                    for (int k = 0; k < 3; ++k)
+                        out[di + k] = std::uint8_t(float(tex.rgba[si + k]) / 255.0f * float(tint[k]) * a + out[di + k] * (1.0f - a) + 0.5f);
+                    out[di + 3] = 255;
+                }
+            return true;
+        };
+        if (!queue.empty() && !std::getenv("SC2_QUEUE_PANE_OLD")) {
+            const double qs = double(view_h) / double(kRefHeight);
+            int icon_col[3] = {155, 255, 190};
+            hud_console_color(*ui_store_, console_panel.race, "StandardButtonIcon", icon_col);
+            int pfill[3] = {155, 255, 190}, pborder[3] = {40, 125, 75};
+            hud_console_color(*ui_store_, console_panel.race, "StandardProgressFill", pfill);
+            hud_console_color(*ui_store_, console_panel.race, "StandardProgressBorder", pborder);
+            const int saved_px = draw::forced_font_px();
+            for (int q = 1; q <= 4; ++q) {
+                if (std::size_t(q) < queue.size()) continue;
+                const HudRect s = hud_queue_slot(view_w, view_h, q, &console_panel);
+                if (s.w() <= 0) continue;
+                slot_backdrop(s);
+                if (queue_border(s, q + 1, icon_col)) continue;
+                draw_box_rgba(out, view_w, view_h, s.x0, s.y0, s.x1, s.y1, std::uint8_t(icon_col[0]), std::uint8_t(icon_col[1]), std::uint8_t(icon_col[2]));
+                draw_box_rgba(out, view_w, view_h, s.x0 + 1, s.y0 + 1, s.x1 - 1, s.y1 - 1, std::uint8_t(icon_col[0]), std::uint8_t(icon_col[1]), std::uint8_t(icon_col[2]));
+                const std::string num = std::to_string(q + 1);
+                const int npx = std::max(8, int(36.0 * qs + 0.5));
+                draw::set_forced_font_px(npx);
+                const int nw = text_w_rgba(num, 1);
+                draw_text_rgba(out, view_w, view_h, (s.x0 + s.x1) / 2 - nw / 2, (s.y0 + s.y1) / 2 - npx / 2, num.c_str(), 1,
+                               std::uint8_t(icon_col[0]), std::uint8_t(icon_col[1]), std::uint8_t(icon_col[2]));
+            }
+            const HudRect a = hud_queue_slot(view_w, view_h, 0, &console_panel);
+            if (a.w() > 0) {
+                const int bx0 = a.x1 + int(4.0 * qs + 0.5), bx1 = bx0 + int(128.0 * qs + 0.5);
+                const bool old_bar = std::getenv("SC2_QUEUE_SLOT_BOXES") != nullptr;
+                const int by1 = a.y1 - int(4.0 * qs + 0.5), by0 = by1 - std::max(3, int((old_bar ? 8.0 : 13.0) * qs + 0.5));
+                const int inset = old_bar ? 1 : std::max(1, int(4.0 * qs + 0.5));
+                const float pf = queue[0].progress < 0.0f ? 0.0f : (queue[0].progress > 1.0f ? 1.0f : queue[0].progress);
+                const int fillx = bx0 + inset + int(float(bx1 - bx0 - 2 * inset) * pf + 0.5f);
+                for (int y = by0; y < by1 && y < int(view_h); ++y)
+                    for (int x = bx0; x < bx1 && x < int(view_w); ++x) {
+                        if (x < 0 || y < 0) continue;
+                        const std::size_t di = (std::size_t(y) * view_w + std::size_t(x)) * 4;
+                        const bool corner = !old_bar && (x == bx0 || x == bx1 - 1) && (y == by0 || y == by1 - 1);
+                        if (corner) continue;
+                        const bool edge = y == by0 || y == by1 - 1 || x == bx0 || x == bx1 - 1;
+                        const bool on = !edge && x < fillx && x >= bx0 + inset && y >= by0 + inset && y < by1 - inset;
+                        out[di] = std::uint8_t(edge ? pborder[0] : on ? pfill[0] : 10);
+                        out[di + 1] = std::uint8_t(edge ? pborder[1] : on ? pfill[1] : 14);
+                        out[di + 2] = std::uint8_t(edge ? pborder[2] : on ? pfill[2] : 12);
+                        out[di + 3] = 255;
+                    }
+                std::string word = "Training";
+                if (const std::string* w = cat_->strings().find("UI/Training")) word = *w;
+                const LabelLook al = resolve_label_style(hud_style_set(), "QueueActivity", human_race());
+                const FaceScope activity_face(old_bar ? nullptr : style_face(al.font));
+                const int lpx = std::max(6, int((!old_bar && al.height > 0 ? double(al.height) : 14.0) * qs + 0.5));
+                draw::set_forced_font_px(lpx);
+                const bool styled = al.set && !old_bar;
+                draw_text_rgba(out, view_w, view_h, bx0 + (old_bar ? 0 : int(4.0 * qs + 0.5)), by0 - int((old_bar ? 2.0 : 12.0) * qs + 0.5) - lpx - 1, word.c_str(), 1, styled ? al.r : 214,
+                               styled ? al.g : 226, styled ? al.b : 220);
+            }
+            draw::set_forced_font_px(saved_px);
+        }
+        for (std::size_t q = 0; q < queue.size() && q < 8; ++q) {
+            const HudRect s = hud_queue_slot(view_w, view_h, int(q), &console_panel);
+            if (s.w() <= 0) continue;
+            slot_backdrop(s);
+            slot_icon(s, queue[q].catalog_id);
+            if (queue[q].progress > 0.0f && std::getenv("SC2_QUEUE_PANE_OLD")) slot_bar(s, queue[q].progress, 0, 200, 200);
+            {
+                int qcol[3] = {155, 255, 190};
+                hud_console_color(*ui_store_, console_panel.race, "StandardButtonIcon", qcol);
+                if (queue_border(s, 1, qcol)) continue;
+            }
+            const int f = q == 0 ? 3 : 2;
+            draw_box_rgba(out, view_w, view_h, s.x0, s.y0, s.x1, s.y1,
+                          std::uint8_t(slot_border[0] * f / 3), std::uint8_t(slot_border[1] * f / 3),
+                          std::uint8_t(slot_border[2] * f / 3));
+        }
+        for (std::size_t q = 0; q < hud_equipment_.size(); ++q) {
+            const HudRect s = hud_equipment_cell(view_w, view_h, int(q), &console_panel, int(hud_equipment_.size()));
+            if (s.w() <= 0) continue;
+            if (hud_equipment_[q].icon.empty() || !ui_store_) continue;
+            const IconAtlas::Icon& ic = icons_.get(*ui_store_, hud_equipment_[q].icon);
+            if (!ic.ok()) continue;
+            blit_icon(ic, s.x0 + 2, s.y0 + 2, s.x1 - 2, s.y1 - 2);
+            if (cat_ && !std::getenv("SC2_NO_EQUIPMENT_BORDER")) {
+                const std::string esfx = ui::layout_race_suffix(console_panel.race);
+                std::string border = cat_->resolve_asset("@@@UI/ButtonBorderEquipment", esfx, esfx);
+                if (border.empty() || border[0] == '@') border = cat_->resolve_asset("@@UI/ButtonBorderEquipment", esfx);
+                if (std::getenv("SC2_LABEL_FACE_TRACE") && q == 0) std::fprintf(stderr, "[labelface] equipment border %s\n", border.c_str());
+                if (!border.empty() && border[0] != '@') {
+                    int bc[3] = {40, 125, 75};
+                    hud_console_color(*ui_store_, console_panel.race, "StandardButtonBorder", bc);
+                    const IconAtlas::Icon& bi = icons_.get(*ui_store_, border.c_str());
+                    if (bi.ok()) blit_icon_tinted(bi, s.x0, s.y0, s.x1, s.y1, float(bc[0]) / 255.0f, float(bc[1]) / 255.0f, float(bc[2]) / 255.0f);
+                }
+            }
+            {
+                char lv[8];
+                std::snprintf(lv, sizeof lv, "%d", hud_equipment_[q].level);
+                if (cat_ && !std::getenv("SC2_NO_EQUIPMENT_BORDER")) {
+                    const double esc = double(view_h) / double(kRefHeight);
+                    const LabelLook ll = resolve_label_style(hud_style_set(), "EquipmentIconLevel", human_race());
+                    const FaceScope level_face(style_face(ll.font));
+                    const int saved_lpx = draw::forced_font_px();
+                    const int lpx = std::max(6, int((ll.height > 0 ? double(ll.height) : 16.0) * esc + 0.5));
+                    draw::set_forced_font_px(lpx);
+                    const int lw2 = text_w_rgba(lv, 1);
+                    draw_text_rgba(out, view_w, view_h, s.x1 - int(8.0 * esc + 0.5) - lw2, s.y1 - int(8.0 * esc + 0.5) - lpx, lv, 1,
+                                   ll.set ? ll.r : 255, ll.set ? ll.g : 255, ll.set ? ll.b : 255);
+                    draw::set_forced_font_px(saved_lpx);
+                } else {
+                const int lw = text_w_rgba(lv, 1);
+                const int bx1 = s.x1 - 2, by1 = s.y1 - 2, bx0 = bx1 - lw - 6, by0 = by1 - ui::kFontH - 2;
+                for (int y = std::max(0, by0); y < by1 && y < int(view_h); ++y)
+                    for (int x = std::max(0, bx0); x < bx1 && x < int(view_w); ++x) {
+                        const std::size_t di = (std::size_t(y) * view_w + std::size_t(x)) * 4;
+                        out[di] = 8; out[di + 1] = 10; out[di + 2] = 12; out[di + 3] = 255;
+                    }
+                draw_text_rgba(out, view_w, view_h, bx0 + 3, by0 + 1, lv, 1, 235, 236, 210);
+                }
+            }
+        }
+
+        const std::vector<std::uint32_t> hold = world_.passengers(sel);
+        for (std::size_t c = 0; c < hold.size() && c < 8; ++c) {
+            const HudRect s = hud_cargo_slot(view_w, view_h, int(c), &console_panel);
+            if (s.w() <= 0) continue;
+            const Unit& pu = world_.unit(hold[c]);
+            slot_backdrop(s);
+            slot_icon(s, pu.catalog_id);
+            const float lf = pu.hp_max.raw() > 0 ? float(pu.hp.to_double() / pu.hp_max.to_double()) : 1.0f;
+            slot_bar(s, lf, lf <= 0.3f ? 225 : (lf <= 0.6f ? 230 : 70), lf <= 0.3f ? 75 : (lf <= 0.6f ? 210 : 220),
+                     lf <= 0.3f ? 60 : (lf <= 0.6f ? 70 : 90));
+            draw_box_rgba(out, view_w, view_h, s.x0, s.y0, s.x1, s.y1, std::uint8_t(slot_border[0]),
+                          std::uint8_t(slot_border[1]), std::uint8_t(slot_border[2]));
+        }
+    }
+
     if (cfg_.human_player >= 0 && ui_store_) {
         std::vector<BuildCardEntry> ov_builds;
         std::vector<AbilityCardEntry> ov_abils;
@@ -5729,6 +9197,51 @@ void MeleeGame::build_overlay(std::uint32_t view_w, std::uint32_t view_h,
             std::uint8_t br = 20, bg = 24, bb = 32;
             if (btn.state == ButtonState::Disabled) { br = 40; bg = 22; bb = 22; }
             else if (btn.state != ButtonState::Empty) { br = 26, bg = 34, bb = 48; }
+            bool cell_active = false;
+            if (console_cell_art && btn.state == ButtonState::Enabled && !btn.icon.empty() && !std::getenv("SC2_NO_ACTIVE_ORDER_CELL")) {
+                std::string icn = btn.icon;
+                for (char& ch : icn) ch = char(std::tolower(static_cast<unsigned char>(ch)));
+                auto has = [&](const char* s) { return icn.find(s) != std::string::npos; };
+                for (std::uint32_t sid : selection_) {
+                    if (sid >= world_.units().size()) continue;
+                    const Unit& sun = world_.unit(sid);
+                    if (!sun.alive || sun.orders.empty()) continue;
+                    const sim::OrderType ot = sun.orders.front().type;
+                    if ((ot == sim::OrderType::Move && has("command-move")) || (ot == sim::OrderType::HoldPosition && has("holdposition")) ||
+                        (ot == sim::OrderType::Patrol && has("patrol")) ||
+                        ((ot == sim::OrderType::AttackMove || ot == sim::OrderType::Attack) && has("command-attack")) ||
+                        (ot == sim::OrderType::Gather && sun.carrying <= 0 && has("gather")) ||
+                        (ot == sim::OrderType::Gather && sun.carrying > 0 && has("returncargo")) ||
+                        (ot == sim::OrderType::Repair && has("repair"))) {
+                        cell_active = true;
+                        break;
+                    }
+                }
+            }
+            if (console_cell_art && btn.state != ButtonState::Empty) {
+                const int chr = human_race();
+                const std::string cellp = std::string(cell_active ? "Assets/Textures/ui_console_commandbutton_highlighted_" : "Assets/Textures/ui_console_commandbutton_normal_") +
+                                          (chr == 1 ? "defaultprotoss" : chr == 2 ? "defaultzerg" : "defaultterran") + ".dds";
+                blit_icon(icons_.get(*ui_store_, cellp.c_str()), c.x0, c.y0, c.x1, c.y1);
+            } else if (console_cell_art) {
+                const int chr = human_race();
+                const std::string cellp = std::string("Assets/Textures/ui_console_commandbutton_normal_") +
+                                          (chr == 1 ? "defaultprotoss" : chr == 2 ? "defaultzerg" : "defaultterran") + ".dds";
+                const IconAtlas::Icon& ghost = icons_.get(*ui_store_, cellp.c_str());
+                if (ghost.ok() && c.x1 > c.x0 && c.y1 > c.y0)
+                    for (int y = c.y0; y < c.y1 && y < int(view_h); ++y)
+                        for (int x = c.x0; x < c.x1 && x < int(view_w); ++x) {
+                            if (x < 0 || y < 0) continue;
+                            const int sx = (x - c.x0) * int(ghost.w) / (c.x1 - c.x0), sy = (y - c.y0) * int(ghost.h) / (c.y1 - c.y0);
+                            const std::size_t si = (std::size_t(sy) * ghost.w + std::size_t(sx)) * 4;
+                            const float a = 0.04f * ghost.rgba[si + 3] / 255.0f;
+                            const float l = 0.299f * ghost.rgba[si] + 0.587f * ghost.rgba[si + 1] + 0.114f * ghost.rgba[si + 2];
+                            const std::size_t di = (std::size_t(y) * view_w + std::size_t(x)) * 4;
+                            for (int k = 0; k < 3; ++k) out[di + k] = std::uint8_t(l * a + out[di + k] * (1.0f - a) + 0.5f);
+                        }
+            }
+            const bool grey_disabled = console_cell_art && !std::getenv("SC2_DISABLED_CELL_DARK");
+            if (!console_cell_art || (btn.state == ButtonState::Disabled && !grey_disabled))
             for (int y = c.y0; y < c.y1 && y < int(view_h); ++y)
                 for (int x = c.x0; x < c.x1 && x < int(view_w); ++x) {
                     if (x < 0 || y < 0) continue;
@@ -5738,10 +9251,104 @@ void MeleeGame::build_overlay(std::uint32_t view_w, std::uint32_t view_h,
                     out[di + 2] = std::uint8_t(bb * 0.55f + out[di + 2] * 0.45f);
                     out[di + 3] = 255;
                 }
+            bool slot_autocast = btn.autocast;
+            float slot_cooldown = btn.cooldown;
+            if (cast_policy_ && cat_ && btn.state != ButtonState::Empty)
+                for (const AbilityCardEntry& ab : ov_abils) {
+                    if (ab.slot != i || ab.ability.empty()) continue;
+                    if (cat_->ability_autocast(ab.ability).offered)
+                        for (std::uint32_t sid : selection_)
+                            if (autocast_state(sid, ab.ability)) { slot_autocast = true; break; }
+                    for (std::uint32_t sid : selection_) {
+                        const float f = cast_policy_->cooldown_fraction(world_, sid, ab.ability);
+                        if (f > slot_cooldown) slot_cooldown = f;
+                    }
+                    break;
+                }
+            if (slot_autocast && btn.state != ButtonState::Empty)
+                for (int y = c.y0; y < c.y1 && y < int(view_h); ++y)
+                    for (int x = c.x0; x < c.x1 && x < int(view_w); ++x) {
+                        if (x < 0 || y < 0) continue;
+                        if (x > c.x0 + 1 && x < c.x1 - 2 && y > c.y0 + 1 && y < c.y1 - 2) continue;
+                        const std::size_t di = (std::size_t(y) * view_w + x) * 4;
+                        out[di] = 40; out[di + 1] = 220; out[di + 2] = 90; out[di + 3] = 255;
+                    }
             if (btn.state != ButtonState::Empty && !btn.icon.empty()) {
-                blit_icon(icons_.get(*ui_store_, btn.icon.c_str()), c.x0 + 1, c.y0 + 1, c.x1 - 1,
-                          c.y1 - 1);
-                if (btn.state == ButtonState::Disabled)
+                {
+                    const IconAtlas::Icon& card_ic = icons_.get(*ui_store_, btn.icon.c_str());
+                    bool white_art = card_ic.ok();
+                    for (std::size_t q = 0; white_art && q + 3 < card_ic.rgba.size(); q += 4 * 7)
+                        if (card_ic.rgba[q + 3] > 64) {
+                            const int mx = std::max({int(card_ic.rgba[q]), int(card_ic.rgba[q + 1]), int(card_ic.rgba[q + 2])});
+                            const int mn = std::min({int(card_ic.rgba[q]), int(card_ic.rgba[q + 1]), int(card_ic.rgba[q + 2])});
+                            if (mx - mn > 24) white_art = false;
+                        }
+                    const bool terran_card = console_cell_art && human_race() == 0 && white_art && !cell_active;
+                    float tr = 1.0f, tg = 1.0f, tb = 1.0f;
+                    if (std::getenv("SC2_CARD_TINT_OLD")) {
+                        if (terran_card) { tr = 136.0f / 255.0f; tg = 227.0f / 255.0f; tb = 162.0f / 255.0f; }
+                    } else if (console_cell_art && white_art && !cell_active) {
+                        int ic3[3] = {155, 255, 190};
+                        hud_console_color(*ui_store_, console_panel.race, "StandardButtonIcon", ic3);
+                        tr = float(ic3[0]) / 255.0f; tg = float(ic3[1]) / 255.0f; tb = float(ic3[2]) / 255.0f;
+                    }
+                    static const int kIconInset = std::getenv("SC2_CARD_ICON_INSET") ? std::atoi(std::getenv("SC2_CARD_ICON_INSET")) : 0;
+                    blit_icon_tinted(card_ic, c.x0 + kIconInset, c.y0 + kIconInset, c.x1 - kIconInset, c.y1 - kIconInset, tr, tg, tb);
+                    const std::string cell_key = !btn.hotkey.empty() ? btn.hotkey : (btn.is_cancel && !std::getenv("SC2_CANCEL_RED_BOX") ? std::string("Esc") : std::string());
+                    static const bool kLetterPlate = std::getenv("SC2_CARD_LETTER_BARE") == nullptr && std::getenv("SC2_CARD_TINT_OLD") == nullptr;
+                    if (kLetterPlate && console_cell_art && !cell_key.empty() && cell_key.size() <= 3) {
+                        const int tx = c.x0 + 5, ty = c.y0 + 5;
+                        const int pw = text_w_rgba(cell_key, 1) + 3;
+                        for (int y = ty; y < ty + 12 && y < int(view_h); ++y)
+                            for (int x = tx; x < tx + pw && x < int(view_w); ++x) {
+                                if (x < 0 || y < 0) continue;
+                                const std::size_t di = (std::size_t(y) * view_w + std::size_t(x)) * 4;
+                                for (int k = 0; k < 3; ++k) out[di + k] = std::uint8_t(out[di + k] * 0.53f + 0.5f);
+                            }
+                        draw_text_rgba(out, view_w, view_h, tx, ty, cell_key.c_str(), 1, 240, 250, 242);
+                    } else
+                    if (console_cell_art && !cell_key.empty() && cell_key.size() <= 3)
+                        draw_text_rgba(out, view_w, view_h, c.x0 + (std::getenv("SC2_CARD_TINT_OLD") ? 3 : 5), c.y0 + (std::getenv("SC2_CARD_TINT_OLD") ? 2 : 4), cell_key.c_str(), 1, 240, 250, 242);
+                }
+                if (btn.charges >= 0) {
+                    const LabelLook cl = resolve_label_style(hud_style_set(), "GameButtonCharge", int(console_panel.race));
+                    const double bsc = double(c.w()) / 76.0;
+                    draw::set_forced_font_px(render::OverlayFont::fractional(double(cl.set && cl.height > 0 ? cl.height : 16) * bsc));
+                    {
+                        const FaceScope charge_face(style_face(cl.set && !cl.font.empty() ? cl.font : std::string("UI/Fonts/Eurostile-Bol.otf")));
+                        const std::string n = std::to_string(btn.charges);
+                        const int nw = text_w_rgba(n, 1);
+                        const int nh = int(double(cl.set && cl.height > 0 ? cl.height : 16) * bsc + 0.5);
+                        const int off = int(8.0 * bsc + 0.5);
+                        draw_text_rgba(out, view_w, view_h, c.x1 - off - nw, c.y1 - off - nh, n.c_str(), 1, cl.r, cl.g, cl.b);
+                    }
+                    draw::set_forced_font_px(0);
+                }
+                if (slot_cooldown > 0.0f) {
+                    const float ccx = 0.5f * float(c.x0 + c.x1), ccy = 0.5f * float(c.y0 + c.y1);
+                    for (int y = c.y0; y < c.y1 && y < int(view_h); ++y)
+                        for (int x = c.x0; x < c.x1 && x < int(view_w); ++x) {
+                            if (x < 0 || y < 0) continue;
+                            if (!cooldown_sweep_covers(ccx, ccy, float(x) + 0.5f, float(y) + 0.5f,
+                                                       slot_cooldown))
+                                continue;
+                            const std::size_t di = (std::size_t(y) * view_w + x) * 4;
+                            out[di] = std::uint8_t(out[di] * 0.35f);
+                            out[di + 1] = std::uint8_t(out[di + 1] * 0.35f);
+                            out[di + 2] = std::uint8_t(out[di + 2] * 0.35f);
+                        }
+                }
+                if (btn.state == ButtonState::Disabled && grey_disabled) {
+                    for (int y = c.y0; y < c.y1 && y < int(view_h); ++y)
+                        for (int x = c.x0; x < c.x1 && x < int(view_w); ++x) {
+                            if (x < 0 || y < 0) continue;
+                            const std::size_t di = (std::size_t(y) * view_w + x) * 4;
+                            const float l = 0.58f * (0.299f * out[di] + 0.587f * out[di + 1] + 0.114f * out[di + 2]);
+                            out[di] = out[di + 1] = out[di + 2] = std::uint8_t(l + 0.5f);
+                        }
+                    if (!btn.hotkey.empty() && btn.hotkey.size() <= 2)
+                        draw_text_rgba(out, view_w, view_h, c.x0 + (std::getenv("SC2_CARD_TINT_OLD") ? 3 : 5), c.y0 + (std::getenv("SC2_CARD_TINT_OLD") ? 2 : 4), btn.hotkey.c_str(), 1, 240, 250, 242);
+                } else if (btn.state == ButtonState::Disabled)
                     for (int y = c.y0; y < c.y1 && y < int(view_h); ++y)
                         for (int x = c.x0; x < c.x1 && x < int(view_w); ++x) {
                             if (x < 0 || y < 0) continue;
@@ -5753,8 +9360,8 @@ void MeleeGame::build_overlay(std::uint32_t view_w, std::uint32_t view_h,
                 const std::uint8_t lr = btn.is_cancel ? 200 : 130;
                 const std::uint8_t lg = btn.is_cancel ? 90 : 160;
                 const std::uint8_t lb = btn.is_cancel ? 90 : 200;
-                draw_box_rgba(out, view_w, view_h, c.x0, c.y0, c.x1, c.y1, lr, lg, lb);
-            } else {
+                if (!console_cell_art || (btn.is_cancel && std::getenv("SC2_CANCEL_RED_BOX"))) draw_box_rgba(out, view_w, view_h, c.x0, c.y0, c.x1, c.y1, lr, lg, lb);
+            } else if (!console_cell_art) {
                 draw_box_rgba(out, view_w, view_h, c.x0, c.y0, c.x1, c.y1, 60, 70, 88);
             }
         }
@@ -5789,21 +9396,74 @@ void MeleeGame::build_overlay(std::uint32_t view_w, std::uint32_t view_h,
                     else if (lines[li].rfind("Requires:", 0) == 0) { r = 236; g = 120; b = 110; }
                     draw::text(out, view_w, view_h, x0 + pad, y0 + pad + int(li) * lh, lines[li], sc, r, g, b);
                 }
+            } else if (const HudButton* hb = hud_buttons_.hovered(); hb && cat_ && !hb->tooltip_key.empty()) {
+                std::vector<std::string> raw = hud_tooltip_lines(cat_->strings(), cat_->hotkeys(), hb->tooltip_key);
+                if (!raw.empty()) {
+                    const double tsc = double(view_h) / double(kRefHeight);
+                    const bool mm = hb->id == HudButtonId::MinimapPing || hb->id == HudButtonId::MinimapTerrain || hb->id == HudButtonId::MinimapColor;
+                    const LabelLook tl = resolve_label_style(hud_style_set(), "@@@StandardTooltip", human_race());
+                    const int fpx = std::max(6, int(double(tl.height > 0 ? tl.height : 20) * tsc + 0.5));
+                    const int saved_px = draw::forced_font_px();
+                    draw::set_forced_font_px(fpx);
+                    const FaceScope tip_face(style_face(tl.font));
+                    const int wrap_w = int((mm ? 320.0 : 450.0) * tsc + 0.5), pad = int(15.0 * tsc + 0.5);
+                    std::vector<std::string> lines;
+                    for (const std::string& ln : raw) {
+                        std::string cur, word;
+                        auto flush_word = [&]() {
+                            if (word.empty()) return;
+                            const std::string trial = cur.empty() ? word : cur + " " + word;
+                            if (!cur.empty() && text_w_rgba(trial, 1) > wrap_w) {
+                                lines.push_back(cur);
+                                cur = word;
+                            } else {
+                                cur = trial;
+                            }
+                            word.clear();
+                        };
+                        for (char ch : ln) {
+                            if (ch == ' ') flush_word();
+                            else word.push_back(ch);
+                        }
+                        flush_word();
+                        lines.push_back(cur);
+                    }
+                    const int lh = fpx + std::max(1, fpx / 5);
+                    int tw = 0;
+                    for (const std::string& ln : lines) tw = std::max(tw, text_w_rgba(ln, 1));
+                    const int pw = tw + pad * 2, ph = int(lines.size()) * lh + pad * 2;
+                    int x0 = hb->rect.x0, y0 = hb->rect.y0 - ph - 2;
+                    if (y0 < 0) y0 = hb->rect.y1 + 2;
+                    if (x0 + pw > int(view_w)) x0 = int(view_w) - pw;
+                    if (y0 + ph > int(view_h)) y0 = int(view_h) - ph;
+                    if (x0 < 0) x0 = 0;
+                    if (y0 < 0) y0 = 0;
+                    draw::fill(out, view_w, view_h, x0, y0, x0 + pw, y0 + ph, 12, 16, 26, 235);
+                    draw::box(out, view_w, view_h, x0, y0, x0 + pw, y0 + ph, 90, 120, 170);
+                    for (std::size_t li = 0; li < lines.size(); ++li)
+                        draw_text_rgba(out, view_w, view_h, x0 + pad, y0 + pad + int(li) * lh, lines[li], 1, tl.set ? tl.r : 132, tl.set ? tl.g : 210,
+                                       tl.set ? tl.b : 255);
+                    draw::set_forced_font_px(saved_px);
+                }
             }
         }
     }
 
-    char fps[24];
-    std::snprintf(fps, sizeof(fps), "FPS %d", int(fps_smooth_ + 0.5f));
-    draw_text_rgba(out, view_w, view_h, 6, 6, fps, 2, 80, 255, 120);
+    static const bool kShowFps = std::getenv("SC2_SHOW_FPS") != nullptr;
+    if (kShowFps) {
+        char fps[24];
+        std::snprintf(fps, sizeof(fps), "FPS %d", int(fps_smooth_ + 0.5f));
+        draw_text_rgba(out, view_w, view_h, 6, 6, fps, 2, 80, 255, 120);
+    }
 
     if (replay_drive_) {
         char rb[40];
         std::snprintf(rb, sizeof(rb), "REPLAY  %d/%d", world_.tick(), replay_total_);
-        const int tw = int(std::string(rb).size()) * (ui::kFontW + 1) * 2;
+        const int tw = text_w_rgba(rb, 2);
         draw_text_rgba(out, view_w, view_h, (int(view_w) - tw) / 2, 6, rb, 2, 255, 210, 90);
     }
 
+    hud_menu_draw(view_w, view_h, out);
     if (pause_menu_open_) {
         draw::fill_a(out, view_w, view_h, 0, 0, int(view_w), int(view_h), 0, 0, 0, theme::kAlphaScrim);
         PauseRect resume, quit;
@@ -5819,9 +9479,24 @@ void MeleeGame::build_overlay(std::uint32_t view_w, std::uint32_t view_h,
                     theme::kSurface.r, theme::kSurface.g, theme::kSurface.b, 255, 255);
         draw::box_a(out, view_w, view_h, px0, py0, px1, py1, theme::kBorderStrong.r, theme::kBorderStrong.g, theme::kBorderStrong.b, 255);
         const std::string title = "GAME MENU";
-        draw::text(out, view_w, view_h, (px0 + px1 - draw::text_w(title, 3)) / 2, py0 + std::max(12, (resume.y0 - py0 - ui::kFontH * 3) / 2),
-                   title, 3, theme::kTextHi.r, theme::kTextHi.g, theme::kTextHi.b);
         const PauseRects all = pause_rects_all(view_w, view_h);
+        static const bool text_leak = std::getenv("SC2_PAUSE_TEXT_LEAK") != nullptr;
+        const bool sized = ui_store_ && !text_leak;
+        const int saved_pause_px = draw::forced_font_px();
+        const double psc = double(view_h) / double(kRefHeight);
+        const int label_px = sized ? std::max(6, int(20.0 * psc + 0.5)) : draw::font_px_for(2);
+        const int title_px = sized ? std::max(6, int(24.0 * psc + 0.5)) : draw::font_px_for(3);
+        int first_row_y = resume.y0;
+        if (sized) {
+            first_row_y = std::min(resume.y0, quit.y0);
+            if (all.has_load) first_row_y = std::min(first_row_y, all.load.y0);
+            if (all.has_save) first_row_y = std::min(first_row_y, all.save.y0);
+            draw::set_forced_font_px(title_px);
+        }
+        draw::text(out, view_w, view_h, (px0 + px1 - draw::text_w(title, 3)) / 2,
+                   sized ? py0 + std::max(4, (first_row_y - py0 - title_px) / 2) : py0 + std::max(12, (resume.y0 - py0 - ui::kFontH * 3) / 2),
+                   title, 3, theme::kTextHi.r, theme::kTextHi.g, theme::kTextHi.b);
+        if (sized) draw::set_forced_font_px(label_px);
         const PauseRect* rects[4] = {&all.load, &all.save, &resume, &quit};
         const char* labels[4] = {"LOAD GAME", "SAVE GAME", "RESUME GAME", "QUIT GAME"};
         for (int i = 0; i < 4; ++i) {
@@ -5836,8 +9511,9 @@ void MeleeGame::build_overlay(std::uint32_t view_w, std::uint32_t view_h,
             draw::box_a(out, view_w, view_h, r.x0, r.y0, r.x1, r.y1, edge.r, edge.g, edge.b, 255);
             const theme::Rgb ink = hot ? theme::kTextHi : theme::kTextBody;
             draw::text(out, view_w, view_h, r.x0 + (r.x1 - r.x0 - draw::text_w(labels[i], 2)) / 2,
-                       r.y0 + (r.y1 - r.y0 - ui::kFontH * 2) / 2, labels[i], 2, ink.r, ink.g, ink.b);
+                       r.y0 + (r.y1 - r.y0 - (sized ? label_px : ui::kFontH * 2)) / 2, labels[i], 2, ink.r, ink.g, ink.b);
         }
+        draw::set_forced_font_px(saved_pause_px);
     }
 }
 

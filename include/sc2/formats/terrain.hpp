@@ -112,8 +112,8 @@ struct PaintedPathing {
         if (row0 + 1 >= kRows || col0 + 3 >= kStride) return false;
         for (uint32_t dy = 0; dy < 2; ++dy)
             for (uint32_t dx = 0; dx < 4; ++dx)
-                if (cells[size_t(row0 + dy) * kStride + col0 + dx] != 0) return false;
-        return true;
+                if (cells[size_t(row0 + dy) * kStride + col0 + dx] == 0) return true;
+        return false;
     }
     static PaintedPathing parse(const std::vector<uint8_t>& data);
 };
@@ -167,6 +167,34 @@ struct WaterMap {
 
 Model build_water_mesh(const WaterMap& water, const std::vector<float>& level, float cell = 1.0f);
 
+struct VertexTint {
+    static constexpr std::uint32_t kPlainKind = 1;
+    static constexpr int kPlainSide = 5;
+    struct Patch {
+        std::uint32_t key = 0;
+        std::uint32_t kind = 0;
+        float x0 = 0, y0 = 0, x1 = 0, y1 = 0;
+        std::vector<std::uint8_t> data;
+        bool plain() const {
+            return kind == kPlainKind && data.size() == std::size_t(kPlainSide * kPlainSide) &&
+                   x1 > x0 && y1 > y0;
+        }
+        std::uint8_t at(int cx, int cy) const {
+            if (!plain() || cx < 0 || cy < 0 || cx >= kPlainSide || cy >= kPlainSide) return 255;
+            return data[std::size_t(cy) * std::size_t(kPlainSide) + std::size_t(cx)];
+        }
+    };
+    std::uint32_t version = 0;
+    std::vector<Patch> patches;
+    bool empty() const { return patches.empty(); }
+    std::size_t plain_count() const {
+        std::size_t n = 0;
+        for (const Patch& p : patches) n += p.plain() ? 1u : 0u;
+        return n;
+    }
+    static VertexTint parse(const std::vector<std::uint8_t>& d);
+};
+
 struct TextureMask {
     uint32_t version = 0;
     uint32_t mask_w = 0, mask_h = 0;
@@ -174,9 +202,9 @@ struct TextureMask {
     bool empty() const { return mask_w == 0 || mask_h == 0; }
     uint32_t quad_w() const { return mask_w ? (mask_w + 127) / 128 : 0; }
     uint32_t quad_h() const {
-        const uint32_t qw = quad_w();
-        if (qw == 0) return 0;
-        return uint32_t((texels.size() / 8 / 4096) / qw);
+        const uint32_t cols = (mask_w / 2 + 31) / 32;
+        if (cols == 0) return 0;
+        return uint32_t((texels.size() / 8 / 2048) / cols);
     }
     bool planar_ok() const { return mask_w > 0 && quad_w() > 0 && quad_h() > 0; }
     uint8_t layer_weight(uint32_t layer, uint32_t x, uint32_t y) const;

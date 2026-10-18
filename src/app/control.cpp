@@ -95,8 +95,14 @@ std::vector<uint32_t> Control::box_select(const sim::World& world, const ScreenR
     float miny = std::min(rect.y0, rect.y1), maxy = std::max(rect.y0, rect.y1);
 
     std::vector<uint32_t> hits;
+    float best_foreign_d2 = 0.0f;
+    uint32_t best_foreign = 0;
+    bool have_foreign = false;
+    const float cxr = 0.5f * (minx + maxx), cyr = 0.5f * (miny + maxy);
     for (const sim::Unit& u : world.units()) {
-        if (!u.alive || u.player != player_) continue;
+        if (!u.alive || u.unselectable) continue;
+        const bool own = u.player == player_;
+        if (!own && u.player < 0) continue;
         const float ux = float(u.x.to_double()), uy = float(u.y.to_double());
         const float fz = ground_z(ux, uy);
         float fx, fy;
@@ -107,8 +113,20 @@ std::vector<uint32_t> Control::box_select(const sim::World& world, const ScreenR
             xlo = std::min(fx, tx); xhi = std::max(fx, tx);
             ylo = std::min(fy, ty); yhi = std::max(fy, ty);
         }
-        if (xhi >= minx && xlo <= maxx && yhi >= miny && ylo <= maxy) hits.push_back(u.id);
+        if (!(xhi >= minx && xlo <= maxx && yhi >= miny && ylo <= maxy)) continue;
+        if (own) {
+            hits.push_back(u.id);
+            continue;
+        }
+        const float mx = 0.5f * (xlo + xhi) - cxr, my = 0.5f * (ylo + yhi) - cyr;
+        const float d2 = mx * mx + my * my;
+        if (!have_foreign || d2 < best_foreign_d2) {
+            have_foreign = true;
+            best_foreign_d2 = d2;
+            best_foreign = u.id;
+        }
     }
+    if (hits.empty() && have_foreign) return {best_foreign};
     if (marquee) {
         bool any_mobile = false;
         for (std::uint32_t id : hits)
@@ -250,7 +268,7 @@ uint32_t Control::pick_own(const sim::World& world, const ScreenPoint& p) const 
     uint32_t best = kNoTarget;
     Fixed best_d2;
     for (const sim::Unit& u : world.units()) {
-        if (!u.alive || u.player != player_ || u.resource_left > 0) continue;
+        if (!u.alive || u.player != player_ || u.resource_left > 0 || u.unselectable) continue;
         Fixed r = std::max(u.radius, pick_radius_);
         Fixed dx = u.x - gx, dy = u.y - gy;
         Fixed d2 = dx * dx + dy * dy;

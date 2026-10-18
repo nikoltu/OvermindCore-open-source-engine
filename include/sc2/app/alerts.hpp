@@ -46,7 +46,10 @@ public:
                 continue;
             }
             if (u.alive && (u.hp < s.hp || u.shields < s.shields)) {
-                const AlertKind kind = u.speed.raw() == 0 ? AlertKind::AttackTown : AlertKind::AttackUnit;
+                const bool authored = !u.catalog_id.empty();
+                const AlertKind kind = (authored ? u.town_alert : u.speed.raw() == 0)
+                                           ? AlertKind::AttackTown
+                                           : AlertKind::AttackUnit;
                 const float x = float(u.x.to_double()), y = float(u.y.to_double());
                 if (admit(kind, x, y)) {
                     log.emit(MsgZone::Alert, "Your forces are under attack", overlap_.life, true, x, y);

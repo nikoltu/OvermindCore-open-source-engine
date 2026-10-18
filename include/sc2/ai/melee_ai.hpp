@@ -3,6 +3,7 @@
 #include <cstdint>
 #include <string>
 #include <utility>
+#include <array>
 #include <vector>
 
 #include "sc2/ai/combat.hpp"
@@ -51,8 +52,11 @@ struct MeleeConfig {
         int attack_duration_s = 0;
     };
     std::vector<WavePhase> wave_phases;
+    std::array<std::vector<WavePhase>, 5> wave_ladders;
     sim::Fixed attack_caution = sim::Fixed::from_ratio(9, 10);
     int max_pending = 2;
+    bool worker_builds = false;
+    int gas_peons_per_geyser = 3;
     bool smart_combat = false;
     sim::Fixed defense_radius = sim::Fixed::from_int(14);
     sim::Fixed supply_margin = sim::Fixed::from_int(2);
@@ -61,6 +65,8 @@ struct MeleeConfig {
 
     int num_scouts = 0;
     std::vector<StockStep> stock;
+    std::vector<StockStep> hd_stock;
+    std::string hd_build_id;
     bool has_expansion = false;
     BuildItem expansion_unit;
     std::vector<std::pair<sim::Fixed, sim::Fixed>> expansion_sites;
@@ -108,6 +114,10 @@ private:
     void run_stock(sim::World& w);
     bool stock_active() const { return stock_idx_ < cfg_.stock.size(); }
     int owned_or_pending(const sim::World& w, const std::string& id) const;
+    bool make_item(sim::World& w, uint32_t from, const BuildItem& item);
+    bool place_structure(sim::World& w, const BuildItem& item);
+    void prune_site_builds(const sim::World& w);
+    void run_gas(sim::World& w);
     void run_scout(sim::World& w);
     void run_army(sim::World& w);
     int patches_near(const sim::World& w, sim::Fixed x, sim::Fixed y, sim::Fixed radius) const;
@@ -126,6 +136,9 @@ private:
     int wave_phase_start_tick_ = -1;
     int launched_desired_ = 0;
     bool producer_pending_ = false;
+    struct SiteBuild { std::string id; uint32_t builder = sim::kNoTarget; };
+    std::vector<SiteBuild> site_builds_;
+    std::string producer_id_;
     bool army_alt_ = false;
     bool expansion_pending_ = false;
     sim::Fixed expand_x_, expand_y_;

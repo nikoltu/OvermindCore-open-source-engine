@@ -2,19 +2,25 @@
 
 #include <cstdint>
 #include <functional>
+#include <map>
 #include <memory>
 #include <optional>
 #include <string>
 #include <vector>
 
 #include "sc2/app/cliff_place.hpp"
+#include "sc2/app/install.hpp"
 #include "sc2/app/glue_screen.hpp"
 #include "sc2/app/melee_game.hpp"
 #include "sc2/app/menu.hpp"
 #include "sc2/app/platform.hpp"
+#include "sc2/app/portrait_catalog.hpp"
 #include "sc2/app/sandbox_game.hpp"
 #include "sc2/app/screen_router.hpp"
+#include "sc2/app/shell_ui.hpp"
+#include "sc2/app/shell_screens.hpp"
 #include "sc2/app/test_map.hpp"
+#include "sc2/app/ui_icons.hpp"
 #include "sc2/app/ui_theme.hpp"
 #include "sc2/data/environment.hpp"
 #include "sc2/formats/map_archive.hpp"
@@ -42,7 +48,7 @@ class FrontEnd {
 public:
     FrontEnd(data::Catalog& cat, MeleeModels& models, casc::Storage& store, const TestMap& map);
     ~FrontEnd() {
-        if (draw::active_font() == &overlay_font_ || draw::active_font() == &overlay_font_ext_) draw::set_active_font(nullptr);
+        if (draw::active_font() == &overlay_font_ || draw::active_font() == &overlay_font_ext_ || draw::active_font() == &overlay_font_bold_) draw::set_active_font(nullptr);
     }
 
     void resolve_shell_faces() { ensure_overlay_font(); }
@@ -52,18 +58,41 @@ public:
     void select_options_panel(int i);
     using ConfigGet = std::function<std::string(const std::string&)>;
     using ConfigSet = std::function<bool(const std::string&, const std::string&)>;
-    void set_config_io(ConfigGet get, ConfigSet set) { config_get_ = std::move(get); config_set_ = std::move(set); }
+    void set_config_io(ConfigGet get, ConfigSet set) {
+        config_get_ = get;
+        config_set_ = set;
+        settings_.set_io(std::move(get), std::move(set));
+    }
+    ShellSettings& settings() { return settings_; }
+    const ShellSettings& settings() const { return settings_; }
+    const ShellFx& fx() const { return fx_; }
+    bool quit_confirm_open() const { return quit_confirm_ || ui_.modal == "quit"; }
+
+    static void request_boot_screen(const std::string& name);
+    bool enter_screen(const std::string& boot_name);
+    bool shell_v2_screen();
+    std::vector<shell::Control> shell_controls(std::uint32_t view_w, std::uint32_t view_h);
+    const shell::UiState& shell_state() const { return ui_; }
+    void set_clipboard_callback(std::function<std::string()> cb) { clipboard_cb_ = std::move(cb); }
+    void set_open_folder_callback(std::function<bool(const std::string&)> cb) { open_folder_cb_ = std::move(cb); }
+    int lobby_ai_difficulty() const { return settings_.ai_difficulty(); }
+    GameClock::Speed lobby_speed() const { return settings_.game_speed(); }
+    bool options_engine_page() const { return options_engine_page_; }
     static std::string option_key(const std::string& checkbox_name);
     bool option_checked(const std::string& checkbox_name) const;
     void toggle_option(const std::string& checkbox_name);
     const std::string& shell_face_path(theme::Face f) const { return face_path_[std::size_t(f)]; }
-    const render::OverlayFont& shell_face(theme::Face f) const { return f == theme::Face::HeaderExtended ? overlay_font_ext_ : overlay_font_; }
+    const render::OverlayFont& shell_face(theme::Face f) const {
+        return f == theme::Face::HeaderExtended ? overlay_font_ext_ : (f == theme::Face::Bold ? overlay_font_bold_ : overlay_font_);
+    }
 
     void set_maps(std::vector<platform::MapEntry> maps);
 
     void set_maps_folder_callback(std::function<void()> cb) { maps_folder_cb_ = std::move(cb); }
+    void set_double_click_ms(double ms) { double_click_ms_ = ms; }
 
     void set_console_renderer(MeleeGame::ConsoleRenderer fn) { console_renderer_ = std::move(fn); }
+    const data::EnvLight& map_environment() const { return current_env_; }
     void set_portrait_renderer(MeleeGame::PortraitRenderer fn) { portrait_renderer_ = std::move(fn); }
 
     void set_texture_callback(std::function<void(formats::Model&, const formats::LoadedMap&)> cb) {
@@ -73,9 +102,12 @@ public:
     bool step(const render::InputState& in, float dt_ms,
               std::vector<render::SceneInstance>& scene, render::Camera& cam);
     void build_overlay(std::uint32_t view_w, std::uint32_t view_h, std::vector<std::uint8_t>& out);
+    void set_software_cursor(bool on) { software_cursor_ = on; }
+    bool cursor_drawn() const { return cursor_drawn_; }
 
     const data::EnvLight& current_environment() const { return current_env_; }
     void set_ground_fog(bool on) { ground_fog_ = on; if (skirmish_) skirmish_->set_ground_fog(on); }
+    void set_reveal_map(bool on) { reveal_map_ = on; if (skirmish_) skirmish_->set_reveal_map(on); }
     const render::FogField* ground_fog() const { return skirmish_ ? skirmish_->ground_fog() : nullptr; }
 
     void enter_sandbox() { start_sandbox(); }
@@ -151,6 +183,23 @@ public:
     int map_scroll() const { return map_scroll_; }
 
 private:
+    friend struct shell::ShellCtx;
+    bool run_shell_screen(shell::Pass pass, std::uint32_t view_w, std::uint32_t view_h, const render::InputState* in,
+                          std::vector<std::uint8_t>* out, float dt_ms, std::vector<shell::Control>* controls, bool* escape);
+    void remember_last_match();
+    shell::UiState ui_;
+    std::function<std::string()> clipboard_cb_;
+    std::function<bool(const std::string&)> open_folder_cb_;
+    PortraitCatalog portraits_;
+    std::map<std::string, IconAtlas::Icon> thumb_cache_;
+    std::size_t thumb_cursor_ = 0;
+    std::vector<data::TeamColor> team_colors_;
+    bool team_colors_read_ = false;
+    std::uint64_t match_seed_ = 0;
+    float loading_ms_ = 0.0f;
+    bool game_data_probed_ = false;
+    InstallInfo game_data_;
+
     struct Button {
         int x0 = 0, y0 = 0, x1 = 0, y1 = 0;
         std::string label;
@@ -175,6 +224,37 @@ private:
     std::vector<Button> replay_buttons(std::uint32_t view_w, std::uint32_t view_h) const;
     void scan_replays();
     void record_match_replay();
+
+    std::vector<Button> play_hub_buttons(std::uint32_t view_w, std::uint32_t view_h) const;
+    std::vector<Button> custom_buttons(std::uint32_t view_w, std::uint32_t view_h) const;
+    std::vector<Button> profile_buttons(std::uint32_t view_w, std::uint32_t view_h) const;
+    std::vector<Button> quit_dialog_buttons(std::uint32_t view_w, std::uint32_t view_h) const;
+    std::vector<Button> options_shell_buttons(std::uint32_t view_w, std::uint32_t view_h,
+                                              const std::vector<Button>& authored) const;
+    std::vector<Button> screen_buttons(std::uint32_t view_w, std::uint32_t view_h);
+    void activate(const Button& b, float mx, std::uint32_t view_w, std::uint32_t view_h);
+    void shell_keyboard(const render::InputState& in, std::uint32_t view_w, std::uint32_t view_h);
+    const IconAtlas::Icon* map_preview(int index);
+    void apply_settings_to_match();
+    int custom_rows_per_page(std::uint32_t view_h) const;
+    void clamp_custom_scroll(std::uint32_t view_h);
+
+    ShellSettings settings_;
+    ShellFx fx_;
+    float mouse_x_ = 0.0f, mouse_y_ = 0.0f;
+    bool left_down_ = false;
+    bool quit_confirm_ = false;
+    bool options_engine_page_ = false;
+    bool prev_pan_[4] = {false, false, false, false};
+    int custom_scroll_ = 0;
+    bool profile_editing_ = false;
+    ScreenId last_drawn_ = ScreenId::Count;
+    std::map<std::string, IconAtlas::Icon> preview_cache_;
+    IconAtlas cursor_icons_;
+    float cursor_x_ = -1.0f, cursor_y_ = -1.0f;
+    bool software_cursor_ = false, cursor_drawn_ = false;
+    void build_overlay_body(std::uint32_t view_w, std::uint32_t view_h, std::vector<std::uint8_t>& out);
+    std::string preview_failed_;
     int lobby_rows_per_page(std::uint32_t view_h) const;
     void clamp_map_scroll(std::uint32_t view_h);
 
@@ -190,15 +270,18 @@ private:
         real_map_.reset();
         real_ground_ = formats::Model{};
         real_doodads_.clear();
+        real_fluff_.clear();
         real_cliffs_ = CliffField{};
         map_built_ = false;
         pending_map_bytes_.clear();
         load_plan_.reset();
+        match_seed_ = 0;
     }
     MeleeGame::ConsoleRenderer console_renderer_;
     MeleeGame::PortraitRenderer portrait_renderer_;
     std::unique_ptr<MeleeGame> skirmish_;
     bool ground_fog_ = false;
+    bool reveal_map_ = false;
     MatchResult::Outcome last_outcome_ = MatchResult::Outcome::Ongoing;
     std::unique_ptr<data::UpgradeCatalog> research_up_;
     std::unique_ptr<SandboxGame> sandbox_;
@@ -282,11 +365,14 @@ private:
     data::EnvLight current_env_;
     formats::Model real_ground_;
     formats::Model real_water_;
+    formats::Model real_roads_;
     std::array<float, 4> real_water_rgba_ = {1.0f, 1.0f, 1.0f, 1.0f};
     std::vector<formats::PlacedDoodad> real_doodads_;
+    std::vector<formats::PlacedDoodad> real_fluff_;
     CliffField real_cliffs_;
 
     std::function<void()> maps_folder_cb_;
+    double double_click_ms_ = 0.0;
     std::function<void(formats::Model&, const formats::LoadedMap&)> texture_cb_;
 
     render::OverlayFont overlay_font_;
@@ -295,7 +381,8 @@ private:
     ConfigGet config_get_;
     ConfigSet config_set_;
     std::map<std::string, std::string> config_mem_;
-    std::string face_path_[2];
+    render::OverlayFont overlay_font_bold_;
+    std::string face_path_[theme::kFaceCount];
     bool overlay_font_tried_ = false;
     void ensure_overlay_font();
 };

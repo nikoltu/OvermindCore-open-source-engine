@@ -30,11 +30,18 @@ enum class ScreenId {
     Credits,
     Hotkeys,
     Sandbox,
+    Profile,
+    Portraits,
+    DataSetup,
+    Starting,
+    Widgets,
     Count,
 };
 
 const char* screen_flow_id(ScreenId id);
 ScreenId screen_from_flow_id(const std::string& flow_id);
+const char* screen_boot_name(ScreenId id);
+ScreenId screen_from_boot_name(const std::string& name);
 const char* screen_name(ScreenId id);
 
 enum class TransitionKind { Replace, Push, Close, Pop };

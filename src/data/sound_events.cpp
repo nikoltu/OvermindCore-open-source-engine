@@ -13,6 +13,8 @@ const char* to_string(UnitEvent event) {
         case UnitEvent::Ready:   return "Ready";
         case UnitEvent::Select:  return "Select";
         case UnitEvent::Confirm: return "Confirm";
+        case UnitEvent::AttackOrder: return "AttackOrder";
+        case UnitEvent::Pissed:  return "Pissed";
     }
     return "";
 }
@@ -24,6 +26,8 @@ std::optional<UnitEvent> parse_unit_event(const std::string& name) {
     if (name == "Ready") return UnitEvent::Ready;
     if (name == "Select") return UnitEvent::Select;
     if (name == "Confirm") return UnitEvent::Confirm;
+    if (name == "AttackOrder") return UnitEvent::AttackOrder;
+    if (name == "Pissed") return UnitEvent::Pissed;
     return std::nullopt;
 }
 
@@ -42,6 +46,8 @@ EventSpec spec_for(UnitEvent e) {
         case UnitEvent::Ready:   return {{}, {"Ready"}};
         case UnitEvent::Select:  return {{}, {"What"}};
         case UnitEvent::Confirm: return {{}, {"Yes"}};
+        case UnitEvent::AttackOrder: return {{}, {"Attack"}};
+        case UnitEvent::Pissed:  return {{}, {"Pissed"}};
     }
     return {};
 }

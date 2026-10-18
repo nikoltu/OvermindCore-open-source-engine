@@ -1,6 +1,7 @@
 #include "sc2/render/creep_layer.hpp"
 
 #include <algorithm>
+#include <cmath>
 #include <cstddef>
 
 #include "sc2/casc/storage.hpp"
@@ -62,7 +63,10 @@ std::string resolve_creep_diffuse(const casc::Storage& store) {
 formats::Model build_creep_model(const sim::CreepGrid& grid,
                                  const std::function<float(float, float)>& ground_z,
                                  float z_offset, float uv_tiles_per_cell,
-                                 const std::string& diffuse_path) {
+                                 const std::string& diffuse_path, int fringe_cells,
+                                 float map_w, float map_h, float uv_angle) {
+    const bool map_uv = map_w > 0.0f && map_h > 0.0f;
+    const float uvc = std::cos(uv_angle), uvs_ = std::sin(uv_angle);
     formats::Model m;
     const int w = grid.width(), h = grid.height();
     if (w <= 0 || h <= 0) return m;
@@ -76,7 +80,11 @@ formats::Model build_creep_model(const sim::CreepGrid& grid,
     std::size_t region_first = 0, region_first_index = 0;
     for (int cy = 0; cy < h; ++cy) {
         for (int cx = 0; cx < w; ++cx) {
-            if (!grid.is_creep_cell(cx, cy)) continue;
+            bool draw = grid.is_creep_cell(cx, cy);
+            for (int dy = -fringe_cells; dy <= fringe_cells && !draw; ++dy)
+                for (int dx = -fringe_cells; dx <= fringe_cells && !draw; ++dx)
+                    if (cx + dx >= 0 && cy + dy >= 0 && cx + dx < w && cy + dy < h && grid.is_creep_cell(cx + dx, cy + dy)) draw = true;
+            if (!draw) continue;
             if (m.positions.size() / 3 - region_first + 4 > 65535) {
                 formats::M3Region r;
                 r.first_vertex = uint32_t(region_first);
@@ -99,8 +107,14 @@ formats::Model build_creep_model(const sim::CreepGrid& grid,
                 m.positions.push_back(xs[k]);
                 m.positions.push_back(ys[k]);
                 m.positions.push_back(z);
-                m.uvs.push_back(us[k]);
-                m.uvs.push_back(vs[k]);
+                if (map_uv) {
+                    const float tx = xs[k] / map_w, ty = -ys[k] / map_h;
+                    m.uvs.push_back((uvc * tx - uvs_ * ty) * uv_tiles_per_cell);
+                    m.uvs.push_back((uvs_ * tx + uvc * ty) * uv_tiles_per_cell);
+                } else {
+                    m.uvs.push_back(us[k]);
+                    m.uvs.push_back(vs[k]);
+                }
                 zmin = std::min(zmin, z);
                 zmax = std::max(zmax, z);
                 xmin = std::min(xmin, xs[k]);

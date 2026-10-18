@@ -9,6 +9,7 @@
 #include <cstdint>
 #include <cstring>
 #include <map>
+#include <memory>
 #include <stdexcept>
 #include <string>
 #include <unordered_map>
@@ -67,7 +68,8 @@ RenderResult render_scene(const std::vector<SceneInstance>& instances,
                           uint32_t width, uint32_t height, const Camera* cam_in,
                           const casc::Storage* storage,
                           const std::string& texture_root, bool enable_particles,
-                          const data::EnvLight* env, const FogField* fog, uint32_t resize_from) {
+                          const data::EnvLight* env, const FogField* fog, uint32_t resize_from,
+                          const float* window_shadow_clip) {
     std::vector<const SceneInstance*> live;
     for (const auto& inst : instances)
         if (inst.model && inst.model->vertex_count && !inst.model->indices.empty())
@@ -80,12 +82,22 @@ RenderResult render_scene(const std::vector<SceneInstance>& instances,
     const VkQueue queue = gpu.graphics_queue();
     const uint32_t gfx = gpu.graphics_family();
 
+    SceneRenderer::Tunables tun;
+    if (window_shadow_clip) {
+        tun.camera_fit_shadow = true;
+        tun.shadow_clip = *window_shadow_clip;
+        tun.clear_color[0] = tun.clear_color[1] = tun.clear_color[2] = 0.0f;
+    }
     SceneRenderer sr(pd, dev, queue, gfx, resize_from ? resize_from : width, resize_from ? resize_from : height,
-                     VK_FORMAT_R8G8B8A8_UNORM, storage, texture_root);
+                     VK_FORMAT_R8G8B8A8_UNORM, storage, texture_root, tun);
     if (resize_from) sr.resize(width, height);
     if (env) sr.set_environment(*env);
     if (fog) sr.set_fog(*fog);
-    sr.prepare(live);
+    std::vector<const SceneInstance*> light_only;
+    for (const auto& inst : instances)
+        if (inst.model && !(inst.model->vertex_count && !inst.model->indices.empty()) && !inst.model->lights.empty())
+            light_only.push_back(&inst);
+    sr.prepare(live, &light_only);
 
     Camera cam;
     if (cam_in) {
@@ -106,7 +118,12 @@ RenderResult render_scene(const std::vector<SceneInstance>& instances,
 
     std::vector<SceneRenderer::ParticleVertex> pverts;
     std::vector<SceneRenderer::ParticleGroup> pgroups;
-    if (enable_particles) build_particles(sr, live, cam, pverts, pgroups);
+    std::vector<const SceneInstance*> emitting = live;
+    for (const auto& inst : instances)
+        if (inst.model && !(inst.model->vertex_count && !inst.model->indices.empty()) &&
+            (!inst.model->particles.empty() || !inst.model->ribbons.empty()))
+            emitting.push_back(&inst);
+    if (enable_particles) build_particles(sr, emitting, cam, pverts, pgroups);
 
     VkDeviceSize rbytes = VkDeviceSize(width) * height * 4;
     Buffer readback = make_buffer(pd, dev, rbytes, VK_BUFFER_USAGE_TRANSFER_DST_BIT, nullptr);
@@ -174,6 +191,111 @@ RenderResult render_scene(const std::vector<SceneInstance>& instances,
     check(vkMapMemory(dev, readback.mem.get(), 0, rbytes, 0, &mapped), "vkMapMemory(readback)");
     std::memcpy(out.rgba.data(), mapped, size_t(rbytes));
     vkUnmapMemory(dev, readback.mem.get());
+    return out;
+}
+
+RenderResult render_scene_session(const std::string& key, const std::vector<SceneInstance>& instances, uint32_t width, uint32_t height,
+                                  const Camera& cam, const casc::Storage* storage, const data::EnvLight* env) {
+    std::vector<const SceneInstance*> live;
+    for (const auto& inst : instances)
+        if (inst.model && inst.model->vertex_count && !inst.model->indices.empty()) live.push_back(&inst);
+    if (live.empty()) throw std::runtime_error("render_scene_session: no drawable instances");
+
+    Device& gpu = Device::shared_headless("render_scene");
+    const VkPhysicalDevice pd = gpu.physical();
+    const VkDevice dev = gpu.device();
+    const VkQueue queue = gpu.graphics_queue();
+    const uint32_t gfx = gpu.graphics_family();
+
+    struct Session {
+        std::string key;
+        uint32_t w = 0, h = 0;
+        std::unique_ptr<SceneRenderer> sr;
+        Buffer readback;
+        Unique<VkCommandPool> pool;
+        VkCommandBuffer cmd = VK_NULL_HANDLE;
+        Unique<VkFence> fence;
+    };
+    static std::unique_ptr<Session> session;
+    if (!session || session->key != key || session->w != width || session->h != height) {
+        if (session) vkDeviceWaitIdle(dev);
+        session.reset();
+        auto s = std::make_unique<Session>();
+        s->key = key;
+        s->w = width;
+        s->h = height;
+        SceneRenderer::Tunables tun;
+        s->sr = std::make_unique<SceneRenderer>(pd, dev, queue, gfx, width, height, VK_FORMAT_R8G8B8A8_UNORM, storage, std::string(), tun);
+        if (env) s->sr->set_environment(*env);
+        s->readback = make_buffer(pd, dev, VkDeviceSize(width) * height * 4, VK_BUFFER_USAGE_TRANSFER_DST_BIT, nullptr);
+        VkCommandPoolCreateInfo cpi{};
+        cpi.sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO;
+        cpi.flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
+        cpi.queueFamilyIndex = gfx;
+        VkCommandPool rawPool = VK_NULL_HANDLE;
+        check(vkCreateCommandPool(dev, &cpi, nullptr, &rawPool), "vkCreateCommandPool(session)");
+        s->pool = Unique<VkCommandPool>(rawPool, [dev](VkCommandPool p) { vkDestroyCommandPool(dev, p, nullptr); });
+        VkCommandBufferAllocateInfo cbi{};
+        cbi.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
+        cbi.commandPool = rawPool;
+        cbi.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+        cbi.commandBufferCount = 1;
+        check(vkAllocateCommandBuffers(dev, &cbi, &s->cmd), "vkAllocateCommandBuffers(session)");
+        VkFenceCreateInfo fi{};
+        fi.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO;
+        VkFence rawFence = VK_NULL_HANDLE;
+        check(vkCreateFence(dev, &fi, nullptr, &rawFence), "vkCreateFence(session)");
+        s->fence = Unique<VkFence>(rawFence, [dev](VkFence f) { vkDestroyFence(dev, f, nullptr); });
+        session = std::move(s);
+    }
+    Session& S = *session;
+    SceneRenderer& sr = *S.sr;
+    sr.prepare(live, nullptr);
+
+    const VkDeviceSize rbytes = VkDeviceSize(width) * height * 4;
+    check(vkResetCommandBuffer(S.cmd, 0), "vkResetCommandBuffer(session)");
+    VkCommandBufferBeginInfo bbi{};
+    bbi.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+    bbi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+    check(vkBeginCommandBuffer(S.cmd, &bbi), "vkBeginCommandBuffer(session)");
+    const std::vector<SceneRenderer::ParticleVertex> pverts;
+    const std::vector<SceneRenderer::ParticleGroup> pgroups;
+    sr.record(S.cmd, live, cam, pverts, pgroups);
+    VkImageMemoryBarrier lb{};
+    lb.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+    lb.oldLayout = lb.newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+    lb.srcQueueFamilyIndex = lb.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    lb.image = sr.ldr_image();
+    lb.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+    lb.srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+    lb.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+    vkCmdPipelineBarrier(S.cmd, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr, 1, &lb);
+    VkBufferImageCopy region{};
+    region.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+    region.imageExtent = {width, height, 1};
+    vkCmdCopyImageToBuffer(S.cmd, sr.ldr_image(), VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, S.readback.buf.get(), 1, &region);
+    check(vkEndCommandBuffer(S.cmd), "vkEndCommandBuffer(session)");
+
+    const VkFence fence = S.fence.get();
+    check(vkResetFences(dev, 1, &fence), "vkResetFences(session)");
+    VkSubmitInfo si{};
+    si.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+    si.commandBufferCount = 1;
+    si.pCommandBuffers = &S.cmd;
+    check(vkQueueSubmit(queue, 1, &si, fence), "vkQueueSubmit(session)");
+    check(vkWaitForFences(dev, 1, &fence, VK_TRUE, UINT64_MAX), "vkWaitForFences(session)");
+
+    RenderResult out;
+    out.width = width;
+    out.height = height;
+    out.mvp = cam.view_proj(float(width) / float(height));
+    out.lit_drawn = sr.lit_drawn();
+    out.lit_culled = sr.lit_culled();
+    out.rgba.resize(size_t(rbytes));
+    void* mapped = nullptr;
+    check(vkMapMemory(dev, S.readback.mem.get(), 0, rbytes, 0, &mapped), "vkMapMemory(session readback)");
+    std::memcpy(out.rgba.data(), mapped, size_t(rbytes));
+    vkUnmapMemory(dev, S.readback.mem.get());
     return out;
 }
 

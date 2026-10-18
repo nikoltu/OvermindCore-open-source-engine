@@ -9,7 +9,7 @@ namespace sc2::data {
 class ActorCatalog;
 class AudioCatalog;
 
-enum class UnitEvent { Birth, Attack, Death, Ready, Select, Confirm };
+enum class UnitEvent { Birth, Attack, Death, Ready, Select, Confirm, AttackOrder, Pissed };
 
 const char* to_string(UnitEvent event);
 

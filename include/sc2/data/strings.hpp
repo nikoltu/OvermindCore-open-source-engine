@@ -14,6 +14,9 @@ public:
 
     std::string resolve(const std::string& ref) const;
 
+    std::string resolve(const std::string& ref, const std::string& race,
+                        const std::string& skin = std::string()) const;
+
     const std::string* find(const std::string& key) const;
 
     std::size_t size() const { return map_.size(); }

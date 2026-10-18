@@ -27,6 +27,12 @@ public:
 
     const GlyphBitmap& glyph(char ch, int pixel_height) const;
 
+    static constexpr int kFractionalBase = 1 << 20;
+    static int fractional(double px) { return px > 0.0 ? kFractionalBase + int(px * 64.0 + 0.5) : 0; }
+    static double height_px(int pixel_height) {
+        return pixel_height >= kFractionalBase ? double(pixel_height - kFractionalBase) / 64.0 : double(pixel_height);
+    }
+
     int advance_px(char ch, int pixel_height) const { return glyph(ch, pixel_height).advance; }
 
     int ascent_px(int pixel_height) const;

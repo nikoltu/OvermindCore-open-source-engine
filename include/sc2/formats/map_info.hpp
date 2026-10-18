@@ -1,5 +1,6 @@
 #pragma once
 
+#include <array>
 #include <cstdint>
 #include <stdexcept>
 #include <string>
@@ -22,6 +23,10 @@ struct MapInfoHeader {
 
     std::int32_t camera_left = 0, camera_bottom = 0, camera_right = 0, camera_top = 0;
     bool has_camera_bounds = false;
+    float base_height = 0.0f;
+    bool has_base_height = false;
+    std::array<std::int32_t, 16> player_color{{-1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1}};
+    bool has_players = false;
 
     std::uint32_t playable_x0 = 0, playable_y0 = 0, playable_x1 = 0, playable_y1 = 0;
 
@@ -101,6 +106,46 @@ inline MapInfoHeader parse_map_info(const std::vector<std::uint8_t>& b) {
             h.playable_y0 = y0 > kPlayableEdgeMargin ? y0 : kPlayableEdgeMargin;
             h.playable_x1 = x1 < max_x ? x1 : max_x;
             h.playable_y1 = y1 < max_y ? y1 : max_y;
+            if (pos + 20 <= b.size()) {
+                h.base_height = float(u32(pos + 16)) / 4096.0f;
+                h.has_base_height = true;
+            }
+            if (h.version == 0x27) {
+                std::size_t q = pos + 20;
+                auto skip_cstr = [&](std::size_t& at) {
+                    while (at < b.size() && b[at] != 0) ++at;
+                    if (at >= b.size()) return false;
+                    ++at;
+                    return true;
+                };
+                bool ok = q + 4 <= b.size();
+                if (ok) q += 4;
+                ok = ok && skip_cstr(q) && q + 2 + 28 + 32 + 4 <= b.size();
+                if (ok) {
+                    q += 2 + 28 + 32;
+                    const std::uint32_t n = u32(q);
+                    q += 4;
+                    std::array<std::int32_t, 16> col;
+                    col.fill(-1);
+                    ok = n >= 1 && n <= 16;
+                    for (std::uint32_t i = 0; ok && i < n; ++i) {
+                        if (q + 9 > b.size()) { ok = false; break; }
+                        const std::uint8_t pid = b[q];
+                        const std::uint32_t control = u32(q + 1);
+                        const std::int32_t c = std::int32_t(u32(q + 5));
+                        q += 9;
+                        ok = pid < 16 && control <= 5 && c >= -1 && c < 16 && skip_cstr(q) && q + 12 <= b.size();
+                        if (!ok) break;
+                        q += 12;
+                        ok = skip_cstr(q);
+                        if (ok && control == 1) col[pid] = c;
+                    }
+                    if (ok) {
+                        h.player_color = col;
+                        h.has_players = true;
+                    }
+                }
+            }
         }
     }
     return h;

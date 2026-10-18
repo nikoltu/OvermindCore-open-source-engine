@@ -15,6 +15,7 @@ struct ChargeSpec {
     double time_start = 0;
     double time_use = 0;
     std::string link;
+    std::string location;
     bool time_queuing = false;
     bool from_attr = false;
     bool from_child = false;
@@ -36,6 +37,7 @@ inline void merge_charge_node(const core::XmlNode& ch, ChargeSpec& out) {
         else if (field == "TimeStart") out.time_start = std::strtod(value.c_str(), nullptr);
         else if (field == "TimeUse") out.time_use = std::strtod(value.c_str(), nullptr);
         else if (field == "Link") out.link = value;
+        else if (field == "Location") out.location = value;
     };
     out.found = true;
     for (const auto& kv : ch.attrs) {

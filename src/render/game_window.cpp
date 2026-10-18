@@ -1,3 +1,4 @@
+#include "sc2/render/frame_prof.hpp"
 #include "sc2/render/game_window.hpp"
 
 #include "sc2/core/version.hpp"
@@ -22,6 +23,7 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <cmath>
 #include <cstdio>
 #include <cstring>
@@ -70,9 +72,12 @@ struct InputAccum {
     char key_char = 0;
     std::vector<std::string> key_tokens;
     bool alt = false;
+    std::string text;
     bool resized = false;
     bool minimized = false;
 };
+
+std::atomic<bool> g_os_cursor_hidden{false};
 
 LRESULT CALLBACK game_wndproc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
     auto* in = reinterpret_cast<InputAccum*>(GetWindowLongPtrW(h, GWLP_USERDATA));
@@ -91,6 +96,12 @@ LRESULT CALLBACK game_wndproc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
                 }
             }
             return 0;
+        case WM_SETCURSOR:
+            if (LOWORD(lp) == HTCLIENT && g_os_cursor_hidden.load()) {
+                SetCursor(nullptr);
+                return TRUE;
+            }
+            break;
         case WM_MOUSEMOVE:
             if (in) { in->mouse_x = float(GET_X_LPARAM(lp)); in->mouse_y = float(GET_Y_LPARAM(lp)); }
             return 0;
@@ -103,6 +114,30 @@ LRESULT CALLBACK game_wndproc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
         case WM_MOUSEWHEEL:
             if (in) in->wheel += float(GET_WHEEL_DELTA_WPARAM(wp)) / 120.0f;
             return 0;
+        case WM_CHAR: {
+            static std::uint32_t high = 0;
+            std::uint32_t cp = std::uint32_t(wp) & 0xFFFFu;
+            if (cp >= 0xD800u && cp <= 0xDBFFu) { high = cp; return 0; }
+            if (cp >= 0xDC00u && cp <= 0xDFFFu) {
+                if (!high) return 0;
+                cp = 0x10000u + ((high - 0xD800u) << 10) + (cp - 0xDC00u);
+            }
+            high = 0;
+            if (!in || cp < 0x20u || cp == 0x7Fu) return 0;
+            if (cp < 0x80u) in->text += char(cp);
+            else if (cp < 0x800u) { in->text += char(0xC0u | (cp >> 6)); in->text += char(0x80u | (cp & 0x3Fu)); }
+            else if (cp < 0x10000u) {
+                in->text += char(0xE0u | (cp >> 12));
+                in->text += char(0x80u | ((cp >> 6) & 0x3Fu));
+                in->text += char(0x80u | (cp & 0x3Fu));
+            } else {
+                in->text += char(0xF0u | (cp >> 18));
+                in->text += char(0x80u | ((cp >> 12) & 0x3Fu));
+                in->text += char(0x80u | ((cp >> 6) & 0x3Fu));
+                in->text += char(0x80u | (cp & 0x3Fu));
+            }
+            return 0;
+        }
         case WM_KEYDOWN:
         case WM_KEYUP:
         case WM_SYSKEYDOWN:
@@ -130,6 +165,12 @@ LRESULT CALLBACK game_wndproc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
                     case VK_ADD: tok = "NumPadPlus"; break;
                     case VK_SUBTRACT: tok = "NumPadMinus"; break;
                     case VK_PAUSE: tok = "Pause"; break;
+                    case VK_RETURN: tok = "Enter"; break;
+                    case VK_OEM_2: tok = "Slash"; break;
+                    case VK_OEM_5: tok = "BackSlash"; break;
+                    case VK_OEM_4: tok = "BracketOpen"; break;
+                    case VK_OEM_6: tok = "BracketClose"; break;
+                    case VK_OEM_7: tok = "Apostrophe"; break;
                     default: break;
                 }
                 if (tok) in->key_tokens.emplace_back(tok);
@@ -156,7 +197,7 @@ LRESULT CALLBACK game_wndproc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
                     if (wp >= '0' && wp <= '9') in->num[wp - '0'] = down;
                     break;
             }
-            if (msg == WM_SYSKEYDOWN || msg == WM_SYSKEYUP) break;
+            if ((msg == WM_SYSKEYDOWN || msg == WM_SYSKEYUP) && wp != VK_F10) break;
             return 0;
         }
     }
@@ -186,6 +227,8 @@ const wchar_t* game_window_class(HINSTANCE hinst) {
 }
 
 }
+
+void set_os_cursor_hidden(bool hidden) { g_os_cursor_hidden.store(hidden); }
 
 WindowResult run_game_window(const GameFrameFn& frame, const casc::Storage* storage,
                              uint32_t width, uint32_t height,
@@ -244,6 +287,7 @@ WindowResult run_game_window(const GameFrameFn& frame, const casc::Storage* stor
     SceneRenderer::Tunables tun;
     tun.camera_fit_shadow = true;
     tun.shadow_clip = shadow_clip;
+    tun.clear_color[0] = tun.clear_color[1] = tun.clear_color[2] = 0.0f;
     SceneRenderer scene_renderer(pd, dev, queue, gfx, width, height, fmt.format, storage,
                                  texture_root, tun);
 
@@ -571,6 +615,7 @@ WindowResult run_game_window(const GameFrameFn& frame, const casc::Storage* stor
     bool running = true;
 
     while (running) {
+        SC2_PROF_SCOPE("loop_iter");
         MSG m;
         while (PeekMessageW(&m, nullptr, 0, 0, PM_REMOVE)) {
             TranslateMessage(&m);
@@ -643,6 +688,8 @@ WindowResult run_game_window(const GameFrameFn& frame, const casc::Storage* stor
         in.key_char = accum.key_char;
         in.key_tokens.swap(accum.key_tokens);
         in.key_alt = accum.alt;
+        in.text.swap(accum.text);
+        accum.text.clear();
         in.quit = accum.quit || accum.esc;
         prev = accum;
         accum.wheel = 0;
@@ -652,14 +699,19 @@ WindowResult run_game_window(const GameFrameFn& frame, const casc::Storage* stor
 
         scene.clear();
         overlay.clear();
-        bool cont = frame(in, dt_ms, scene, cam, overlay);
+        double cb_ms = 0.0;
+        bool cont;
+        { SC2_PROF_SCOPE("frame_cb"); cont = frame(in, dt_ms, scene, cam, overlay); }
+        (void)cb_ms;
         if (!cont || accum.quit) running = false;
         const bool has_overlay = overlay.size() == size_t(sc_w) * size_t(sc_h) * 4;
 
         if (env_provider) scene_renderer.set_environment(env_provider());
 
         VkFence raw_fence = fence.get();
-        vkWaitForFences(dev, 1, &raw_fence, VK_TRUE, UINT64_MAX);
+        { SC2_PROF_SCOPE("fence_wait");
+          vkWaitForFences(dev, 1, &raw_fence, VK_TRUE, UINT64_MAX); }
+        SC2_PROF_SCOPE("submit_half");
         if (fog_provider) {
             const FogField* f = fog_provider();
             scene_renderer.set_fog(f ? *f : FogField{});
@@ -671,11 +723,19 @@ WindowResult run_game_window(const GameFrameFn& frame, const casc::Storage* stor
         for (const SceneInstance& s : scene)
             if (s.model && s.model->vertex_count && !s.model->indices.empty()) live.push_back(&s);
 
-        scene_renderer.prepare(live);
+        std::vector<const SceneInstance*> light_only;
+        for (const SceneInstance& s : scene)
+            if (s.model && !(s.model->vertex_count && !s.model->indices.empty()) && !s.model->lights.empty()) light_only.push_back(&s);
+        scene_renderer.prepare(live, &light_only);
 
         std::vector<SceneRenderer::ParticleVertex> pverts;
         std::vector<SceneRenderer::ParticleGroup> pgroups;
-        build_particles(scene_renderer, live, cam, pverts, pgroups);
+        std::vector<const SceneInstance*> emitting = live;
+        for (const SceneInstance& s : scene)
+            if (s.model && !(s.model->vertex_count && !s.model->indices.empty()) &&
+                (!s.model->particles.empty() || !s.model->ribbons.empty()))
+                emitting.push_back(&s);
+        build_particles(scene_renderer, emitting, cam, pverts, pgroups);
 
         VkSwapchainKHR cur_swap = swapchain.get();
         uint32_t idx = 0;
@@ -813,6 +873,7 @@ WindowResult run_game_window(const GameFrameFn& frame, const casc::Storage* stor
         ppi.pImageIndices = &idx;
         VkResult pr = vkQueuePresentKHR(queue, &ppi);
         if (pr == VK_SUCCESS || pr == VK_SUBOPTIMAL_KHR) ++result.frames_presented;
+        frame_prof_tick();
         if (pr == VK_ERROR_OUT_OF_DATE_KHR || pr == VK_SUBOPTIMAL_KHR || accum.resized) {
             accum.resized = false;
             recreate_swapchain();

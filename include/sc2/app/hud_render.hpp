@@ -23,6 +23,9 @@ struct ConsolePanel;
 HudRect hud_minimap_rect(std::uint32_t out_w, std::uint32_t out_h,
                          const ConsolePanel* console = nullptr);
 
+HudRect hud_equipment_cell(std::uint32_t out_w, std::uint32_t out_h, int index,
+                           const ConsolePanel* console = nullptr, int count = 0);
+
 inline std::string hud_clock_text(int game_seconds) {
     if (game_seconds < 0) return {};
     const int m = game_seconds / 60, s = game_seconds % 60;
@@ -30,6 +33,8 @@ inline std::string hud_clock_text(int game_seconds) {
 }
 
 HudRect hud_idle_button_rect(std::uint32_t out_w, std::uint32_t out_h, const ConsolePanel* console = nullptr);
+HudRect hud_army_button_rect(std::uint32_t out_w, std::uint32_t out_h, const ConsolePanel* console = nullptr);
+HudRect hud_warp_button_rect(std::uint32_t out_w, std::uint32_t out_h, const ConsolePanel* console = nullptr);
 
 inline bool hud_supply_blocked(int used, int cap) { return cap > 0 && used >= cap; }
 
@@ -38,6 +43,7 @@ constexpr std::uint8_t kSupplyBlockedR = 255, kSupplyBlockedG = 0, kSupplyBlocke
 HudRect hud_cargo_slot(std::uint32_t out_w, std::uint32_t out_h, int slot, const ConsolePanel* console = nullptr);
 
 HudRect hud_queue_slot(std::uint32_t out_w, std::uint32_t out_h, int slot, const ConsolePanel* console = nullptr);
+HudRect hud_behavior_slot(std::uint32_t out_w, std::uint32_t out_h, int slot, const ConsolePanel* console = nullptr);
 
 int hud_panel_height(std::uint32_t out_h);
 
@@ -62,6 +68,9 @@ HudRect hud_unit_wireframe_rect(std::uint32_t out_w, std::uint32_t out_h,
 HudRect hud_progress_bar_rect(std::uint32_t out_w, std::uint32_t out_h,
                               const ConsolePanel* console = nullptr);
 
+HudRect hud_progress_button_rect(std::uint32_t out_w, std::uint32_t out_h,
+                                 const ConsolePanel* console = nullptr);
+
 HudRect hud_unit_panel_rect(std::uint32_t out_w, std::uint32_t out_h,
                             const ConsolePanel* console = nullptr);
 
@@ -85,6 +94,7 @@ struct MinimapBackdrop {
     int fw = 0, fh = 0;
     int viewer_player = -1;
     MinimapExtent extent;
+    MinimapExtent terrain_extent;
 };
 
 std::vector<std::uint8_t> hud_bake_minimap_terrain(const std::vector<std::uint8_t>& level,

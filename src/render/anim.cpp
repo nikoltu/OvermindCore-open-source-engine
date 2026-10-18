@@ -2,7 +2,10 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdio>
+#include <cstdlib>
 #include <sstream>
+#include <string>
 
 namespace sc2::render {
 
@@ -78,10 +81,16 @@ bool sample(const formats::M3Track& tr, float t, uint16_t interp, int comps,
 }
 
 void field(const formats::Model& m, uint32_t seq, const formats::M3AnimRef& a,
-           float t, int comps, float* out) {
+           float t, int comps, float* out, const ClipLayers* global = nullptr) {
     for (int c = 0; c < comps; ++c) out[c] = a.init[c];
     if (a.anim_flags == 0) return;
     const formats::M3Track* tr = find_track(m, seq, a.anim_id);
+    if (!tr && global)
+        for (const ClipLayer& L : *global)
+            if ((tr = find_track(m, L.seq, a.anim_id)) != nullptr) {
+                t = L.time_ms + (L.seq < m.sequences.size() ? float(m.sequences[L.seq].start_ms) : 0.0f);
+                break;
+            }
     if (tr) sample(*tr, t, a.interp, comps, out);
 }
 
@@ -96,7 +105,24 @@ Mat4 bind_matrix(const formats::Model& m, size_t b) {
 
 }
 
+bool region_visible(const formats::Model& m, int seq, float time_ms, std::size_t region, const ClipLayers* global) {
+    static const bool kOff = std::getenv("SC2_NO_BATCH_BONE_VISIBILITY") != nullptr || std::getenv("SC2_NO_BONE_VISIBILITY") != nullptr;
+    if (kOff || seq < 0 || region >= m.region_bone.size()) return true;
+    const int b = m.region_bone[region];
+    if (b < 0 || std::size_t(b) >= m.bones.size()) return true;
+    const formats::M3Bone& bone = m.bones[std::size_t(b)];
+    if (bone.visibility.anim_flags == 0) return true;
+    float V[1] = {bone.visibility.init[0]};
+    field(m, std::uint32_t(seq), bone.visibility, time_ms, 1, V, global);
+    return V[0] >= 0.5f;
+}
+
 std::vector<Mat4> pose_world(const formats::Model& m, uint32_t seq, float time_ms) {
+    return pose_world(m, seq, time_ms, -1, 0.0f);
+}
+
+std::vector<Mat4> pose_world(const formats::Model& m, uint32_t seq, float time_ms, int yaw_bone, float yaw_rad,
+                             const ClipLayers* global) {
     size_t n = m.bones.size();
     std::vector<Mat4> world(n);
     if (n == 0) return world;
@@ -104,15 +130,34 @@ std::vector<Mat4> pose_world(const formats::Model& m, uint32_t seq, float time_m
     float t = time_ms;
     if (seq < m.sequences.size()) t += float(m.sequences[seq].start_ms);
 
+    static const bool kUiKeep = std::getenv("SC2_BONE_VIS_UI_KEEP") != nullptr;
+    const bool ui_model = kUiKeep && m.name.find("\\UI\\") != std::string::npos;
     std::vector<Mat4> local(n);
     for (size_t b = 0; b < n; ++b) {
         const formats::M3Bone& bone = m.bones[b];
         float T[3], R[4] = {0, 0, 0, 1}, S[3] = {1, 1, 1};
-        field(m, seq, bone.location, t, 3, T);
-        field(m, seq, bone.rotation, t, 4, R);
-        field(m, seq, bone.scale, t, 3, S);
+        field(m, seq, bone.location, t, 3, T, global);
+        field(m, seq, bone.rotation, t, 4, R, global);
+        field(m, seq, bone.scale, t, 3, S, global);
+        static const bool kBoneVis = std::getenv("SC2_NO_BONE_VISIBILITY") == nullptr;
+        if (std::getenv("SC2_BONE_VIS_TRACE") && bone.visibility.anim_flags == 0) {
+            static int told_static = 0;
+            const char* want = std::getenv("SC2_BONE_VIS_MODEL");
+            if (want && m.name.find(want) != std::string::npos && told_static++ < 600)
+                std::fprintf(stderr, "[bonevis-static] %s parent %d model %s init %.0f\n", bone.name.c_str(), int(bone.parent), m.name.c_str(), double(bone.visibility.init[0]));
+        }
+        if (kBoneVis && !ui_model && bone.visibility.anim_flags != 0) {
+            float V[1] = {bone.visibility.init[0]};
+            field(m, seq, bone.visibility, t, 1, V, global);
+            if (std::getenv("SC2_BONE_VIS_TRACE")) {
+                static int told = 0;
+                if (std::string(std::getenv("SC2_BONE_VIS_TRACE")) == "1" ? told++ < 400 : bone.name.find(std::getenv("SC2_BONE_VIS_TRACE")) != std::string::npos && told++ < 6) std::fprintf(stderr, "[bonevis] %s flags %x model %s seq %u t %.0f init %.0f now %.3f\n", bone.name.c_str(), unsigned(bone.flags), m.name.c_str(), unsigned(seq), double(t), double(bone.visibility.init[0]), double(V[0]));
+            }
+            if (V[0] < 0.5f) S[0] = S[1] = S[2] = 0.0f;
+        }
         local[b] = translation(T[0], T[1], T[2]) * from_quat(R[0], R[1], R[2], R[3]) *
                    scaling(S[0], S[1], S[2]);
+        if (int(b) == yaw_bone && yaw_rad != 0.0f) local[b] = local[b] * rotation_z(yaw_rad);
     }
     std::vector<char> done(n, 0);
     for (bool progress = true; progress;) {
@@ -179,7 +224,12 @@ bool posed_bounds(const formats::Model& m, int seq, float time_ms, float mn[3], 
 }
 
 std::vector<Mat4> pose(const formats::Model& m, uint32_t seq, float time_ms) {
-    std::vector<Mat4> world = pose_world(m, seq, time_ms);
+    return pose(m, seq, time_ms, -1, 0.0f);
+}
+
+std::vector<Mat4> pose(const formats::Model& m, uint32_t seq, float time_ms, int yaw_bone, float yaw_rad,
+                       const ClipLayers* global) {
+    std::vector<Mat4> world = pose_world(m, seq, time_ms, yaw_bone, yaw_rad, global);
     size_t n = world.size();
     std::vector<Mat4> skin(n, Mat4::identity());
     for (size_t b = 0; b < n; ++b) skin[b] = world[b] * bind_matrix(m, b);
@@ -209,6 +259,71 @@ int select_sequence(const formats::Model& m, const std::vector<std::string>& tok
         pick -= w;
     }
     return cands[0];
+}
+
+int select_variation(const formats::Model& m, const std::string& token, uint64_t seed, double clock_ms, float* time_ms) {
+    std::vector<int> cands;
+    uint64_t total = 0;
+    for (size_t i = 0; i < m.sequences.size(); ++i) {
+        std::vector<std::string> t = tokenize(m.sequences[i].name);
+        bool named = false, other = false;
+        for (const std::string& s : t) {
+            if (s == token) named = true;
+            else if (s.find_first_not_of("0123456789") != std::string::npos) other = true;
+        }
+        if (!named || other) continue;
+        cands.push_back(int(i));
+        total += m.sequences[i].frequency ? m.sequences[i].frequency : 1;
+    }
+    if (time_ms) *time_ms = 0.0f;
+    if (cands.empty()) return -1;
+    double t = clock_ms > 0.0 ? clock_ms : 0.0;
+    int seq = cands[0];
+    for (uint64_t loop = 0; loop < 100000; ++loop) {
+        uint64_t h = seed + loop * 0x9E3779B97F4A7C15ULL;
+        h ^= h >> 33; h *= 0xff51afd7ed558ccdULL; h ^= h >> 33; h *= 0xc4ceb9fe1a85ec53ULL; h ^= h >> 33;
+        uint64_t pick = h % total;
+        seq = cands[0];
+        for (int i : cands) {
+            const uint64_t w = m.sequences[i].frequency ? m.sequences[i].frequency : 1;
+            if (pick < w) { seq = i; break; }
+            pick -= w;
+        }
+        const double len = double(m.sequences[size_t(seq)].length_ms());
+        if (len <= 0.0 || t < len) break;
+        t -= len;
+    }
+    if (time_ms) *time_ms = float(t);
+    return seq;
+}
+
+int select_take(const formats::Model& m, int seq, uint64_t seed, uint32_t loop) {
+    if (seq < 0 || size_t(seq) >= m.sequences.size()) return seq;
+    auto words = [](const std::string& name) {
+        std::vector<std::string> out;
+        for (const std::string& s : tokenize(name))
+            if (s.find_first_not_of("0123456789") != std::string::npos) out.push_back(s);
+        std::sort(out.begin(), out.end());
+        return out;
+    };
+    const std::vector<std::string> own = words(m.sequences[size_t(seq)].name);
+    std::vector<int> cands;
+    uint64_t total = 0;
+    for (size_t i = 0; i < m.sequences.size(); ++i) {
+        if (words(m.sequences[i].name) != own) continue;
+        cands.push_back(int(i));
+        total += m.sequences[i].frequency ? m.sequences[i].frequency : 1;
+    }
+    if (cands.size() < 2 || total == 0) return seq;
+    uint64_t h = seed + uint64_t(loop) * 0x9E3779B97F4A7C15ULL;
+    h ^= h >> 33; h *= 0xff51afd7ed558ccdULL; h ^= h >> 33; h *= 0xc4ceb9fe1a85ec53ULL; h ^= h >> 33;
+    uint64_t pick = h % total;
+    for (int i : cands) {
+        const uint64_t w = m.sequences[i].frequency ? m.sequences[i].frequency : 1;
+        if (pick < w) return i;
+        pick -= w;
+    }
+    return seq;
 }
 
 void collect_events(const formats::Model& m, uint32_t seq, float t0, float t1,
@@ -247,11 +362,23 @@ bool attachment_transform(const formats::Model& m, const std::string& name, uint
     return true;
 }
 
+static const formats::M3Track* find_layered(const formats::Model& m, uint32_t seq, uint32_t anim_id, float& t,
+                                            const ClipLayers* global) {
+    if (const formats::M3Track* tr = find_track(m, seq, anim_id)) return tr;
+    if (global)
+        for (const ClipLayer& L : *global)
+            if (const formats::M3Track* tr = find_track(m, L.seq, anim_id)) {
+                t = L.time_ms;
+                return tr;
+            }
+    return nullptr;
+}
+
 void animated_layer_field(const formats::Model& model, uint32_t seq, uint16_t interp, uint16_t flags, uint32_t anim_id,
-                          float time_ms, int comps, const float* fallback, float* out) {
+                          float time_ms, int comps, const float* fallback, float* out, const ClipLayers* global) {
     for (int c = 0; c < comps; ++c) out[c] = fallback[c];
     if (flags == 0) return;
-    const formats::M3Track* tr = find_track(model, seq, anim_id);
+    const formats::M3Track* tr = find_layered(model, seq, anim_id, time_ms, global);
     if (!tr) return;
     float v[4] = {0, 0, 0, 0};
     if (!sample(*tr, time_ms, interp, comps, v)) return;
@@ -259,9 +386,9 @@ void animated_layer_field(const formats::Model& model, uint32_t seq, uint16_t in
 }
 
 float animated_scalar(const formats::Model& model, uint32_t seq, const formats::M3AnimRef& ref,
-                      float time_ms, float fallback) {
+                      float time_ms, float fallback, const ClipLayers* global) {
     if (ref.anim_flags == 0) return fallback;
-    const formats::M3Track* tr = find_track(model, seq, ref.anim_id);
+    const formats::M3Track* tr = find_layered(model, seq, ref.anim_id, time_ms, global);
     if (!tr) return fallback;
     float v = 0.0f;
     if (!sample(*tr, time_ms, ref.interp, 1, &v)) return fallback;

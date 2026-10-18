@@ -2,22 +2,30 @@
 
 #include <cstdlib>
 #include <string>
+#include <cstdint>
 #include <unordered_map>
+#include <vector>
 
 #include "sc2/casc/storage.hpp"
 
 namespace sc2::app {
 
-inline std::unordered_map<std::string, float> water_type_heights(casc::Storage& store) {
+inline std::unordered_map<std::string, float> water_type_heights(casc::Storage& store,
+                                                                 const std::vector<std::uint8_t>* map_xml = nullptr) {
     std::unordered_map<std::string, float> out;
-    static const char* kMods[] = {"void", "swarm", "liberty", "core"};
+    static const char* kMods[] = {nullptr, "void", "swarm", "liberty", "core"};
     for (const char* m : kMods) {
         std::string xml;
-        try {
-            auto b = store.read_by_name(std::string("mods/") + m +
-                                        ".sc2mod/base.sc2data/GameData/WaterData.xml");
-            xml.assign(b.begin(), b.end());
-        } catch (const std::exception&) { continue; }
+        if (!m) {
+            if (!map_xml) continue;
+            xml.assign(map_xml->begin(), map_xml->end());
+        } else {
+            try {
+                auto b = store.read_by_name(std::string("mods/") + m +
+                                            ".sc2mod/base.sc2data/GameData/WaterData.xml");
+                xml.assign(b.begin(), b.end());
+            } catch (const std::exception&) { continue; }
+        }
 
         std::size_t pos = 0;
         while (true) {

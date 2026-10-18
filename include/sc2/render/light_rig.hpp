@@ -1,4 +1,5 @@
 #pragma once
+#include <cstdlib>
 
 #include <algorithm>
 #include <cmath>
@@ -35,13 +36,25 @@ inline LightRig rig_from_env(const data::EnvLight& env) {
             d.spec[i] = float(s.spec_color[i] * s.spec_multiplier);
         }
     };
-    one(env.key, r.key);
+    if (!std::getenv("SC2_NO_KEY")) one(env.key, r.key);
     one(env.fill, r.fill);
     one(env.back, r.back);
     if (env.has_ambient)
         for (int i = 0; i < 3; ++i) r.ambient[i] = float(env.ambient_color[i]);
     r.present = r.key.present || r.fill.present || r.back.present;
     return r;
+}
+
+inline void shade_retail(const LightRig& r, const Vec3& n, float sh, float out[3], float ambient_mult = 1.0f,
+                         float diffuse_mult = 1.0f) {
+    for (int i = 0; i < 3; ++i) out[i] = r.ambient[i] * ambient_mult;
+    const RigLight* ls[3] = {&r.key, &r.fill, &r.back};
+    for (int k = 0; k < 3; ++k) {
+        const RigLight* l = ls[k];
+        if (!l->present) continue;
+        const float d = std::max(0.0f, -(n.x * l->dir.x + n.y * l->dir.y + n.z * l->dir.z));
+        for (int i = 0; i < 3; ++i) out[i] += l->color[i] * diffuse_mult * d * (k == 0 ? sh : 1.0f);
+    }
 }
 
 inline void shade(const LightRig& r, const Vec3& n, float sh, float out[3], float floor_ = 0.0f) {

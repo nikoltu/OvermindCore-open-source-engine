@@ -35,6 +35,9 @@ public:
 
     const std::string* resolve_name_ci(const std::string& path) const;
 
+    void set_overlay(std::unordered_map<std::string, std::vector<uint8_t>> files);
+    std::size_t overlay_size() const { return overlay_.size(); }
+
     std::vector<uint8_t> read_root() const;
 
     std::vector<uint8_t> read_blte_stream(const Location& loc) const;
@@ -48,6 +51,9 @@ private:
     bool has_mndx_ = false;
     mutable std::unordered_map<std::string, std::string> ci_names_;
     mutable bool ci_built_ = false;
+    std::unordered_map<std::string, std::vector<uint8_t>> overlay_;
+    mutable std::unordered_map<std::string, std::string> overlay_names_;
+    const std::vector<uint8_t>* overlay_find(const std::string& path, std::string* key = nullptr) const;
     std::string root_ckey_hex_;
     std::string encoding_ekey_hex_;
 

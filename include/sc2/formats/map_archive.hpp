@@ -1,14 +1,19 @@
 #pragma once
 
 #include <algorithm>
+#include <cctype>
+#include <cmath>
 #include <cstdint>
 #include <map>
 #include <stdexcept>
+#include <cstdlib>
+#include <cstring>
 #include <string>
 #include <unordered_map>
 #include <utility>
 #include <vector>
 
+#include "sc2/formats/hard_tile.hpp"
 #include "sc2/formats/map_info.hpp"
 #include "sc2/formats/mpq.hpp"
 #include "sc2/formats/placed_objects.hpp"
@@ -19,6 +24,51 @@
 #include "sc2/sim/terrain_map.hpp"
 
 namespace sc2::formats {
+
+struct ScriptedCamera {
+    bool found = false;
+    std::string id;
+    float distance = 0.0f;
+    float pitch_deg = 0.0f;
+    float fov_deg = 0.0f;
+    float yaw_deg = 180.0f;
+};
+
+inline ScriptedCamera parse_scripted_camera(const std::vector<std::uint8_t>& script_bytes,
+                                            const std::vector<std::uint8_t>& objects_bytes) {
+    ScriptedCamera out;
+    const std::string script(script_bytes.begin(), script_bytes.end());
+    const std::string objects(objects_bytes.begin(), objects_bytes.end());
+    const std::string call = "CameraApplyInfo(", from = "CameraInfoFromId(";
+    std::string id;
+    for (std::size_t at = script.find(call); at != std::string::npos; at = script.find(call, at + 1)) {
+        const std::size_t eol = script.find('\n', at);
+        const std::size_t f = script.find(from, at);
+        if (f == std::string::npos || (eol != std::string::npos && f > eol)) continue;
+        std::size_t b = f + from.size(), e = b;
+        while (e < script.size() && script[e] >= '0' && script[e] <= '9') ++e;
+        if (e > b) id = script.substr(b, e - b);
+    }
+    if (id.empty()) return out;
+    const std::size_t o0 = objects.find("<ObjectCamera Id=\"" + id + "\"");
+    if (o0 == std::string::npos) return out;
+    std::size_t o1 = objects.find("</ObjectCamera>", o0);
+    if (o1 == std::string::npos) o1 = objects.size();
+    const std::string body = objects.substr(o0, o1 - o0);
+    auto value = [&](const char* index, float& dst) {
+        const std::string key = std::string("<CameraValue Index=\"") + index + "\" Value=\"";
+        const std::size_t k = body.find(key);
+        if (k == std::string::npos) return false;
+        dst = float(std::atof(body.c_str() + k + key.size()));
+        return true;
+    };
+    if (!value("Distance", out.distance) || !value("Pitch", out.pitch_deg) || !value("FieldOfView", out.fov_deg)) return out;
+    value("Yaw", out.yaw_deg);
+    if (out.distance <= 0.0f || out.fov_deg <= 0.0f) return out;
+    out.id = id;
+    out.found = true;
+    return out;
+}
 
 struct LoadedMap {
     std::uint32_t width = 0;
@@ -33,6 +83,7 @@ struct LoadedMap {
     std::vector<std::uint8_t> body_nav_block;
     std::vector<std::uint8_t> body_place_block;
     PlacedObjects objects;
+    ScriptedCamera scripted_camera;
     MapInfoHeader info;
     std::vector<std::uint8_t> heightmap_raw;
     TerrainQuantize quantize;
@@ -46,6 +97,12 @@ struct LoadedMap {
     std::vector<std::string> tileset_textures;
     TextureInfo texture_info;
     TextureMask texture_mask;
+    VertexTint vertex_tint;
+    struct FluffDoodad {
+        float x = 0, y = 0;
+        std::uint8_t slot = 0;
+    };
+    std::vector<FluffDoodad> fluff;
     bool has_splat = false;
     bool has_retail_splat = false;
     CliffMap cliff;
@@ -55,6 +112,7 @@ struct LoadedMap {
     PaintedPathing painted;
     std::uint32_t painted_blocked = 0;
     std::size_t ramp_rescued = 0;
+    std::size_t halo_reopened = 0;
     std::size_t doodad_blocked = 0;
     std::size_t unit_blocked = 0;
     std::size_t out_of_bounds_blocked = 0;
@@ -77,6 +135,13 @@ struct LoadedMap {
     }
     bool has_cliff_levels = false;
     WaterMap water;
+    std::vector<HardTile> hard_tiles;
+    std::vector<std::pair<std::string, std::vector<std::uint8_t>>> game_data;
+    const std::vector<std::uint8_t>* game_data_file(const std::string& leaf) const {
+        for (const auto& kv : game_data)
+            if (kv.first == leaf) return &kv.second;
+        return nullptr;
+    }
 
     std::uint32_t cell_width() const {
         return info.width ? info.width : (width ? width - 1 : 0);
@@ -219,6 +284,31 @@ inline LoadedMap load_map_terrain(std::vector<std::uint8_t> sc2map_bytes) {
                             if (wall) out.nav.mark_cliff(x, y, true);
                         }
                     }
+                    if (!out.sync_height.empty() && out.sync_height.level.size() ==
+                                                        std::size_t(out.sync_height.width) * out.sync_height.height) {
+                        const int vw = int(out.sync_height.width), vh = int(out.sync_height.height);
+                        std::vector<std::uint8_t> was_free(std::size_t(mw) * std::size_t(mh), 0);
+                        for (int y = 0; y < mh; ++y)
+                            for (int x = 0; x < mw; ++x) was_free[std::size_t(y) * mw + x] = out.nav.is_blocked_cell(x, y) ? 0 : 1;
+                        auto vlevel = [&](int vx, int vy) { return out.sync_height.level[std::size_t(vy) * vw + vx]; };
+                        for (int y = 0; y < mh; ++y)
+                            for (int x = 0; x < mw; ++x) {
+                                if (!out.cell_flags.blocked(std::uint32_t(x), std::uint32_t(y))) continue;
+                                if (!out.painted.empty() && out.painted.cell_unpathable(std::uint32_t(x), std::uint32_t(y))) continue;
+                                if (!out.nav.is_blocked_cell(x, y)) continue;
+                                if (x + 1 >= vw || y + 1 >= vh) continue;
+                                const std::uint16_t l0 = vlevel(x, y);
+                                if (vlevel(x + 1, y) != l0 || vlevel(x, y + 1) != l0 || vlevel(x + 1, y + 1) != l0) continue;
+                                const bool touches_free =
+                                    (x > 0 && was_free[std::size_t(y) * mw + x - 1]) || (x + 1 < mw && was_free[std::size_t(y) * mw + x + 1]) ||
+                                    (y > 0 && was_free[std::size_t(y - 1) * mw + x]) || (y + 1 < mh && was_free[std::size_t(y + 1) * mw + x]);
+                                if (!touches_free) continue;
+                                out.nav.set_blocked(x, y, false);
+                                out.nav.mark_cliff(x, y, false);
+                                if (out.blocked_cells > 0) --out.blocked_cells;
+                                ++out.halo_reopened;
+                            }
+                    }
                 }
             }
         } catch (const std::exception&) {
@@ -292,11 +382,54 @@ inline LoadedMap load_map_terrain(std::vector<std::uint8_t> sc2map_bytes) {
             out.water = WaterMap{};
         }
     }
+    for (const std::string& name : arc.list()) {
+        std::string low = name;
+        for (char& c : low) c = c == '\\' ? '/' : char(std::tolower(static_cast<unsigned char>(c)));
+        const std::size_t gd = low.find("base.sc2data/gamedata/");
+        if (gd == std::string::npos || low.size() < 4 || low.compare(low.size() - 4, 4, ".xml") != 0) continue;
+        try {
+            out.game_data.emplace_back(name.substr(gd + 22), arc.read_file(name));
+        } catch (const std::exception&) {
+        }
+    }
+    if (arc.contains("t3HardTile")) {
+        try {
+            out.hard_tiles = parse_hard_tiles(arc.read_file("t3HardTile"));
+        } catch (const std::exception&) {
+            out.hard_tiles.clear();
+        }
+    }
 
     if (arc.contains("Objects")) out.objects = parse_placed_objects(arc.read_file("Objects"));
+    if (arc.contains("Objects") && arc.contains("MapScript.galaxy")) {
+        try { out.scripted_camera = parse_scripted_camera(arc.read_file("MapScript.galaxy"), arc.read_file("Objects")); }
+        catch (const std::exception&) { out.scripted_camera = ScriptedCamera{}; }
+    }
 
     out.placement = build_terrain_map(out);
 
+    if (arc.contains("t3VertCol")) {
+        try { out.vertex_tint = VertexTint::parse(arc.read_file("t3VertCol")); }
+        catch (const std::exception&) { out.vertex_tint = VertexTint{}; }
+    }
+    if (arc.contains("t3FluffDoodad")) {
+        try {
+            const std::vector<std::uint8_t> fb = arc.read_file("t3FluffDoodad");
+            if (fb.size() >= 28 && fb[0] == 'D' && fb[1] == 'L' && fb[2] == 'F' && fb[3] == 'T') {
+                std::uint32_t count = 0;
+                std::memcpy(&count, fb.data() + 24, 4);
+                if (std::size_t(count) * 9 + 28 <= fb.size()) {
+                    out.fluff.resize(count);
+                    for (std::uint32_t i = 0; i < count; ++i) {
+                        const std::uint8_t* r = fb.data() + 28 + std::size_t(i) * 9;
+                        std::memcpy(&out.fluff[i].x, r, 4);
+                        std::memcpy(&out.fluff[i].y, r + 4, 4);
+                        out.fluff[i].slot = r[8];
+                    }
+                }
+            }
+        } catch (const std::exception&) { out.fluff.clear(); }
+    }
     if (arc.contains("t3TextureMasks")) {
         try { out.texture_mask = TextureMask::parse(arc.read_file("t3TextureMasks")); }
         catch (const std::exception&) { out.texture_mask = TextureMask{}; }
@@ -377,6 +510,20 @@ inline float map_vertex_height(const LoadedMap& map, std::uint32_t col, std::uin
     const float scale = map.quantize.found ? float(map.quantize.quantize_scale) : 1.0f / 512.0f;
     const float bias = (map.quantize.found ? float(map.quantize.quantize_bias) : 0.0f) +
                        (map.quantize.found ? float(map.quantize.standard_height) : 0.0f);
+    const std::uint16_t h = std::uint16_t(raw[rec]) | std::uint16_t(raw[rec + 1]) << 8;
+    return float(h) * scale - bias;
+}
+
+inline float map_sculpt_height(const LoadedMap& map, std::uint32_t col, std::uint32_t row) {
+    const HeightMap& hm = map.heightmap;
+    const std::vector<std::uint8_t>& raw = map.heightmap_raw;
+    if (hm.width == 0 || hm.height == 0 || hm.stride < 2) return 0.0f;
+    if (col >= hm.width) col = hm.width - 1;
+    if (row >= hm.height) row = hm.height - 1;
+    const std::size_t rec = hm.data_offset + (std::size_t(row) * hm.width + col) * hm.stride;
+    if (rec + 1 >= raw.size()) return 0.0f;
+    const float scale = map.quantize.found ? float(map.quantize.quantize_scale) : 1.0f / 512.0f;
+    const float bias = map.quantize.found ? float(map.quantize.quantize_bias) : 0.0f;
     const std::uint16_t h = std::uint16_t(raw[rec]) | std::uint16_t(raw[rec + 1]) << 8;
     return float(h) * scale - bias;
 }
@@ -617,9 +764,21 @@ inline std::vector<float> tier_relief(const LoadedMap& map) {
         if (d > 1e-3f && (step <= 0.0f || d < step)) step = d;
     }
     const float band = step > 0.0f ? 0.45f * step : 0.45f;
-    for (float& d : out) d = d > band ? band : (d < -band ? -band : d);
     const CliffMap& cm = map.cliff;
     const bool have_raw = cm.raw.size() == std::size_t(cm.width) * cm.height;
+    constexpr int kNear = 3;
+    for (std::uint32_t y = 0; y < cm.height; ++y)
+        for (std::uint32_t x = 0; x < cm.width; ++x) {
+            const std::size_t k = std::size_t(y) * cm.width + x;
+            bool near = false;
+            for (int dy = -kNear; dy <= kNear && !near; ++dy)
+                for (int dx = -kNear; dx <= kNear && !near; ++dx) {
+                    const int nx = int(x) + dx, ny = int(y) + dy;
+                    if (nx < 0 || ny < 0 || nx >= int(cm.width) || ny >= int(cm.height)) continue;
+                    if (cm.levels[std::size_t(ny) * cm.width + nx] != cm.levels[k]) near = true;
+                }
+            if (near) out[k] = out[k] > band ? band : (out[k] < -band ? -band : out[k]);
+        }
     for (std::uint32_t y = 0; y < cm.height; ++y)
         for (std::uint32_t x = 0; x < cm.width; ++x) {
             const std::size_t k = std::size_t(y) * cm.width + x;
@@ -635,6 +794,257 @@ inline std::vector<float> tier_relief(const LoadedMap& map) {
             if (edge) out[k] = 0.0f;
         }
     return out;
+}
+
+inline float engine_z_offset(const LoadedMap& map);
+inline float vertex_ground_z(const LoadedMap& map, const std::vector<float>& th, float off, std::uint32_t c,
+                             std::uint32_t r) {
+    const std::uint32_t W = map.cliff.width, H = map.cliff.height;
+    int lo = 1 << 30, hi = -1;
+    for (int dy = -1; dy <= 0; ++dy)
+        for (int dx = -1; dx <= 0; ++dx) {
+            const int x = int(c) + dx, y = int(r) + dy;
+            if (x < 0 || y < 0 || x >= int(W) || y >= int(H)) continue;
+            const int L = map.cliff.levels[std::size_t(y) * W + std::size_t(x)];
+            lo = std::min(lo, L); hi = std::max(hi, L);
+        }
+    (void)th; (void)lo; (void)hi;
+    return map_vertex_height(map, c, r) - off;
+}
+
+inline float vertex_ground_bilinear(const LoadedMap& map, const std::vector<float>& th, float off, float x, float y) {
+    const float W = float(map.cliff.width), H = float(map.cliff.height);
+    x = std::min(std::max(x, 0.0f), W);
+    y = std::min(std::max(y, 0.0f), H);
+    const std::uint32_t c = std::min(std::uint32_t(x), map.cliff.width ? map.cliff.width - 1 : 0u);
+    const std::uint32_t r = std::min(std::uint32_t(y), map.cliff.height ? map.cliff.height - 1 : 0u);
+    const float fx = x - float(c), fy = y - float(r);
+    const float z00 = vertex_ground_z(map, th, off, c, r), z10 = vertex_ground_z(map, th, off, c + 1, r);
+    const float z01 = vertex_ground_z(map, th, off, c, r + 1), z11 = vertex_ground_z(map, th, off, c + 1, r + 1);
+    return (z00 * (1.0f - fx) + z10 * fx) * (1.0f - fy) + (z01 * (1.0f - fx) + z11 * fx) * fy;
+}
+
+inline bool vertex_cell_wall(const LoadedMap& map, const std::vector<float>& th, float off, std::uint32_t c,
+                             std::uint32_t r, float z[4]) {
+    z[0] = vertex_ground_z(map, th, off, c, r);
+    z[1] = vertex_ground_z(map, th, off, c + 1, r);
+    z[2] = vertex_ground_z(map, th, off, c, r + 1);
+    z[3] = vertex_ground_z(map, th, off, c + 1, r + 1);
+    const float mn = std::min(std::min(z[0], z[1]), std::min(z[2], z[3]));
+    const float mx = std::max(std::max(z[0], z[1]), std::max(z[2], z[3]));
+    static const bool no_walls = std::getenv("SC2_NO_WALL_CELLS") != nullptr;
+    if (no_walls || mx - mn <= 0.5f || th.empty()) return false;
+    const std::uint32_t W = map.cliff.width, H = map.cliff.height;
+    int lo = 1 << 30, hi = -1;
+    for (int dy = -1; dy <= 1; ++dy)
+        for (int dx = -1; dx <= 1; ++dx) {
+            const int x = int(c) + dx, y = int(r) + dy;
+            if (x < 0 || y < 0 || x >= int(W) || y >= int(H)) continue;
+            const std::size_t k = std::size_t(y) * W + std::size_t(x);
+            if (map.cliff.raw.size() == std::size_t(W) * H && (map.cliff.raw[k] & 63)) return false;
+            const int L = map.cliff.levels[k];
+            lo = std::min(lo, L); hi = std::max(hi, L);
+        }
+    if (hi <= lo) return false;
+    const float step = th[std::size_t(std::min(hi, int(th.size()) - 1))] - th[std::size_t(std::min(lo, int(th.size()) - 1))];
+    if (mx - mn <= 0.5f * step) return false;
+    for (int i = 0; i < 4; ++i) z[i] = std::min(z[i], mn + 0.3f);
+    return true;
+}
+
+inline std::vector<float> bake_ground_heights_vertex(const LoadedMap& map, std::uint32_t& out_w, std::uint32_t& out_h) {
+    out_w = map.cliff.width;
+    out_h = map.cliff.height;
+    std::vector<float> out;
+    if (map.cliff.empty()) { out_w = out_h = 0; return out; }
+    const std::vector<float> th = tier_heights(map);
+    const float off = engine_z_offset(map);
+    out.resize(std::size_t(out_w) * out_h);
+    for (std::uint32_t y = 0; y < out_h; ++y)
+        for (std::uint32_t x = 0; x < out_w; ++x) {
+            float z[4];
+            vertex_cell_wall(map, th, off, x, y, z);
+            out[std::size_t(y) * out_w + x] = 0.25f * (z[0] + z[1] + z[2] + z[3]);
+        }
+    return out;
+}
+
+inline Model build_map_mesh_vertex(const LoadedMap& map, float cell = 1.0f, const std::vector<std::uint8_t>* skip = nullptr) {
+    Model m;
+    if (map.cliff.empty()) return m;
+    const std::uint32_t W = map.cliff.width, H = map.cliff.height, VW = W + 1;
+    const float off = engine_z_offset(map);
+    const std::vector<float> th = tier_heights(map);
+    const std::uint32_t rows_per_band = std::max<std::uint32_t>(1, 60000u / VW - 1);
+    struct WallCell { std::uint32_t c, r; float z[4]; };
+    std::vector<WallCell> walls;
+    std::vector<std::pair<std::uint32_t, std::uint32_t>> under;
+    auto push = [&](std::uint32_t c, std::uint32_t r) {
+        m.positions.push_back(float(c) * cell);
+        m.positions.push_back(float(r) * cell);
+        const float z0 = vertex_ground_z(map, th, off, c, r);
+        m.positions.push_back(z0);
+        m.uvs.push_back(float(c) / float(W));
+        m.uvs.push_back(float(r) / float(H));
+        static const bool kSeamNormal = std::getenv("SC2_TERRAIN_SEAM_NORMAL") != nullptr;
+        auto seam = [&](int vc, int vr) {
+            if (kSeamNormal || map.cliff.levels.size() != std::size_t(W) * H) return false;
+            int lo = 1 << 30, hi = -1;
+            for (int dy = -1; dy <= 0; ++dy)
+                for (int dx = -1; dx <= 0; ++dx) {
+                    const int x = vc + dx, y = vr + dy;
+                    if (x < 0 || y < 0 || x >= int(W) || y >= int(H)) continue;
+                    const std::size_t k = std::size_t(y) * W + std::size_t(x);
+                    if (map.cliff.raw.size() == std::size_t(W) * H && (map.cliff.raw[k] & 63)) return false;
+                    const int L = map.cliff.levels[k];
+                    lo = std::min(lo, L); hi = std::max(hi, L);
+                }
+            return hi > lo;
+        };
+        const bool own_seam = seam(int(c), int(r));
+        auto slope = [&](int dc, int dr) {
+            float s = 0.0f;
+            int n = 0;
+            if (own_seam) return 0.0f;
+            for (int sgn = -1; sgn <= 1; sgn += 2) {
+                const int nc = int(c) + sgn * dc, nr = int(r) + sgn * dr;
+                if (nc < 0 || nr < 0 || nc > int(W) || nr > int(H)) continue;
+                if (seam(nc, nr)) continue;
+                const float dz = vertex_ground_z(map, th, off, std::uint32_t(nc), std::uint32_t(nr)) - z0;
+                if (std::fabs(dz) > 1.0f) continue;
+                s += float(sgn) * dz;
+                ++n;
+            }
+            return n ? s / (float(n) * cell) : 0.0f;
+        };
+        static const float kNormalGain = std::getenv("SC2_TERRAIN_NORMAL_GAIN") ? float(std::atof(std::getenv("SC2_TERRAIN_NORMAL_GAIN"))) : 1.0f;
+        const float gx = slope(1, 0) * kNormalGain, gy = slope(0, 1) * kNormalGain, gl = std::sqrt(gx * gx + gy * gy + 1.0f);
+        m.normals.insert(m.normals.end(), {-gx / gl, -gy / gl, 1.0f / gl});
+    };
+    for (std::uint32_t r0 = 0; r0 < H; r0 += rows_per_band) {
+        const std::uint32_t r1 = std::min(H, r0 + rows_per_band);
+        M3Region rg;
+        rg.first_vertex = std::uint32_t(m.positions.size() / 3);
+        rg.first_index = std::uint32_t(m.indices.size());
+        for (std::uint32_t r = r0; r <= r1; ++r)
+            for (std::uint32_t c = 0; c <= W; ++c) push(c, r);
+        for (std::uint32_t r = 0; r < r1 - r0; ++r)
+            for (std::uint32_t c = 0; c < W; ++c) {
+                float z[4];
+                if (skip && skip->size() == std::size_t(W) * H && (*skip)[std::size_t(r0 + r) * W + c]) { under.push_back({c, r0 + r}); continue; }
+                if (vertex_cell_wall(map, th, off, c, r0 + r, z)) { walls.push_back({c, r0 + r, {z[0], z[1], z[2], z[3]}}); continue; }
+                const std::uint16_t a = std::uint16_t(r * VW + c), b = std::uint16_t(a + 1),
+                                    d = std::uint16_t(a + VW), e = std::uint16_t(d + 1);
+                m.indices.insert(m.indices.end(), {a, d, b, b, d, e});
+            }
+        rg.num_vertices = std::uint32_t(m.positions.size() / 3) - rg.first_vertex;
+        rg.num_indices = std::uint32_t(m.indices.size()) - rg.first_index;
+        m.regions.push_back(rg);
+        m.region_material.push_back(-1);
+    }
+    for (std::size_t w0 = 0; w0 < walls.size(); w0 += 3000) {
+        const std::size_t w1 = std::min(walls.size(), w0 + 3000);
+        M3Region rg;
+        rg.first_vertex = std::uint32_t(m.positions.size() / 3);
+        rg.first_index = std::uint32_t(m.indices.size());
+        auto tri = [&](const float p[3][3], bool both) {
+            const float nz = (p[1][0] - p[0][0]) * (p[2][1] - p[0][1]) - (p[1][1] - p[0][1]) * (p[2][0] - p[0][0]);
+            const std::uint32_t nv = std::uint32_t(m.positions.size() / 3) - rg.first_vertex;
+            if (nv + 3 > 60000u) return;
+            for (int i = 0; i < 3; ++i) {
+                m.positions.insert(m.positions.end(), {p[i][0] * cell, p[i][1] * cell, p[i][2]});
+                m.normals.insert(m.normals.end(), {0.0f, 0.0f, 1.0f});
+                m.uvs.push_back(p[i][0] / float(W));
+                m.uvs.push_back(p[i][1] / float(H));
+            }
+            const std::uint16_t a = std::uint16_t(nv), b = std::uint16_t(nv + 1), c = std::uint16_t(nv + 2);
+            if (nz >= 0.0f || both) m.indices.insert(m.indices.end(), {a, b, c});
+            if (nz < 0.0f || both) m.indices.insert(m.indices.end(), {a, c, b});
+        };
+        for (std::size_t k = w0; k < w1; ++k) {
+            const WallCell& wc = walls[k];
+            float raw[4], x[4], y[4];
+            int nh = 0;
+            bool high[4];
+            for (int i = 0; i < 4; ++i) {
+                x[i] = float(wc.c + std::uint32_t(i & 1));
+                y[i] = float(wc.r + std::uint32_t(i >> 1));
+                raw[i] = vertex_ground_z(map, th, off, wc.c + std::uint32_t(i & 1), wc.r + std::uint32_t(i >> 1));
+            }
+            const float mn = std::min(std::min(raw[0], raw[1]), std::min(raw[2], raw[3]));
+            const float mx = std::max(std::max(raw[0], raw[1]), std::max(raw[2], raw[3]));
+            for (int i = 0; i < 4; ++i) { high[i] = raw[i] > 0.5f * (mn + mx); nh += high[i] ? 1 : 0; }
+            auto P = [&](float p[3], int i, bool flat) { p[0] = x[i]; p[1] = y[i]; p[2] = flat ? wc.z[i] : raw[i]; };
+            auto wall = [&](int i, int j, float dx, float dy) {
+                const float dl = std::sqrt(dx * dx + dy * dy);
+                if (dl > 1e-5f) { dx /= dl; dy /= dl; }
+                float q[3][3], fi[3], fj[3];
+                P(fi, i, true); P(fj, j, true);
+                fi[0] += dx; fi[1] += dy; fj[0] += dx; fj[1] += dy;
+                const float lowz = std::min(fi[2], fj[2]);
+                fi[2] = fj[2] = lowz;
+                P(q[0], i, false); P(q[1], j, false); std::copy(fi, fi + 3, q[2]); tri(q, true);
+                P(q[0], j, false); std::copy(fj, fj + 3, q[1]); std::copy(fi, fi + 3, q[2]); tri(q, true);
+                P(q[0], i, true); P(q[1], j, true); std::copy(fi, fi + 3, q[2]); tri(q, true);
+                P(q[0], j, true); std::copy(fj, fj + 3, q[1]); std::copy(fi, fi + 3, q[2]); tri(q, true);
+            };
+            float q[3][3];
+            static const int kAdj[4][2] = {{1, 2}, {0, 3}, {0, 3}, {1, 2}};
+            if (nh == 3) {
+                int l = 0;
+                for (int i = 0; i < 4; ++i) if (!high[i]) l = i;
+                const int n1 = kAdj[l][0], n2 = kAdj[l][1], o = 3 - l;
+                P(q[0], n1, false); P(q[1], n2, false); P(q[2], o, false); tri(q, false);
+                P(q[0], n1, true); P(q[1], n2, true); P(q[2], l, true); tri(q, false);
+                wall(n1, n2, x[o] - x[l], y[o] - y[l]);
+            } else {
+                P(q[0], 0, true); P(q[1], 1, true); P(q[2], 2, true); tri(q, false);
+                P(q[0], 1, true); P(q[1], 3, true); P(q[2], 2, true); tri(q, false);
+                static const int kEdge[4][2] = {{0, 1}, {1, 3}, {3, 2}, {2, 0}};
+                if (nh == 2)
+                    for (const auto& e : kEdge)
+                        if (high[e[0]] && high[e[1]])
+                            wall(e[0], e[1], 0.5f * (x[e[0]] + x[e[1]]) - (float(wc.c) + 0.5f), 0.5f * (y[e[0]] + y[e[1]]) - (float(wc.r) + 0.5f));
+            }
+        }
+        rg.num_vertices = std::uint32_t(m.positions.size() / 3) - rg.first_vertex;
+        rg.num_indices = std::uint32_t(m.indices.size()) - rg.first_index;
+        m.regions.push_back(rg);
+        m.region_material.push_back(-1);
+    }
+    for (std::size_t u0 = 0; u0 < under.size(); u0 += 10000) {
+        const std::size_t u1 = std::min(under.size(), u0 + 10000);
+        M3Region rg;
+        rg.first_vertex = std::uint32_t(m.positions.size() / 3);
+        rg.first_index = std::uint32_t(m.indices.size());
+        for (std::size_t k = u0; k < u1; ++k) {
+            const std::uint32_t c = under[k].first, r = under[k].second;
+            float lowz = 1e30f;
+            for (int i = 0; i < 4; ++i)
+                lowz = std::min(lowz, vertex_ground_z(map, th, off, c + std::uint32_t(i & 1), r + std::uint32_t(i >> 1)));
+            const std::uint16_t a = std::uint16_t((k - u0) * 4);
+            for (int i = 0; i < 4; ++i) {
+                const float x = float(c + std::uint32_t(i & 1)), y = float(r + std::uint32_t(i >> 1));
+                m.positions.insert(m.positions.end(), {x * cell, y * cell, lowz - 0.15f});
+                m.normals.insert(m.normals.end(), {0.0f, 0.0f, 1.0f});
+                m.uvs.push_back(x / float(W));
+                m.uvs.push_back(y / float(H));
+            }
+            m.indices.insert(m.indices.end(), {a, std::uint16_t(a + 2), std::uint16_t(a + 1), std::uint16_t(a + 1), std::uint16_t(a + 2), std::uint16_t(a + 3)});
+        }
+        rg.num_vertices = std::uint32_t(m.positions.size() / 3) - rg.first_vertex;
+        rg.num_indices = std::uint32_t(m.indices.size()) - rg.first_index;
+        m.regions.push_back(rg);
+        m.region_material.push_back(-1);
+    }
+    m.vertex_count = std::uint32_t(m.positions.size() / 3);
+    for (int a = 0; a < 3; ++a) { m.bounds_min[a] = 1e30f; m.bounds_max[a] = -1e30f; }
+    for (std::uint32_t i = 0; i < m.vertex_count; ++i)
+        for (int a = 0; a < 3; ++a) {
+            m.bounds_min[a] = std::min(m.bounds_min[a], m.positions[i * 3 + a]);
+            m.bounds_max[a] = std::max(m.bounds_max[a], m.positions[i * 3 + a]);
+        }
+    return m;
 }
 
 inline Model build_map_mesh_stepped(const LoadedMap& map, float cell = 1.0f,
@@ -676,6 +1086,25 @@ inline Model build_map_mesh_stepped(const LoadedMap& map, float cell = 1.0f,
     return mesh;
 }
 
+inline float engine_z_offset(const LoadedMap& map) {
+    if (map.cliff.empty()) return 0.0f;
+    const std::vector<float> th = tier_heights(map);
+    const CliffMap& cm = map.cliff;
+    std::vector<std::uint64_t> cnt(th.size(), 0);
+    for (std::uint8_t L : cm.levels) if (L < th.size()) ++cnt[L];
+    std::size_t best = 0;
+    for (std::size_t L = 1; L < cnt.size(); ++L) if (cnt[L] > cnt[best]) best = L;
+    std::map<int, std::uint64_t> hist;
+    for (std::uint32_t y = 0; y < cm.height; ++y)
+        for (std::uint32_t x = 0; x < cm.width; ++x)
+            if (cm.levels[std::size_t(y) * cm.width + x] == best)
+                ++hist[int(map_cell_height(map, x, y) * 16.0f + 0.5f)];
+    int mode = 0;
+    std::uint64_t n = 0;
+    for (const auto& kv : hist) if (kv.second > n) { n = kv.second; mode = kv.first; }
+    return float(mode) / 16.0f - th[best];
+}
+
 inline Model build_map_water(const LoadedMap& map, float cell = 1.0f, float lift = 0.5f,
                              const std::unordered_map<std::string, float>* type_heights = nullptr) {
     if (map.water.empty()) return Model{};
@@ -700,7 +1129,7 @@ inline Model build_map_water(const LoadedMap& map, float cell = 1.0f, float lift
     for (const WaterPlane& p : map.water.planes) {
         if (type_heights) {
             auto it = type_heights->find(p.type);
-            if (it != type_heights->end()) { level.push_back(it->second); continue; }
+            if (it != type_heights->end()) { level.push_back(it->second - engine_z_offset(map)); continue; }
         }
         const float minx = p.min_x < p.max_x ? p.min_x : p.max_x;
         const float maxx = p.min_x < p.max_x ? p.max_x : p.min_x;
@@ -730,6 +1159,8 @@ inline void append_map_water(Model& ground, const LoadedMap& map, float cell = 1
     const std::uint32_t ibase = std::uint32_t(ground.indices.size());
     ground.positions.insert(ground.positions.end(), w.positions.begin(), w.positions.end());
     ground.uvs.insert(ground.uvs.end(), w.uvs.begin(), w.uvs.end());
+    if (ground.normals.size() == std::size_t(vbase) * 3)
+        for (std::size_t i = 0; i < w.positions.size() / 3; ++i) ground.normals.insert(ground.normals.end(), {0.0f, 0.0f, 1.0f});
     ground.indices.reserve(ground.indices.size() + w.indices.size());
     for (std::uint16_t idx : w.indices) ground.indices.push_back(idx);
     for (std::size_t r = 0; r < w.regions.size(); ++r) {

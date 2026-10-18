@@ -56,6 +56,9 @@ void Mixer::mix(std::int16_t* out, std::size_t out_frames) {
 
         const double step = static_cast<double>(v.src_rate) / static_cast<double>(out_rate_);
         const double g = static_cast<double>(v.gain);
+        const double pan = v.pan < -1.0f ? -1.0 : (v.pan > 1.0f ? 1.0 : static_cast<double>(v.pan));
+        const double theta = (pan + 1.0) * 0.78539816339744831;
+        const double gl = std::cos(theta) * 1.4142135623730951, gr = std::sin(theta) * 1.4142135623730951;
         const std::size_t fc = v.frame_count;
         const int sc = v.channels;
 
@@ -82,11 +85,16 @@ void Mixer::mix(std::int16_t* out, std::size_t out_frames) {
 
             const std::size_t base = f * static_cast<std::size_t>(oc);
             if (sc == oc) {
-                for (int c = 0; c < oc; ++c) acc[base + static_cast<std::size_t>(c)] += interp(c) * g;
+                if (oc == 2) {
+                    acc[base] += interp(0) * g * gl;
+                    acc[base + 1] += interp(1) * g * gr;
+                } else {
+                    for (int c = 0; c < oc; ++c) acc[base + static_cast<std::size_t>(c)] += interp(c) * g;
+                }
             } else if (sc == 1 && oc == 2) {
                 const double s = interp(0) * g;
-                acc[base] += s;
-                acc[base + 1] += s;
+                acc[base] += s * gl;
+                acc[base + 1] += s * gr;
             } else if (sc == 2 && oc == 1) {
                 acc[base] += (interp(0) + interp(1)) * 0.5 * g;
             } else {

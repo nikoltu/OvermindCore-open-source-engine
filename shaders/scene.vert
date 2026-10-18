@@ -12,10 +12,17 @@ layout(location = 1) in vec3 inNormal;
 layout(location = 2) in vec2 inUV;
 layout(location = 3) in vec4 inWeight;
 layout(location = 4) in uvec4 inBone;
+layout(location = 5) in vec2 inUV1;
+layout(location = 6) in vec4 inColor;
 layout(location = 0) out vec3 vNormal;
 layout(location = 1) out vec2 vUV;
 layout(location = 2) out vec4 vLightPos;
 layout(location = 3) out vec3 vWorldPos;
+layout(location = 4) out float vVAlpha;
+layout(location = 5) out float vVShade;
+layout(location = 6) out vec2 vUV1;
+layout(location = 7) out vec3 vVColor;
+layout(location = 8) out float vVAO;
 void main() {
     float wsum = inWeight.x + inWeight.y + inWeight.z + inWeight.w;
     vec4 p;
@@ -36,8 +43,13 @@ void main() {
     }
     vec4 wp = pc.world * p;
     gl_Position = g.viewProj * wp;
-    vNormal = nrm;
+    vNormal = mat3(pc.world) * nrm;
     vUV = inUV;
+    vUV1 = inUV1;
+    vVColor = inColor.rgb;
+    vVAO = inColor.a;
     vLightPos = g.lightVP * wp;
     vWorldPos = wp.xyz;
+    vVAlpha = (inWeight.w == 0.0 && (inBone.w & 0x10000u) != 0u) ? float(inBone.w & 255u) / 255.0 : 2.0;
+    vVShade = (inWeight.w == 0.0 && (inBone.w & 0x10000u) != 0u) ? 1.0 - float((inBone.w >> 8) & 255u) / 255.0 : 1.0;
 }

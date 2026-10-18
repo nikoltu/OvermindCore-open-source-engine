@@ -22,13 +22,21 @@ struct Frame {
     const Frame* find(const std::string& name) const;
 };
 
+struct ConstScope {
+    std::string race;
+    std::string skin;
+    bool empty() const { return race.empty() && skin.empty(); }
+};
+
+const char* layout_race_suffix(int race);
+
 struct Layout {
     bool locked = false;
     std::vector<std::pair<std::string, std::string>> constants;
     std::vector<Frame> frames;
 
     const std::string* constant(const std::string& name) const;
-    std::string resolve(const std::string& value) const;
+    std::string resolve(const std::string& value, const ConstScope& scope = ConstScope{}) const;
     std::size_t frame_count() const;
     const Frame* find(const std::string& name) const;
 };
@@ -82,6 +90,9 @@ struct LayoutSet {
 
     const std::string* constant(const std::string& name) const;
     std::string resolve(const std::string& value) const;
+    void set_const_scope(const ConstScope& s) { scope = s; }
+    const ConstScope& const_scope() const { return scope; }
+    ConstScope scope;
 
     const Frame* find_template(const std::string& path) const;
 
@@ -121,6 +132,13 @@ std::vector<SolvedFrame> solve_layout(const Frame& root, const Rect& canvas,
                                       const TextResolver& resolve_text,
                                       const FrameCollapsed& collapsed,
                                       const DataResolver& data);
+
+using StyleHeight = std::function<int(const std::string& style_name)>;
+std::vector<SolvedFrame> solve_layout(const Frame& root, const Rect& canvas,
+                                      const TextResolver& resolve_text,
+                                      const FrameCollapsed& collapsed,
+                                      const DataResolver& data,
+                                      const StyleHeight& style_height);
 
 struct FrameState {
     std::string name;

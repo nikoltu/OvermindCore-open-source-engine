@@ -1,6 +1,7 @@
 #include "sc2/app/hud_layout.hpp"
 
 #include <cmath>
+#include <cstdlib>
 #include <exception>
 #include <map>
 #include <memory>
@@ -16,10 +17,11 @@ namespace sc2::app {
 
 namespace {
 
-HudAuthoredRects::R find_rect(const std::vector<ui::SolvedFrame>& solved,
-                              const std::string& type, float cw, float ch) {
+HudAuthoredRects::R find_rect(const std::vector<ui::SolvedFrame>& solved, const std::string& name,
+                              float cw, float ch, const char* parent = nullptr) {
     for (const ui::SolvedFrame& f : solved) {
-        if (f.type != type) continue;
+        if (f.name != name) continue;
+        if (parent && f.parent != parent) continue;
         if (f.rect.w <= 0 || f.rect.h <= 0) continue;
         if (f.rect.w > cw || f.rect.h > ch) continue;
         return {f.rect.x, f.rect.y, f.rect.x + f.rect.w, f.rect.y + f.rect.h};
@@ -27,11 +29,12 @@ HudAuthoredRects::R find_rect(const std::vector<ui::SolvedFrame>& solved,
     return {};
 }
 
+constexpr float kAspectSteps = 4096.0f;
+
 }
 
 const HudPauseRects* hud_pause_rects(casc::Storage& store, float aspect) {
     if (!(aspect > 0.1f) || aspect > 10.0f) return nullptr;
-    constexpr float kAspectSteps = 4096.0f;
     const int akey = int(std::lround(aspect * kAspectSteps));
     static std::map<std::pair<const casc::Storage*, int>, std::unique_ptr<HudPauseRects>> cache;
     auto key = std::make_pair(static_cast<const casc::Storage*>(&store), akey);
@@ -90,16 +93,14 @@ const HudPauseRects* hud_pause_rects(casc::Storage& store, float aspect) {
     return slot && slot->ok ? slot.get() : nullptr;
 }
 
-const HudAuthoredRects* hud_authored_rects(casc::Storage& store, float aspect) {
+const MeleeGameUiSolve* melee_gameui_solve(casc::Storage& store, float aspect) {
     if (!(aspect > 0.1f) || aspect > 10.0f) return nullptr;
-    constexpr float kAspectSteps = 4096.0f;
     const int akey = int(std::lround(aspect * kAspectSteps));
-    static std::map<std::pair<const casc::Storage*, int>, std::unique_ptr<HudAuthoredRects>> cache;
+    static std::map<std::pair<const casc::Storage*, int>, std::unique_ptr<MeleeGameUiSolve>> cache;
     auto key = std::make_pair(static_cast<const casc::Storage*>(&store), akey);
     auto it = cache.find(key);
-    if (it != cache.end()) return it->second && it->second->ok ? it->second.get() : nullptr;
-    if (cache.size() >= 32) cache.clear();
-
+    if (it != cache.end()) return it->second.get();
+    if (cache.size() >= 8) cache.clear();
     auto& slot = cache[key];
     const ui::LayoutSet* set = layout_namespace(store);
     if (!set) return nullptr;
@@ -108,7 +109,10 @@ const HudAuthoredRects* hud_authored_rects(casc::Storage& store, float aspect) {
     try {
         const float ch = kRefHeight;
         const float cw = ch * (float(akey) / kAspectSteps);
-        ui::Frame inst = set->instantiate(*gui);
+        auto s = std::make_unique<MeleeGameUiSolve>();
+        s->root = set->instantiate(*gui);
+        s->canvas_w = cw;
+        s->canvas_h = ch;
         static const char* const kMeleeCollapsed[] = {
             "CashPanel",         "TeamResourceButton",     "ResourceLabel2",
             "ResourceLabel3",    "ResourceIconBackground2", "ResourceIconBackground3",
@@ -118,8 +122,38 @@ const HudAuthoredRects* hud_authored_rects(casc::Storage& store, float aspect) {
                 if (f.name == n) return true;
             return false;
         };
-        std::vector<ui::SolvedFrame> solved =
-            ui::solve_layout(inst, ui::Rect{0, 0, cw, ch}, ui::TextResolver{}, melee_collapsed);
+        const ui::StyleSet* styles = style_namespace(store);
+        ui::StyleHeight style_height;
+        if (styles)
+            style_height = [styles](const std::string& name) {
+                return styles->resolve(name).height;
+            };
+        s->frames = ui::solve_layout(s->root, ui::Rect{0, 0, cw, ch}, ui::TextResolver{},
+                                     melee_collapsed, ui::DataResolver{}, style_height);
+        slot = std::move(s);
+    } catch (const std::exception&) {
+        slot.reset();
+    }
+    return slot.get();
+}
+
+const HudAuthoredRects* hud_authored_rects(casc::Storage& store, float aspect) {
+    if (!(aspect > 0.1f) || aspect > 10.0f) return nullptr;
+    const int akey = int(std::lround(aspect * kAspectSteps));
+    static std::map<std::pair<const casc::Storage*, int>, std::unique_ptr<HudAuthoredRects>> cache;
+    auto key = std::make_pair(static_cast<const casc::Storage*>(&store), akey);
+    auto it = cache.find(key);
+    if (it != cache.end()) return it->second && it->second->ok ? it->second.get() : nullptr;
+    if (cache.size() >= 32) cache.clear();
+
+    auto& slot = cache[key];
+    const MeleeGameUiSolve* sol = melee_gameui_solve(store, aspect);
+    if (!sol) return nullptr;
+    try {
+        const ui::Frame& inst = sol->root;
+        const std::vector<ui::SolvedFrame>& solved = sol->frames;
+        const float cw = sol->canvas_w;
+        const float ch = sol->canvas_h;
         auto r = std::make_unique<HudAuthoredRects>();
         r->canvas_w = cw;
         r->minimap = find_rect(solved, "Minimap", cw, ch);
@@ -128,7 +162,50 @@ const HudAuthoredRects* hud_authored_rects(casc::Storage& store, float aspect) {
         r->control_group = find_rect(solved, "ControlGroupPanel", cw, ch);
         r->alert = find_rect(solved, "AlertPanel", cw, ch);
         r->idle_button = find_rect(solved, "IdleButton", cw, ch);
+        r->army_button = find_rect(solved, "ArmyButton", cw, ch);
+        r->warp_button = find_rect(solved, "PylonButton", cw, ch);
         r->equipment = find_rect(solved, "EquipmentPanel", cw, ch);
+        r->error_display = find_rect(solved, "ErrorDisplay", cw, ch);
+        r->warning_display = find_rect(solved, "WarningDisplay", cw, ch);
+        auto timing_of = [&inst](const char* frame_name, HudMessageTiming& out) {
+            const ui::Frame* f = inst.find(frame_name);
+            if (!f) return;
+            auto num = [f](const char* tag) -> float {
+                const core::XmlNode* n = f->prop(tag);
+                if (!n) return 0.0f;
+                const std::string v = n->attr_or("val", "");
+                return v.empty() ? 0.0f : float(std::atof(v.c_str()));
+            };
+            out.duration_ms = num("MessageDuration");
+            out.fade_ms = num("FadeDuration");
+            out.max_messages = int(num("MaxMessages"));
+        };
+        timing_of("ErrorDisplay", r->error_timing);
+        timing_of("WarningDisplay", r->warning_timing);
+        auto style_of = [&inst](const char* frame_name, std::string& out) {
+            const ui::Frame* f = inst.find(frame_name);
+            if (!f) return;
+            if (const core::XmlNode* n = f->prop("Style")) out = n->attr_or("val", "");
+        };
+        auto pane_style_of = [&](const char* frame_name, std::string& out) {
+            if (const ui::Frame* pane = inst.find("InfoPaneUnit"))
+                if (const ui::Frame* f = pane->find(frame_name))
+                    if (const core::XmlNode* n = f->prop("Style")) {
+                        out = n->attr_or("val", "");
+                        return;
+                    }
+            style_of(frame_name, out);
+        };
+        pane_style_of("NameLabel", r->style_unit_name);
+        pane_style_of("TypeLabel", r->style_unit_type);
+        pane_style_of("InfoLabel", r->style_unit_info);
+        style_of("CountLabel", r->style_group_count);
+        style_of("IndexLabel", r->style_group_index);
+        r->vital_shield = find_rect(solved, "ShieldLabel", cw, ch);
+        r->vital_life = find_rect(solved, "LifeLabel", cw, ch);
+        r->vital_energy = find_rect(solved, "EnergyLabel", cw, ch);
+        style_of("LifeLabel", r->style_vital);
+        if (r->style_vital.empty()) style_of("ShieldLabel", r->style_vital);
         {
             int found = 0;
             for (const ui::SolvedFrame& f : solved) {
@@ -168,12 +245,28 @@ const HudAuthoredRects* hud_authored_rects(casc::Storage& store, float aspect) {
         r->command = find_rect(solved, "CommandPanel", cw, ch);
         r->info = find_rect(solved, "InfoPanel", cw, ch);
         r->wireframe = find_rect(solved, "UnitWireframe", cw, ch);
-        for (const ui::SolvedFrame& f : solved) {
-            if (f.parent != "ProgressContainer") continue;
-            if (f.name == "ProgressBar") r->progress_bar = find_rect({f}, "ProgressBar", cw, ch);
-            else if (f.name == "ProgressButton")
-                r->progress_button = find_rect({f}, "ProgressButton", cw, ch);
+        {
+            int found = 0;
+            for (const ui::SolvedFrame& f : solved) {
+                if (f.name.size() != 13 || f.name.compare(0, 12, "BehaviorIcon") != 0) continue;
+                const int idx = f.name[12] - '0';
+                if (idx < 0 || idx >= 6 || f.rect.w <= 0 || f.rect.h <= 0) continue;
+                if (!r->behavior_slots[idx].ok()) ++found;
+                r->behavior_slots[idx] = {f.rect.x, f.rect.y, f.rect.x + f.rect.w, f.rect.y + f.rect.h};
+            }
+            if (found == 0 && r->wireframe.ok()) {
+                const auto unit = (r->wireframe.x1 - r->wireframe.x0) / 140;
+                const auto bx1 = r->wireframe.x0 + unit * 10, bx0 = bx1 - unit * 32;
+                for (int i = 0; i < 6; ++i) {
+                    const auto by0 = r->wireframe.y0 + unit * 32 * i;
+                    r->behavior_slots[i] = {bx0, by0, bx1, by0 + unit * 32};
+                }
+                found = 6;
+            }
+            r->behavior_slots_ok = found > 0;
         }
+        r->progress_bar = find_rect(solved, "ProgressBar", cw, ch, "ProgressContainer");
+        r->progress_button = find_rect(solved, "ProgressButton", cw, ch, "ProgressContainer");
         r->progress_ok = r->progress_bar.ok() && r->progress_button.ok();
         r->portrait = find_rect(solved, "PortraitPanel", cw, ch);
         r->resource = find_rect(solved, "ResourcePanel", cw, ch);
@@ -256,6 +349,56 @@ const HudAuthoredRects* hud_authored_rects(casc::Storage& store, float aspect) {
         return nullptr;
     }
     return slot && slot->ok ? slot.get() : nullptr;
+}
+
+static bool parse_console_color(const std::string& v, int rgb[3]) {
+    if (v.empty() || v[0] == '#' || v[0] == '@') return false;
+    if (v.find(',') != std::string::npos) {
+        int c[3] = {0, 0, 0};
+        std::size_t at = 0;
+        for (int i = 0; i < 3; ++i) {
+            if (at >= v.size()) return false;
+            std::size_t end = v.find(',', at);
+            const std::string part = v.substr(at, end == std::string::npos ? std::string::npos : end - at);
+            if (part.empty()) return false;
+            for (char ch : part)
+                if (ch < '0' || ch > '9') return false;
+            const long n = std::strtol(part.c_str(), nullptr, 10);
+            if (n < 0 || n > 255) return false;
+            c[i] = int(n);
+            if (end == std::string::npos) {
+                if (i != 2) return false;
+                at = v.size();
+            } else {
+                at = end + 1;
+            }
+        }
+        rgb[0] = c[0];
+        rgb[1] = c[1];
+        rgb[2] = c[2];
+        return true;
+    }
+    if (v.size() != 6) return false;
+    for (char ch : v)
+        if (!((ch >= '0' && ch <= '9') || (ch >= 'a' && ch <= 'f') || (ch >= 'A' && ch <= 'F')))
+            return false;
+    const long n = std::strtol(v.c_str(), nullptr, 16);
+    rgb[0] = int((n >> 16) & 0xFF);
+    rgb[1] = int((n >> 8) & 0xFF);
+    rgb[2] = int(n & 0xFF);
+    return true;
+}
+
+bool hud_console_color(casc::Storage& store, int race, const std::string& name, int rgb[3]) {
+    if (name.empty()) return false;
+    const char* suffix = ui::layout_race_suffix(race);
+    if (!suffix || !suffix[0]) return false;
+    ui::ConstScope scope;
+    scope.race = suffix;
+    scope.skin = suffix;
+    const ui::LayoutSet* set = layout_namespace(store, kCoreLayoutRoot, scope);
+    if (!set) return false;
+    return parse_console_color(set->resolve("###" + name), rgb);
 }
 
 }

@@ -8,6 +8,7 @@
 #endif
 #include <windows.h>
 
+#include <shellapi.h>
 #include <shlobj.h>
 #include <winsock2.h>
 #include <ws2tcpip.h>
@@ -252,6 +253,31 @@ void LoadingScreen::close() {
         ::DestroyWindow(impl_->hwnd);
         impl_->hwnd = nullptr;
     }
+}
+
+double double_click_ms() {
+    const UINT ms = ::GetDoubleClickTime();
+    return ms > 0 ? double(ms) : 500.0;
+}
+
+std::string clipboard_text() {
+    std::string out;
+    if (!::IsClipboardFormatAvailable(CF_UNICODETEXT) || !::OpenClipboard(nullptr)) return out;
+    if (HANDLE h = ::GetClipboardData(CF_UNICODETEXT)) {
+        if (const wchar_t* w = static_cast<const wchar_t*>(::GlobalLock(h))) {
+            out = narrow(std::wstring(w));
+            ::GlobalUnlock(h);
+        }
+    }
+    ::CloseClipboard();
+    return out;
+}
+
+bool open_folder(const std::string& path) {
+    std::error_code ec;
+    if (path.empty() || !fs::is_directory(path, ec)) return false;
+    const HINSTANCE r = ::ShellExecuteW(nullptr, L"open", widen(path).c_str(), nullptr, nullptr, SW_SHOWNORMAL);
+    return reinterpret_cast<INT_PTR>(r) > 32;
 }
 
 bool attach_parent_console() {

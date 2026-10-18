@@ -28,6 +28,10 @@ struct Sound {
     std::optional<std::string> mode;
     std::optional<std::string> chance;
     std::optional<std::string> pitch;
+    int dupe_destroy = 16;
+    int dupe_mute = 10;
+    bool dupe_prevent = false;
+    int resource_priority = 32;
     struct RolloffPoint {
         float distance = 0.0f;
         float volume_db = 0.0f;

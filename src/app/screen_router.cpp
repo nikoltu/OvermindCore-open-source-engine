@@ -13,7 +13,15 @@ const char* const kFlowIds[] = {
     "ingame", "pause_menu", "game_result", "score", "replay_browse", "replay_controls", "credits",
     "",
     "",
+    "",
+    "",
+    "",
+    "",
+    "",
 };
+const char* const kEngineNames[] = {"hotkeys", "sandbox", "profile", "portraits", "data_setup", "starting", "widgets"};
+static_assert(sizeof(kEngineNames) / sizeof(kEngineNames[0]) == std::size_t(ScreenId::Count) - std::size_t(ScreenId::Hotkeys),
+              "every engine-only ScreenId needs a boot name");
 static_assert(sizeof(kFlowIds) / sizeof(kFlowIds[0]) == std::size_t(ScreenId::Count),
               "every ScreenId needs a flow-id row (empty for engine-only)");
 
@@ -21,7 +29,7 @@ const char* const kNames[] = {
     "Boot", "Login", "Main Menu", "Home", "Campaign", "Difficulty", "Versus AI", "Custom Games",
     "Lobby", "Skirmish", "Options", "Load Game", "Save Replay", "Loading", "In Game",
     "Game Menu", "Game Result", "Score", "Replays", "Replay Controls", "Credits", "Hotkeys",
-    "Sandbox",
+    "Sandbox", "Profile", "Portraits", "Game Data", "Starting", "Widgets",
 };
 static_assert(sizeof(kNames) / sizeof(kNames[0]) == std::size_t(ScreenId::Count),
               "every ScreenId needs a display name");
@@ -84,6 +92,28 @@ const FlowEdge kEdges[] = {
     {S::GlueRoot,          "SandboxButton",                                   S::Sandbox,        K::Replace, true,  false},
     {S::Sandbox,           "Leave sandbox",                                   S::GlueRoot,       K::Pop,     true,  true},
     {S::GlueRoot,          "PlayButton",                                      S::Lobby,          K::Replace, true,  false},
+    {S::VersusAI,          "CustomButton",                                    S::Custom,         K::Replace, true,  false},
+    {S::VersusAI,          "ReplayButton",                                    S::ReplayBrowse,   K::Replace, true,  false},
+    {S::Home,              "PlayButton",                                      S::VersusAI,       K::Replace, true,  false},
+    {S::GlueRoot,          "ProfileButton",                                   S::Profile,        K::Push,    true,  false},
+    {S::Profile,           "BackButton",                                      S::GlueRoot,       K::Close,   true,  true},
+    {S::GlueRoot,          "PlayNowButton",                                   S::Loading,        K::Replace, true,  false},
+    {S::GlueRoot,          "WatchReplayButton",                               S::Loading,        K::Replace, true,  false},
+    {S::Profile,           "PortraitButton",                                  S::Portraits,      K::Push,    true,  false},
+    {S::Portraits,         "BackButton",                                      S::Profile,        K::Close,   true,  true},
+    {S::GameResult,        "PlayAgainButton",                                 S::Loading,        K::Replace, true,  false},
+    {S::GameResult,        "ChangeSetupButton",                               S::Lobby,          K::Replace, true,  false},
+    {S::GameResult,        "WatchReplayButton",                               S::Loading,        K::Replace, true,  false},
+    {S::Score,             "WatchAgainButton",                                S::Loading,        K::Replace, true,  false},
+    {S::Boot,              "game folder known",                               S::Starting,       K::Replace, true,  false},
+    {S::Boot,              "first run",                                       S::DataSetup,      K::Replace, true,  false},
+    {S::DataSetup,         "ContinueButton",                                  S::Starting,       K::Replace, true,  false},
+    {S::DataSetup,         "BackButton",                                      S::Boot,           K::Close,   true,  true},
+    {S::Starting,          "startup complete",                                S::GlueRoot,       K::Replace, true,  false},
+    {S::Starting,          "ChangeFolderButton",                              S::DataSetup,      K::Replace, true,  false},
+    {S::Starting,          "QuitButton",                                      S::Boot,           K::Replace, true,  true},
+    {S::Options,           "GameDataButton",                                  S::DataSetup,      K::Push,    true,  false},
+    {S::Widgets,           "BackButton",                                      S::GlueRoot,       K::Pop,     true,  true},
 };
 
 const char* const kLayoutBoot[] = {nullptr};
@@ -154,13 +184,16 @@ const char* const kLayoutCredits[] = {"Glue/ScreenCreditsSC2.SC2Layout",
                                       "Glue/CreditsPanel.SC2Layout", nullptr};
 const char* const kLayoutHotkeys[] = {"Glue/HotkeyDialog.SC2Layout", nullptr};
 const char* const kLayoutSandbox[] = {nullptr};
+const char* const kLayoutProfile[] = {nullptr};
+const char* const kLayoutNone[] = {nullptr};
 
 const char* const* const kLayouts[] = {
     kLayoutBoot,      kLayoutLogin,     kLayoutGlueRoot,   kLayoutHome,        kLayoutCampaign,
     kLayoutCampDiff,  kLayoutVersusAI,  kLayoutCustom,     kLayoutLobby,       kLayoutSkirmish,
     kLayoutOptions,   kLayoutLoadGame,  kLayoutSaveReplay, kLayoutLoading,     kLayoutInGame,
     kLayoutPause,     kLayoutGameResult, kLayoutScore,     kLayoutReplayBrowse, kLayoutReplayCtl,
-    kLayoutCredits,   kLayoutHotkeys,   kLayoutSandbox,
+    kLayoutCredits,   kLayoutHotkeys,   kLayoutSandbox,    kLayoutProfile,
+    kLayoutNone,      kLayoutNone,      kLayoutNone,       kLayoutNone,
 };
 static_assert(sizeof(kLayouts) / sizeof(kLayouts[0]) == std::size_t(ScreenId::Count),
               "every ScreenId needs a document row");
@@ -210,6 +243,18 @@ ScreenId screen_from_flow_id(const std::string& flow_id) {
     if (flow_id.empty()) return ScreenId::Count;
     for (std::size_t i = 0; i < std::size_t(ScreenId::Count); ++i)
         if (flow_id == kFlowIds[i]) return ScreenId(i);
+    return ScreenId::Count;
+}
+
+const char* screen_boot_name(ScreenId id) {
+    if (id >= ScreenId::Count) return "";
+    return id >= ScreenId::Hotkeys ? kEngineNames[std::size_t(id) - std::size_t(ScreenId::Hotkeys)] : kFlowIds[std::size_t(id)];
+}
+
+ScreenId screen_from_boot_name(const std::string& name) {
+    if (name.empty()) return ScreenId::Count;
+    for (std::size_t i = 0; i < std::size_t(ScreenId::Count); ++i)
+        if (name == screen_boot_name(ScreenId(i))) return ScreenId(i);
     return ScreenId::Count;
 }
 

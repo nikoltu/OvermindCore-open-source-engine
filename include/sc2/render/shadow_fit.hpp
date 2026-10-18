@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdlib>
 
 #include "sc2/render/mat4.hpp"
 #include "sc2/render/scene.hpp"
@@ -92,7 +93,8 @@ inline ShadowBox fit_shadow_ortho(const Vec3& aabb_min, const Vec3& aabb_max, co
         if (any && fxmx > fxmn && fymx > fymn) {
             const float lh = std::sqrt(L.x * L.x + L.y * L.y);
             const float reach = std::fabs(L.z) > 1e-4f ? (wmx.z - wmn.z) * lh / std::fabs(L.z) : 0.0f;
-            const float grow = std::min(reach, sradius);
+            static const bool kGrow = std::getenv("SC2_SHADOW_FIT_GROW") != nullptr;
+            const float grow = kGrow ? std::min(reach, sradius) : 0.0f;
             xmn = std::max(xmn, fxmn - grow); xmx = std::min(xmx, fxmx + grow);
             ymn = std::max(ymn, fymn - grow); ymx = std::min(ymx, fymx + grow);
             narrowed = xmx > xmn && ymx > ymn;

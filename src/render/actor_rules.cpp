@@ -81,6 +81,7 @@ AnimArgs anim_args_of(const std::vector<std::string>& args) {
 ActorRules ActorRules::from_actor(const data::CActorUnit& a) {
     ActorRules out;
     out.valid = true;
+    out.walk_anim_move_speed = a.walk_anim_move_speed.value_or(0.0);
 
     for (const data::ActorRule& r : a.on) {
         if (r.event_head == "UnitBirth" && r.verb == "AnimPlay") {

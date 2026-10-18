@@ -1,6 +1,8 @@
 #pragma once
 #include <cstdint>
 
+#include "sc2/app/ui_canvas.hpp"
+
 namespace sc2::app::theme {
 
 struct Rgb {
@@ -88,7 +90,8 @@ inline constexpr std::uint8_t kAlphaInsetBtn = 36;
 inline constexpr std::uint8_t kAlphaInsetPrimary = 89;
 inline constexpr std::uint8_t kAlphaCatActive = 128;
 
-enum class Face : std::uint8_t { Standard = 0, HeaderExtended = 1 };
+enum class Face : std::uint8_t { Standard = 0, HeaderExtended = 1, Bold = 2 };
+inline constexpr int kFaceCount = 3;
 struct Type {
     int px;
     float track;
@@ -249,5 +252,90 @@ inline constexpr int kMapThumb = 56;
 inline constexpr int kFilterH = 36;
 
 inline constexpr int kFooterMark = 20;
+
+inline int pt(float v, std::uint32_t view_h) {
+    const double px = double(v) * double(view_h) / double(kRefHeight);
+    return int(px + (px < 0.0 ? -0.5 : 0.5));
+}
+
+namespace v2 {
+inline constexpr Rgb kBgBase{11, 10, 12};
+inline constexpr Rgb kBgGlow{28, 18, 22};
+inline constexpr Rgb kSurface1{21, 19, 23};
+inline constexpr Rgb kSurface2{30, 27, 33};
+inline constexpr Rgb kSurface3{42, 38, 46};
+inline constexpr Rgb kSurfaceSel{58, 20, 24};
+inline constexpr Rgb kLine1{44, 40, 48};
+inline constexpr Rgb kLine2{69, 64, 74};
+inline constexpr Rgb kLine3{107, 100, 112};
+inline constexpr Rgb kAccent{255, 58, 42};
+inline constexpr Rgb kAccentHot{255, 138, 120};
+inline constexpr Rgb kAccentDeep{200, 48, 58};
+inline constexpr Rgb kPrimaryTop{176, 28, 28};
+inline constexpr Rgb kPrimaryBottom{122, 16, 18};
+inline constexpr Rgb kPrimaryRim{255, 74, 52};
+inline constexpr Rgb kTextHi{247, 243, 242};
+inline constexpr Rgb kTextBody{217, 211, 214};
+inline constexpr Rgb kTextMuted{156, 147, 154};
+inline constexpr Rgb kTextFaint{117, 109, 116};
+inline constexpr Rgb kTextDisabled{90, 83, 90};
+inline constexpr Rgb kOk{106, 222, 140};
+inline constexpr Rgb kWarn{232, 200, 106};
+inline constexpr Rgb kErr{255, 122, 122};
+inline constexpr Rgb kFocus{255, 255, 255};
+inline constexpr std::uint8_t kAlphaScrim = 153;
+
+struct Token {
+    const char* name;
+    Rgb rgb;
+};
+inline constexpr Token kTokens[] = {
+    {"bg.base", kBgBase},         {"bg.glow", kBgGlow},           {"surface.1", kSurface1},
+    {"surface.2", kSurface2},     {"surface.3", kSurface3},       {"surface.sel", kSurfaceSel},
+    {"line.1", kLine1},           {"line.2", kLine2},             {"line.3", kLine3},
+    {"accent", kAccent},          {"accent.hot", kAccentHot},     {"accent.deep", kAccentDeep},
+    {"primary.top", kPrimaryTop}, {"primary.bottom", kPrimaryBottom}, {"primary.rim", kPrimaryRim},
+    {"text.hi", kTextHi},         {"text.body", kTextBody},       {"text.muted", kTextMuted},
+    {"text.faint", kTextFaint},   {"text.disabled", kTextDisabled}, {"ok", kOk},
+    {"warn", kWarn},              {"err", kErr},                  {"focus", kFocus},
+};
+inline constexpr int kTokenCount = int(sizeof(kTokens) / sizeof(kTokens[0]));
+
+inline constexpr Type kDisplay{96, 0.10f, Face::HeaderExtended};
+inline constexpr Type kH1{56, 0.10f, Face::HeaderExtended};
+inline constexpr Type kH2{36, 0.10f, Face::HeaderExtended};
+inline constexpr Type kH3{28, 0.08f, Face::HeaderExtended};
+inline constexpr Type kLabel{18, 0.14f, Face::HeaderExtended};
+inline constexpr Type kButtonXl{48, 0.14f, Face::Bold};
+inline constexpr Type kButtonLg{30, 0.14f, Face::Bold};
+inline constexpr Type kButton{22, 0.10f, Face::Standard};
+inline constexpr Type kBody{22, 0.0f, Face::Standard};
+inline constexpr Type kSmall{20, 0.0f, Face::Standard};
+inline constexpr Type kStat{44, 0.0f, Face::Bold};
+inline constexpr Type kKey{18, 0.0f, Face::Standard};
+struct Role {
+    const char* name;
+    Type type;
+};
+inline constexpr Role kRoles[] = {
+    {"display", kDisplay},    {"h1", kH1},         {"h2", kH2},     {"h3", kH3},
+    {"label", kLabel},        {"button.xl", kButtonXl}, {"button.lg", kButtonLg}, {"button", kButton},
+    {"body", kBody},          {"small", kSmall},   {"stat", kStat}, {"key", kKey},
+};
+inline constexpr int kRoleCount = int(sizeof(kRoles) / sizeof(kRoles[0]));
+
+inline constexpr float kLineW = 2.0f;
+inline constexpr float kMargin = 64.0f;
+inline constexpr float kGlowH = 480.0f;
+inline constexpr float kBandPitch = 67.0f;
+inline constexpr float kBandH = 27.0f;
+inline constexpr float kBandDrift = 1.67f;
+inline constexpr std::uint8_t kBandAlpha = 8;
+inline constexpr float kTopBarH = 96.0f;
+inline constexpr float kHintBarY = 1144.0f;
+inline constexpr float kHintBarH = 56.0f;
+inline constexpr float kCanvasW = 2133.0f;
+inline constexpr float kNarrowW = 1920.0f;
+}
 
 }

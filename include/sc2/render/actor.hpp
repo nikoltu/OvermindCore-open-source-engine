@@ -34,6 +34,7 @@ struct AnimSlot {
     std::vector<std::string> closing;
     std::vector<std::string> content;
     bool closing_phase = false;
+    bool global = false;
 };
 
 struct ActorEventRule {
@@ -41,6 +42,7 @@ struct ActorEventRule {
     std::vector<std::pair<std::string, std::string>> filters;
     std::string verb;
     std::vector<std::string> args;
+    std::string target;
 };
 
 struct ActorEvent {
@@ -77,19 +79,61 @@ struct ActorInstance {
     bool has_oneshot = true;
     bool dead = false;
     float clock = 0;
+    static constexpr float kDefaultBlendMs = 200.0f;
+    float blend_time_ms = kDefaultBlendMs;
+    bool blend_time_set = false;
+    int prev_seq = -1;
+    float prev_time_ms = 0;
+    float blend_left_ms = 0, blend_total_ms = 0;
+    int noted_seq = -1;
+    bool turret_bound = false;
+    int turret_bone = -1;
+    float turret_yaw = 0.0f;
+    float turret_goal = 0.0f;
+    bool turret_has_goal = false;
+    float turret_rate_rad = 0.0f, turret_arc_rad = 0.0f, turret_start_rad = 0.0f, turret_idle_rate_rad = 0.0f;
+    bool turret_spin = false;
+    bool turret_hold = false;
+    bool turret_had_goal = false;
+    float turret_fidget_min_s = 0.0f, turret_fidget_max_s = 0.0f, turret_fidget_turn_rad = 0.0f, turret_fidget_rate_rad = 0.0f;
+    float turret_fidget_chance = 0.0f;
+    float turret_fidget_wait_s = -1.0f;
+    float turret_fidget_offset = 0.0f;
+    bool turret_fidget_turning = false;
+    std::uint32_t turret_fidget_rng = 0;
+    void note_pose(int seq, float time_ms);
+    float blend_weight() const {
+        return (prev_seq >= 0 && blend_total_ms > 0.0f && blend_left_ms > 0.0f) ? blend_left_ms / blend_total_ms : 0.0f;
+    }
     float walk_scale = 1.0f;
     uint32_t swing = 0;
     int cached_seq[kAnimStateCount] = {-2, -2, -2, -2, -2, -2, -2, -2, -2, -2, -2};
+    uint32_t idle_loops = 0;
+    uint32_t walk_loops = 0;
+    uint32_t slot_plays = 0;
+    uint32_t oneshot_plays = 0;
+    std::vector<std::string> paused_names;
+    bool paused_all = false;
+    bool anim_paused(const std::string& slot) const;
+    std::vector<std::string> anim_groups;
+    std::vector<std::string> birth_clips;
 
     std::vector<formats::M3Event> last_events;
 
     std::vector<AnimSlot> slots;
 
     std::vector<ActorEventRule> event_rules;
+
+    int model_variation = -1;
+
+    void bind_event_rules(std::vector<ActorEventRule> rules);
+    int apply_birth_groups(const std::string& unit_id);
     std::vector<ActorTimer> timers;
     std::vector<ActorEvent> queued;
     std::size_t bus_overflow = 0;
     std::size_t unhandled_verbs = 0;
+    float bus_tint[3] = {1.0f, 1.0f, 1.0f};
+    bool bus_tint_set = false;
     std::size_t unanswerable_filters = 0;
     std::map<std::string, int> status;
     void set_status(const std::string& name, int value, bool raise_set);
@@ -116,6 +160,7 @@ struct ActorInstance {
     AnimSlot* top_slot();
     int current_sequence();
     float current_time() const;
+    ClipLayers global_layers() const;
     const std::vector<std::string>& tokens_of(AnimState s) const;
     int sequence_of(AnimState s);
     void trigger(AnimState s);
@@ -144,6 +189,7 @@ struct ActorDriver {
     };
     std::function<BurrowPair(const std::string&)> burrow_pair;
     std::function<BurrowPair(const std::string&)> depot_pair;
+    std::function<std::string(uint32_t)> morph_target;
 
     struct Shadow {
         bool known = false;
@@ -152,6 +198,10 @@ struct ActorDriver {
         std::uint32_t cast_count = 0;
         bool flying = false;
         bool gathering = false;
+        int res_level = -1;
+        std::int32_t res_cap = 0;
+        int res_depleted = -1;
+        int power_down = -1;
         bool burrowed = false;
         float burrow_finish_ms = -1.0f;
         bool burrow_finish_down = false;
@@ -159,6 +209,7 @@ struct ActorDriver {
         float depot_finish_ms = -1.0f;
         bool depot_finish_down = false;
         std::string catalog_id;
+        std::string morph_to;
         bool constructing = false;
         bool moving = false;
         bool created_raised = false;

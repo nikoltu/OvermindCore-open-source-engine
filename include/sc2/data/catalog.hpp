@@ -64,12 +64,18 @@ public:
                        const std::vector<std::string>& campaign_roots,
                        const std::string& mission_local_root = "");
 
+    void load_missing_only(const casc::Storage& store, const std::vector<std::string>& roots);
+
     void load_strings_text(const std::string& text) { strings_.load_text(text); }
     const StringTable& strings() const { return strings_; }
 
     void load_assets(const casc::Storage& store);
     void load_assets_text(const std::string& text) { assets_.load_text(text); }
     std::string resolve_asset(const std::string& ref) const { return assets_.resolve(ref); }
+    std::string resolve_asset(const std::string& ref, const std::string& race,
+                              const std::string& skin = std::string()) const {
+        return assets_.resolve(ref, race, skin);
+    }
 
     struct ConsoleSkinModels {
         std::string minimap, info, command;
@@ -89,6 +95,31 @@ public:
     void load_hotkeys_text(const std::string& text) { hotkeys_.load_text(text); }
     const StringTable& hotkeys() const { return hotkeys_; }
     std::optional<std::string> unit_display_name(const std::string& unit_id) const;
+    std::optional<std::string> button_tooltip(const std::string& button_id) const {
+        if (button_id.empty()) return std::nullopt;
+        const std::string* raw = strings().find("Button/Tooltip/" + button_id);
+        if (!raw || raw->empty()) return std::nullopt;
+        std::string out;
+        out.reserve(raw->size());
+        for (std::size_t i = 0; i < raw->size();) {
+            if ((*raw)[i] != '<') { out += (*raw)[i++]; continue; }
+            const std::size_t end = raw->find('>', i);
+            if (end == std::string::npos) { out += (*raw)[i++]; continue; }
+            const std::string tag = raw->substr(i, end - i + 1);
+            if (tag == "<n/>" || tag == "<N/>") out += '\n';
+            i = end + 1;
+        }
+        while (!out.empty() && (out.back() == '\n' || out.back() == ' ')) out.pop_back();
+        if (out.empty()) return std::nullopt;
+        return out;
+    }
+    std::optional<std::string> unit_life_armor_name(const std::string& unit_id) const {
+        if (unit_id.empty()) return std::nullopt;
+        const auto key = scalar("CUnit", unit_id, "LifeArmorName");
+        if (!key || key->empty()) return std::nullopt;
+        if (const std::string* text = strings().find(*key); text && !text->empty()) return *text;
+        return std::nullopt;
+    }
     std::optional<std::string> ability_display_name(const std::string& ability_id) const;
 
     void ingest(const std::vector<uint8_t>& xml);
@@ -195,6 +226,24 @@ public:
     std::string cabil_effect_link(const std::string& abil_id) const;
 
     std::optional<std::string> button_icon(const std::string& button_id) const;
+    std::optional<std::string> ability_set_id(const std::string& abil_id) const {
+        auto v = scalar("CAbil", abil_id, "AbilSetId");
+        if (!v || v->empty()) return std::nullopt;
+        return v;
+    }
+    std::optional<std::string> ability_redirect_target(const std::string& abil_id) const {
+        const Entry* e = find("CAbil", abil_id);
+        if (!e || e->tag.rfind("CAbilRedirect", 0) != 0) return std::nullopt;
+        auto v = scalar("CAbil", abil_id, "Abil");
+        if (!v || v->empty()) return std::nullopt;
+        return v;
+    }
+    std::optional<std::string> behavior_info_icon(const std::string& behavior_id) const;
+    struct CursorLook {
+        std::string texture;
+        int hotspot_x = 0, hotspot_y = 0;
+    };
+    std::optional<CursorLook> cursor_look(const std::string& cursor_id) const;
 
     struct AbilityCardButton {
         std::string ability;
@@ -246,12 +295,30 @@ public:
         return {read("RandomDelayMin"), read("RandomDelayMax")};
     }
 
+    bool unit_has_worker_rally(const std::string& unit_id) const {
+        for (const std::string& ab : array_links("CUnit", unit_id, "AbilArray")) {
+            const Entry* e = find("CAbil", ab);
+            if (!e || e->tag != "CAbilRally") continue;
+            for (const core::XmlNode& n : resolved("CAbil", ab))
+                if (n.name == "InfoArray" && n.attr_or("UseFilters", "").compare(0, 6, "Worker") == 0) return true;
+        }
+        return false;
+    }
+
+    double weapon_range_slop(const std::string& weapon_id) const {
+        return scalar_num("CWeapon", weapon_id, "RangeSlop").value_or(1.0);
+    }
+
     double weapon_fire_arc_deg(const std::string& weapon_id) const {
         const double arc = scalar_num("CWeapon", weapon_id, "Arc").value_or(0.0);
         const double slop = scalar_num("CWeapon", weapon_id, "ArcSlop").value_or(11.25);
         return arc * 0.5 + slop;
     }
 
+    bool effect_damage_hidden(const std::string& effect_id) const {
+        auto v = scalar("CEffect", effect_id, "Visibility");
+        return v && *v == "Hidden";
+    }
     double effect_armor_reduction(const std::string& effect_id) const {
         if (auto id = damage_effect_id(effect_id, 0))
             if (auto v = scalar_num("CEffect", *id, "ArmorReduction")) return *v;
@@ -288,6 +355,7 @@ public:
         std::string child;
         double radius = 0;
         int max_count = 0;
+        bool exclude_target = false;
     };
     std::optional<EnumAreaSpec> effect_enum_area(const std::string& effect_id) const {
         std::map<long, EnumAreaSpec> slots;
@@ -313,8 +381,12 @@ public:
                 s.radius = std::strtod(r->c_str(), nullptr);
             if (const std::string* mc = n.attr("MaxCount"); mc && !mc->empty()) s.max_count = std::atoi(mc->c_str());
         }
-        if (auto it = slots.find(0); it != slots.end() && !it->second.child.empty())
+        if (auto it = slots.find(0); it != slots.end() && !it->second.child.empty()) {
+            for (const core::XmlNode& n : resolved("CEffect", effect_id))
+                if (n.name == "ExcludeArray")
+                    if (const std::string* v = n.attr("Value"); v && *v == "Target") it->second.exclude_target = true;
             return it->second;
+        }
         return std::nullopt;
     }
 
@@ -495,6 +567,7 @@ public:
 
     struct BehaviorBuff {
         double duration = 0;
+        bool duration_authored = false;
         double move_speed_mult = 1.0;
         double rate_mult = 1.0;
         double attack_speed_mult = 1.0;
@@ -507,9 +580,21 @@ public:
         bool invulnerable = false;
         bool uncommandable = false;
         bool untargetable = false;
+        bool suppress_cloak = false, benign = false, passive = false;
+        bool disable_abils = false;
+        bool disable_production = false, disable_spawner = false;
+        bool disable_morph = false, disable_transport = false;
+        double weapon_range_bonus = 0.0;
+        double move_speed_max = -1.0;
+        double decel_mult = 1.0;
+        bool suppress_collision = false;
+        bool suppress_passenger = false;
+        std::vector<std::string> disabled_weapons;
+        std::vector<std::string> disabled_abils;
         double life_armor_bonus = 0.0, shield_armor_bonus = 0.0;
         int max_stack = 1;
         std::string initial_effect, periodic_effect, expire_effect, final_effect;
+        double food = 0.0, life_max_bonus = 0.0;
     };
     std::optional<BehaviorBuff> behavior_buff(const std::string& behavior_id) const;
 
@@ -526,6 +611,7 @@ public:
         bool excludes_spell = false;
         std::uint8_t kinds = 15;
         bool present = false;
+        std::string handled;
     };
     DamageResponse behavior_damage_response(const std::string& behavior_id) const;
 
@@ -627,11 +713,13 @@ public:
         return sp;
     }
 
+    enum class SpawnOwner { Caster, Neutral, Target, Source };
     struct CreateUnitSpec {
         std::string unit;
         int count = 1;
         std::string spawn_effect;
         double spawn_range = 0;
+        SpawnOwner spawn_owner = SpawnOwner::Caster;
     };
 
     std::optional<CreateUnitSpec> effect_create_unit(const std::string& effect_id) const {
@@ -744,16 +832,20 @@ public:
         std::vector<std::pair<std::string, std::string>> filters;
         std::string verb;
         std::vector<std::string> args;
+        std::string target;
     };
 
     std::vector<ActorRule> actor_rules(const std::string& actor_id,
-                                       const std::string& family = "CActorUnit") const;
+                                       const std::string& family = "CActorUnit", bool with_macros = true) const;
 
     std::optional<std::array<int, 3>> ability_rally_color(const std::string& ability_id) const {
         if (ability_id.empty()) return std::nullopt;
         for (const core::XmlNode& n : resolved("CAbil", ability_id)) {
             if (n.name != "OrderArray") continue;
-            const std::string v = n.attr_or("Color", "");
+            std::string v = n.attr_or("Color", "");
+            if (v.empty())
+                for (const core::XmlNode& ch : n.children)
+                    if (ch.name == "Color") { v = ch.attr_or("value", ""); break; }
             if (v.empty()) continue;
             int comp[4] = {255, 200, 200, 200};
             std::size_t i = 0;
@@ -1048,6 +1140,20 @@ public:
         footprint_shape_rings(fp_id, &w);
         if (w.empty()) return -1;
         return *std::min_element(w.begin(), w.end());
+    }
+
+    bool unit_placement_grid_phase(const std::string& unit_id, double& fx, double& fy) const {
+        const auto fp = scalar("CUnit", unit_id, "PlacementFootprint");
+        if (!fp || fp->empty()) return false;
+        double rx = 0.5, ry = 0.5;
+        footprint_grid_phase(*fp, 0.0, 0.0, 0.0, 0.0, rx, ry);
+        auto to_world = [](double f) {
+            const double w = 0.5 - f;
+            return w - std::floor(w);
+        };
+        fx = to_world(rx);
+        fy = to_world(ry);
+        return true;
     }
 
     void footprint_grid_phase(const std::string& fp_id, double minx, double miny, double maxx,
@@ -1717,6 +1823,26 @@ public:
         return out;
     }
 
+    bool hidden_sibling_covers_min_range(const std::string& unit_id, const std::string& weapon) const {
+        auto num = [&](const std::string& w, const char* f, double dflt) {
+            const auto v = scalar("CWeapon", w, f);
+            return v && !v->empty() ? std::atof(v->c_str()) : dflt;
+        };
+        auto planes = [&](const std::string& w) {
+            const std::string tf = scalar("CWeapon", w, "TargetFilters").value_or("");
+            const std::string req = tf.substr(0, tf.find(';'));
+            if (req.empty()) return 3;
+            return (req.find("Ground") != std::string::npos ? 1 : 0) | (req.find("Air") != std::string::npos ? 2 : 0);
+        };
+        const double min_r = num(weapon, "MinimumRange", 0.0);
+        if (min_r <= 0.0) return false;
+        for (const std::string& h : array_links("CUnit", unit_id, "WeaponArray"))
+            if (!h.empty() && h != weapon && weapon_hidden(h) && !weapon_disabled(h) &&
+                num(h, "MinimumRange", 0.0) <= 0.0 && num(h, "Range", 5.0) >= min_r && (planes(h) & planes(weapon)) != 0)
+                return true;
+        return false;
+    }
+
     std::string unit_toggled_weapon(const std::string& unit_id) const {
         for (const std::string& ab : array_links("CUnit", unit_id, "AbilArray"))
             for (const std::string& beh : array_links("CAbil", ab, "BehaviorArray")) {
@@ -2306,11 +2432,43 @@ public:
         }
         return spawner_trained_.count(unit_id) != 0;
     }
+    bool calldown_magazine(const std::string& ability_id) const {
+        const Entry* e = find("CAbil", ability_id);
+        return e && e->tag == "CAbilArmMagazine" && !scalar("CAbil", ability_id, "CalldownEffect").value_or("").empty();
+    }
+    struct RangeRing {
+        double radius = 0;
+        std::string source;
+        bool on_placement = false;
+        bool on_selection = false;
+    };
+    const std::vector<RangeRing>& unit_range_rings(const std::string& unit_id) const {
+        build_range_rings();
+        static const std::vector<RangeRing> kNone;
+        auto it = range_rings_.find(unit_id);
+        return it == range_rings_.end() ? kNone : it->second;
+    }
+    std::optional<double> ability_range_ring(const std::string& abil_id) const {
+        build_range_rings();
+        auto it = abil_rings_.find(abil_id);
+        if (it == abil_rings_.end()) return std::nullopt;
+        return it->second;
+    }
+    bool calldown_ammo_unit(const std::string& unit_id) const {
+        if (!calldown_ammo_built_) {
+            for (const std::string& id : ids("CAbil"))
+                if (calldown_magazine(id))
+                    for (const AbilInfoRow& r : ability_info_rows(id))
+                        if (!r.self_macro && !r.unit.empty()) calldown_ammo_.insert(r.unit);
+            calldown_ammo_built_ = true;
+        }
+        return calldown_ammo_.count(unit_id) != 0;
+    }
     std::vector<TrainProduct> unit_train_products(const std::string& producer_id) const {
         std::vector<TrainProduct> out;
         for (const AbilityCardButton& b : unit_ability_card_buttons(producer_id)) {
             const Entry* e = find("CAbil", b.ability);
-            if (!e || e->tag != "CAbilTrain") continue;
+            if (!e || (e->tag != "CAbilTrain" && !calldown_magazine(b.ability))) continue;
             if (b.command.empty()) continue;
             if (!unit_carries_ability(producer_id, b.ability)) continue;
             const auto row = ability_info_row(b.ability, b.command);
@@ -2616,6 +2774,17 @@ public:
         return 0;
     }
 
+    std::string resource_exhausted_alert(const std::string& unit_id) const {
+        for (const std::string& beh : array_links("CUnit", unit_id, "BehaviorArray")) {
+            if (beh.empty()) continue;
+            const Entry* e = find("CBehavior", beh);
+            if (!e || e->tag != "CBehaviorResource") continue;
+            if (auto a = scalar("CBehavior", beh, "ExhaustedAlert"); a && !a->empty()) return *a;
+            return {};
+        }
+        return {};
+    }
+
     std::string transport_ability(const std::string& unit_id) const {
         for (const std::string& ab : array_links("CUnit", unit_id, "AbilArray")) {
             if (ab.empty()) continue;
@@ -2623,6 +2792,63 @@ public:
             if (e && e->tag == "CAbilTransport") return ab;
         }
         return {};
+    }
+
+    struct LoadRule {
+        int require_race = -1;
+        std::vector<std::string> require_types;
+        std::vector<std::string> exclude_types;
+        std::vector<std::string> block_behaviors;
+        int unknown = 0;
+        bool empty() const {
+            return require_race < 0 && require_types.empty() && exclude_types.empty() &&
+                   block_behaviors.empty();
+        }
+    };
+    LoadRule transport_load_rule(const std::string& unit_id) const {
+        LoadRule r;
+        const std::string ab = transport_ability(unit_id);
+        if (ab.empty()) return r;
+        std::vector<std::string> todo = array_links("CAbil", ab, "LoadValidatorArray");
+        for (std::size_t i = 0; i < todo.size(); ++i) {
+            const std::string& vid = todo[i];
+            if (vid.empty()) continue;
+            const Entry* v = find("CValidator", vid);
+            if (!v) { ++r.unknown; continue; }
+            if (v->tag == "CValidatorCombine") {
+                for (const std::string& m : array_links("CValidator", vid, "CombineArray"))
+                    if (!m.empty()) todo.push_back(m);
+                continue;
+            }
+            if (v->tag == "CValidatorUnitType") {
+                const auto val = scalar("CValidator", vid, "Value");
+                if (!val || val->empty()) { ++r.unknown; continue; }
+                const auto find_s = scalar("CValidator", vid, "Find");
+                const bool want = !find_s || find_s->empty() || *find_s != "0";
+                (want ? r.require_types : r.exclude_types).push_back(*val);
+                continue;
+            }
+            if (v->tag == "CValidatorUnitCompareField") {
+                const auto fld = scalar("CValidator", vid, "Field");
+                const auto val = scalar("CValidator", vid, "Value");
+                if (fld && val && *fld == "Race") {
+                    r.require_race = *val == "Terr" ? 0 : *val == "Prot" ? 1 : *val == "Zerg" ? 2 : -1;
+                    if (r.require_race < 0) ++r.unknown;
+                } else {
+                    ++r.unknown;
+                }
+                continue;
+            }
+            if (v->tag == "CValidatorUnitCompareBehaviorCount") {
+                const auto beh = scalar("CValidator", vid, "Behavior");
+                const auto cmp = scalar("CValidator", vid, "Compare");
+                if (beh && !beh->empty() && (!cmp || cmp->empty())) r.block_behaviors.push_back(*beh);
+                else ++r.unknown;
+                continue;
+            }
+            ++r.unknown;
+        }
+        return r;
     }
 
     bool transport_player_hold(const std::string& unit_id) const {
@@ -2633,6 +2859,11 @@ public:
             if (n.name == "Flags" && n.attr_or("index", "") == "PlayerHold")
                 on = n.attr_or("value", "1") != "0";
         return on;
+    }
+    double transport_field(const std::string& unit_id, const char* field) const {
+        const std::string ab = transport_ability(unit_id);
+        if (ab.empty()) return 0.0;
+        return scalar_num("CAbil", ab, field).value_or(0.0);
     }
     double transport_load_range(const std::string& unit_id) const {
         const std::string ab = transport_ability(unit_id);
@@ -2645,6 +2876,7 @@ public:
     struct TurretSpec {
         double yaw_arc = 0, yaw_rate = 0, yaw_idle_rate = 0, yaw_start = 0;
         std::string idle;
+        double fidget_delay_min = 0, fidget_delay_max = 0, fidget_turn_angle = 0, fidget_turning_rate = 0, fidget_turn_chance = 0;
     };
     std::optional<TurretSpec> turret(const std::string& turret_id) const {
         if (!find("CTurret", turret_id)) return std::nullopt;
@@ -2657,7 +2889,29 @@ public:
             const std::string v = str(f);
             return v.empty() ? 0.0 : std::strtod(v.c_str(), nullptr);
         };
-        return TurretSpec{num("YawArc"), num("YawRate"), num("YawIdleRate"), num("YawStart"), str("Idle")};
+        TurretSpec ts{num("YawArc"), num("YawRate"), num("YawIdleRate"), num("YawStart"), str("Idle")};
+        std::map<std::string, double> chance;
+        auto scan = [&](const std::vector<core::XmlNode>& nodes) {
+            for (const core::XmlNode& fn : nodes) {
+                if (fn.name != "Fidget") continue;
+                auto take = [&](const char* a, double& out) {
+                    if (const std::string* s = fn.attr(a)) out = std::strtod(s->c_str(), nullptr);
+                };
+                take("DelayMin", ts.fidget_delay_min);
+                take("DelayMax", ts.fidget_delay_max);
+                take("TurnAngle", ts.fidget_turn_angle);
+                take("TurningRate", ts.fidget_turning_rate);
+                for (const core::XmlNode& c : fn.children)
+                    if (c.name == "ChanceArray")
+                        if (const std::string* s = c.attr("value")) chance[c.attr_or("index", "")] = std::strtod(s->c_str(), nullptr);
+            }
+        };
+        if (const auto* d = tag_default_nodes("CTurret")) scan(*d);
+        scan(resolved("CTurret", turret_id));
+        double total = 0;
+        for (const auto& kv : chance) total += kv.second;
+        if (total > 0) ts.fidget_turn_chance = chance["Turn"] / total;
+        return ts;
     }
     std::string weapon_turret(const std::string& unit_id, const std::string& weapon_id) const {
         std::string t;
@@ -2792,6 +3046,21 @@ public:
         return pathing_footprint_offsets(*fp, "Check");
     }
 
+    bool power_source_reaches_higher(const std::string& unit_id) const {
+        bool reaches = true;
+        for (const std::string& beh : array_links("CUnit", unit_id, "BehaviorArray")) {
+            if (beh.empty()) continue;
+            const Entry* e = find("CBehavior", beh);
+            if (!e || e->tag != "CBehaviorPowerSource") continue;
+            if (scalar("CBehavior", beh, "PowerLevel")) continue;
+            if (scalar("CBehavior", beh, "Requirements")) continue;
+            for (const core::XmlNode& n : resolved("CBehavior", beh))
+                if (n.name == "CliffLevelFlags" && n.attr_or("index", "") == "Higher")
+                    reaches = n.attr_or("value", "1") != "0";
+        }
+        return reaches;
+    }
+
     double power_source_radius(const std::string& unit_id) const {
         double best = 0;
         for (const std::string& beh : array_links("CUnit", unit_id, "BehaviorArray")) {
@@ -2869,6 +3138,22 @@ public:
             if (auto p = scalar_num("CBehavior", beh, "Period")) return *p;
         }
         return 0;
+    }
+
+    bool radar_disabled_while_constructing(const std::string& unit_id) const {
+        for (const std::string& beh : array_links("CUnit", unit_id, "BehaviorArray")) {
+            if (beh.empty()) continue;
+            bool grants_radar = false, disabled = false;
+            for (const core::XmlNode& n : resolved("CBehavior", beh)) {
+                if (n.name == "Modification" && n.attr("Radar")) grants_radar = true;
+                if (n.name == "BuffFlags" &&
+                    n.attr_or("index", "") == "DisableWhileUnderConstruction" &&
+                    n.attr_or("value", "0") != "0")
+                    disabled = true;
+            }
+            if (grants_radar && disabled) return true;
+        }
+        return false;
     }
 
     double radar_range(const std::string& unit_id) const {
@@ -2953,14 +3238,41 @@ public:
     std::vector<ArcSplash> weapon_arc_splash(const std::string& weapon_id) const;
 
     std::optional<double> missile_speed(const std::string& weapon_id) const;
+    std::optional<double> effect_missile_speed(const std::string& effect_id) const;
+    struct MissileMover {
+        double range_lte = 0.0;
+        double speed = 0.0;
+        double accel = 0.0;
+        double max_speed = 0.0;
+    };
+    std::vector<MissileMover> effect_missile_movers(const std::string& effect_id) const;
+    double weapon_turret_yaw_rate(const std::string& unit_id) const;
 
     std::optional<std::string> weapon_missile_model_id(const std::string& weapon_id) const;
+    std::optional<std::string> weapon_impact_model_id(const std::string& weapon_id) const;
+    std::optional<std::string> weapon_launch_model_id(const std::string& weapon_id) const;
 
     const std::vector<core::XmlNode>& singleton_fields(const std::string& family) const;
 
     const std::vector<core::XmlNode>* tag_default_nodes(const std::string& tag) const {
         auto it = tag_defaults_.find(tag);
         return it == tag_defaults_.end() ? nullptr : &it->second;
+    }
+    bool ability_disables_class(const std::string& abil, const std::string& cls) const {
+        const Entry* e = find("CAbil", abil);
+        if (!e) return false;
+        int own = -1;
+        for (const core::XmlNode& n : resolved("CAbil", abil))
+            if (n.name == "AbilClassDisableArray" && n.attr_or("index", "") == cls) own = n.attr_or("value", "0") != "0";
+        if (own >= 0) return own == 1;
+        if (const std::vector<core::XmlNode>* d = tag_default_indexed_nodes(e->tag))
+            for (const core::XmlNode& n : *d)
+                if (n.name == "AbilClassDisableArray" && n.attr_or("index", "") == cls) own = n.attr_or("value", "0") != "0";
+        return own == 1;
+    }
+    const std::vector<core::XmlNode>* tag_default_indexed_nodes(const std::string& tag) const {
+        auto it = tag_default_indexed_.find(tag);
+        return it == tag_default_indexed_.end() ? nullptr : &it->second;
     }
     std::optional<double> refund_fraction(const std::string& abil_id, const std::string& resource) const {
         std::optional<double> v;
@@ -3080,6 +3392,271 @@ public:
                 if (n.name == "On" && n.attr_or("Terms", "") == want) return id;
         return {};
     }
+    struct BeamActor {
+        std::string actor;
+        std::string model;
+    };
+    std::optional<BeamActor> beam_for_effect(const std::string& effect_id) const {
+        if (effect_id.empty()) return std::nullopt;
+        const std::string prefix = "Effect." + effect_id + ".";
+        std::vector<std::string> ids_ = ids("CActorBeamSimple");
+        for (const std::string& s : ids("CActorBeamStandard")) ids_.push_back(s);
+        std::sort(ids_.begin(), ids_.end());
+        for (const std::string& id : ids_) {
+            const char* fam = find("CActorBeamSimple", id) ? "CActorBeamSimple" : "CActorBeamStandard";
+            bool creates = false;
+            std::string model;
+            for (const core::XmlNode& n : resolved(fam, id)) {
+                if (n.name == "Model") {
+                    if (const std::string* v = n.attr("value")) model = *v;
+                    else if (const std::string* l = n.attr("Link")) model = *l;
+                } else if (n.name == "On" && n.attr_or("Send", "") == "Create") {
+                    const std::string terms = n.attr_or("Terms", "");
+                    if (terms.rfind(prefix, 0) == 0) creates = true;
+                }
+            }
+            if (creates) return BeamActor{id, model};
+        }
+        return std::nullopt;
+    }
+    struct WarpBirth {
+        double slow_s = 0;
+        double fast_s = 0;
+    };
+    std::optional<WarpBirth> warp_birth_of(const std::string& warp_abil) const {
+        if (warp_abil.empty()) return std::nullopt;
+        const std::string want = "Abil." + warp_abil + ".TargetStart";
+        std::vector<std::string> ids_ = ids("CActorProgress");
+        std::sort(ids_.begin(), ids_.end());
+        for (const std::string& id : ids_) {
+            const auto& kids = resolved("CActorProgress", id);
+            bool creates = false;
+            for (const core::XmlNode& n : kids)
+                if (n.name == "On" && n.attr_or("Terms", "") == want && n.attr_or("Send", "") == "Create") creates = true;
+            if (!creates) continue;
+            WarpBirth wb;
+            bool any = false;
+            for (const core::XmlNode& n : kids) {
+                if (n.name != "On" || n.attr_or("Target", "") != "_Unit") continue;
+                const std::string terms = n.attr_or("Terms", "");
+                const std::string send = n.attr_or("Send", "");
+                if (terms.rfind("ActorCreation", 0) != 0 || send.rfind("$Birth ", 0) != 0) continue;
+                double v[4] = {0, 0, 0, 0};
+                const char* p = send.c_str() + 7;
+                int k = 0;
+                for (; k < 4; ++k) {
+                    char* end = nullptr;
+                    v[k] = std::strtod(p, &end);
+                    if (end == p) break;
+                    p = end;
+                }
+                if (k < 4 || send.find("AsDuration") == std::string::npos) continue;
+                if (terms.find("ValidateUnit SuperPower") != std::string::npos && terms.find("!ValidateUnit") == std::string::npos)
+                    wb.fast_s = v[3];
+                else
+                    wb.slow_s = v[3];
+                any = true;
+            }
+            if (any) return wb;
+        }
+        return std::nullopt;
+    }
+    std::optional<std::array<float, 3>> actor_tint(const std::string& unit_id, const std::string& terms_prefix,
+                                                   const std::string& terms_contains) const;
+    std::optional<float> unit_anim_blend_time(const std::string& unit_id) const {
+        if (unit_id.empty()) return std::nullopt;
+        ensure_actor_by_unit();
+        auto it = actor_by_unit_.find(unit_id);
+        if (it == actor_by_unit_.end()) return std::nullopt;
+        const auto v = scalar("CActorUnit", it->second, "AnimBlendTime");
+        if (!v || v->empty()) return std::nullopt;
+        const double s = std::strtod(v->c_str(), nullptr);
+        if (s < 0.0) return std::nullopt;
+        return float(s);
+    }
+    std::vector<std::string> minimap_priority_order() const {
+        std::vector<std::string> out;
+        for (const core::XmlNode& n : resolved("CActorGlobalConfig", "SYSTEM_ActorConfig")) {
+            if (n.name != "MinimapRenderPriorityList") continue;
+            const std::string v = n.attr_or("value", "");
+            if (!v.empty()) out.push_back(v);
+        }
+        return out;
+    }
+    std::string minimap_render_priority(const std::string& unit_id) const {
+        if (unit_id.empty()) return {};
+        ensure_actor_by_unit();
+        auto it = actor_by_unit_.find(unit_id);
+        if (it == actor_by_unit_.end()) return {};
+        if (const auto v = scalar("CActorUnit", it->second, "MinimapRenderPriority"))
+            if (!v->empty()) return *v;
+        return {};
+    }
+    double unit_damage_flash_ms() const {
+        for (const char* entry : {"Dflt", "CoreDflt"}) {
+            if (const auto v = scalar("CGameUI", entry, "UnitDamageFlashDuration"))
+                if (!v->empty()) {
+                    const double d = std::strtod(v->c_str(), nullptr);
+                    if (d > 0.0) return d;
+                }
+        }
+        return 3000.0;
+    }
+    struct SelectionLook {
+        std::array<std::uint8_t, 3> selected = {0, 168, 90};
+        std::array<std::uint8_t, 3> subgroup = {0, 250, 25};
+        std::array<std::uint8_t, 3> ally = {255, 255, 0};
+        std::array<std::uint8_t, 3> enemy = {230, 0, 0};
+        float width = 0.03f;
+        float inner_boundary = 0.86f;
+        float inner_falloff = 0.40f;
+        float pre_alpha = 0.75f;
+        float pre_rotation = 0.50f;
+        int pre_segments = 8;
+        float pre_solid = 0.80f;
+    };
+    SelectionLook selection_look() const {
+        SelectionLook s;
+        auto rgb_of = [](const std::string& v, std::array<std::uint8_t, 3>& out) {
+            int a = 255, r = 0, g = 0, b = 0;
+            if (std::sscanf(v.c_str(), "%d,%d,%d,%d", &a, &r, &g, &b) != 4) return;
+            out = {std::uint8_t(r), std::uint8_t(g), std::uint8_t(b)};
+        };
+        for (const char* entry : {"Dflt", "CoreDflt"}) {
+            for (const core::XmlNode& n : resolved("CGameUI", entry)) {
+                if (n.name == "SelectionColors") {
+                    const std::string idx = n.attr_or("index", ""), v = n.attr_or("value", "");
+                    if (v.empty()) continue;
+                    if (idx == "Selected") rgb_of(v, s.selected);
+                    else if (idx == "Subgroup") rgb_of(v, s.subgroup);
+                    else if (idx == "Ally") rgb_of(v, s.ally);
+                    else if (idx == "Enemy") rgb_of(v, s.enemy);
+                    continue;
+                }
+                if (n.name != "SelectionData") continue;
+                for (const core::XmlNode& f : n.children) {
+                    const std::string v = f.attr_or("value", "");
+                    if (v.empty()) continue;
+                    const double d = std::strtod(v.c_str(), nullptr);
+                    if (f.name == "SelectionWidth") s.width = float(d);
+                    else if (f.name == "SelectionInnerBoundaryRatio") s.inner_boundary = float(d);
+                    else if (f.name == "SelectionInnerBoundaryFallOffRatio") s.inner_falloff = float(d);
+                    else if (f.name == "PreselectionAlpha") s.pre_alpha = float(d);
+                    else if (f.name == "PreselectionRotationSpeed") s.pre_rotation = float(d);
+                    else if (f.name == "PreselectionSegmentCount") s.pre_segments = int(d);
+                    else if (f.name == "PreselectionSegmentPercentSolid") s.pre_solid = float(d);
+                }
+            }
+        }
+        if (s.pre_segments < 1) s.pre_segments = 1;
+        return s;
+    }
+    struct MinimapColors {
+        std::array<std::uint8_t, 3> resource = {126, 191, 241};
+        std::array<std::uint8_t, 3> frustum = {255, 255, 255};
+        std::array<std::uint8_t, 3> unit_border = {0, 0, 0};
+        float border_size = 1.0f;
+        float min_dot_size = 3.0f;
+        std::array<std::uint8_t, 3> blip = {255, 0, 0};
+        float radar_alpha = 60.0f / 255.0f;
+    };
+    MinimapColors minimap_colors() const {
+        MinimapColors c;
+        auto rgb_of = [](const std::string& v, std::array<std::uint8_t, 3>& out) {
+            int a = 255, r = 0, g = 0, b = 0;
+            if (std::sscanf(v.c_str(), "%d,%d,%d,%d", &a, &r, &g, &b) != 4) return;
+            out = {std::uint8_t(r), std::uint8_t(g), std::uint8_t(b)};
+        };
+        for (const char* entry : {"Dflt", "CoreDflt"}) {
+            for (const core::XmlNode& n : resolved("CGameUI", entry)) {
+                if (n.name != "MinimapData") continue;
+                for (const core::XmlNode& f : n.children) {
+                    const std::string v = f.attr_or("value", "");
+                    if (v.empty()) continue;
+                    if (f.name == "ResourceUnitColor") rgb_of(v, c.resource);
+                    else if (f.name == "FrustumColor") rgb_of(v, c.frustum);
+                    else if (f.name == "UnitBorderColor") rgb_of(v, c.unit_border);
+                    else if (f.name == "BlipUnitColor") rgb_of(v, c.blip);
+                    else if (f.name == "BorderSize") {
+                        const double d = std::strtod(v.c_str(), nullptr);
+                        if (d >= 0.0 && d < 16.0) c.border_size = float(d);
+                    }
+                    else if (f.name == "MinUnitDotSize") {
+                        const double d = std::strtod(v.c_str(), nullptr);
+                        if (d > 0.0 && d < 64.0) c.min_dot_size = float(d);
+                    }
+                    else if (f.name == "RadarAlpha") {
+                        const double d = std::strtod(v.c_str(), nullptr);
+                        if (d > 0.0 && d <= 255.0) c.radar_alpha = float(d / 255.0);
+                    }
+                }
+            }
+        }
+        return c;
+    }
+    struct MinimapLook {
+        std::string icon;
+        float scale = 1.0f;
+    };
+    std::optional<MinimapLook> unit_minimap_icon(const std::string& unit_id) const {
+        if (unit_id.empty()) return std::nullopt;
+        ensure_actor_by_unit();
+        auto it = actor_by_unit_.find(unit_id);
+        if (it == actor_by_unit_.end()) return std::nullopt;
+        const auto v = scalar("CActorUnit", it->second, "MinimapIcon");
+        if (!v || v->empty()) return std::nullopt;
+        MinimapLook look;
+        look.icon = *v;
+        if (const auto s = scalar("CActorUnit", it->second, "MinimapIconScale")) {
+            const double d = std::strtod(s->c_str(), nullptr);
+            if (d > 0.0) look.scale = float(d);
+        }
+        return look;
+    }
+    struct HallucinationLook {
+        std::string behavior;
+        std::array<float, 3> tint = {1.0f, 1.0f, 1.0f};
+        float opacity = 1.0f;
+    };
+    std::optional<HallucinationLook> hallucination_look() const {
+        HallucinationLook look;
+        bool found = false;
+        for (const std::string& id : ids("CActor")) {
+            const Entry* e = find("CActor", id);
+            if (!e) continue;
+            std::string beh;
+            bool tinter = false;
+            for (const core::XmlNode& n : e->own) {
+                if (n.name != "On") continue;
+                const std::string terms = n.attr_or("Terms", "");
+                const std::string send = n.attr_or("Send", "");
+                if (send.rfind("Signal ", 0) == 0 && send.find("TintOn") != std::string::npos &&
+                    terms.rfind("Behavior.", 0) == 0) {
+                    const std::size_t dot = terms.find('.', 9);
+                    if (dot != std::string::npos && terms.compare(dot, 4, ".On;") == 0) beh = terms.substr(9, dot - 9);
+                }
+                if (terms.rfind("Signal.", 0) == 0 && terms.find("TintOn") != std::string::npos &&
+                    n.attr_or("Target", "") == "_Unit") {
+                    int r = 255, g = 255, b = 255;
+                    float op = 1.0f;
+                    if (send.rfind("SetTintColor ", 0) == 0 && std::sscanf(send.c_str() + 13, "%d,%d,%d", &r, &g, &b) == 3) {
+                        look.tint = {float(r) / 255.0f, float(g) / 255.0f, float(b) / 255.0f};
+                        tinter = true;
+                    } else if (send.rfind("SetOpacity ", 0) == 0 && std::sscanf(send.c_str() + 11, "%f", &op) == 1) {
+                        look.opacity = op;
+                        tinter = true;
+                    }
+                }
+            }
+            if (tinter && !beh.empty()) {
+                look.behavior = beh;
+                found = true;
+                break;
+            }
+        }
+        if (!found) return std::nullopt;
+        return look;
+    }
     std::string build_ability_of(const std::string& structure) const {
         std::vector<std::string> ab = ids("CAbil");
         std::sort(ab.begin(), ab.end());
@@ -3116,6 +3693,8 @@ private:
     const std::vector<core::XmlNode>& resolve_chain(const std::string& family, const std::string& id) const;
     std::string sibling_actor_family(const std::string& family, const std::string& id) const;
     std::vector<std::string> load_skips_;
+    bool add_only_ = false;
+    std::set<std::string> add_only_new_;
     static std::vector<std::string> unlisted_families_;
     using IdMap = std::unordered_map<std::string, Entry>;
     std::unordered_map<std::string, IdMap> families_;
@@ -3123,6 +3702,7 @@ private:
     std::unordered_map<std::string, std::string> consts_;
     std::unordered_map<std::string, std::vector<core::XmlNode>> singletons_;
     std::unordered_map<std::string, std::vector<core::XmlNode>> tag_defaults_;
+    std::unordered_map<std::string, std::vector<core::XmlNode>> tag_default_indexed_;
     StringTable strings_;
     StringTable hotkeys_;
     StringTable assets_;
@@ -3130,9 +3710,16 @@ private:
     mutable std::unordered_map<std::string, std::vector<core::XmlNode>> resolved_cache_;
     mutable std::unordered_set<std::string> spawner_trained_;
     mutable bool spawner_trained_built_ = false;
+    mutable std::unordered_set<std::string> calldown_ammo_;
+    mutable bool calldown_ammo_built_ = false;
+    mutable std::unordered_map<std::string, std::vector<RangeRing>> range_rings_;
+    mutable std::unordered_map<std::string, double> abil_rings_;
+    mutable bool range_rings_built_ = false;
+    void build_range_rings() const;
 
     mutable std::unordered_map<std::string, std::string> actor_by_unit_;
     mutable bool actor_by_unit_built_ = false;
+    void ensure_actor_by_unit() const;
     mutable std::set<std::string> carded_cmds_;
     mutable bool carded_cmds_built_ = false;
 

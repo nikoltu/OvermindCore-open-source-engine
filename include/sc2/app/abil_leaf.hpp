@@ -39,6 +39,10 @@ inline const char* effect_kind_name(sim::EffectKind k) {
         case sim::EffectKind::DestroyPersistent: return "DestroyPersistent";
         case sim::EffectKind::CancelOrder: return "CancelOrder";
         case sim::EffectKind::TransferBehavior: return "TransferBehavior";
+        case sim::EffectKind::UseCalldown: return "UseCalldown";
+        case sim::EffectKind::WeaponCooldown: return "WeaponCooldown";
+        case sim::EffectKind::LaunchMissile: return "LaunchMissile";
+        case sim::EffectKind::RedirectPassengers: return "RedirectPassengers";
     }
     return "?";
 }

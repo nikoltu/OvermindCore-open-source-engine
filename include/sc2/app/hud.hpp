@@ -3,6 +3,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include "sc2/app/hud_messages.hpp"
@@ -17,6 +18,15 @@ namespace sc2::app {
 struct HudMessageLine {
     MsgZone zone = MsgZone::Alert;
     std::string text;
+    float ttl = 0.0f;
+    float ttl0 = 0.0f;
+};
+
+struct HudMessageStyle {
+    bool set = false;
+    std::uint8_t r = 255, g = 255, b = 255;
+    bool centred = false;
+    int height_pt = 0;
 };
 
 struct EquipmentEntry {
@@ -31,7 +41,10 @@ struct HudContent {
     int supply_used = 0;
     int supply_max = 0;
     int game_seconds = -1;
+    bool widget_art = false;
     int idle_workers = 0;
+    int army_units = 0;
+    int warp_gates_ready = 0;
     std::vector<EquipmentEntry> equipment;
     int lead_kills = 0;
 
@@ -43,6 +56,51 @@ struct HudContent {
     WireframeState lead_wireframe;
 
     std::vector<HudMessageLine> messages;
+
+    struct MinimapPing {
+        float x = 0, y = 0;
+        float age = 0;
+        float ping_time = 6.0f;
+        std::uint8_t r = 255, g = 0, b = 0;
+    };
+    std::vector<MinimapPing> pings;
+
+    struct MinimapIcon {
+        float x = 0, y = 0;
+        const std::vector<std::uint8_t>* rgba = nullptr;
+        int tw = 0, th = 0;
+        float scale = 1.0f;
+        std::uint32_t unit = 0xFFFFFFFFu;
+    };
+    std::vector<MinimapIcon> minimap_icons;
+
+    std::uint8_t resource_rgb[3] = {126, 191, 241};
+    std::uint8_t frustum_rgb[3] = {255, 255, 255};
+    std::uint8_t border_rgb[3] = {0, 0, 0};
+    int border_px = 1;
+    HudMessageStyle error_style;
+    HudMessageStyle warning_style;
+    float min_dot_pt = 3.0f;
+
+    struct MinimapFlash {
+        std::uint32_t unit = 0xFFFFFFFFu;
+        std::uint8_t r = 255, g = 0, b = 0;
+    };
+    std::vector<MinimapFlash> minimap_flashes;
+
+    struct MinimapTeamColor {
+        std::uint8_t rgb[3] = {150, 150, 150};
+        std::uint8_t sel_rgb[3] = {150, 150, 150};
+        bool set = false;
+    };
+    std::vector<MinimapTeamColor> player_colors;
+    std::vector<std::uint32_t> minimap_selected;
+
+    std::vector<std::uint8_t> minimap_priority;
+
+    std::vector<std::pair<float, float>> radar_blips;
+    std::uint8_t blip_rgb[3] = {255, 0, 0};
+    float blip_alpha = 60.0f / 255.0f;
 };
 
 class HudModel {
