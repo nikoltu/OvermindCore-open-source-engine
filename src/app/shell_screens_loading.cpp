@@ -1,5 +1,6 @@
 #include "sc2/app/shell_screens.hpp"
 
+#include <algorithm>
 #include <cstdio>
 
 namespace sc2::app::shell {
@@ -18,10 +19,48 @@ bool screen_loading(Ui& ui, ShellCtx& ctx) {
     const ShellCtx::LoadView v = ctx.loading();
 
     ui.text(ui.at(L::kH1MapName), v.map, v2::kH1, v2::kTextHi, Align::Centre);
-    const std::string mode = v.replay ? std::string("REPLAY") : std::string("1V1 MELEE - ") + ShellSettings::speed_name(ctx.settings.game_speed());
+    std::vector<int> teams;
+    for (const MeleeSlot& s : v.players) teams.push_back(s.team);
+    const std::vector<std::vector<int>> cols = team_columns(teams);
+    const std::string fmt = v.players.size() > 2 ? format_label(cols) : std::string("1V1");
+    const std::string mode = v.replay ? std::string("REPLAY") : fmt + " MELEE - " + ShellSettings::speed_name(ctx.settings.game_speed());
     ui.text(ui.at(L::kLabel1v1Melee), mode, v2::kLabel, v2::kTextMuted, Align::Centre);
 
-    {
+    if (v.players.size() > 2) {
+        const float x0 = L::kPlayerCard.x, x1 = L::kPlayerCard2.x + L::kPlayerCard2.w;
+        const float y0 = L::kPlayerCard.y, h = L::kPlayerCard.h, gap = 48.0f;
+        std::size_t deepest = 1;
+        for (const auto& c : cols) deepest = std::max(deepest, c.size());
+        const float col_w = (x1 - x0 - gap * float(cols.size() - 1)) / float(cols.size());
+        const float card_h = (h - 12.0f * float(deepest - 1)) / float(deepest);
+        int you = -1;
+        for (std::size_t p = 0; p < v.players.size(); ++p)
+            if (v.players[p].controller == MeleeSlot::Controller::Human && you < 0) you = int(p);
+        for (std::size_t c = 0; c < cols.size(); ++c) {
+            const float cx = x0 + (col_w + gap) * float(c);
+            if (c > 0) ui.text(ui.at(cx - gap, y0 + h / 2.0f - 20.0f, gap, 40.0f), "VS", v2::kLabel, v2::kTextFaint, Align::Centre);
+            for (std::size_t k = 0; k < cols[c].size(); ++k) {
+                const int p = cols[c][k];
+                const MeleeSlot& s = v.players[std::size_t(p)];
+                const Rect card = ui.at(cx, y0 + (card_h + 12.0f) * float(k), col_w, card_h);
+                ui.panel(card);
+                ui.publish_region("loading/player" + std::to_string(p), card);
+                theme::Rgb tc{};
+                if (ctx.team_color(p, tc)) ui.fill(Rect{card.x0, card.y0, card.x0 + ui.px(8.0f), card.y1}, tc);
+                std::string name = p == you ? ctx.player_name() : std::string("A.I.");
+                if (p != you && !v.replay)
+                    name += std::string(" - ") + ShellSettings::difficulty_name(s.difficulty > 0 ? s.difficulty : ctx.settings.ai_difficulty());
+                const int pad = ui.px(24.0f), mark = std::min(ui.px(48.0f), std::max(1, card.h() / 3));
+                ui.text(Rect{card.x0 + pad, card.y0 + ui.px(12.0f), card.x1 - ui.px(12.0f), card.y0 + ui.px(48.0f)}, name, v2::kH3, v2::kTextHi);
+                const IconAtlas::Icon* icon = ctx.race_mark(as_lobby(s.race));
+                const Rect mr{card.x0 + pad, card.y0 + ui.px(56.0f), card.x0 + pad + mark, card.y0 + ui.px(56.0f) + mark};
+                ui.picture(mr, icon);
+                ui.text(Rect{icon ? mr.x1 + ui.px(12.0f) : mr.x0, mr.y0, card.x1 - ui.px(12.0f), mr.y1}, race_word(s.race), v2::kBody, v2::kTextBody);
+            }
+        }
+    }
+
+    if (v.players.size() <= 2) {
         ui.panel(ui.at(L::kPlayerCard));
         theme::Rgb tc{};
         const bool have_tc = ctx.team_color(0, tc);
@@ -36,8 +75,8 @@ bool screen_loading(Ui& ui, ShellCtx& ctx) {
         ui.text(icon ? rr : Rect{mark.x0, rr.y0, rr.x1, rr.y1}, race_word(v.race[0]), v2::kBody, v2::kTextBody);
         if (have_tc) ui.fill(ui.at(L::kTeamColourBar), tc);
     }
-    ui.text(ui.at(L::kVs), "VS", v2::kH1, v2::kTextFaint, Align::Centre);
-    {
+    if (v.players.size() <= 2) ui.text(ui.at(L::kVs), "VS", v2::kH1, v2::kTextFaint, Align::Centre);
+    if (v.players.size() <= 2) {
         const Rect card = ui.at(L::kPlayerCard2);
         ui.panel(card);
         theme::Rgb tc{};

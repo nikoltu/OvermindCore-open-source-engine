@@ -54,6 +54,7 @@ struct MeleeConfig {
     std::vector<WavePhase> wave_phases;
     std::array<std::vector<WavePhase>, 5> wave_ladders;
     sim::Fixed attack_caution = sim::Fixed::from_ratio(9, 10);
+    int match_players = 2;
     int max_pending = 2;
     bool worker_builds = false;
     int gas_peons_per_geyser = 3;
@@ -109,6 +110,9 @@ private:
     bool supply_ok(const sim::World& w, const BuildItem& it) const;
     void run_workers(sim::World& w);
     void run_production(sim::World& w);
+    bool run_supply(sim::World& w);
+    int own_pending(const sim::World& w) const;
+    static const bool kSupplyAfterProducer;
     bool army_unit2_gate_ok(const sim::World& w) const;
     void run_expansion(sim::World& w);
     void run_stock(sim::World& w);
@@ -123,6 +127,7 @@ private:
     int patches_near(const sim::World& w, sim::Fixed x, sim::Fixed y, sim::Fixed radius) const;
     uint32_t nearest_mineral(const sim::World& w, sim::Fixed x, sim::Fixed y) const;
     bool enemy_target(const sim::World& w, sim::Fixed& tx, sim::Fixed& ty) const;
+    int32_t target_player(const sim::World& w, bool* several = nullptr) const;
 
     int player_;
     MeleeConfig cfg_;

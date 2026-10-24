@@ -13,6 +13,13 @@ class FrontEnd;
 class PortraitCatalog;
 struct PortraitRef;
 struct ScoreRow;
+struct MatchPlayerCard {
+    Race race = Race::Terran;
+    int team = -1;
+    MeleeSlot::Controller controller = MeleeSlot::Controller::AI;
+    int difficulty = 0;
+    bool won = false;
+};
 }
 
 namespace sc2::app::shell {
@@ -45,6 +52,7 @@ struct ShellCtx {
         std::string map, stage;
         int map_index = 0;
         Race race[2] = {Race::Terran, Race::Terran};
+        std::vector<MeleeSlot> players;
         bool replay = false;
         std::size_t done = 0, total = 0;
         float elapsed_ms = 0.0f;
@@ -57,8 +65,15 @@ struct ShellCtx {
         Race race[2] = {Race::Terran, Race::Terran};
         int tier = 0;
         const std::vector<ScoreRow>* score = nullptr;
+        const std::vector<MatchPlayerCard>* players = nullptr;
     };
     ResultView result() const;
+    int lobby_format() const;
+    bool set_lobby_format(int format);
+    int lobby_rows() const;
+    void lobby_row(int i, int& controller, int& race, int& difficulty, int& team) const;
+    void set_lobby_row(int i, int controller, int race, int difficulty, int team);
+    int map_start_count(int index);
     std::string player_name() const;
     Race player_default_race() const;
     const IconAtlas::Icon* player_portrait();
@@ -77,6 +92,30 @@ struct ShellCtx {
     };
     GameData game_data();
 };
+
+inline std::vector<std::vector<int>> team_columns(const std::vector<int>& teams) {
+    std::vector<int> keys;
+    std::vector<std::vector<int>> cols;
+    for (std::size_t p = 0; p < teams.size(); ++p) {
+        const int key = teams[p] >= 0 ? teams[p] : -(int(p) + 2);
+        std::size_t c = 0;
+        while (c < keys.size() && keys[c] != key) ++c;
+        if (c == keys.size()) {
+            keys.push_back(key);
+            cols.emplace_back();
+        }
+        cols[c].push_back(int(p));
+    }
+    return cols;
+}
+inline std::string format_label(const std::vector<std::vector<int>>& cols) {
+    bool singles = true;
+    for (const auto& c : cols) singles = singles && c.size() == 1;
+    if (singles && cols.size() > 2) return "FFA";
+    std::string s;
+    for (std::size_t i = 0; i < cols.size(); ++i) s += (i ? "V" : "") + std::to_string(cols[i].size());
+    return s;
+}
 
 using ScreenFn = bool (*)(Ui&, ShellCtx&);
 ScreenFn screen_fn(ScreenId id);

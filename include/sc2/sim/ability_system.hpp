@@ -18,6 +18,7 @@ struct AbilitySpec {
     std::uint32_t req_attr_mask = 0;
     std::uint32_t exc_attr_mask = 0;
     bool require_energy = false;
+    bool require_energy_pool = false;
     std::vector<VitalGate> vital_gates{};
     Fixed life_cost{};
 };
@@ -48,6 +49,7 @@ public:
             if ((t.attributes & s.req_attr_mask) != s.req_attr_mask) return false;
             if (t.attributes & s.exc_attr_mask) return false;
             if (s.require_energy && t.energy.raw() <= 0) return false;
+            if (s.require_energy_pool && t.energy_max.raw() <= 0) return false;
             for (const VitalGate& g : s.vital_gates)
                 if (!vital_gate_passes(g, t)) return false;
         }

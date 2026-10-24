@@ -2,6 +2,7 @@
 
 #include <vulkan/vulkan.h>
 
+#include <atomic>
 #include <cstring>
 #include <stdexcept>
 #include <string>
@@ -10,6 +11,11 @@
 #include "sc2/render/vk_raii.hpp"
 
 namespace sc2::render {
+
+inline std::atomic<long long>* gpu_alloc_bytes() {
+    static std::atomic<long long> b[2] = {{0}, {0}};
+    return b;
+}
 
 inline void check(VkResult r, const char* what) {
     if (r != VK_SUCCESS)
@@ -58,7 +64,11 @@ inline Buffer make_buffer(VkPhysicalDevice pd, VkDevice dev, VkDeviceSize size, 
         VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
     VkDeviceMemory rawmem = VK_NULL_HANDLE;
     check(vkAllocateMemory(dev, &ai, nullptr, &rawmem), "vkAllocateMemory(buffer)");
-    out.mem = Unique<VkDeviceMemory>(rawmem, [dev](VkDeviceMemory m) { vkFreeMemory(dev, m, nullptr); });
+    gpu_alloc_bytes()[1] += (long long)req.size;
+    out.mem = Unique<VkDeviceMemory>(rawmem, [dev, sz = (long long)req.size](VkDeviceMemory m) {
+        vkFreeMemory(dev, m, nullptr);
+        gpu_alloc_bytes()[1] -= sz;
+    });
     check(vkBindBufferMemory(dev, raw, rawmem, 0), "vkBindBufferMemory");
     if (src && size) {
         void* p = nullptr;
@@ -113,7 +123,11 @@ inline Image make_image(VkPhysicalDevice pd, VkDevice dev, VkFormat fmt, VkImage
     ai.memoryTypeIndex = find_memory(pd, req.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
     VkDeviceMemory rawmem = VK_NULL_HANDLE;
     check(vkAllocateMemory(dev, &ai, nullptr, &rawmem), "vkAllocateMemory(image)");
-    out.mem = Unique<VkDeviceMemory>(rawmem, [dev](VkDeviceMemory m) { vkFreeMemory(dev, m, nullptr); });
+    gpu_alloc_bytes()[0] += (long long)req.size;
+    out.mem = Unique<VkDeviceMemory>(rawmem, [dev, sz = (long long)req.size](VkDeviceMemory m) {
+        vkFreeMemory(dev, m, nullptr);
+        gpu_alloc_bytes()[0] -= sz;
+    });
     check(vkBindImageMemory(dev, raw, rawmem, 0), "vkBindImageMemory");
     VkImageViewCreateInfo vi{};
     vi.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
@@ -153,7 +167,11 @@ inline Image make_image_array(VkPhysicalDevice pd, VkDevice dev, VkFormat fmt,
     ai.memoryTypeIndex = find_memory(pd, req.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
     VkDeviceMemory rawmem = VK_NULL_HANDLE;
     check(vkAllocateMemory(dev, &ai, nullptr, &rawmem), "vkAllocateMemory(image array)");
-    out.mem = Unique<VkDeviceMemory>(rawmem, [dev](VkDeviceMemory m) { vkFreeMemory(dev, m, nullptr); });
+    gpu_alloc_bytes()[0] += (long long)req.size;
+    out.mem = Unique<VkDeviceMemory>(rawmem, [dev, sz = (long long)req.size](VkDeviceMemory m) {
+        vkFreeMemory(dev, m, nullptr);
+        gpu_alloc_bytes()[0] -= sz;
+    });
     check(vkBindImageMemory(dev, raw, rawmem, 0), "vkBindImageMemory(array)");
     VkImageViewCreateInfo vi{};
     vi.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;

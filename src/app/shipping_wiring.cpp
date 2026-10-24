@@ -11,6 +11,7 @@
 #include "sc2/data/catalog.hpp"
 #include "sc2/data/production.hpp"
 #include "sc2/data/requirements.hpp"
+#include "sc2/render/offscreen.hpp"
 
 #include <algorithm>
 #include <map>
@@ -131,6 +132,16 @@ void apply_shipping_wiring(MeleeGame& game, const data::Catalog& cat,
     game.world().set_accelerating_movers(std::getenv("SC2_MOVERS_CONSTANT") == nullptr);
     game.world().set_turret_aim(std::getenv("SC2_TURRET_AIM_BODY") == nullptr);
     game.world().set_exact_build_progress(std::getenv("SC2_BUILD_PROGRESS_TRUNCATED") == nullptr);
+    game.world().set_gas_worker_inside(std::getenv("SC2_GAS_WORKER_OUTSIDE") == nullptr);
+    game.world().set_gas_harvest_ordered(std::getenv("SC2_GAS_HARVEST_ANY") == nullptr);
+    game.world().set_cargo_hidden(std::getenv("SC2_CARGO_SHOWN") == nullptr);
+    game.world().set_cliff_leap(std::getenv("SC2_REAPER_ONE_CELL_LEAP") == nullptr);
+    game.world().set_morph_vital_fraction(std::getenv("SC2_MORPH_HP_ABSOLUTE") == nullptr);
+    game.world().set_path_nearest_fallback(std::getenv("SC2_PATH_STRAIGHT_FALLBACK") == nullptr);
+    game.world().set_smart_structure_contact(std::getenv("SC2_SMART_STRUCTURE_TO_CENTRE") == nullptr);
+    game.world().set_research_queue(std::getenv("SC2_RESEARCH_CONCURRENT") == nullptr);
+    game.world().set_research_dies_with_host(std::getenv("SC2_RESEARCH_OUTLIVES_HOST") == nullptr);
+    game.world().set_presentation_log(std::getenv("SC2_NO_EFFECT_ACTORS") == nullptr);
     game.world().set_gather_dock_footprint(std::getenv("SC2_GATHER_DOCK_RADIUS") == nullptr);
     game.world().set_death_reveal(true);
     auto cgame = [&](const char* field) -> sim::Fixed {
@@ -142,6 +153,22 @@ void apply_shipping_wiring(MeleeGame& game, const data::Catalog& cat,
     game.world().set_call_for_help(cgame("CallForHelpRadius"), cgame("CallForHelpPeriod"));
     game.world().set_attack_reveal(cgame("AttackRevealTime"));
     game.set_stalemate(cgame("StalemateTestTime"), cgame("StalemateWarningTime"));
+    game.set_selection_warm(std::getenv("SC2_NO_SELECTION_WARM") == nullptr);
+    {
+        const char* hz = std::getenv("SC2_PORTRAIT_HZ");
+        game.set_portrait_hz(hz ? float(std::atof(hz)) : 30.0f);
+    }
+    game.set_pick_broadphase(std::getenv("SC2_PICK_BROADPHASE_OLD") == nullptr);
+    game.set_select_rules_672(std::getenv("SC2_SELECT_MODES_OLD") == nullptr);
+    game.set_portrait_async(std::getenv("SC2_PORTRAIT_DECODE_SYNC") == nullptr);
+    game.set_warm_foreign(std::getenv("SC2_NO_WARM_FOREIGN") == nullptr);
+    game.set_card_cache(std::getenv("SC2_CARD_COMPOSE_EVERY_FRAME") == nullptr);
+    game.set_morph_transition_models(std::getenv("SC2_MORPH_NO_TRANSITION_MODEL") == nullptr);
+    game.set_construction_child_team(std::getenv("SC2_CHILD_TEAM_TINT") != nullptr);
+    render::world_async_loads() = std::getenv("SC2_WORLD_DECODE_SYNC") == nullptr;
+    render::offscreen_on_window_device() = std::getenv("SC2_OFFSCREEN_OWN_DEVICE") == nullptr;
+    render::texture_take_once() = std::getenv("SC2_TEX_TAKE_ONCE_OLD") == nullptr;
+    if (const char* mb = std::getenv("SC2_UPLOAD_BATCH_MB")) render::upload_batch_budget_mb() = std::size_t(std::max(0, std::atoi(mb)));
     game.world().set_arc_movement(true);
 }
 

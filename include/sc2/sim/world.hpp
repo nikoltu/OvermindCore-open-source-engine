@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <cstdint>
 #include <functional>
+#include <map>
 #include <string>
 #include <unordered_map>
 #include <unordered_set>
@@ -33,6 +34,7 @@ enum class CmdError : uint16_t {
     CantBuildTooFarFromCreepSource,
     CantBuildTooFarFromBuildPowerSource,
     CantBuildOnThat,
+    MustBuildRefineryFirst,
 };
 
 inline const char* cmd_error_key(CmdError e) {
@@ -46,6 +48,7 @@ inline const char* cmd_error_key(CmdError e) {
         case CmdError::CantBuildTooFarFromCreepSource: return "e_cmdCantBuildTooFarFromCreepSource";
         case CmdError::CantBuildTooFarFromBuildPowerSource: return "e_cmdCantBuildTooFarFromBuildPowerSource";
         case CmdError::CantBuildOnThat: return "e_cmdCantBuildOnThat";
+        case CmdError::MustBuildRefineryFirst: return "e_cmdMustBuildRefineryFirst";
         case CmdError::None: break;
     }
     return "";
@@ -149,6 +152,9 @@ struct AbilityDef {
     Fixed beh_speed_cap{Fixed::from_int(-1)};
     std::vector<std::uint32_t> beh_disabled_weapons{};
     Fixed beh_decel_mult{Fixed::from_int(1)};
+    Fixed beh_accel_mult{Fixed::from_int(1)};
+    std::uint32_t beh_wpn_bonus_attr = 0;
+    Fixed beh_wpn_bonus_amount{};
     bool beh_suppress_collision = false;
     bool beh_suppress_passenger = false;
     Fixed beh_life_armor{}, beh_shield_armor{};
@@ -168,6 +174,9 @@ struct AbilityDef {
     bool spawn_snap_resource = false;
     bool spawn_neutral = false;
     bool spawn_blocks_ground = false;
+    std::uint32_t spawn_unit_tag = 0;
+    std::uint32_t fx_tag = 0;
+    std::vector<std::pair<std::uint32_t, Fixed>> fx_spawn_tags{};
     int32_t mineral_cost = 0, gas_cost = 0;
     Fixed morph_heal_life_frac{}, morph_heal_shield_frac{};
     std::uint32_t behavior_tag = 0;
@@ -202,7 +211,11 @@ struct VitalGate {
 
 struct ValidatorOp {
     enum Kind : std::uint8_t { And, Or, Vital, Filters, UnitType, NoBehavior, OrderQueue, CompareRange, BehaviorCount, PlayerRequirement,
-                               Compare, Mover, ConstFalse, Pathable } kind = And;
+                               Compare, Mover, ConstFalse, Pathable, EnumArea } kind = And;
+    Fixed area_radius;
+    std::int32_t area_count = 1;
+    std::uint8_t area_cmp = 5;
+    bool area_extend = false, loc_source = false, exc_worker = false, exc_constructing = false;
     bool negate = false;
     bool on_caster = false;
     std::vector<std::uint16_t> kids;
@@ -251,6 +264,9 @@ struct EffectNode {
     Fixed beh_speed_cap{Fixed::from_int(-1)};
     std::vector<std::uint32_t> beh_disabled_weapons;
     Fixed beh_decel_mult{Fixed::from_int(1)};
+    Fixed beh_accel_mult{Fixed::from_int(1)};
+    std::uint32_t beh_wpn_bonus_attr = 0;
+    Fixed beh_wpn_bonus_amount{};
     bool beh_suppress_collision = false;
     bool beh_suppress_passenger = false;
     Fixed beh_life_armor{}, beh_shield_armor{};
@@ -265,6 +281,7 @@ struct EffectNode {
     std::uint8_t persist_affiliation = 0;
     bool persist_excludes_structure = false;
     bool persist_follow_source = false;
+    bool persist_channeled = false;
     Fixed persist_initial_delay{};
     Fixed area_ring_r[3] = {Fixed(), Fixed(), Fixed()};
     Fixed area_ring_frac[3] = {Fixed(), Fixed(), Fixed()};
@@ -281,6 +298,7 @@ struct EffectNode {
     bool spawn_snap_resource = false;
     bool spawn_neutral = false;
     bool spawn_blocks_ground = false;
+    std::uint32_t spawn_unit_tag = 0;
     int32_t mineral_cost = 0, gas_cost = 0;
     Fixed morph_heal_life_frac, morph_heal_shield_frac;
     std::uint32_t wpn_bonus_attr = 0;
@@ -333,6 +351,9 @@ struct EffectNode {
     Fixed beh_food, beh_life_max;
     bool spawn_exact = false;
     bool missile_never_instant = false;
+    std::uint32_t fx_tag = 0;
+    std::uint32_t fx_beh_tag = 0;
+    std::vector<std::pair<std::uint32_t, Fixed>> fx_spawn_tags{};
 };
 
 struct EffectContext {
@@ -358,11 +379,15 @@ struct Order {
     uint32_t target = kNoTarget;
     uint32_t ability = kNoAbility;
     Fixed px{}, py{};
+    bool exact_arrival = false;
+    bool contact = false;
+    bool walk_in = false;
 };
 
 struct BehaviorInstance {
     uint16_t kind = 0;
     uint32_t src = 0;
+    uint32_t present_src = 0;
     uint32_t caster = 0xFFFFFFFFu;
     Fixed timer;
     bool permanent = false;
@@ -383,6 +408,7 @@ struct BehaviorInstance {
     Fixed speed_cap{Fixed::from_int(-1)};
     std::vector<std::uint32_t> disabled_weapons;
     Fixed decel_mult{Fixed::from_int(1)};
+    Fixed accel_mult{Fixed::from_int(1)};
     bool suppress_collision = false;
     bool suppress_passenger = false;
     bool remove_when_firing = false;
@@ -431,10 +457,13 @@ struct PersistentInstance {
     int32_t applied = 0;
     EffectRef expire = kNoEffect, final_effect = kNoEffect;
     std::uint32_t src = 0;
+    std::uint64_t present_id = 0;
+    std::uint32_t present_tag = 0;
     EffectRef initial_deferred = kNoEffect;
     Fixed expire_delay;
     bool expire_done = false;
     std::uint32_t source = kNoTarget, target = kNoTarget;
+    bool channeled = false;
     std::vector<ValidatorOp> pval;
     std::vector<std::uint16_t> pval_roots;
 };
@@ -474,6 +503,18 @@ struct KnockImpulse {
 struct ForceFieldInstance {
     Fixed x, y, radius, timer;
     std::vector<std::pair<int, int>> cells;
+    std::uint32_t unit_tag = 0;
+};
+
+struct PresentationEvent {
+    std::uint64_t seq = 0;
+    std::uint64_t instance = 0;
+    std::uint32_t fx_tag = 0;
+    bool stop = false;
+    std::uint32_t source = 0xFFFFFFFFu, target = 0xFFFFFFFFu;
+    Fixed src_x, src_y;
+    Fixed tx, ty;
+    std::int32_t player = -1;
 };
 
 inline uint32_t type_identity(const std::string& s) {
@@ -530,6 +571,7 @@ struct Unit {
     int32_t vision_player = -1;
     Fixed speed_mult_creep = Fixed::from_int(1);
     bool can_jump = false;
+    Fixed jump_range;
     bool walks_cliffs = false;
     bool crushes_ff = false;
     int32_t creep_radius = 0;
@@ -580,7 +622,9 @@ struct Unit {
     bool saturation_exempt = false;
     Fixed mine_time_mult;
     bool is_gas = false;
+    bool resource_raw = false;
     bool gathers_gas = false;
+    bool in_gas_structure = false;
     BuildVerb build_verb = BuildVerb::Committed;
     bool is_worker = false;
     Fixed mine_time;
@@ -652,11 +696,13 @@ struct Unit {
     Fixed buff_damage;
 
     Fixed morph_timer;
+    Fixed morph_total;
     Fixed lift_lock{}, lift_rise_delay{}, lift_rise{}, lift_t{};
     uint32_t morph_finish_beh = 0;
     int32_t morph_proto = -1;
 
     Fixed salvage_timer;
+    Fixed salvage_total;
     int32_t salvage_minerals = 0;
     int32_t salvage_gas = 0;
 
@@ -756,6 +802,7 @@ struct Unit {
     Fixed cloak_drain;
     Fixed cloak_field_radius;
     bool field_cloaked = false;
+    bool cloak_field_self = true;
     bool cloak_suppressed() const {
         for (const BehaviorInstance& b : behaviors)
             if (b.suppress_cloak && (b.permanent || b.timer.raw() > 0)) return true;
@@ -824,6 +871,9 @@ struct Unit {
     bool land_pending = false;
     Fixed land_x, land_y;
     Fixed land_timer;
+    int32_t land_addon = 0;
+    Fixed land_addon_time;
+    int32_t land_addon_minerals = 0, land_addon_gas = 0;
     uint32_t attributes = 0;
     uint32_t wpn_target_filter = 3;
     uint8_t target_sort = 0;
@@ -957,10 +1007,11 @@ inline bool vital_gate_passes(const VitalGate& g, const Unit& t) {
 }
 
 struct Player {
-    int last_combat_tick = -1000000;
+    int last_combat_tick = 0;
     int32_t minerals = 50;
     int32_t gas = 0;
     int32_t team = -1;
+    bool defeated = false;
 };
 
 struct VeterancyDef {
@@ -1136,6 +1187,8 @@ public:
         return false;
     }
     static bool collision_suppressed(const Unit& u) {
+        if (u.in_gas_structure) return true;
+        if (u.loaded && default_cargo_hidden()) return true;
         for (const BehaviorInstance& b : u.behaviors)
             if (b.suppress_collision && (b.permanent || b.timer.raw() > 0)) return true;
         return false;
@@ -1145,6 +1198,23 @@ public:
         for (const BehaviorInstance& b : u.behaviors)
             if (b.permanent || b.timer.raw() > 0) m = m * b.decel_mult;
         return m;
+    }
+    static Fixed behavior_accel_mult(const Unit& u) {
+        Fixed m = Fixed::from_int(1);
+        for (const BehaviorInstance& b : u.behaviors)
+            if (b.permanent || b.timer.raw() > 0) m = m * b.accel_mult;
+        return m;
+    }
+    struct BehaviorUpgradeMod {
+        Fixed move_speed_mult{Fixed::from_int(-1)};
+        Fixed accel_mult{Fixed::from_int(-1)};
+    };
+    void put_behavior_upgrade_mod(int32_t player, std::uint32_t beh_tag, const BehaviorUpgradeMod& m) {
+        behavior_upgrade_mods_[{player, beh_tag}] = m;
+    }
+    const BehaviorUpgradeMod* behavior_upgrade_mod(int32_t player, std::uint32_t beh_tag) const {
+        auto it = behavior_upgrade_mods_.find({player, beh_tag});
+        return it == behavior_upgrade_mods_.end() ? nullptr : &it->second;
     }
     static bool weapon_disabled(const Unit& u, std::uint32_t slot_tag) {
         if (slot_tag == 0) return false;
@@ -1204,6 +1274,7 @@ public:
         return false;
     }
     bool untargetable(const Unit& u) const {
+        if (u.in_gas_structure) return true;
         for (const BehaviorInstance& b : u.behaviors)
             if (b.untargetable) return true;
         return false;
@@ -1262,6 +1333,7 @@ public:
     CmdError last_error() const { return last_error_; }
     int32_t last_error_player() const { return last_error_player_; }
     void clear_last_error() { last_error_ = CmdError::None; last_error_player_ = -1; }
+    void report_error(int32_t player, CmdError e) { refuse(player, e); }
 
     bool splash_hits(const Unit& attacker, const Unit& victim) const {
         std::uint8_t rel = 0;
@@ -1314,6 +1386,18 @@ public:
         const int32_t slot = u.cast_prep_ability;
         if (slot < 0 || std::size_t(slot) >= abilities_.size()) return false;
         return (abilities_[std::size_t(slot)].uninterruptible & 1u) != 0;
+    }
+    bool is_channelling(uint32_t id) const;
+    bool cancel_channel(uint32_t id);
+    bool cancel_cast(uint32_t id) {
+        if (id >= units_.size()) return false;
+        Unit& u = units_[id];
+        if (u.cast_prep.raw() <= 0) return false;
+        const int32_t slot = u.cast_prep_ability;
+        cancel_cast_prep(u);
+        if (!u.orders.empty() && u.orders.front().type == OrderType::Cast && int32_t(u.orders.front().ability) == slot)
+            u.orders.erase(u.orders.begin());
+        return true;
     }
     void cancel_cast_prep(Unit& u) {
         if (u.cast_prep.raw() <= 0) return;
@@ -1427,7 +1511,8 @@ public:
         for (int i = 0; i < ticks; ++i) step();
     }
 
-    void begin_research(int32_t player, const std::string& id, Fixed delay);
+    void begin_research(int32_t player, const std::string& id, Fixed delay, uint32_t producer = kNoTarget,
+                        int32_t minerals = 0, int32_t gas = 0);
     void grant_upgrade(int32_t player, const std::string& id);
     const std::vector<std::string>& researched(int32_t player) const;
     bool has_upgrade(int32_t player, const std::string& id) const;
@@ -1520,6 +1605,12 @@ public:
     bool queue_train_at(uint32_t producer, const Unit& proto, int32_t mineral_cost,
                         int32_t gas_cost, Fixed build_time, Fixed x, Fixed y, int32_t count = 1);
     size_t pending_count() const { return pending_.size(); }
+    size_t pending_count(int32_t player) const {
+        size_t n = 0;
+        for (const Pending& p : pending_)
+            if (p.producer < units_.size() && units_[p.producer].player == player) ++n;
+        return n;
+    }
     bool pending_progress(uint32_t producer, Fixed& frac) const {
         for (int i = int(pending_.size()) - 1; i >= 0; --i) {
             const Pending& p = pending_[size_t(i)];
@@ -1564,6 +1655,26 @@ public:
             return true;
         }
         return false;
+    }
+
+    struct ResearchSlotView {
+        std::string id;
+        float progress = 0.0f;
+    };
+    std::vector<ResearchSlotView> research_at(uint32_t producer) const {
+        std::vector<ResearchSlotView> out;
+        if (producer == kNoTarget) return out;
+        for (const PendingResearch& p : research_pending_) {
+            if (p.producer != producer) continue;
+            ResearchSlotView v;
+            v.id = p.id;
+            if (p.total.raw() > 0) {
+                const double f = 1.0 - p.timer.to_double() / p.total.to_double();
+                v.progress = float(f < 0.0 ? 0.0 : (f > 1.0 ? 1.0 : f));
+            }
+            out.push_back(std::move(v));
+        }
+        return out;
     }
 
     size_t pending_for(uint32_t producer) const {
@@ -1732,12 +1843,14 @@ public:
         return id < units_.size() && units_[id].build_charges > 0 && units_[id].build_cd.raw() <= 0;
     }
     uint32_t found_charged_build(uint32_t caster, const Unit& proto, Fixed x, Fixed y, Fixed build_time) {
-        if (caster >= units_.size() || !build_charge_ready(caster)) return kNoTarget;
+        if (caster >= units_.size()) return kNoTarget;
+        const bool uncharged = units_[caster].build_charges < 0;
+        if (!uncharged && !build_charge_ready(caster)) return kNoTarget;
         const Unit& c = units_[caster];
         const Fixed dx = x - c.x, dy = y - c.y, reach = c.radius + c.build_range;
-        if (dx * dx + dy * dy > reach * reach) return kNoTarget;
+        if ((!uncharged || c.build_range.raw() > 0) && dx * dx + dy * dy > reach * reach) return kNoTarget;
         const int32_t owner = c.player;
-        spend_build_charge(caster);
+        if (!uncharged) spend_build_charge(caster);
         Unit u = proto;
         u.player = owner;
         u.x = x;
@@ -1808,6 +1921,36 @@ public:
         u.land_x = x;
         u.land_y = y;
         u.land_timer = Fixed::from_int(-1);
+        if (u.land_addon != 0) {
+            player(u.player).minerals += u.land_addon_minerals;
+            player(u.player).gas += u.land_addon_gas;
+        }
+        u.land_addon = 0;
+        return true;
+    }
+    bool addon_slot_clear(uint32_t id, Fixed x, Fixed y, int32_t kind) const {
+        if (id >= units_.size() || !addon_body_factory_) return true;
+        Unit probe;
+        if (!addon_body_factory_(units_[id], kind, probe)) return true;
+        Fixed ax, ay;
+        addon_slot(x, y, ax, ay);
+        return !site_blocked(probe, ax, ay, id);
+    }
+    bool order_land_addon(uint32_t id, Fixed x, Fixed y, int32_t kind, Fixed build_time, int32_t minerals,
+                          int32_t gas) {
+        if (kind != kAddonTechLab && kind != kAddonReactor) return false;
+        if (!addon_slot_clear(id, x, y, kind)) return false;
+        if (id >= units_.size()) return false;
+        Player& pl = player(units_[id].player);
+        if (pl.minerals < minerals || pl.gas < gas) return false;
+        if (!order_land(id, x, y)) return false;
+        pl.minerals -= minerals;
+        pl.gas -= gas;
+        Unit& u = units_[id];
+        u.land_addon = kind;
+        u.land_addon_time = build_time;
+        u.land_addon_minerals = minerals;
+        u.land_addon_gas = gas;
         return true;
     }
     bool land(uint32_t id, Fixed x, Fixed y) {
@@ -1909,6 +2052,7 @@ public:
             return true;
         }
         u.salvage_timer = delay;
+        u.salvage_total = delay;
         u.salvage_minerals = refund_minerals;
         u.salvage_gas = refund_gas;
         return true;
@@ -1955,14 +2099,27 @@ public:
 
     int32_t add_persistent(PersistentInstance p);
     size_t persistent_count() const { return persistents_.size(); }
+    const std::vector<PersistentInstance>& persistents() const { return persistents_; }
+    const std::vector<ForceFieldInstance>& force_fields() const { return force_fields_; }
+    static constexpr std::size_t kPresentationLogCap = 2048;
+    void set_presentation_log(bool on) {
+        presentation_log_ = on;
+        if (!on) {
+            presentation_events_.clear();
+            presentation_delayed_.clear();
+        }
+    }
+    bool presentation_log() const { return presentation_log_; }
+    const std::vector<PresentationEvent>& presentation_events() const { return presentation_events_; }
 
     bool start_heal(std::uint32_t caster, std::uint32_t target, Fixed heal_rate, Fixed drain_factor,
                     Fixed range, HealVital vital = HealVital::Life);
     size_t healer_count() const { return healers_.size(); }
     const std::vector<HealerInstance>& healers() const { return healers_; }
 
-    int32_t add_force_field(Fixed x, Fixed y, Fixed radius, Fixed duration) {
+    int32_t add_force_field(Fixed x, Fixed y, Fixed radius, Fixed duration, std::uint32_t unit_tag = 0) {
         ForceFieldInstance ff;
+        ff.unit_tag = unit_tag;
         ff.x = x;
         ff.y = y;
         ff.radius = radius;
@@ -2033,7 +2190,16 @@ public:
         if (morph_disabled(units_[id])) return;
         units_[id].morph_proto = proto;
         units_[id].morph_timer = time;
+        units_[id].morph_total = time;
         units_[id].morph_finish_beh = finish_behavior;
+    }
+    bool cancel_morph(uint32_t id) {
+        if (id >= units_.size() || units_[id].morph_proto < 0) return false;
+        units_[id].morph_proto = -1;
+        units_[id].morph_timer = Fixed();
+        units_[id].morph_total = Fixed();
+        units_[id].morph_finish_beh = 0;
+        return true;
     }
     std::string morph_target_id(uint32_t id) const {
         if (id >= units_.size()) return std::string();
@@ -2379,6 +2545,41 @@ public:
     }
 
     void set_gather_dock_footprint(bool on) { gather_dock_footprint_ = on; }
+    static bool default_gas_worker_inside();
+    void set_research_queue(bool on) { research_queue_ = on; }
+    bool research_queue() const { return research_queue_; }
+    void set_research_dies_with_host(bool on) { research_dies_with_host_ = on; }
+    bool research_dies_with_host() const { return research_dies_with_host_; }
+    struct LostResearch {
+        int32_t player = 0;
+        std::string id;
+        uint32_t producer = kNoTarget;
+    };
+    std::vector<LostResearch> take_lost_research() {
+        std::vector<LostResearch> out;
+        out.swap(research_lost_);
+        return out;
+    }
+    void set_gas_worker_inside(bool on) { gas_worker_inside_ = on; }
+    bool gas_worker_inside() const { return gas_worker_inside_; }
+    static bool default_gas_harvest_ordered();
+    static bool default_cargo_hidden();
+    static bool default_cliff_leap();
+    static bool default_morph_vital_fraction();
+    static bool default_path_nearest_fallback();
+    void set_path_nearest_fallback(bool on) { path_nearest_fallback_ = on; }
+    void set_smart_structure_contact(bool on) { smart_structure_contact_ = on; }
+    Fixed footprint_gap(const Unit& t, Fixed x, Fixed y) const;
+    void set_morph_vital_fraction(bool on) { morph_vital_fraction_ = on; }
+    void set_cliff_leap(bool on) { cliff_leap_ = on; }
+    bool cliff_leap() const { return cliff_leap_; }
+    void set_cargo_hidden(bool on) { cargo_hidden_ = on; }
+    bool cargo_hidden() const { return cargo_hidden_; }
+    void set_gas_harvest_ordered(bool on) { gas_harvest_ordered_ = on; }
+    bool gas_harvest_ordered() const { return gas_harvest_ordered_; }
+    bool gas_node_harvestable(const Unit& n, int32_t player) const {
+        return n.alive && n.is_gas && !n.resource_raw && n.resource_left > 0 && (n.player < 0 || n.player == player);
+    }
     void set_exact_build_progress(bool on) { exact_build_progress_ = on; }
     void set_accelerating_movers(bool on) { accelerating_movers_ = on; }
     void set_turret_aim(bool on) { turret_aim_ = on; }
@@ -2523,6 +2724,13 @@ public:
     void release_dead_creep_sources();
 
     int winner() const;
+
+    int refresh_defeats();
+    int32_t alliance_key(int32_t p) const {
+        const int32_t t = team_of(p);
+        return t >= 0 ? t : -(p + 2);
+    }
+    int32_t winning_team() const;
 
 private:
     std::uint8_t hit_kind_ = kDamageKindSpell;
@@ -2681,12 +2889,25 @@ private:
     std::vector<StatModInstance> stat_mods_;
     std::vector<KnockImpulse> knockbacks_;
     std::vector<ForceFieldInstance> force_fields_;
+    bool presentation_log_ = false;
+    std::vector<PresentationEvent> presentation_events_;
+    std::uint64_t presentation_seq_ = 0;
+    struct DelayedPresentation {
+        Fixed left;
+        PresentationEvent e;
+    };
+    std::vector<DelayedPresentation> presentation_delayed_;
+    std::uint64_t log_presentation(std::uint32_t tag, bool stop, std::uint64_t instance, std::uint32_t source,
+                                   std::uint32_t target, Fixed sx, Fixed sy, Fixed tx, Fixed ty, std::int32_t player);
+    std::uint64_t log_effect_edge(std::uint32_t tag, bool stop, std::uint64_t instance, const EffectContext& ctx);
 
     struct PendingResearch {
         int32_t player = 0;
         std::string id;
         Fixed timer;
         Fixed total;
+        uint32_t producer = kNoTarget;
+        int32_t minerals = 0, gas = 0;
     };
     std::unordered_map<int32_t, std::vector<std::string>> researched_;
     std::vector<PendingResearch> research_pending_;
@@ -2729,6 +2950,7 @@ private:
                           Fixed cast_x{}, cast_y{}; bool has_cast_point = false; };
     std::vector<PendingSpawn> pending_spawns_;
     std::vector<Fixed> sep_budget_, sep_allowance_, sep_x0_, sep_y0_;
+    std::vector<std::uint8_t> sep_held_;
     Fixed crowd_max_radius_;
     int crowd_max_tick_ = -1;
     std::vector<uint32_t> dropoffs_;
@@ -2805,6 +3027,16 @@ private:
     bool accelerating_movers_ = false;
     bool exact_build_progress_ = false;
     bool gather_dock_footprint_ = false;
+    bool gas_worker_inside_ = default_gas_worker_inside();
+    bool gas_harvest_ordered_ = default_gas_harvest_ordered();
+    bool cargo_hidden_ = default_cargo_hidden();
+    bool cliff_leap_ = default_cliff_leap();
+    bool morph_vital_fraction_ = default_morph_vital_fraction();
+    bool path_nearest_fallback_ = default_path_nearest_fallback();
+    bool smart_structure_contact_ = false;
+    bool research_queue_ = false;
+    bool research_dies_with_host_ = false;
+    std::vector<LostResearch> research_lost_;
     bool death_reveal_enabled_ = false;
     ScanSweep scan_sweep_;
     bool building_burndown_enabled_ = false;
@@ -2837,6 +3069,7 @@ private:
     std::unordered_set<std::string> techlab_gated_;
     bool turn_limit_ = false;
     bool acceleration_ = false;
+    std::map<std::pair<int32_t, std::uint32_t>, BehaviorUpgradeMod> behavior_upgrade_mods_;
     TrainGate train_gate_;
     RequirementGate requirement_gate_;
     bool leash_ = false;
@@ -2859,6 +3092,7 @@ private:
         return false;
     }
     Fixed move_step(Unit& u, Fixed dt, Fixed brake_dist = Fixed::from_raw(-1));
+    static bool harvest_brake(bool drop);
     bool move_unit_toward(Unit& u, Fixed gx, Fixed gy, Fixed step);
     bool move_unit_toward_impl(Unit& u, Fixed gx, Fixed gy, Fixed step);
     bool advance_turn(Unit& u, Fixed tx, Fixed ty, Fixed fire_arc_deg = Fixed());

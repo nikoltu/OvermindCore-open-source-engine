@@ -45,6 +45,7 @@ struct UpgradeRevert {
         wpn_range, wpn2_range, wpn_period, wpn2_period, wpn_bonus_amount,
         shields_max, shields, acquire_range, speed_mult_creep, burrow_speed;
     std::uint32_t wpn_bonus_attr;
+    sim::Fixed accel{};
 };
 
 std::size_t apply_upgrade_to_live(sim::World& w, const data::Catalog& cat,
@@ -64,6 +65,7 @@ struct AbilityBuild {
     std::uint32_t req_attr_mask = 0;
     std::uint32_t exc_attr_mask = 0;
     bool require_energy = false;
+    bool require_energy_pool = false;
     bool requires_ground = false;
     bool requires_spawner_target = false;
     std::vector<sim::VitalGate> vital_gates;
@@ -102,9 +104,11 @@ sim::Fixed ability_cooldown_sec(const data::Catalog& cat, const std::string& abi
 
 enum class AbilTargetMode { Instant, Unit, Point };
 AbilTargetMode ability_target_mode(const data::Catalog& cat, const std::string& abil_id);
+std::uint8_t ability_target_excluded_rel(const data::Catalog& cat, const std::string& abil_id, bool& authored);
 
 std::pair<int, int> morph_cost_delta(const data::Catalog& cat, const std::string& source_unit,
                                      const std::string& target_unit);
+std::pair<int, int> morph_charge(const data::Catalog& cat, const std::string& source_unit, const std::string& morph_abil);
 
 int add_sensor_tower(const data::Catalog& cat, sim::SensorTowerSystem& towers, std::int32_t owner,
                      sim::Fixed x, sim::Fixed y, const std::string& unit_id);

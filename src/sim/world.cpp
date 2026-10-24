@@ -1,12 +1,43 @@
 #include "sc2/sim/world.hpp"
 
 #include <algorithm>
+#include <cstdlib>
 
 #include "sc2/sim/build.hpp"
 #include "sc2/sim/combat.hpp"
 #include "sc2/sim/weapon.hpp"
 
 namespace sc2::sim {
+
+bool World::default_gas_worker_inside() {
+    static const bool kInside = std::getenv("SC2_GAS_WORKER_OUTSIDE") == nullptr;
+    return kInside;
+}
+
+bool World::default_gas_harvest_ordered() {
+    static const bool kOrdered = std::getenv("SC2_GAS_HARVEST_ANY") == nullptr;
+    return kOrdered;
+}
+
+bool World::default_cargo_hidden() {
+    static const bool kHidden = std::getenv("SC2_CARGO_SHOWN") == nullptr;
+    return kHidden;
+}
+
+bool World::default_cliff_leap() {
+    static const bool kLeap = std::getenv("SC2_REAPER_ONE_CELL_LEAP") == nullptr;
+    return kLeap;
+}
+
+bool World::default_morph_vital_fraction() {
+    static const bool kFraction = std::getenv("SC2_MORPH_HP_ABSOLUTE") == nullptr;
+    return kFraction;
+}
+
+bool World::default_path_nearest_fallback() {
+    static const bool kNearest = std::getenv("SC2_PATH_STRAIGHT_FALLBACK") == nullptr;
+    return kNearest;
+}
 
 Fixed World::dist2(const Unit& a, const Unit& b) {
     Fixed dx = a.x - b.x, dy = a.y - b.y;
@@ -38,6 +69,34 @@ int World::winner() const {
             return -1;
     }
     return found;
+}
+
+int World::refresh_defeats() {
+    int latched = 0;
+    for (std::size_t p = 0; p < players_.size(); ++p) {
+        if (players_[p].defeated || defeat_holders(int(p)) > 0) continue;
+        players_[p].defeated = true;
+        ++latched;
+    }
+    return latched;
+}
+
+int32_t World::winning_team() const {
+    bool found = false;
+    int32_t key = -1;
+    for (const Unit& u : units_) {
+        if (!u.alive || u.player < 0) continue;
+        if (defeat_rule_authored_ && !u.prevent_defeat) continue;
+        if (player(u.player).defeated) continue;
+        const int32_t k = alliance_key(u.player);
+        if (!found) {
+            found = true;
+            key = k;
+        } else if (k != key) {
+            return -1;
+        }
+    }
+    return found ? key : -1;
 }
 
 bool World::visible_to(int32_t player, const Unit& target) const {
@@ -276,6 +335,12 @@ bool move_toward(Unit& u, Fixed tx, Fixed ty, Fixed step) {
 }
 }
 
+bool World::harvest_brake(bool drop) {
+    static const char* kEnv = std::getenv("SC2_HARVEST_BRAKE");
+    static const std::string kBrake = kEnv ? std::string(kEnv) : std::string("drop");
+    return kBrake == "both" || kBrake == (drop ? "drop" : "mine");
+}
+
 Fixed World::move_step(Unit& u, Fixed dt, Fixed brake_dist) {
     Fixed speed = (u.flying && u.speed_air.raw() > 0) ? u.speed_air : u.speed;
     if (creep_.is_creep(u.x, u.y)) speed = speed * u.speed_mult_creep;
@@ -293,7 +358,8 @@ Fixed World::move_step(Unit& u, Fixed dt, Fixed brake_dist) {
         if (cap < speed) speed = cap;
     }
     if (u.cur_speed < speed) {
-        u.cur_speed = u.cur_speed + u.accel * dt;
+        const Fixed a = u.behaviors.empty() ? u.accel : u.accel * behavior_accel_mult(u);
+        u.cur_speed = u.cur_speed + a * dt;
         if (u.cur_speed > speed) u.cur_speed = speed;
     } else if (u.cur_speed > speed) {
         Fixed d = u.decel.raw() > 0 ? u.decel : u.accel;
@@ -381,7 +447,8 @@ static Fixed raw_length(Fixed dx, Fixed dy);
 void World::displace_from_force_field(const ForceFieldInstance& ff) {
     if (ff.radius.raw() <= 0) return;
     for (Unit& u : units_) {
-        if (!u.alive || u.flying || u.crushes_ff || u.loaded || (u.attributes & kAttrStructure)) continue;
+        if (!u.alive || u.flying || u.crushes_ff || u.loaded || u.in_gas_structure || (u.attributes & kAttrStructure))
+            continue;
         const Fixed dx = u.x - ff.x, dy = u.y - ff.y;
         if (dx * dx + dy * dy >= ff.radius * ff.radius) continue;
         const Fixed rim = ff.radius + u.radius - kContactSlack;
@@ -440,7 +507,11 @@ bool World::move_unit_toward_impl(Unit& u, Fixed gx, Fixed gy, Fixed step) {
                            u.path_gx != gcx || u.path_gy != gcy || u.path_rev != nav_.revision();
     if (need_plan) {
         std::vector<NavCell> cells;
-        find_path(nav_, scx, scy, gcx, gcy, cells, u.can_jump, u.crushes_ff, u.walks_cliffs, &gx, &gy, u.radius);
+        int leap = 1;
+        if (cliff_leap_ && u.can_jump && u.jump_range.raw() > 0 && nav_.cell_size().raw() > 0)
+            leap = std::max(1, int(u.jump_range.raw() / nav_.cell_size().raw()));
+        find_path(nav_, scx, scy, gcx, gcy, cells, u.can_jump, u.crushes_ff, u.walks_cliffs, &gx, &gy, u.radius, leap,
+                  path_nearest_fallback_);
         ++nav_plans_;
         if (cells.empty()) ++nav_plan_failures_;
         u.path.clear();
@@ -501,7 +572,8 @@ bool World::move_unit_toward_impl(Unit& u, Fixed gx, Fixed gy, Fixed step) {
             int tcx = 0, tcy = 0;
             nav_.to_cell(u.x, u.y, tcx, tcy);
             const bool crushable_here =
-                u.crushes_ff && nav_.has_ff() && nav_.is_ff_cell(tcx, tcy);
+                (u.crushes_ff && nav_.has_ff() && nav_.is_ff_cell(tcx, tcy)) ||
+                (cliff_leap_ && u.can_jump && nav_.is_cliff_cell(tcx, tcy));
             if ((tcx != fcx || tcy != fcy) && !crushable_here && nav_.is_blocked_cell(tcx, tcy)) {
                 const Fixed full_x = u.x, full_y = u.y;
                 u.x = prev_x;
@@ -529,6 +601,7 @@ bool World::move_unit_toward_impl(Unit& u, Fixed gx, Fixed gy, Fixed step) {
                         for (int gx = x0; gx <= x1; ++gx) {
                             if (!nav_.is_blocked_cell(gx, gy)) continue;
                             if (u.crushes_ff && nav_.has_ff() && nav_.is_ff_cell(gx, gy)) continue;
+                            if (cliff_leap_ && u.can_jump && nav_.is_cliff_cell(gx, gy)) continue;
                             Fixed mx, my;
                             nav_.cell_center(gx, gy, mx, my);
                             Fixed nx = cx < mx - half ? mx - half : (cx > mx + half ? mx + half : cx);
@@ -618,6 +691,7 @@ void World::apply_separation() {
     sep_allowance_.resize(n);
     sep_x0_.resize(n);
     sep_y0_.resize(n);
+    sep_held_.assign(n, 0);
     std::vector<Fixed>& budget = sep_budget_;
     std::vector<Fixed>& allowance = sep_allowance_;
     std::vector<Fixed>& pass_x0 = sep_x0_;
@@ -669,6 +743,40 @@ void World::apply_separation() {
             const Fixed reach = contact - kSlack;
             if (reach.raw() <= 0) continue;
             if (d2 >= reach * reach) continue;
+            {
+                static const bool kGoalPress = std::getenv("SC2_SEP_NO_GOAL_PRESS") == nullptr;
+                if (kGoalPress && !m.orders.empty() && are_allied(m.player, b.player)) {
+                    const Order& mo = m.orders.front();
+                    const bool pt = mo.type == OrderType::Move || mo.type == OrderType::AttackMove;
+                    const bool b_crowd = b.arrived && b.arrive_x == mo.tx && b.arrive_y == mo.ty;
+                    const Fixed gx = mo.tx - b.x, gy = mo.ty - b.y;
+                    if (pt && !b_crowd && b.orders.empty() && !b.moved_this_tick && gx * gx + gy * gy < reach * reach) {
+                        const Fixed d = raw_length(dx, dy);
+                        const Fixed nx = d.raw() > 0 ? dx / d : ux, ny = d.raw() > 0 ? dy / d : uy;
+                        const Fixed deficit = reach - d;
+                        const Fixed recoil = Fixed::from_raw(deficit.raw() >> 3);
+                        Fixed push = deficit - recoil;
+                        if (push > budget[j]) push = budget[j];
+                        budget[j] = budget[j] - push;
+                        const Fixed pre_x = b.x, pre_y = b.y;
+                        m.x = m.x - nx * recoil;
+                        m.y = m.y - ny * recoil;
+                        b.x = b.x + nx * push;
+                        b.y = b.y + ny * push;
+                        if (push.raw() > 0) {
+                            if (!b.has_anchor && b.orders.empty() && !b.moved_this_tick && b.push_release == 0) {
+                                b.has_anchor = true;
+                                b.anchor_x = pre_x;
+                                b.anchor_y = pre_y;
+                            }
+                            b.pushed_this_tick = true;
+                            b.push_dir_x = nx;
+                            b.push_dir_y = ny;
+                        }
+                        continue;
+                    }
+                }
+            }
             Fixed lat = dx * lx + dy * ly;
             const Fixed sign = lat.raw() >= 0 ? Fixed::from_int(1) : Fixed::from_int(-1);
             if (lat.raw() < 0) lat = Fixed() - lat;
@@ -684,6 +792,7 @@ void World::apply_separation() {
                 share_m = Fixed(); share_b = need;
             } else {
                 share_m = need; share_b = Fixed();
+                sep_held_[j] = 1;
             }
             const Fixed mcap = budget[i];
             const Fixed bcap = budget[j];
@@ -882,6 +991,18 @@ void World::apply_separation() {
             if (r.id == m.id || !r.alive || r.flying || r.burrowed) continue;
             if (r.speed.raw() == 0 || r.moved_this_tick) continue;
             if (collision_suppressed(r)) continue;
+            static const bool kHoldsPushed = std::getenv("SC2_R701B_HOLDS_PUSHED") != nullptr;
+            if (!kHoldsPushed && r.pushed_this_tick) continue;
+            {
+                static const bool kHeldInside = std::getenv("SC2_SEP_NO_HELD_INSIDE") == nullptr;
+                const size_t ri = size_t(&r - units_.data());
+                if (kHeldInside && ri < sep_held_.size() && sep_held_[ri]) {
+                    const Fixed hb_x = pass_x0[i] - r.x, hb_y = pass_y0[i] - r.y;
+                    const Fixed held_gap = (m.sep_radius.raw() > 0 ? m.sep_radius : m.radius) +
+                                           (r.sep_radius.raw() > 0 ? r.sep_radius : r.radius) - kContactSlack;
+                    if (raw_length(hb_x, hb_y) + Fixed::from_raw(16) < held_gap) continue;
+                }
+            }
             const Fixed msr = m.sep_radius.raw() > 0 ? m.sep_radius : m.radius;
             const Fixed rsr = r.sep_radius.raw() > 0 ? r.sep_radius : r.radius;
             const Fixed gap = msr + rsr - kContactSlack;
@@ -975,6 +1096,10 @@ Order World::smart_order(uint32_t actor, uint32_t target, Fixed tx, Fixed ty) co
         o.type = OrderType::Move;
         o.tx = t.x;
         o.ty = t.y;
+        if (smart_structure_contact_ && t.speed.raw() == 0 && !t.footprint_offsets.empty() && target != actor) {
+            o.target = target;
+            o.contact = true;
+        }
         return o;
     }
     Order o;
@@ -982,6 +1107,31 @@ Order World::smart_order(uint32_t actor, uint32_t target, Fixed tx, Fixed ty) co
     o.tx = tx;
     o.ty = ty;
     return o;
+}
+
+Fixed World::footprint_gap(const Unit& t, Fixed x, Fixed y) const {
+    if (t.footprint_offsets.empty() || !nav_.configured()) {
+        const Fixed ex = x - t.x, ey = y - t.y;
+        const Fixed d = isqrt(ex * ex + ey * ey) - t.radius;
+        return d.raw() > 0 ? d : Fixed();
+    }
+    int ocx = 0, ocy = 0;
+    nav_.to_cell(t.x, t.y, ocx, ocy);
+    const Fixed half = nav_.cell_size() / Fixed::from_int(2);
+    bool first = true;
+    Fixed best2;
+    for (const auto& [ox, oy] : t.footprint_offsets) {
+        Fixed cx, cy;
+        nav_.cell_center(ocx + int(ox), ocy + int(oy), cx, cy);
+        Fixed ex = x - cx, ey = y - cy;
+        if (ex.raw() < 0) ex = Fixed() - ex;
+        if (ey.raw() < 0) ey = Fixed() - ey;
+        ex = ex > half ? ex - half : Fixed();
+        ey = ey > half ? ey - half : Fixed();
+        const Fixed d2 = ex * ex + ey * ey;
+        if (first || d2 < best2) { best2 = d2; first = false; }
+    }
+    return isqrt(best2);
 }
 
 Fixed World::supply_used(int32_t p) const {
@@ -1038,6 +1188,9 @@ int32_t World::add_ability(AbilityDef def) {
     n.beh_disabled_abils = def.beh_disabled_abils;
     n.beh_disabled_weapons = def.beh_disabled_weapons;
     n.beh_decel_mult = def.beh_decel_mult;
+    n.beh_accel_mult = def.beh_accel_mult;
+    n.beh_wpn_bonus_attr = def.beh_wpn_bonus_attr;
+    n.beh_wpn_bonus_amount = def.beh_wpn_bonus_amount;
     n.beh_suppress_collision = def.beh_suppress_collision;
     n.beh_suppress_passenger = def.beh_suppress_passenger;
     n.beh_benign = def.beh_benign;
@@ -1058,6 +1211,9 @@ int32_t World::add_ability(AbilityDef def) {
     n.spawn_snap_resource = def.spawn_snap_resource;
     n.spawn_neutral = def.spawn_neutral;
     n.spawn_blocks_ground = def.spawn_blocks_ground;
+    n.spawn_unit_tag = def.spawn_unit_tag;
+    n.fx_tag = def.fx_tag;
+    n.fx_spawn_tags = def.fx_spawn_tags;
     n.mineral_cost = def.mineral_cost;
     n.gas_cost = def.gas_cost;
     n.morph_heal_life_frac = def.morph_heal_life_frac;
@@ -1116,6 +1272,11 @@ bool World::behavior_rooted(const Unit& u) {
 
 int32_t World::add_persistent(PersistentInstance p) {
     const bool defer_for_validators = !p.pval_roots.empty();
+    if (presentation_log_ && p.present_tag != 0) {
+        const bool has_src = p.source < units_.size();
+        p.present_id = log_presentation(p.present_tag, false, 0, p.source, p.target, has_src ? units_[p.source].x : p.x,
+                                        has_src ? units_[p.source].y : p.y, p.x, p.y, p.owner);
+    }
     persistents_.push_back(p);
     if (apply_persistent_now_) {
         apply_persistent_now_ = false;
@@ -1153,6 +1314,14 @@ void World::step_cast(Unit& u, Fixed dt) {
     const EffectKind kind = has_root ? effects_[ab.root].kind : ab.kind;
 
     if (has_root ? root_is_point_cast(ab.root) : is_point_self(kind)) {
+        if (o.walk_in && ab.range.raw() > 0 && o.target == kNoTarget) {
+            const Fixed reach = ab.range + u.radius;
+            const Fixed ddx = o.tx - u.x, ddy = o.ty - u.y;
+            if (ddx * ddx + ddy * ddy > reach * reach) {
+                move_unit_toward(u, o.tx, o.ty, move_step(u, dt));
+                return;
+            }
+        }
         u.orders.erase(u.orders.begin());
         if (ab.cooldown.raw() > 0 && ability_cooldown_left(u.id, int32_t(o.ability)).raw() <= 0)
             arm_ability_cooldown(u.id, int32_t(o.ability), ab.cooldown);
@@ -1237,6 +1406,33 @@ bool World::teleport_unit(uint32_t id, Fixed tx, Fixed ty) {
     return true;
 }
 
+std::uint64_t World::log_presentation(std::uint32_t tag, bool stop, std::uint64_t instance, std::uint32_t source,
+                                      std::uint32_t target, Fixed sx, Fixed sy, Fixed tx, Fixed ty, std::int32_t player) {
+    PresentationEvent e;
+    e.seq = ++presentation_seq_;
+    e.instance = instance ? instance : e.seq;
+    e.fx_tag = tag;
+    e.stop = stop;
+    e.source = source;
+    e.target = target;
+    e.src_x = sx;
+    e.src_y = sy;
+    e.tx = tx;
+    e.ty = ty;
+    e.player = player;
+    if (presentation_events_.size() >= kPresentationLogCap)
+        presentation_events_.erase(presentation_events_.begin(),
+                                   presentation_events_.begin() + long(kPresentationLogCap / 4));
+    presentation_events_.push_back(e);
+    return e.seq;
+}
+
+std::uint64_t World::log_effect_edge(std::uint32_t tag, bool stop, std::uint64_t instance, const EffectContext& ctx) {
+    const bool has_src = ctx.source < units_.size();
+    return log_presentation(tag, stop, instance, ctx.source, ctx.target, has_src ? units_[ctx.source].x : ctx.sx,
+                            has_src ? units_[ctx.source].y : ctx.sy, ctx.tx, ctx.ty, ctx.origin);
+}
+
 void World::execute_effect(EffectRef ref, const EffectContext& ctx, int depth) {
     if (depth > kMaxEffectDepth) return;
     if (ref < 0 || ref >= EffectRef(effects_.size())) return;
@@ -1254,6 +1450,21 @@ void World::execute_effect(EffectRef ref, const EffectContext& ctx, int depth) {
     }
     for (const std::uint16_t r : n.validator_roots)
         if (!validator_passes(n.validators, r, ctx)) return;
+    struct FxStop {
+        World* w = nullptr;
+        std::uint32_t tag = 0;
+        std::uint64_t start = 0;
+        const EffectContext* c = nullptr;
+        ~FxStop() {
+            if (w) w->log_effect_edge(tag, true, start, *c);
+        }
+    } fx_stop;
+    if (presentation_log_ && n.fx_tag != 0 && n.kind != EffectKind::CreatePersistent) {
+        fx_stop.start = log_effect_edge(n.fx_tag, false, 0, ctx);
+        fx_stop.w = this;
+        fx_stop.tag = n.fx_tag;
+        fx_stop.c = &ctx;
+    }
     switch (n.kind) {
         case EffectKind::Set:
             for (EffectRef c : n.children) execute_effect(c, ctx, depth + 1);
@@ -1408,6 +1619,7 @@ void World::execute_effect(EffectRef ref, const EffectContext& ctx, int depth) {
             p.owner = ctx.origin;
             p.source = ctx.source;
             p.target = ctx.target;
+            p.channeled = n.persist_channeled;
             if (!n.periodic_validator_roots.empty()) {
                 p.pval = n.validators;
                 p.pval_roots = n.periodic_validator_roots;
@@ -1430,6 +1642,7 @@ void World::execute_effect(EffectRef ref, const EffectContext& ctx, int depth) {
             p.final_effect = n.final_effect;
             p.expire_delay = n.persist_expire_delay;
             p.src = n.persist_src;
+            p.present_tag = n.persist_src != 0 ? n.persist_src : n.fx_tag;
             if (n.persist_initial_delay.raw() > 0) {
                 p.timer = n.persist_initial_delay;
                 p.count = n.period_count;
@@ -1446,7 +1659,7 @@ void World::execute_effect(EffectRef ref, const EffectContext& ctx, int depth) {
         }
         case EffectKind::CreateUnit: {
             if (n.spawn_blocks_ground && n.radius.raw() > 0)
-                add_force_field(ctx.tx, ctx.ty, n.radius, n.duration);
+                add_force_field(ctx.tx, ctx.ty, n.radius, n.duration, n.spawn_unit_tag);
             if (n.spawn_proto >= 0 && n.spawn_proto < int32_t(spawn_protos_.size()) &&
                 n.spawn_count > 0) {
                 PendingSpawn ps{n.spawn_proto, n.spawn_count, ctx.tx, ctx.ty,
@@ -1472,6 +1685,31 @@ void World::execute_effect(EffectRef ref, const EffectContext& ctx, int depth) {
                         ps.gather_node = node;
                         ps.depot = ctx.source;
                     }
+                }
+                if (presentation_log_) {
+                    std::uint64_t inst = 0;
+                    const bool has_src = ctx.source < units_.size();
+                    const Fixed sx = has_src ? units_[ctx.source].x : ctx.sx, sy = has_src ? units_[ctx.source].y : ctx.sy;
+                    for (const auto& st : n.fx_spawn_tags) {
+                        if (st.second.raw() <= 0) {
+                            const std::uint64_t s = log_presentation(st.first, false, inst, ctx.source, kNoTarget, sx, sy,
+                                                                     ps.x, ps.y, ctx.origin);
+                            if (inst == 0) inst = s;
+                            continue;
+                        }
+                        DelayedPresentation dp;
+                        dp.left = st.second;
+                        dp.e.fx_tag = st.first;
+                        dp.e.source = ctx.source;
+                        dp.e.src_x = sx;
+                        dp.e.src_y = sy;
+                        dp.e.tx = ps.x;
+                        dp.e.ty = ps.y;
+                        dp.e.player = ctx.origin;
+                        presentation_delayed_.push_back(dp);
+                    }
+                    for (DelayedPresentation& dp : presentation_delayed_)
+                        if (dp.e.instance == 0) dp.e.instance = inst;
                 }
                 pending_spawns_.push_back(ps);
             }
@@ -1741,6 +1979,7 @@ void World::execute_effect(EffectRef ref, const EffectContext& ctx, int depth) {
             BehaviorInstance b;
             b.kind = n.beh_control_transfer ? kCastBehaviorKindControl : kCastBehaviorKind;
             b.src = n.behavior_tag;
+            b.present_src = n.fx_beh_tag;
             b.max_stack = n.beh_max_stack;
             b.timer = n.duration.raw() > 0 ? n.duration : Fixed::from_raw(1);
             b.speed_mult = n.move_speed_mult;
@@ -1761,6 +2000,17 @@ void World::execute_effect(EffectRef ref, const EffectContext& ctx, int depth) {
             b.disabled_abils = n.beh_disabled_abils;
             b.disabled_weapons = n.beh_disabled_weapons;
             b.decel_mult = n.beh_decel_mult;
+            b.accel_mult = n.beh_accel_mult;
+            b.wpn_bonus_attr = n.beh_wpn_bonus_attr;
+            b.wpn_bonus_amount = n.beh_wpn_bonus_amount;
+            {
+                const uint32_t who = ctx.source < units_.size() ? ctx.source : ctx.target;
+                if (who < units_.size() && !behavior_upgrade_mods_.empty())
+                    if (const BehaviorUpgradeMod* m = behavior_upgrade_mod(units_[who].player, b.src)) {
+                        if (m->move_speed_mult.raw() >= 0) b.speed_mult = m->move_speed_mult;
+                        if (m->accel_mult.raw() >= 0) b.accel_mult = m->accel_mult;
+                    }
+            }
             b.suppress_collision = n.beh_suppress_collision;
             b.suppress_passenger = n.beh_suppress_passenger;
             b.benign = n.beh_benign;
@@ -1954,6 +2204,44 @@ bool World::validator_passes(const std::vector<ValidatorOp>& ops, std::uint16_t 
         const Fixed px = ctx.has_cast_point || ctx.target >= units_.size() ? ctx.tx : units_[ctx.target].x;
         const Fixed py = ctx.has_cast_point || ctx.target >= units_.size() ? ctx.ty : units_[ctx.target].y;
         r = !nav_.configured() || !nav_.is_blocked(px, py);
+    } else if (v.kind == ValidatorOp::EnumArea) {
+        Fixed px = ctx.tx, py = ctx.ty;
+        if (v.loc_source) {
+            if (ctx.source < units_.size()) { px = units_[ctx.source].x; py = units_[ctx.source].y; }
+            else { px = ctx.sx; py = ctx.sy; }
+        } else if (!ctx.has_cast_point && ctx.target < units_.size()) {
+            px = units_[ctx.target].x;
+            py = units_[ctx.target].y;
+        }
+        const int32_t owner = ctx.origin >= 0 ? ctx.origin
+                                              : (ctx.source < units_.size() ? units_[ctx.source].player : -1);
+        std::int32_t n = 0;
+        for (const Unit& u : units_) {
+            if (!u.alive) continue;
+            const Fixed reach = v.area_extend ? v.area_radius + u.radius : v.area_radius;
+            const Fixed dx = u.x - px, dy = u.y - py;
+            if (dx * dx + dy * dy > reach * reach) continue;
+            const std::uint8_t plane = u.flying ? 2 : 1;
+            std::uint8_t rel = 8;
+            if (u.id == ctx.source) rel = 1;
+            else if (u.player == owner) rel = 2;
+            else if (u.player < 0) rel = 16;
+            else if (owner >= 0 && are_allied(u.player, owner)) rel = 4;
+            if ((u.attributes & v.req_attr) != v.req_attr || (u.attributes & v.exc_attr) != 0) continue;
+            if ((v.req_plane != 0 && (v.req_plane & plane) == 0) || (v.exc_plane & plane) != 0) continue;
+            if ((v.exc_rel & rel) != 0) continue;
+            if (v.exc_worker && u.is_worker) continue;
+            if (v.exc_constructing && u.constructing) continue;
+            if (!v.kids.empty()) {
+                EffectContext c2 = ctx;
+                c2.target = u.id;
+                c2.has_cast_point = false;
+                if (!validator_passes(ops, v.kids[0], c2, no_unit_passes)) continue;
+            }
+            ++n;
+        }
+        r = compare_token(v.area_cmp, Fixed::from_int(n), Fixed::from_int(v.area_count)) &&
+            compare_token(v.cmp, Fixed::from_int(n), Fixed::from_int(v.count_value));
     } else {
         const std::uint32_t who = v.on_caster ? ctx.source : ctx.target;
         if (who >= units_.size()) return no_unit_passes;
@@ -2208,7 +2496,7 @@ void World::apply_weapon_fire(uint32_t attacker, uint32_t target, Fixed w_dmg, u
         const Fixed tx = tgt.x, ty = tgt.y;
         for (Unit& o : units_) {
             if (!o.alive || o.id == atk || !splash_hits(u, o)) continue;
-            if (o.loaded || o.burrowed) continue;
+            if (o.loaded || o.burrowed || o.in_gas_structure) continue;
             const Fixed dx = o.x - tx, dy = o.y - ty;
             const Fixed d2 = dx * dx + dy * dy;
             const Fixed slack = u.splash_offset_by_radius ? o.radius : Fixed();
@@ -2225,7 +2513,7 @@ void World::apply_weapon_fire(uint32_t attacker, uint32_t target, Fixed w_dmg, u
         const Fixed tx = tgt.x, ty = tgt.y;
         for (Unit& o : units_) {
             if (!o.alive || o.id == atk || !splash_hits(u, o)) continue;
-            if (o.loaded || o.burrowed || o.flying) continue;
+            if (o.loaded || o.burrowed || o.flying || o.in_gas_structure) continue;
             if (in_line_splash(u.x, u.y, tx, ty, u.splash_line_first, u.splash_line_step,
                                u.splash_line_count, u.splash_line_radius, o.x, o.y,
                                u.splash_line_from_source))
@@ -2236,7 +2524,7 @@ void World::apply_weapon_fire(uint32_t attacker, uint32_t target, Fixed w_dmg, u
         const Fixed tx = tgt.x, ty = tgt.y;
         for (Unit& o : units_) {
             if (!o.alive || o.id == atk || !splash_hits(u, o)) continue;
-            if (o.loaded || o.burrowed || o.flying) continue;
+            if (o.loaded || o.burrowed || o.flying || o.in_gas_structure) continue;
             Fixed frac;
             for (int k = 0; k < 2; ++k)
                 if (u.arc_radius[k].raw() > 0 && u.arc_frac[k].raw() > 0 &&
@@ -2262,7 +2550,7 @@ void World::apply_weapon_fire(uint32_t attacker, uint32_t target, Fixed w_dmg, u
                 if (hit[i]) continue;
                 const Unit& o = units_[i];
                 if (!o.alive || are_allied(o.player, u.player)) continue;
-                if (o.loaded || o.burrowed) continue;
+                if (o.loaded || o.burrowed || o.in_gas_structure) continue;
                 const std::uint32_t plane_bit = o.flying ? 2u : 1u;
                 if ((u.wpn_target_filter & plane_bit) == 0) continue;
                 const std::int64_t dx = std::int64_t((o.x - fx).raw()), dy = std::int64_t((o.y - fy).raw());
@@ -2311,16 +2599,27 @@ void World::step_point_defense(Fixed dt) {
 }
 
 void World::step_landing(Fixed dt) {
+    auto refund_addon = [this](Unit& u) {
+        if (u.land_addon != 0) {
+            player(u.player).minerals += u.land_addon_minerals;
+            player(u.player).gas += u.land_addon_gas;
+        }
+        u.land_addon = 0;
+    };
     for (Unit& u : units_) {
         if (!u.land_pending) continue;
         if (!u.alive || !u.flying) {
             u.land_pending = false;
+            refund_addon(u);
             continue;
         }
         if (u.land_timer.raw() < 0) {
             if (!u.orders.empty()) {
                 const Order& o = u.orders.front();
-                if (o.type != OrderType::Move || o.tx != u.land_x || o.ty != u.land_y) u.land_pending = false;
+                if (o.type != OrderType::Move || o.tx != u.land_x || o.ty != u.land_y) {
+                    u.land_pending = false;
+                    refund_addon(u);
+                }
                 continue;
             }
             u.land_timer = u.land_time;
@@ -2329,7 +2628,12 @@ void World::step_landing(Fixed dt) {
         u.land_timer = u.land_timer - dt;
         if (u.land_timer.raw() > 0) continue;
         u.land_pending = false;
-        land(u.id, u.land_x, u.land_y);
+        const bool landed = land(u.id, u.land_x, u.land_y);
+        if (landed && u.land_addon != 0 && build_addon(u.id, u.land_addon, u.land_addon_time)) {
+            u.land_addon = 0;
+            continue;
+        }
+        refund_addon(u);
     }
 }
 
@@ -2637,6 +2941,36 @@ bool World::cancel_construction(uint32_t building, int32_t mineral_cost, int32_t
     return true;
 }
 
+bool World::is_channelling(uint32_t id) const {
+    for (const PersistentInstance& p : persistents_)
+        if (p.channeled && p.source == id && p.count > 0 && !p.expire_done) return true;
+    return false;
+}
+
+bool World::cancel_channel(uint32_t id) {
+    bool any = false;
+    for (std::size_t i = 0; i < persistents_.size(); ++i) {
+        PersistentInstance& p = persistents_[i];
+        if (!p.channeled || p.source != id || p.count <= 0 || p.expire_done) continue;
+        p.count = 0;
+        p.expire_done = true;
+        any = true;
+        if (p.final_effect < 0) continue;
+        EffectContext ctx;
+        ctx.source = p.source;
+        ctx.target = p.target;
+        ctx.origin = p.owner;
+        ctx.sx = ctx.tx = p.x;
+        ctx.sy = ctx.ty = p.y;
+        ctx.cast_x = p.x;
+        ctx.cast_y = p.y;
+        ctx.has_cast_point = true;
+        const EffectRef fi = p.final_effect;
+        execute_effect(fi, ctx);
+    }
+    return any;
+}
+
 bool World::cancel_worker_build(uint32_t builder, int32_t mineral_cost, int32_t gas_cost) {
     for (size_t i = 0; i < worker_builds_.size(); ++i) {
         if (worker_builds_[i].builder != builder) continue;
@@ -2690,11 +3024,13 @@ bool World::issue_worker_build(uint32_t builder, Fixed x, Fixed y, const Unit& p
         if (!placement_.can_place(fx, fy, fw, fh,  proto.requires_vespene))
             return false;
         if (!footprint_clear_of_blockers(*this, placement_, fx, fy, fw, fh, builder,
-                                         proto.requires_vespene))
+                                         proto.requires_vespene)) {
+            refuse(bp, CmdError::CantBuildLocationBlocked);
             return false;
+        }
     }
-    if (!placement_.configured() && site_blocked(proto, x, y, builder)) return false;
-    if (site_reserved(proto, x, y, bp, builder)) return false;
+    if (!placement_.configured() && site_blocked(proto, x, y, builder)) { refuse(bp, CmdError::CantBuildLocationBlocked); return false; }
+    if (site_reserved(proto, x, y, bp, builder)) { refuse(bp, CmdError::CantBuildLocationBlocked); return false; }
     if (proto.needs_power && !powered_at(x, y, units_[builder].player)) {
         refuse(bp, CmdError::CantBuildTooFarFromBuildPowerSource);
         return false;
@@ -2838,6 +3174,37 @@ void World::train_exit_point(const Unit& pr, Fixed unit_radius, Fixed& ox, Fixed
         const Fixed cap = (h - cut) * Fixed::from_int(2) / span + unit_radius;
         if (cap < d) d = cap;
     }
+    static const bool kExitRay = std::getenv("SC2_EXIT_RAY") != nullptr;
+    if (!kExitRay) {
+        const Fixed s = (h - cut) * Fixed::from_int(2);
+        const Fixed rt2 = unit_radius * Fixed::from_ratio(5793, 4096);
+        const Fixed f = h + unit_radius;
+        const Fixed y0 = s + rt2 - f;
+        if (y0.raw() > 0 && y0 < f) {
+            const Fixed n = Fixed() - f, m = Fixed() - y0;
+            const Fixed vx[8] = {f, f, y0, m, n, n, m, y0};
+            const Fixed vy[8] = {m, y0, f, f, y0, m, n, n};
+            Fixed best_x = dx * d, best_y = dy * d, best_cos = Fixed::from_int(-2);
+            for (int e = 0; e < 8; ++e) {
+                const int e2 = (e + 1) % 8;
+                for (int k = 0; k < 8; ++k) {
+                    const Fixed cx = vx[e] + (vx[e2] - vx[e]) * Fixed::from_int(k) / Fixed::from_int(8);
+                    const Fixed cy = vy[e] + (vy[e2] - vy[e]) * Fixed::from_int(k) / Fixed::from_int(8);
+                    const Fixed len = isqrt(cx * cx + cy * cy);
+                    if (len.raw() <= 0) continue;
+                    const Fixed c = (cx * dx + cy * dy) / len;
+                    if (c > best_cos) {
+                        best_cos = c;
+                        best_x = cx;
+                        best_y = cy;
+                    }
+                }
+            }
+            ox = pr.x + best_x;
+            oy = pr.y + best_y;
+            return;
+        }
+    }
     ox = pr.x + dx * d;
     oy = pr.y + dy * d;
 }
@@ -2918,6 +3285,8 @@ void World::evict_from_site(const Unit& structure, uint32_t builder) {
         const Fixed len = isqrt(dx * dx + dy * dy);
         Order mv;
         mv.type = OrderType::Move;
+        static const bool kEvictStepped = std::getenv("SC2_EVICT_STEPPED_ARRIVAL") != nullptr;
+        mv.exact_arrival = !kEvictStepped;
         if (len.raw() > 0) {
             mv.tx = structure.x + dx * D / len;
             mv.ty = structure.y + dy * D / len;
@@ -3114,6 +3483,7 @@ void World::step_cloak_field() {
         const Fixed r2 = s.cloak_field_radius * s.cloak_field_radius;
         for (Unit& u : units_) {
             if (!u.alive || !are_allied(u.player, s.player)) continue;
+            if (u.id == s.id && !s.cloak_field_self) continue;
             const Fixed dx = u.x - s.x, dy = u.y - s.y;
             if (dx * dx + dy * dy <= r2) u.field_cloaked = true;
         }
@@ -3153,7 +3523,7 @@ void World::step_bunker_fire(Fixed dt) {
             Fixed best_d2;
             for (size_t ei = 0; ei < units_.size(); ++ei) {
                 const Unit& e = units_[ei];
-                if (!e.alive || e.loaded || are_allied(e.player, p.player)) continue;
+                if (!e.alive || e.loaded || e.in_gas_structure || are_allied(e.player, p.player)) continue;
                 const Fixed dx = e.x - bx, dy = e.y - by, r = reach + e.radius;
                 const Fixed d2 = dx * dx + dy * dy;
                 if (d2 > r * r) continue;
@@ -3193,6 +3563,12 @@ void World::step_persistents(Fixed dt, size_t only) {
                 const EffectRef ex = p.expire, fi = p.final_effect;
                 if (ex >= 0) execute_effect(ex, ectx);
                 if (fi >= 0) execute_effect(fi, ectx);
+            }
+            if (presentation_log_ && persistents_[i].present_tag != 0) {
+                const PersistentInstance& q = persistents_[i];
+                const bool has_src = q.source < units_.size();
+                log_presentation(q.present_tag, true, q.present_id, q.source, q.target, has_src ? units_[q.source].x : q.x,
+                                 has_src ? units_[q.source].y : q.y, q.x, q.y, q.owner);
             }
             persistents_.erase(persistents_.begin() + i);
             if (only != kAllPersistents) break;
@@ -3422,6 +3798,16 @@ void World::step_production(Fixed dt) {
             drop(i);
             continue;
         }
+        if (research_dies_with_host_ && pd.egg == kNoTarget &&
+            (pd.producer >= units_.size() || !units_[pd.producer].alive)) {
+            if (pd.producer < units_.size()) {
+                Player& pl = player(units_[pd.producer].player);
+                pl.minerals += pd.mineral_cost;
+                pl.gas += pd.gas_cost;
+            }
+            drop(i);
+            continue;
+        }
         if (pd.producer < units_.size()) {
             const Unit& pr = units_[pd.producer];
             if (pr.needs_power && pr.power_managed && !pr.powered) { ++i; continue; }
@@ -3554,6 +3940,7 @@ void World::step_gather(Unit& u, Fixed dt) {
         u.mine_cd = u.mine_cd - dt;
         if (u.mine_cd.raw() <= 0) {
             u.mine_cd = Fixed();
+            u.in_gas_structure = false;
             if (u.gather_target < units_.size()) {
                 Unit& m = units_[u.gather_target];
                 int32_t amt = (u.carry_override && u.carry_amount > 0)
@@ -3579,13 +3966,23 @@ void World::step_gather(Unit& u, Fixed dt) {
         return;
     }
 
-    if (u.gather_target == kNoTarget || u.gather_target >= units_.size() ||
-        units_[u.gather_target].resource_left <= 0) {
+    const bool ordered_gas = gas_harvest_ordered_ && u.gathers_gas;
+    if (ordered_gas && u.carrying <= 0 && u.gather_target != kNoTarget &&
+        (u.gather_target >= units_.size() || !gas_node_harvestable(units_[u.gather_target], u.player))) {
+        u.gather_target = kNoTarget;
+        u.in_gas_structure = false;
+        if (!u.orders.empty() && u.orders.front().type == OrderType::Gather) u.orders.erase(u.orders.begin());
+        return;
+    }
+    if ((!ordered_gas || u.gather_target == kNoTarget) &&
+        (u.gather_target == kNoTarget || u.gather_target >= units_.size() ||
+         units_[u.gather_target].resource_left <= 0)) {
         uint32_t best = kNoTarget;
         Fixed bd;
         for (const Unit& o : units_) {
             if (o.resource_left <= 0) continue;
             if (o.is_gas != u.gathers_gas) continue;
+            if (ordered_gas && !gas_node_harvestable(o, u.player)) continue;
             Fixed d = dist2(u, o);
             if (best == kNoTarget || d < bd) {
                 best = o.id;
@@ -3629,13 +4026,37 @@ void World::step_gather(Unit& u, Fixed dt) {
             last_progress_tick_ = tick_;
             u.return_cd = u.return_delay;
         } else {
-            move_unit_toward(u, d.x, d.y, move_step(u, dt));
+            const Fixed left = isqrt(dist2(u, d)) - reach;
+            move_unit_toward(u, d.x, d.y, move_step(u, dt, harvest_brake(true) && left.raw() > 0 ? left : Fixed::from_raw(-1)));
         }
     } else if (u.gather_target < units_.size()) {
         Unit& m = units_[u.gather_target];
         Fixed reach = u.radius + m.radius + Fixed::from_ratio(1, 4);
         bool docked = dist2(u, m) <= reach * reach;
-        if (gather_dock_footprint_ && !m.footprint_offsets.empty() && nav_.configured()) {
+        bool gas_fp = false;
+        Fixed fp_gap = Fixed::from_raw(-1);
+        if (gas_worker_inside_ && m.is_gas && !m.footprint_offsets.empty()) {
+            gas_fp = true;
+            const bool grid = nav_.configured();
+            int ocx = m.x.floor(), ocy = m.y.floor();
+            if (grid) nav_.to_cell(m.x, m.y, ocx, ocy);
+            const Fixed half = grid ? Fixed::from_raw(nav_.cell_size().raw() / 2) : Fixed::from_ratio(1, 2);
+            Fixed best2;
+            bool any = false;
+            for (const auto& [ox, oy] : m.footprint_offsets) {
+                Fixed cx = Fixed::from_int(ocx + int(ox)) + half, cy = Fixed::from_int(ocy + int(oy)) + half;
+                if (grid) nav_.cell_center(ocx + int(ox), ocy + int(oy), cx, cy);
+                Fixed ex = u.x > cx ? u.x - cx : cx - u.x;
+                Fixed ey = u.y > cy ? u.y - cy : cy - u.y;
+                ex = ex > half ? ex - half : Fixed();
+                ey = ey > half ? ey - half : Fixed();
+                const Fixed e2 = ex * ex + ey * ey;
+                if (!any || e2 < best2) { best2 = e2; any = true; }
+            }
+            docked = any && best2 <= u.radius * u.radius;
+            if (any) fp_gap = isqrt(best2) - u.radius;
+        }
+        if (!gas_fp && gather_dock_footprint_ && !m.footprint_offsets.empty() && nav_.configured()) {
             int ocx, ocy;
             nav_.to_cell(m.x, m.y, ocx, ocy);
             const Fixed half = Fixed::from_raw(nav_.cell_size().raw() / 2);
@@ -3652,6 +4073,12 @@ void World::step_gather(Unit& u, Fixed dt) {
             }
         }
         if (docked) {
+            if (gas_harvest_ordered_ && m.is_gas && m.constructing) return;
+            if (gas_worker_inside_ && m.is_gas && m.miners_max <= 0 && !u.saturation_exempt) {
+                for (const Unit& w : units_)
+                    if (w.alive && w.id != u.id && w.in_gas_structure && w.gather_target == u.gather_target)
+                        return;
+            }
             if (m.miners_max > 0 && !u.saturation_exempt) {
                 int active = 0;
                 for (const Unit& w : units_)
@@ -3678,6 +4105,7 @@ void World::step_gather(Unit& u, Fixed dt) {
                           for (const Unit& o : units_) {
                             if (!o.alive || o.resource_left <= 0 || o.id == u.gather_target) continue;
                             if (o.is_gas != m.is_gas) continue;
+                            if (gas_harvest_ordered_ && o.is_gas) continue;
                             const Fixed dx = o.x - m.x, dy = o.y - m.y;
                             const Fixed d2 = dx * dx + dy * dy;
                             if (d2 > rr * rr) continue;
@@ -3701,9 +4129,16 @@ void World::step_gather(Unit& u, Fixed dt) {
                             : (u.mine_time.raw() > 0 ? u.mine_time
                                                      : Fixed::parse(m.is_gas ? "1.981" : "2.786"));
             if (u.mine_time_mult.raw() > 0) u.mine_cd = u.mine_cd * u.mine_time_mult;
+            if (gas_worker_inside_ && m.is_gas && u.mine_cd.raw() > 0) u.in_gas_structure = true;
         } else {
             const Fixed bx = u.x, by = u.y;
-            move_unit_toward(u, m.x, m.y, move_step(u, dt));
+            const Fixed left = gas_fp ? fp_gap : isqrt(dist2(u, m)) - reach;
+            Fixed step = move_step(u, dt, harvest_brake(false) && left.raw() > 0 ? left : Fixed::from_raw(-1));
+            if (gas_fp) {
+                const Fixed cap = (fp_gap.raw() > 0 ? fp_gap : Fixed()) + Fixed::from_ratio(1, 64);
+                if (step > cap) step = cap;
+            }
+            move_unit_toward(u, m.x, m.y, step);
             if (u.x == bx && u.y == by) {
                 if (++u.gather_stall_ticks >= kTicksPerSecond && u.acquire_radius.raw() > 0) {
                     u.gather_stall_ticks = 0;
@@ -3712,6 +4147,7 @@ void World::step_gather(Unit& u, Fixed dt) {
                     const Fixed rr = u.acquire_radius;
                     for (const Unit& o : units_) {
                         if (!o.alive || o.resource_left <= 0 || o.id == u.gather_target || o.is_gas != m.is_gas) continue;
+                        if (gas_harvest_ordered_ && o.is_gas) continue;
                         const Fixed dx = o.x - u.x, dy = o.y - u.y, d2 = dx * dx + dy * dy;
                         if (d2 > rr * rr) continue;
                         if (best == kNoTarget || d2 < best_d2) { best = o.id; best_d2 = d2; }
@@ -3849,11 +4285,12 @@ void World::step_nova(Fixed dt) {
     }
 }
 
-void World::begin_research(int32_t player, const std::string& id, Fixed delay) {
+void World::begin_research(int32_t player, const std::string& id, Fixed delay, uint32_t producer, int32_t minerals,
+                           int32_t gas) {
     if (has_upgrade(player, id)) return;
     for (const PendingResearch& p : research_pending_)
         if (p.player == player && p.id == id) return;
-    research_pending_.push_back(PendingResearch{player, id, delay, delay});
+    research_pending_.push_back(PendingResearch{player, id, delay, delay, producer, minerals, gas});
     if (reporting()) {
         Command cmd;
         cmd.kind = CommandKind::Research;
@@ -3926,7 +4363,29 @@ std::vector<std::pair<int32_t, std::string>> World::take_completed_research() {
 
 void World::step_research(Fixed dt) {
     if (research_pending_.empty()) return;
+    std::vector<uint32_t> busy;
     for (std::size_t i = 0; i < research_pending_.size();) {
+        if (research_dies_with_host_ && research_pending_[i].producer != kNoTarget) {
+            const uint32_t pr = research_pending_[i].producer;
+            if (pr >= units_.size() || !units_[pr].alive) {
+                research_lost_.push_back(
+                    LostResearch{research_pending_[i].player, research_pending_[i].id, pr});
+                Player& pl = player(research_pending_[i].player);
+                pl.minerals += research_pending_[i].minerals;
+                pl.gas += research_pending_[i].gas;
+                research_pending_.erase(research_pending_.begin() + std::ptrdiff_t(i));
+                continue;
+            }
+        }
+        if (research_queue_ && research_pending_[i].producer != kNoTarget) {
+            const uint32_t pr = research_pending_[i].producer;
+            const bool host_gone = pr >= units_.size() || !units_[pr].alive;
+            if (!host_gone && std::find(busy.begin(), busy.end(), pr) != busy.end()) {
+                ++i;
+                continue;
+            }
+            busy.push_back(pr);
+        }
         research_pending_[i].timer = research_pending_[i].timer - dt;
         if (research_pending_[i].timer.raw() <= 0) {
             if (!has_upgrade(research_pending_[i].player, research_pending_[i].id)) {
@@ -3942,6 +4401,18 @@ void World::step_research(Fixed dt) {
 
 void World::step() {
     const Fixed dt = World::dt();
+    for (std::size_t k = 0; k < presentation_delayed_.size();) {
+        DelayedPresentation& dp = presentation_delayed_[k];
+        dp.left = dp.left - dt;
+        if (dp.left.raw() > 0) {
+            ++k;
+            continue;
+        }
+        if (presentation_log_)
+            log_presentation(dp.e.fx_tag, false, dp.e.instance, dp.e.source, dp.e.target, dp.e.src_x, dp.e.src_y,
+                             dp.e.tx, dp.e.ty, dp.e.player);
+        presentation_delayed_.erase(presentation_delayed_.begin() + long(k));
+    }
     in_step_ = true;
     for (Unit& u : units_) u.loco_moved = Fixed();
     update_conjoined();
@@ -4026,7 +4497,14 @@ void World::step() {
     step_nova(dt);
     update_watchtowers();
     for (Unit& u : units_) {
-        if (!u.alive) continue;
+        if (!u.alive) { u.in_gas_structure = false; continue; }
+
+        if (u.in_gas_structure) {
+            const bool stay = !u.orders.empty() && u.orders.front().type == OrderType::Gather &&
+                              u.mine_cd.raw() > 0 && u.gather_target < units_.size() &&
+                              units_[u.gather_target].alive && units_[u.gather_target].is_gas;
+            if (!stay) u.in_gas_structure = false;
+        }
 
         const Fixed regen = (u.burrowed && u.burrow_regen.raw() > 0) ? u.burrow_regen : u.life_regen;
         bool regen_held = false;
@@ -4132,6 +4610,7 @@ void World::step() {
                 const int32_t keep_player = u.player;
                 const Fixed keep_x = u.x, keep_y = u.y;
                 const Fixed keep_hp = u.hp, keep_shields = u.shields;
+                const Fixed keep_hp_max = u.hp_max, keep_shields_max = u.shields_max;
                 const Fixed heal_life = u.morph_heal_life_frac, heal_shield = u.morph_heal_shield_frac;
                 const int32_t keep_sp = u.spawner_proto, keep_scap = u.spawner_cap;
                 const int32_t keep_shard = u.spawner_hard_cap;
@@ -4181,6 +4660,15 @@ void World::step() {
                 }
                 u.hp = keep_hp < u.hp_max ? keep_hp : u.hp_max;
                 u.shields = keep_shields < u.shields_max ? keep_shields : u.shields_max;
+                if (morph_vital_fraction_) {
+                    if (keep_hp_max.raw() > 0 && u.hp_max.raw() > 0 && keep_hp_max != u.hp_max)
+                        u.hp = Fixed::from_raw(int32_t(int64_t(keep_hp.raw()) * u.hp_max.raw() / keep_hp_max.raw()));
+                    if (keep_shields_max.raw() > 0 && u.shields_max.raw() > 0 && keep_shields_max != u.shields_max)
+                        u.shields = Fixed::from_raw(
+                            int32_t(int64_t(keep_shields.raw()) * u.shields_max.raw() / keep_shields_max.raw()));
+                    if (u.hp > u.hp_max) u.hp = u.hp_max;
+                    if (u.shields > u.shields_max) u.shields = u.shields_max;
+                }
                 if (heal_life.raw() > 0) {
                     u.hp = u.hp + u.hp_max * heal_life;
                     if (u.hp > u.hp_max) u.hp = u.hp_max;
@@ -4527,6 +5015,9 @@ void World::step() {
                 Fixed dx = o.tx - u.x, dy = o.ty - u.y;
                 const Fixed near = arrival_near(u);
                 done = (dx * dx + dy * dy) <= near * near;
+                if (o.contact && o.type == OrderType::Move)
+                    done = done || o.target >= units_.size() || !units_[o.target].alive ||
+                           footprint_gap(units_[o.target], u.x, u.y) <= u.radius;
                 if (!done && nav_.configured()) {
                     const Fixed d = isqrt(dx * dx + dy * dy);
                     if (u.stall_ticks == 0 || u.stall_gx != o.tx || u.stall_gy != o.ty) {
@@ -4565,6 +5056,21 @@ void World::step() {
                         const Fixed touch = u.radius + r.radius + Fixed::from_ratio(4, 64);
                         if (cx * cx + cy * cy <= touch * touch) { done = true; break; }
                     }
+                }
+                static const bool kGoalPressStop = std::getenv("SC2_SEP_NO_GOAL_PRESS") == nullptr;
+                if (kGoalPressStop && !done && separation_ && !u.flying && !u.burrowed && !collision_suppressed(u)) {
+                    const Fixed left = isqrt(dx * dx + dy * dy) - u.speed * dt;
+                    if (left <= arrival_near(u))
+                        for (const Unit& r : units_) {
+                            if (r.id == u.id || !r.alive || r.flying || r.burrowed || r.speed.raw() == 0) continue;
+                            if (!r.orders.empty() || !are_allied(r.player, u.player) || collision_suppressed(r)) continue;
+                            if (r.arrived && r.arrive_x == o.tx && r.arrive_y == o.ty) continue;
+                            const Fixed reach = u.radius + r.radius - kContactSlack;
+                            const Fixed gx = o.tx - r.x, gy = o.ty - r.y;
+                            if (gx * gx + gy * gy >= reach * reach) continue;
+                            const Fixed cx = r.x - u.x, cy = r.y - u.y, touch = u.radius + r.radius + Fixed::from_ratio(4, 64);
+                            if (cx * cx + cy * cy <= touch * touch) { done = true; break; }
+                        }
                 }
             }
             if (!done) break;
@@ -4783,7 +5289,11 @@ void World::step() {
         } else if (has_dest && can_move) {
             const Fixed bx = dx_dest - u.x, by = dy_dest - u.y;
             const Fixed left = isqrt(bx * bx + by * by) - arrival_near(u);
-            move_unit_toward(u, dx_dest, dy_dest, move_step(u, dt, left.raw() > 0 ? left : Fixed()));
+            Fixed st = move_step(u, dt, left.raw() > 0 ? left : Fixed());
+            static const bool kExactArrival = std::getenv("SC2_MOVE_EXACT_ARRIVAL") != nullptr;
+            const bool exact = kExactArrival || (!u.orders.empty() && u.orders.front().exact_arrival);
+            if (exact && left.raw() > 0 && st > left) st = left;
+            move_unit_toward(u, dx_dest, dy_dest, st);
         }
     }
     step_bunker_fire(dt);
@@ -5017,6 +5527,7 @@ uint64_t World::state_hash() const {
             h = mix(h, uint32_t(u.land_x.raw()));
             h = mix(h, uint32_t(u.land_y.raw()));
             h = mix(h, uint32_t(u.land_timer.raw()));
+            if (u.land_addon != 0) h = mix(h, 0xADD0u + uint32_t(u.land_addon));
         }
         h = mix(h, uint32_t(u.resource_left));
         h = mix(h, uint32_t(u.carrying));
@@ -5126,6 +5637,7 @@ uint64_t World::state_hash() const {
         if (u.burns_down && u.burn_timer.raw() > 0) h = mix(h, uint32_t(u.burn_timer.raw()));
         if (u.loaded) { h = mix(h, 0x10ADu); h = mix(h, u.transport_id); }
         if (u.burrowed) h = mix(h, 0xB020u);
+        if (u.in_gas_structure) h = mix(h, 0x6A51u);
         if (u.burrowed_wpn_on) h = mix(h, 0xB021u);
         if (u.field_cloaked) h = mix(h, 0xC10Bu);
         if (u.time_life.raw() > 0) h = mix(h, uint32_t(u.time_life.raw()));

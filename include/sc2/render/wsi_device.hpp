@@ -66,6 +66,7 @@ struct WsiDevice {
     VkPhysicalDevice pd = VK_NULL_HANDLE;
     uint32_t gfx_family = UINT32_MAX;
     VkQueue queue = VK_NULL_HANDLE;
+    VkQueue side_queue = VK_NULL_HANDLE;
 };
 
 inline WsiDevice create_wsi_device(HINSTANCE hinst, HWND hwnd, const char* ctx,
@@ -154,12 +155,17 @@ inline WsiDevice create_wsi_device(HINSTANCE hinst, HWND hwnd, const char* ctx,
     if (!pick_present_device(rawInst, rawSurf, w.pd, w.gfx_family))
         fail("no graphics+present queue family");
 
-    float prio = 1.0f;
+    uint32_t nqf = 0;
+    vkGetPhysicalDeviceQueueFamilyProperties(w.pd, &nqf, nullptr);
+    std::vector<VkQueueFamilyProperties> qfs(nqf);
+    vkGetPhysicalDeviceQueueFamilyProperties(w.pd, &nqf, qfs.data());
+    const bool two = w.gfx_family < nqf && qfs[w.gfx_family].queueCount >= 2;
+    const float prio[2] = {1.0f, 1.0f};
     VkDeviceQueueCreateInfo qci{};
     qci.sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO;
     qci.queueFamilyIndex = w.gfx_family;
-    qci.queueCount = 1;
-    qci.pQueuePriorities = &prio;
+    qci.queueCount = two ? 2 : 1;
+    qci.pQueuePriorities = prio;
     const char* devext[] = {VK_KHR_SWAPCHAIN_EXTENSION_NAME};
     VkPhysicalDeviceFeatures have{};
     vkGetPhysicalDeviceFeatures(w.pd, &have);
@@ -176,6 +182,8 @@ inline WsiDevice create_wsi_device(HINSTANCE hinst, HWND hwnd, const char* ctx,
     if (vkCreateDevice(w.pd, &dci, nullptr, &dev) != VK_SUCCESS) fail("vkCreateDevice (swapchain) failed");
     w.device = Unique<VkDevice>(dev, [](VkDevice d) { vkDestroyDevice(d, nullptr); });
     vkGetDeviceQueue(dev, w.gfx_family, 0, &w.queue);
+    w.side_queue = w.queue;
+    if (two) vkGetDeviceQueue(dev, w.gfx_family, 1, &w.side_queue);
 
     return w;
 }

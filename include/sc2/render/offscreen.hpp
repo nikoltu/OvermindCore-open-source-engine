@@ -29,4 +29,9 @@ RenderResult render_model(const formats::Model& model, uint32_t width,
 bool project(const Mat4& mvp, float x, float y, float z, uint32_t width,
              uint32_t height, float& px, float& py);
 
+inline bool& offscreen_on_window_device() {
+    static bool v = true;
+    return v;
+}
+
 }

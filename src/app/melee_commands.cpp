@@ -24,10 +24,11 @@ ActionCheck MeleeCommands::can_train(const sim::World& w, uint32_t producer,
 
 bool MeleeCommands::train(sim::World& w, uint32_t producer, const sim::Unit& proto,
                           int mineral_cost, int gas_cost, Fixed build_time,
-                          int pending_cap) {
-    if (!can_train(w, producer, proto, mineral_cost, gas_cost, pending_cap).allowed())
+                          int pending_cap, int count) {
+    const int n = count > 1 ? count : 1;
+    if (!can_train(w, producer, proto, mineral_cost * n, gas_cost * n, pending_cap).allowed())
         return false;
-    return w.queue_train(producer, proto, mineral_cost, gas_cost, build_time);
+    return w.queue_train(producer, proto, mineral_cost, gas_cost, build_time, n);
 }
 
 ActionCheck MeleeCommands::can_build(const sim::World& w, int player,

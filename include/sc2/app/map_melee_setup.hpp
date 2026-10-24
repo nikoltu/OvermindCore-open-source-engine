@@ -8,6 +8,7 @@
 #include <utility>
 
 #include <cstdio>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
@@ -24,10 +25,37 @@
 namespace sc2::app {
 
 struct MapMeleeStarts {
-    int s0x, s0y;
-    int s1x, s1y;
-    int cx, cy;
+    std::vector<std::pair<int, int>> cells;
+    int cx = 0, cy = 0;
+    int s0x() const { return cells[0].first; }
+    int s0y() const { return cells[0].second; }
+    int s1x() const { return cells[1].first; }
+    int s1y() const { return cells[1].second; }
 };
+
+inline MapMeleeStarts map_two_starts(int s0x, int s0y, int s1x, int s1y, int cx, int cy) {
+    MapMeleeStarts st;
+    st.cells = {{s0x, s0y}, {s1x, s1y}};
+    st.cx = cx;
+    st.cy = cy;
+    return st;
+}
+
+inline std::pair<int, int> map_nearest_walkable(const formats::LoadedMap& map, int tx, int ty) {
+    const int W = int(map.width), H = int(map.height);
+    tx = std::clamp(tx, 0, W - 1);
+    ty = std::clamp(ty, 0, H - 1);
+    const int rmax = std::max(W, H);
+    for (int r = 0; r <= rmax; ++r)
+        for (int dy = -r; dy <= r; ++dy)
+            for (int dx = -r; dx <= r; ++dx) {
+                if (std::max(std::abs(dx), std::abs(dy)) != r) continue;
+                int x = tx + dx, y = ty + dy;
+                if (x < 0 || y < 0 || x >= W || y >= H) continue;
+                if (map.terrain.walkable(std::uint32_t(x), std::uint32_t(y))) return {x, y};
+            }
+    return {tx, ty};
+}
 
 inline MapMeleeStarts map_melee_starts_corner_layout(const formats::LoadedMap& map) {
     const int W = int(map.width), H = int(map.height);
@@ -45,20 +73,7 @@ inline MapMeleeStarts map_melee_starts_corner_layout(const formats::LoadedMap& m
     const int insetx = std::max(4, (maxx - minx) / 6);
     const int insety = std::max(4, (maxy - miny) / 6);
 
-    auto nearest_walkable = [&](int tx, int ty) -> std::pair<int, int> {
-        tx = std::clamp(tx, 0, W - 1);
-        ty = std::clamp(ty, 0, H - 1);
-        const int rmax = std::max(W, H);
-        for (int r = 0; r <= rmax; ++r)
-            for (int dy = -r; dy <= r; ++dy)
-                for (int dx = -r; dx <= r; ++dx) {
-                    if (std::max(std::abs(dx), std::abs(dy)) != r) continue;
-                    int x = tx + dx, y = ty + dy;
-                    if (x < 0 || y < 0 || x >= W || y >= H) continue;
-                    if (map.terrain.walkable(std::uint32_t(x), std::uint32_t(y))) return {x, y};
-                }
-        return {tx, ty};
-    };
+    auto nearest_walkable = [&](int tx, int ty) -> std::pair<int, int> { return map_nearest_walkable(map, tx, ty); };
 
     {
         const auto& sl = map.objects.start_locations;
@@ -80,7 +95,7 @@ inline MapMeleeStarts map_melee_starts_corner_layout(const formats::LoadedMap& m
             if (near0(b) < near0(a)) std::swap(a, b);
             const auto A = nearest_walkable(int(std::floor(a.first)), int(std::floor(a.second)));
             const auto B = nearest_walkable(int(std::floor(b.first)), int(std::floor(b.second)));
-            return {A.first, A.second, B.first, B.second, (minx + maxx) / 2, (miny + maxy) / 2};
+            return map_two_starts(A.first, A.second, B.first, B.second, (minx + maxx) / 2, (miny + maxy) / 2);
         }
     }
 
@@ -122,7 +137,7 @@ inline MapMeleeStarts map_melee_starts_corner_layout(const formats::LoadedMap& m
         std::tie(s0x, s0y) = nearest_walkable(minx + insetx, miny + insety);
         std::tie(s1x, s1y) = nearest_walkable(maxx - insetx, maxy - insety);
     }
-    return {s0x, s0y, s1x, s1y, (minx + maxx) / 2, (miny + maxy) / 2};
+    return map_two_starts(s0x, s0y, s1x, s1y, (minx + maxx) / 2, (miny + maxy) / 2);
 }
 
 inline bool map_startless_halls(const formats::LoadedMap& map) {
@@ -130,13 +145,17 @@ inline bool map_startless_halls(const formats::LoadedMap& map) {
            map.info.has_playable_area();
 }
 
-inline MapMeleeStarts map_melee_starts(const formats::LoadedMap& map, std::uint64_t start_seed = 0) {
+inline bool map_startless_retail(const formats::LoadedMap& map) {
+    return map.objects.start_locations.size() < 2 && !map_startless_halls(map) && std::getenv("SC2_STARTLESS_INVENTED_BASE") == nullptr;
+}
+
+inline MapMeleeStarts map_melee_starts(const formats::LoadedMap& map, std::uint64_t start_seed = 0, bool any_pair = true) {
     MapMeleeStarts st = map_melee_starts_corner_layout(map);
     if (map_startless_halls(map)) {
-        st.s0x = int(map.info.playable_x0) + 6;
-        st.s0y = int(map.info.playable_y0) + 6;
-        st.s1x = int(map.info.playable_x1) - 6;
-        st.s1y = int(map.info.playable_y1) - 6;
+        st.cells[0].first = int(map.info.playable_x0) + 6;
+        st.cells[0].second = int(map.info.playable_y0) + 6;
+        st.cells[1].first = int(map.info.playable_x1) - 6;
+        st.cells[1].second = int(map.info.playable_y1) - 6;
         const std::string spec = std::getenv("SC2_STARTLESS_HALLS");
         const std::size_t semi = spec.find(';');
         if (spec.find(',') != std::string::npos) {
@@ -144,25 +163,101 @@ inline MapMeleeStarts map_melee_starts(const formats::LoadedMap& map, std::uint6
             for (int side = 0; side < 2; ++side) {
                 float x = 0.0f, y = 0.0f;
                 if (std::sscanf(part[side].c_str(), "%f,%f", &x, &y) != 2) continue;
-                (side ? st.s1x : st.s0x) = int(std::floor(x));
-                (side ? st.s1y : st.s0y) = int(std::floor(y));
+                st.cells[std::size_t(side)].first = int(std::floor(x));
+                st.cells[std::size_t(side)].second = int(std::floor(y));
             }
         }
         return st;
     }
-    if (std::getenv("SC2_START_SWAP")) {
-        std::swap(st.s0x, st.s1x);
-        std::swap(st.s0y, st.s1y);
-    }
+    if (std::getenv("SC2_START_SWAP")) std::swap(st.cells[0], st.cells[1]);
     if (start_seed == 0) return st;
     std::uint64_t z = start_seed + 0xD1B54A32D192ED03ull;
     z = (z ^ (z >> 30)) * 0xBF58476D1CE4E5B9ull;
     z = (z ^ (z >> 27)) * 0x94D049BB133111EBull;
     z ^= z >> 31;
-    if (z & 1u) {
-        std::swap(st.s0x, st.s1x);
-        std::swap(st.s0y, st.s1y);
+    const auto& sl = map.objects.start_locations;
+    if (sl.size() > 2 && any_pair && std::getenv("SC2_START_FURTHEST_PAIR") == nullptr) {
+        const std::uint64_t S = sl.size(), k = z % (S * (S - 1));
+        const std::size_t a = std::size_t(k / (S - 1));
+        std::size_t b = std::size_t(k % (S - 1));
+        if (b >= a) ++b;
+        st.cells[0] = map_nearest_walkable(map, int(std::floor(sl[a].first)), int(std::floor(sl[a].second)));
+        st.cells[1] = map_nearest_walkable(map, int(std::floor(sl[b].first)), int(std::floor(sl[b].second)));
+        return st;
     }
+    if (z & 1u) std::swap(st.cells[0], st.cells[1]);
+    return st;
+}
+
+inline bool map_melee_any_pair_rule(const formats::LoadedMap& map) {
+    return map.objects.start_locations.size() > 2 && !map_startless_halls(map) && std::getenv("SC2_START_FURTHEST_PAIR") == nullptr;
+}
+
+inline MapMeleeStarts map_melee_starts(const formats::LoadedMap& map, const std::vector<int>& teams,
+                                       std::uint64_t start_seed = 0) {
+    const std::size_t n = teams.size();
+    if (n <= 2) return map_melee_starts(map, start_seed);
+    const auto& sl = map.objects.start_locations;
+    if (sl.size() < n)
+        throw std::invalid_argument("map_melee_starts: " + std::to_string(n) + " players on a map authoring " +
+                                    std::to_string(sl.size()) + " start locations");
+    if (sl.size() > 8)
+        throw std::invalid_argument("map_melee_starts: more than eight authored start locations (" +
+                                    std::to_string(sl.size()) + ")");
+    MapMeleeStarts st = map_melee_starts_corner_layout(map);
+    const std::size_t S = sl.size();
+    std::vector<std::pair<int, int>> cell(S);
+    for (std::size_t i = 0; i < S; ++i)
+        cell[i] = map_nearest_walkable(map, int(std::floor(sl[i].first)), int(std::floor(sl[i].second)));
+    std::vector<std::int64_t> dist(S * S, 0);
+    for (std::size_t i = 0; i < S; ++i)
+        for (std::size_t j = 0; j < S; ++j) {
+            const double dx = double(cell[i].first - cell[j].first), dy = double(cell[i].second - cell[j].second);
+            dist[i * S + j] = std::int64_t(std::llround(std::sqrt(dx * dx + dy * dy) * 1024.0));
+        }
+    std::vector<std::size_t> pick(n, 0);
+    std::vector<char> used(S, 0);
+    std::vector<std::vector<std::size_t>> tied;
+    std::int64_t best = -1;
+    auto walk = [&](auto&& self, std::size_t k, std::int64_t cost) -> void {
+        if (best >= 0 && cost > best) return;
+        if (k == n) {
+            if (best < 0 || cost < best) {
+                best = cost;
+                tied.clear();
+            }
+            tied.push_back(pick);
+            return;
+        }
+        for (std::size_t s = 0; s < S; ++s) {
+            if (used[s]) continue;
+            std::int64_t add = 0;
+            for (std::size_t q = 0; q < k; ++q)
+                if (teams[k] >= 0 && teams[q] == teams[k]) add += dist[pick[q] * S + s];
+            used[s] = 1;
+            pick[k] = s;
+            self(self, k + 1, cost + add);
+            used[s] = 0;
+        }
+    };
+    walk(walk, 0, 0);
+    std::size_t chosen = 0;
+    if (start_seed != 0 && tied.size() > 1) {
+        std::vector<std::size_t> order(tied.size());
+        for (std::size_t i = 0; i < order.size(); ++i) order[i] = i;
+        std::uint64_t z = start_seed;
+        auto next = [&z]() {
+            z += 0x9E3779B97F4A7C15ull;
+            std::uint64_t r = z;
+            r = (r ^ (r >> 30)) * 0xBF58476D1CE4E5B9ull;
+            r = (r ^ (r >> 27)) * 0x94D049BB133111EBull;
+            return r ^ (r >> 31);
+        };
+        for (std::size_t i = order.size() - 1; i > 0; --i) std::swap(order[i], order[std::size_t(next() % (i + 1))]);
+        chosen = order[0];
+    }
+    st.cells.clear();
+    for (std::size_t p = 0; p < n; ++p) st.cells.push_back(cell[tied[chosen][p]]);
     return st;
 }
 
@@ -245,8 +340,8 @@ inline MeleeSetup melee_setup_for_map(const formats::LoadedMap& map, int worker_
     pr.army.supply_uses = Fixed::from_int(1);
 
     MeleeSetup s;
-    s.players.push_back(map_melee_player(pr, st.s0x, st.s0y, st.cx, st.cy, worker_count, patches));
-    s.players.push_back(map_melee_player(pr, st.s1x, st.s1y, st.cx, st.cy, worker_count, patches));
+    s.players.push_back(map_melee_player(pr, st.s0x(), st.s0y(), st.cx, st.cy, worker_count, patches));
+    s.players.push_back(map_melee_player(pr, st.s1x(), st.s1y(), st.cx, st.cy, worker_count, patches));
     return s;
 }
 
@@ -295,7 +390,7 @@ inline MeleeSetup melee_setup_for_map(const formats::LoadedMap& map, const data:
 
     MeleeSetup s;
     for (int side = 0; side < 2; ++side) {
-        const int sx = side ? st.s1x : st.s0x, sy = side ? st.s1y : st.s0y;
+        const int sx = side ? st.s1x() : st.s0x(), sy = side ? st.s1y() : st.s0y();
         MeleePlayerSetup p = map_melee_player(pr, sx, sy, st.cx, st.cy, worker_count, patches);
         p.worker_mineral_cost = scost.minerals > 0 ? scost.minerals : 50;
         p.worker_build_time = secs("SCV", 12);

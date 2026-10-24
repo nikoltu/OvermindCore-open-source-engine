@@ -272,4 +272,12 @@ XmlNode xml_parse(const std::vector<uint8_t>& data) {
     return parser.parse_document();
 }
 
+std::size_t xml_node_heap_bytes(const XmlNode& n) {
+    auto s = [](const std::string& x) { return x.capacity() > 15 ? x.capacity() + 1 : std::size_t(0); };
+    std::size_t b = s(n.name) + s(n.text) + n.attrs.capacity() * sizeof(n.attrs[0]) + n.children.capacity() * sizeof(XmlNode);
+    for (const auto& kv : n.attrs) b += s(kv.first) + s(kv.second);
+    for (const XmlNode& c : n.children) b += xml_node_heap_bytes(c);
+    return b;
+}
+
 }

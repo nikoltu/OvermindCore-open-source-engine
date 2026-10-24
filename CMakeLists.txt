@@ -1,7 +1,7 @@
 cmake_minimum_required(VERSION 3.16)
 project(sc2engine VERSION 0.0.1 LANGUAGES CXX)
 
-set(SC2_ENGINE_BUILD "617")
+set(SC2_ENGINE_BUILD "655")
 set(SC2_ENGINE_STAGE "pre-alfa")
 configure_file(include/sc2/core/version.hpp.in
                ${CMAKE_BINARY_DIR}/generated/sc2/core/version.hpp @ONLY)
@@ -112,6 +112,7 @@ add_library(sc2core STATIC
   src/app/control.cpp
   src/app/melee.cpp
   src/app/melee_game.cpp
+  src/app/effect_actor_host.cpp
   src/app/sandbox_game.cpp
   src/app/front_end.cpp
   src/app/shipping_wiring.cpp
@@ -131,6 +132,7 @@ add_library(sc2core STATIC
   src/app/screen_router.cpp
   src/app/control_groups.cpp
   src/render/anim.cpp
+  src/render/texture_decode.cpp
   src/render/actor.cpp
   src/render/creep_layer.cpp
   src/render/actor_rules.cpp

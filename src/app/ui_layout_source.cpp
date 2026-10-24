@@ -1,5 +1,6 @@
 #include "sc2/app/ui_layout_source.hpp"
 
+#include <cstdlib>
 #include <exception>
 #include <map>
 #include <memory>
@@ -40,9 +41,18 @@ const ui::LayoutSet* layout_namespace(casc::Storage& store, const std::string& m
             read(mod_prefix + "UI/Layout/DescIndex.SC2Layout"));
         if (incs.empty()) return nullptr;
         auto set = std::make_unique<ui::LayoutSet>();
+        if (!std::getenv("SC2_LAYOUT_EAGER")) {
+            casc::Storage* st = &store;
+            const std::string prefix = mod_prefix;
+            set->reader = [st, prefix](const std::string& p) {
+                auto b = st->read_by_name(prefix + p);
+                return std::string(b.begin(), b.end());
+            };
+        }
         for (const std::string& inc : incs) {
             try {
                 set->add_xml(inc, read(mod_prefix + inc));
+                set->drop_frames(set->docs.back());
             } catch (const std::exception&) {
             }
         }

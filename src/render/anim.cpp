@@ -132,6 +132,8 @@ std::vector<Mat4> pose_world(const formats::Model& m, uint32_t seq, float time_m
 
     static const bool kUiKeep = std::getenv("SC2_BONE_VIS_UI_KEEP") != nullptr;
     const bool ui_model = kUiKeep && m.name.find("\\UI\\") != std::string::npos;
+    static const std::string kBoneVisTraceValue = std::getenv("SC2_BONE_VIS_TRACE") ? std::getenv("SC2_BONE_VIS_TRACE") : "";
+    static const char* const kBoneVisTrace = std::getenv("SC2_BONE_VIS_TRACE") ? kBoneVisTraceValue.c_str() : nullptr;
     std::vector<Mat4> local(n);
     for (size_t b = 0; b < n; ++b) {
         const formats::M3Bone& bone = m.bones[b];
@@ -140,7 +142,7 @@ std::vector<Mat4> pose_world(const formats::Model& m, uint32_t seq, float time_m
         field(m, seq, bone.rotation, t, 4, R, global);
         field(m, seq, bone.scale, t, 3, S, global);
         static const bool kBoneVis = std::getenv("SC2_NO_BONE_VISIBILITY") == nullptr;
-        if (std::getenv("SC2_BONE_VIS_TRACE") && bone.visibility.anim_flags == 0) {
+        if (kBoneVisTrace && bone.visibility.anim_flags == 0) {
             static int told_static = 0;
             const char* want = std::getenv("SC2_BONE_VIS_MODEL");
             if (want && m.name.find(want) != std::string::npos && told_static++ < 600)
@@ -149,9 +151,9 @@ std::vector<Mat4> pose_world(const formats::Model& m, uint32_t seq, float time_m
         if (kBoneVis && !ui_model && bone.visibility.anim_flags != 0) {
             float V[1] = {bone.visibility.init[0]};
             field(m, seq, bone.visibility, t, 1, V, global);
-            if (std::getenv("SC2_BONE_VIS_TRACE")) {
+            if (kBoneVisTrace) {
                 static int told = 0;
-                if (std::string(std::getenv("SC2_BONE_VIS_TRACE")) == "1" ? told++ < 400 : bone.name.find(std::getenv("SC2_BONE_VIS_TRACE")) != std::string::npos && told++ < 6) std::fprintf(stderr, "[bonevis] %s flags %x model %s seq %u t %.0f init %.0f now %.3f\n", bone.name.c_str(), unsigned(bone.flags), m.name.c_str(), unsigned(seq), double(t), double(bone.visibility.init[0]), double(V[0]));
+                if (std::string(kBoneVisTrace) == "1" ? told++ < 400 : bone.name.find(kBoneVisTrace) != std::string::npos && told++ < 6) std::fprintf(stderr, "[bonevis] %s flags %x model %s seq %u t %.0f init %.0f now %.3f\n", bone.name.c_str(), unsigned(bone.flags), m.name.c_str(), unsigned(seq), double(t), double(bone.visibility.init[0]), double(V[0]));
             }
             if (V[0] < 0.5f) S[0] = S[1] = S[2] = 0.0f;
         }

@@ -4,6 +4,9 @@
 #include "sc2/formats/m3.hpp"
 #include "sc2/render/anim.hpp"
 #include "sc2/render/vertex_ao.hpp"
+#include "sc2/render/texture_decode.hpp"
+#include <memory>
+#include <optional>
 #include <algorithm>
 #include <cstdlib>
 
@@ -258,6 +261,7 @@ MeleeModels::MeleeModels() = default;
 MeleeModels::~MeleeModels() = default;
 
 data::Catalog& MeleeModels::catalog(casc::Storage& store) {
+    if (shared_catalog_) return *shared_catalog_;
     if (!catalog_ready_) {
         catalog_ = std::make_unique<data::Catalog>();
         try {
@@ -322,10 +326,36 @@ void MeleeModels::resolve_one(casc::Storage& store, const std::string& token) {
     }
     if (models_.count(token)) return;
 
-    std::vector<std::string> candidates;
     bool story = false;
+    std::string model_id;
+    const std::vector<std::string> candidates = unit_candidates(store, token, story, model_id);
+    data::Catalog& ucat = unit_catalog(store, token, story);
+
+    formats::Model model;
+    if (render::TextureDecodePool* pool = render::TextureDecodePool::existing())
+        if (std::optional<render::DecodedTexture> d = pool->take("m3tok:" + token); d && d->ok && d->model) {
+            model = std::move(*d->model);
+            if (story) bind_story_textures(store, model);
+            graft_required_anims(store, ucat, model_id, model, story);
+            models_.emplace(token, std::move(model));
+            return;
+        }
+    for (const std::string& name : candidates) {
+        if (try_decode(store, name, model)) {
+            if (story) bind_story_textures(store, model);
+            graft_required_anims(store, ucat, model_id, model, story);
+            models_.emplace(token, std::move(model));
+            break;
+        }
+    }
+}
+
+std::vector<std::string> MeleeModels::unit_candidates(casc::Storage& store, const std::string& token, bool& story, std::string& model_id) {
+    std::vector<std::string> candidates;
+    story = false;
     data::Catalog& ucat = unit_catalog(store, token, story);
     const UnitModelSource src = unit_model_source(store, ucat, token, story);
+    model_id = src.model_id;
     const auto push_rel = [&](const std::string& rel) {
         for (const char* root : kAssetRoots) candidates.push_back(std::string(root) + rel);
         if (story)
@@ -341,16 +371,59 @@ void MeleeModels::resolve_one(casc::Storage& store, const std::string& token) {
                 candidates.push_back(std::string(root) + suffix);
         }
     }
+    return candidates;
+}
 
-    formats::Model model;
-    for (const std::string& name : candidates) {
-        if (try_decode(store, name, model)) {
-            if (story) bind_story_textures(store, model);
-            graft_required_anims(store, ucat, src.model_id, model, story);
-            models_.emplace(token, std::move(model));
-            break;
+bool MeleeModels::prefetch(casc::Storage& store, const std::string& token) {
+    if (token.empty() || models_.count(token) || std::getenv("SC2_MODEL_DECODE_SYNC")) return true;
+    render::TextureDecodePool& pool = render::TextureDecodePool::instance();
+    const std::string key = "m3tok:" + token;
+    if (pool.ready(key)) return true;
+    if (pool.has(key)) return false;
+    bool story = false;
+    std::string model_id;
+    std::vector<std::string> cands = unit_candidates(store, token, story, model_id);
+    casc::Storage* st = &store;
+    pool.request(key, [st, cands] {
+        render::DecodedTexture d;
+        formats::Model m;
+        for (const std::string& name : cands)
+            if (try_decode(*st, name, m)) {
+                d.model = std::make_shared<formats::Model>(std::move(m));
+                d.ok = true;
+                break;
+            }
+        return d;
+    });
+    return false;
+}
+
+std::size_t MeleeModels::memory_bytes(std::size_t* count) const {
+    auto vb = [](const auto& v) { return v.capacity() * sizeof(v[0]); };
+    auto model_bytes = [&](const formats::Model& m) {
+        std::size_t b = vb(m.positions) + vb(m.uvs) + vb(m.uvs1) + vb(m.vertex_colors) + vb(m.indices) + vb(m.regions) +
+                        vb(m.materials) + vb(m.inverse_bind) + vb(m.vertex_bone_weights) + vb(m.vertex_bone_indices) +
+                        vb(m.normals) + vb(m.tangents) + vb(m.normals_w) + vb(m.bones) + vb(m.sequences) + vb(m.attachments) +
+                        vb(m.particles) + vb(m.splat_weights) + vb(m.vertex_shade) + vb(m.vertex_ao) + vb(m.splat_height);
+        for (const formats::M3Material& mat : m.materials)
+            for (const formats::M3Layer& l : mat.layers) b += l.inline_rgba.capacity() + l.raw_record.capacity();
+        for (const auto& s : m.splat_layers) b += s.rgba.capacity();
+        for (const auto& s : m.splat_normals) b += s.rgba.capacity();
+        for (const formats::M3STC& s : m.stc) {
+            b += vb(s.anim_ids) + vb(s.anim_refs);
+            for (const std::vector<formats::M3Track>& slot : s.sd)
+                for (const formats::M3Track& t : slot) b += vb(t.keys) + vb(t.values) + vb(t.events);
         }
-    }
+        return b;
+    };
+    std::size_t n = 0, b = 0;
+    for (const auto* mp : {&models_, &doodads_, &carries_, &missiles_, &impacts_, &launches_, &burn_models_, &deaths_, &splats_, &actor_splats_})
+        for (const auto& kv : *mp) { ++n; b += model_bytes(kv.second); }
+    for (const auto& kv : beams_) { ++n; b += model_bytes(kv.second.model); }
+    for (const auto& kv : scaffolds_) { ++n; b += model_bytes(kv.second.model); }
+    for (const auto& kv : portraits_) { ++n; b += model_bytes(kv.second.model); }
+    if (count) *count = n;
+    return b;
 }
 
 void MeleeModels::load(casc::Storage& store) {
@@ -515,6 +588,65 @@ const MeleeModels::Portrait* MeleeModels::portrait(casc::Storage& store, const s
     if (auto it = portraits_.find(unit_id); it != portraits_.end()) return it->second.ok ? &it->second : nullptr;
     Portrait p;
     data::Catalog& cat = catalog(store);
+    std::string src_id, src_rel;
+    if (!std::getenv("SC2_MODEL_DECODE_SYNC") && portrait_source(store, unit_id, src_id, src_rel)) {
+        const std::string& expand_id = src_id;
+        const std::string& rel = src_rel;
+        render::DecodedTexture pre;
+        if (render::TextureDecodePool* pool = render::TextureDecodePool::existing())
+            if (std::optional<render::DecodedTexture> d = pool->take("m3por:" + unit_id); d && d->ok && d->m3 && d->model) pre = std::move(*d);
+        int ri = -1;
+        for (const char* root : kAssetRoots) {
+            ++ri;
+            if (pre.ok && ri < pre.pick) continue;
+            try {
+                formats::M3 parsed = pre.ok && ri == pre.pick ? std::move(*pre.m3) : formats::M3::parse(store.read_by_name(std::string(root) + rel));
+                if (const formats::M3Section* cam = parsed.section_by_tag("CAM_")) {
+                    if (cam->count > 0 && std::size_t(cam->offset) + 72 <= parsed.data.size()) {
+                        std::uint32_t bone = 0;
+                        float f = 0.0f, zf = 0.0f, zn = 0.0f;
+                        std::memcpy(&bone, &parsed.data[cam->offset], 4);
+                        std::memcpy(&f, &parsed.data[cam->offset + 24], 4);
+                        std::memcpy(&zf, &parsed.data[cam->offset + 48], 4);
+                        std::memcpy(&zn, &parsed.data[cam->offset + 68], 4);
+                        if (f > 0.01f && f < 3.14f) p.fov_rad = f;
+                        if (zn > 0.0f && zf > zn) {
+                            p.znear = zn;
+                            p.zfar = zf;
+                        }
+                        p.cam_bone = int(bone);
+                        if (cam->version == 3 && std::size_t(cam->offset) + 172 <= parsed.data.size()) {
+                            float fd = 0.0f, fs = 0.0f, fe2 = 0.0f, da = 0.0f;
+                            std::memcpy(&fd, &parsed.data[cam->offset + 108], 4);
+                            std::memcpy(&fs, &parsed.data[cam->offset + 128], 4);
+                            std::memcpy(&fe2, &parsed.data[cam->offset + 148], 4);
+                            std::memcpy(&da, &parsed.data[cam->offset + 168], 4);
+                            if (fd > 0.0f && fd < 1000.0f && fs >= 0.0f && fe2 > fs && fe2 < 1000.0f && da > 0.0f && da <= 16.0f) {
+                                p.dof_focus = fd;
+                                p.dof_start = fs;
+                                p.dof_end = fe2;
+                                p.dof_amount = da;
+                            }
+                        }
+                    }
+                }
+                p.model = pre.ok && ri == pre.pick ? std::move(*pre.model) : parsed.decode_model();
+                if (p.model.vertex_count) {
+                    p.path = std::string(root) + rel;
+                    p.ok = true;
+                    if (cat.find("CLight", expand_id)) {
+                        p.light = data::resolve_environment_light(cat, expand_id);
+                        p.light.params["ExposureAsAuthored"] = 1.0;
+                    }
+                    break;
+                }
+            } catch (const std::exception&) {
+            }
+        }
+        Portrait& slot = portraits_[unit_id];
+        slot = std::move(p);
+        return slot.ok ? &slot : nullptr;
+    }
     std::optional<std::string> pm = cat.scalar("CActorUnit", unit_id, "PortraitModel");
     if (!pm || pm->empty()) pm = unit_id + "Portrait";
     for (std::size_t at; (at = pm->find("##unitName##")) != std::string::npos;) pm->replace(at, 12, unit_id);
@@ -582,6 +714,62 @@ const MeleeModels::Portrait* MeleeModels::portrait(casc::Storage& store, const s
     Portrait& slot = portraits_[unit_id];
     slot = std::move(p);
     return slot.ok ? &slot : nullptr;
+}
+
+bool MeleeModels::portrait_source(casc::Storage& store, const std::string& unit_id, std::string& expand_id, std::string& rel) {
+    data::Catalog& cat = catalog(store);
+    std::optional<std::string> pm = cat.scalar("CActorUnit", unit_id, "PortraitModel");
+    if (!pm || pm->empty()) pm = unit_id + "Portrait";
+    for (std::size_t at; (at = pm->find("##unitName##")) != std::string::npos;) pm->replace(at, 12, unit_id);
+    expand_id = *pm;
+    for (int depth = 0; depth < 16; ++depth) {
+        const data::Catalog::Entry* e = cat.find("CModel", expand_id);
+        if (!e || e->parent.empty()) break;
+        bool own_model = false;
+        for (const core::XmlNode& n : e->own)
+            if (n.name == "Model") { own_model = true; break; }
+        const data::Catalog::Entry* pe = cat.find("CModel", e->parent);
+        if (own_model || !pe || pe->is_default) break;
+        expand_id = e->parent;
+    }
+    auto path = cat.scalar("CModel", expand_id, "Model");
+    if (!path) return false;
+    rel = cat.expand_entry_tokens("CModel", expand_id, *path);
+    for (char& c : rel)
+        if (c == '\\') c = '/';
+    return true;
+}
+
+bool MeleeModels::prefetch_portrait(casc::Storage& store, const std::string& unit_id) {
+    if (unit_id.empty() || portraits_.count(unit_id) || std::getenv("SC2_MODEL_DECODE_SYNC")) return true;
+    render::TextureDecodePool& pool = render::TextureDecodePool::instance();
+    const std::string key = "m3por:" + unit_id;
+    if (pool.ready(key)) return true;
+    if (pool.has(key)) return false;
+    std::string expand_id, rel;
+    if (!portrait_source(store, unit_id, expand_id, rel)) return true;
+    casc::Storage* st = &store;
+    pool.request(key, [st, rel] {
+        render::DecodedTexture d;
+        int ri = -1;
+        for (const char* root : kAssetRoots) {
+            ++ri;
+            try {
+                auto m3 = std::make_shared<formats::M3>(formats::M3::parse(st->read_by_name(std::string(root) + rel)));
+                auto model = std::make_shared<formats::Model>(m3->decode_model());
+                if (model->vertex_count) {
+                    d.m3 = std::move(m3);
+                    d.model = std::move(model);
+                    d.pick = ri;
+                    d.ok = true;
+                    break;
+                }
+            } catch (const std::exception&) {
+            }
+        }
+        return d;
+    });
+    return false;
 }
 
 const formats::Model* MeleeModels::unit_splat(casc::Storage& store, const std::string& unit_id) {
@@ -867,6 +1055,7 @@ const formats::Model* MeleeModels::cmodel(casc::Storage& store, const std::strin
         formats::Model model;
         if (auto path = catalog(store).scalar("CModel", cmodel_id, "Model")) {
             std::string rel = *path;
+            if (rel.find("##") != std::string::npos) rel = catalog(store).expand_entry_tokens("CModel", cmodel_id, rel);
             for (char& c : rel)
                 if (c == '\\') c = '/';
             for (const char* root : kAssetRoots)
@@ -886,7 +1075,7 @@ const std::vector<MeleeModels::BurnState>& MeleeModels::burn_states(casc::Storag
     const std::string create_row = "UnitCreation." + unit_id;
     for (const std::string& mon : cat.ids("CActorStateMonitor")) {
         bool mine = false;
-        const std::vector<core::XmlNode>& rows = cat.resolved("CActorStateMonitor", mon);
+        const auto& rows = cat.resolved("CActorStateMonitor", mon);
         for (const core::XmlNode& n : rows)
             if (n.name == "On" && n.attr_or("Terms", "") == create_row && n.attr_or("Send", "") == "Create") mine = true;
         if (!mine) continue;

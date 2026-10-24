@@ -1,7 +1,10 @@
 #include "sc2/app/control.hpp"
 
 #include <algorithm>
+#include <array>
 #include <cmath>
+#include <cstdlib>
+#include <string>
 
 #include "sc2/sim/weapon.hpp"
 
@@ -78,6 +81,168 @@ Control::Control(const render::Mat4& mvp, uint32_t view_w, uint32_t view_h,
     invertible_ = invert4(mvp_.m, inv_mvp_.m);
 }
 
+bool invert_mat4(const render::Mat4& m, render::Mat4& out) { return invert4(m.m, out.m); }
+
+bool Control::view_ray(const ScreenPoint& p, float o[3], float d[3]) const {
+    if (!invertible_ || view_w_ == 0 || view_h_ == 0) return false;
+    const float ndc_x = (p.x / float(view_w_)) * 2.0f - 1.0f;
+    const float ndc_y = (p.y / float(view_h_)) * 2.0f - 1.0f;
+    float n[4], f[4];
+    transform_point(inv_mvp_.m, ndc_x, ndc_y, 0.0f, n);
+    transform_point(inv_mvp_.m, ndc_x, ndc_y, 1.0f, f);
+    if (std::fabs(n[3]) < 1e-12f || std::fabs(f[3]) < 1e-12f) return false;
+    for (int i = 0; i < 3; ++i) {
+        o[i] = n[i] / n[3];
+        d[i] = f[i] / f[3] - o[i];
+    }
+    return true;
+}
+
+static float capsule_t(const float lo[3], const float ld[3], float r, float h);
+
+float ray_volume_t(const PickVolume& v, const float o[3], const float d[3]) {
+    const auto& m = v.inv.m;
+    const float lo[3] = {m[0] * o[0] + m[4] * o[1] + m[8] * o[2] + m[12], m[1] * o[0] + m[5] * o[1] + m[9] * o[2] + m[13],
+                         m[2] * o[0] + m[6] * o[1] + m[10] * o[2] + m[14]};
+    const float ld[3] = {m[0] * d[0] + m[4] * d[1] + m[8] * d[2], m[1] * d[0] + m[5] * d[1] + m[9] * d[2],
+                         m[2] * d[0] + m[6] * d[1] + m[10] * d[2]};
+    auto sphere = [&](const float c[3], float r) -> float {
+        const float q[3] = {lo[0] - c[0], lo[1] - c[1], lo[2] - c[2]};
+        const float a = ld[0] * ld[0] + ld[1] * ld[1] + ld[2] * ld[2];
+        const float b = q[0] * ld[0] + q[1] * ld[1] + q[2] * ld[2];
+        const float cc = q[0] * q[0] + q[1] * q[1] + q[2] * q[2] - r * r;
+        const float disc = b * b - a * cc;
+        if (a <= 0.0f || disc < 0.0f) return -1.0f;
+        const float t = (-b - std::sqrt(disc)) / a;
+        return t >= 0.0f ? t : (cc <= 0.0f ? 0.0f : -1.0f);
+    };
+    if (v.shape == 0) {
+        float t0 = 0.0f, t1 = 1e30f;
+        for (int i = 0; i < 3; ++i) {
+            const float h = v.size[i];
+            if (std::fabs(ld[i]) < 1e-12f) {
+                if (lo[i] < -h || lo[i] > h) return -1.0f;
+                continue;
+            }
+            float a = (-h - lo[i]) / ld[i], b = (h - lo[i]) / ld[i];
+            if (a > b) std::swap(a, b);
+            t0 = std::max(t0, a);
+            t1 = std::min(t1, b);
+            if (t0 > t1) return -1.0f;
+        }
+        return t0;
+    }
+    const float r = v.size[0];
+    if (v.shape == 1) {
+        const float c[3] = {0, 0, 0};
+        return sphere(c, r);
+    }
+    float h = 0.5f * v.size[1];
+    static const char* cap = std::getenv("SC2_659_CAPSULE");
+    if (cap && cap[0] == 'h') h = v.size[1];
+    float lo_c[3] = {lo[0], lo[1], lo[2]}, ld_c[3] = {ld[0], ld[1], ld[2]};
+    if (cap && (cap[0] == 'x' || cap[0] == 'y')) {
+        const int a = cap[0] == 'x' ? 0 : 1;
+        std::swap(lo_c[a], lo_c[2]);
+        std::swap(ld_c[a], ld_c[2]);
+    }
+    return capsule_t(lo_c, ld_c, r, h);
+}
+
+static float capsule_t(const float lo[3], const float ld[3], float r, float h) {
+    auto sphere = [&](const float c[3]) -> float {
+        const float q[3] = {lo[0] - c[0], lo[1] - c[1], lo[2] - c[2]};
+        const float a = ld[0] * ld[0] + ld[1] * ld[1] + ld[2] * ld[2];
+        const float b = q[0] * ld[0] + q[1] * ld[1] + q[2] * ld[2];
+        const float cc = q[0] * q[0] + q[1] * q[1] + q[2] * q[2] - r * r;
+        const float disc = b * b - a * cc;
+        if (a <= 0.0f || disc < 0.0f) return -1.0f;
+        const float t = (-b - std::sqrt(disc)) / a;
+        return t >= 0.0f ? t : (cc <= 0.0f ? 0.0f : -1.0f);
+    };
+    float best = -1.0f;
+    const float a = ld[0] * ld[0] + ld[1] * ld[1];
+    if (a > 1e-12f) {
+        const float b = lo[0] * ld[0] + lo[1] * ld[1];
+        const float c = lo[0] * lo[0] + lo[1] * lo[1] - r * r;
+        const float disc = b * b - a * c;
+        if (disc >= 0.0f) {
+            float t = (-b - std::sqrt(disc)) / a;
+            if (t < 0.0f && c <= 0.0f) t = 0.0f;
+            const float z = lo[2] + t * ld[2];
+            if (t >= 0.0f && z >= -h && z <= h) best = t;
+        }
+    }
+    for (int s = -1; s <= 1; s += 2) {
+        const float c[3] = {0, 0, float(s) * h};
+        const float t = sphere(c);
+        if (t >= 0.0f && (best < 0.0f || t < best)) best = t;
+    }
+    return best;
+}
+
+std::vector<Control::RayHit> Control::ray_hits(const sim::World& world, const ScreenPoint& p) const {
+    std::vector<RayHit> out;
+    float o[3], d[3];
+    if (!volumes_ || !view_ray(p, o, d)) return out;
+    std::vector<PickVolume> vols;
+    for (const sim::Unit& u : world.units()) {
+        if (!u.alive || u.unselectable || u.loaded || u.in_gas_structure) continue;
+        if (!volumes_->may_hit(u.id, o, d)) continue;
+        vols.clear();
+        if (!volumes_->volumes(u.id, vols)) continue;
+        RayHit h;
+        h.id = u.id;
+        bool any = false;
+        for (const PickVolume& v : vols) {
+            const float t = ray_volume_t(v, o, d);
+            if (t < 0.0f) continue;
+            if (!any || t < h.t) h.t = t;
+            any = true;
+            if (v.tight && (!h.tight || t < h.tight_t)) {
+                h.tight = true;
+                h.tight_t = t;
+            }
+            if (!v.tight && (!h.fuzzy || t < h.fuzzy_t)) {
+                h.fuzzy = true;
+                h.fuzzy_t = t;
+            }
+        }
+        if (any) out.push_back(h);
+    }
+    return out;
+}
+
+std::uint32_t Control::click_pick(const sim::World& world, const ScreenPoint& p, ClickRule rule) const {
+    std::uint32_t best = kNoTarget;
+    float best_t = 0.0f;
+    int best_rank = 0;
+    for (const RayHit& h : ray_hits(world, p)) {
+        const sim::Unit& u = world.units()[h.id];
+        if (u.player != player_ && (u.cloaked || u.burrowed) && !world.revealed_to(player_, u.id)) continue;
+        int rank = 0;
+        float t = h.t;
+        if (rule == ClickRule::TightFirst) {
+            rank = h.tight ? 0 : 1;
+            if (h.tight) t = h.tight_t;
+        } else if (rule == ClickRule::OwnFirst) {
+            rank = u.player == player_ ? 0 : 1;
+        } else if (rule == ClickRule::TightOnly) {
+            if (!h.tight) continue;
+            t = h.tight_t;
+        } else if (rule == ClickRule::FuzzyOnly) {
+            if (!h.fuzzy) continue;
+            t = h.fuzzy_t;
+        }
+        if (best == kNoTarget || rank < best_rank || (rank == best_rank && t < best_t)) {
+            best = h.id;
+            best_t = t;
+            best_rank = rank;
+        }
+    }
+    return best;
+}
+
 bool Control::project(float x, float y, float z, float& px, float& py) const {
     const auto& m = mvp_.m;
     float cx = m[0] * x + m[4] * y + m[8] * z + m[12];
@@ -89,8 +254,143 @@ bool Control::project(float x, float y, float z, float& px, float& py) const {
     return true;
 }
 
+bool Control::volume_screen_rect(std::uint32_t id, ScreenRect& r, int which) const {
+    if (!volumes_) return false;
+    std::vector<PickVolume> vols;
+    if (!volumes_->volumes(id, vols) || vols.empty()) return false;
+    if (which == 1 && std::none_of(vols.begin(), vols.end(), [](const PickVolume& v) { return v.tight; })) which = 0;
+    static const std::vector<std::array<float, 3>> dirs = [] {
+        std::vector<std::array<float, 3>> d;
+        d.push_back({0.0f, 0.0f, 1.0f});
+        d.push_back({0.0f, 0.0f, -1.0f});
+        for (int a = 1; a <= 8; ++a) {
+            const float th = 3.14159265f * float(a) / 9.0f;
+            for (int b = 0; b < 16; ++b) {
+                const float ph = 6.28318531f * float(b) / 16.0f;
+                d.push_back({std::sin(th) * std::cos(ph), std::sin(th) * std::sin(ph), std::cos(th)});
+            }
+        }
+        return d;
+    }();
+    bool any = false;
+    float x0 = 0, y0 = 0, x1 = 0, y1 = 0;
+    for (const PickVolume& v : vols) {
+        if ((which == 1 && !v.tight) || (which == 2 && v.tight)) continue;
+        render::Mat4 fwd;
+        if (!invert_mat4(v.inv, fwd)) continue;
+        const auto& m = fwd.m;
+        auto put = [&](float lx, float ly, float lz) {
+            const float wx = m[0] * lx + m[4] * ly + m[8] * lz + m[12];
+            const float wy = m[1] * lx + m[5] * ly + m[9] * lz + m[13];
+            const float wz = m[2] * lx + m[6] * ly + m[10] * lz + m[14];
+            float px, py;
+            if (!project(wx, wy, wz, px, py)) return;
+            if (!any) {
+                x0 = x1 = px;
+                y0 = y1 = py;
+                any = true;
+            } else {
+                x0 = std::min(x0, px); x1 = std::max(x1, px);
+                y0 = std::min(y0, py); y1 = std::max(y1, py);
+            }
+        };
+        if (v.shape == 0) {
+            for (int c = 0; c < 8; ++c)
+                put(c & 1 ? v.size[0] : -v.size[0], c & 2 ? v.size[1] : -v.size[1], c & 4 ? v.size[2] : -v.size[2]);
+            continue;
+        }
+        const float rad = v.size[0];
+        const float h = v.shape == 2 ? 0.5f * v.size[1] : 0.0f;
+        for (int e = (v.shape == 2 ? -1 : 0); e <= (v.shape == 2 ? 1 : 0); e += 2) {
+            const float cz = float(e) * h;
+            for (const auto& d : dirs) put(d[0] * rad, d[1] * rad, cz + d[2] * rad);
+            if (v.shape != 2) break;
+        }
+    }
+    if (!any) return false;
+    r = ScreenRect{x0, y0, x1, y1};
+    return true;
+}
+
+std::vector<uint32_t> Control::box_select_672(const sim::World& world, const ScreenRect& rect) const {
+    const float minx = std::min(rect.x0, rect.x1), maxx = std::max(rect.x0, rect.x1);
+    const float miny = std::min(rect.y0, rect.y1), maxy = std::max(rect.y0, rect.y1);
+    struct Foreign {
+        std::uint32_t id;
+        bool structure;
+        int rank;
+        float cx;
+    };
+    std::vector<std::uint32_t> own_units, own_structs;
+    std::vector<Foreign> foreign;
+    auto rank_of = [&](const sim::Unit& u) { return box_rules_.rank ? box_rules_.rank(u) : 0; };
+    for (const sim::Unit& u : world.units()) {
+        if (!u.alive || u.unselectable || u.in_gas_structure) continue;
+        if (u.loaded && world.cargo_hidden()) continue;
+        const bool own = u.player == player_;
+        if (!own && (u.cloaked || u.burrowed) && !world.revealed_to(player_, u.id)) continue;
+        const float ux = float(u.x.to_double()), uy = float(u.y.to_double());
+        const float fz = ground_z(ux, uy);
+        float fx, fy;
+        if (!project(ux, uy, fz, fx, fy)) continue;
+        if (fx < minx - 400.0f || fx > maxx + 400.0f || fy < miny - 400.0f || fy > maxy + 600.0f) continue;
+        ScreenRect br;
+        static const char* vw = std::getenv("SC2_672_BOX_VOLUMES");
+        if (!volume_screen_rect(u.id, br, vw ? std::atoi(vw) : 1)) {
+            if (u.player < 0) continue;
+            br = ScreenRect{fx, fy, fx, fy};
+            float tx, ty;
+            if (project(ux, uy, fz + float(u.radius.to_double()) * kSelectHeightPerRadius, tx, ty))
+                br = ScreenRect{std::min(fx, tx), std::min(fy, ty), std::max(fx, tx), std::max(fy, ty)};
+        }
+        if (!(br.x1 >= minx && br.x0 <= maxx && br.y1 >= miny && br.y0 <= maxy)) continue;
+        const bool structure = (u.attributes & sim::kAttrStructure) != 0;
+        if (own) {
+            (structure ? own_structs : own_units).push_back(u.id);
+        } else {
+            foreign.push_back({u.id, structure, rank_of(u), 0.5f * (br.x0 + br.x1)});
+        }
+    }
+    auto capped = [](std::vector<std::uint32_t> v) {
+        if (v.size() > kSelectionCap) v.resize(kSelectionCap);
+        return v;
+    };
+    if (!own_units.empty()) return capped(std::move(own_units));
+    if (!own_structs.empty()) {
+        std::uint32_t lead = own_structs[0];
+        int best = rank_of(world.units()[lead]);
+        for (std::uint32_t id : own_structs) {
+            const int r = rank_of(world.units()[id]);
+            if (r > best) {
+                best = r;
+                lead = id;
+            }
+        }
+        const std::string& type = world.units()[lead].catalog_id;
+        std::vector<std::uint32_t> same;
+        for (std::uint32_t id : own_structs)
+            if (world.units()[id].catalog_id == type) same.push_back(id);
+        return capped(std::move(same));
+    }
+    if (foreign.empty()) return {};
+    const Foreign* pick = &foreign[0];
+    for (const Foreign& f : foreign) {
+        if (f.structure != pick->structure) {
+            if (!f.structure) pick = &f;
+            continue;
+        }
+        if (f.rank != pick->rank) {
+            if (f.rank > pick->rank) pick = &f;
+            continue;
+        }
+        if (f.cx < pick->cx) pick = &f;
+    }
+    return {pick->id};
+}
+
 std::vector<uint32_t> Control::box_select(const sim::World& world, const ScreenRect& rect,
                                           bool marquee) const {
+    if (marquee && box_rules_.on) return box_select_672(world, rect);
     float minx = std::min(rect.x0, rect.x1), maxx = std::max(rect.x0, rect.x1);
     float miny = std::min(rect.y0, rect.y1), maxy = std::max(rect.y0, rect.y1);
 
@@ -101,6 +401,7 @@ std::vector<uint32_t> Control::box_select(const sim::World& world, const ScreenR
     const float cxr = 0.5f * (minx + maxx), cyr = 0.5f * (miny + maxy);
     for (const sim::Unit& u : world.units()) {
         if (!u.alive || u.unselectable) continue;
+        if (u.loaded && world.cargo_hidden()) continue;
         const bool own = u.player == player_;
         if (!own && u.player < 0) continue;
         const float ux = float(u.x.to_double()), uy = float(u.y.to_double());
@@ -234,6 +535,8 @@ uint32_t Control::pick_target(const sim::World& world, const ScreenPoint& p) con
     Fixed best_d2;
     for (const sim::Unit& u : world.units()) {
         if (!u.alive || u.player == player_ || u.resource_left > 0) continue;
+        if (u.loaded && world.cargo_hidden()) continue;
+        if (u.is_gas && u.player < 0 && world.gas_harvest_ordered()) continue;
         Fixed r = std::max(u.radius, pick_radius_);
         Fixed dx = u.x - gx, dy = u.y - gy;
         Fixed d2 = dx * dx + dy * dy;
@@ -253,6 +556,7 @@ uint32_t Control::pick_ally(const sim::World& world, const ScreenPoint& p) const
     Fixed best_d2;
     for (const sim::Unit& u : world.units()) {
         if (!u.alive || u.resource_left > 0 || !world.are_allied(u.player, player_)) continue;
+        if (u.loaded && world.cargo_hidden()) continue;
         const Fixed r = std::max(u.radius, pick_radius_);
         const Fixed dx = u.x - gx, dy = u.y - gy, d2 = dx * dx + dy * dy;
         if (d2 > r * r) continue;
@@ -269,6 +573,7 @@ uint32_t Control::pick_own(const sim::World& world, const ScreenPoint& p) const 
     Fixed best_d2;
     for (const sim::Unit& u : world.units()) {
         if (!u.alive || u.player != player_ || u.resource_left > 0 || u.unselectable) continue;
+        if (u.loaded && world.cargo_hidden()) continue;
         Fixed r = std::max(u.radius, pick_radius_);
         Fixed dx = u.x - gx, dy = u.y - gy;
         Fixed d2 = dx * dx + dy * dy;

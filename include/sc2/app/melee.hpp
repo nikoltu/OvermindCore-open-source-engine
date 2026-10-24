@@ -19,9 +19,21 @@ struct MeleePos {
     sim::Fixed x, y;
 };
 
+enum class Race;
+
+struct MeleeSlot {
+    enum class Controller { Human, AI, Closed };
+    Race race{};
+    Controller controller = Controller::AI;
+    int difficulty = 0;
+    int team = -1;
+};
+
 struct MeleePlayerSetup {
     MeleePos start;
+    int team = -1;
     sim::Unit town_hall;
+    bool no_town_hall = false;
     float town_hall_facing = kPlacedStructureFacing;
     sim::Unit worker;
     int worker_count = 0;
@@ -106,6 +118,7 @@ inline std::vector<std::pair<int, int>> low_tier_wave_ladder(int race_index, int
 
 struct MeleeSetup {
     std::vector<MeleePlayerSetup> players;
+    bool no_melee_end = false;
     std::vector<sim::Unit> neutrals;
     std::vector<float> neutral_facing;
     struct PlacedVariation {

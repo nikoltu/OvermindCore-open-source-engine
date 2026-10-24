@@ -25,6 +25,9 @@ struct WaterMaterial {
     float uv_rate[4] = {0.0f, 0.0f, 0.0f, 0.0f};
     float uv_rotate = 0.0f;
     bool receive_shadows = false;
+    float caustics_falloff = 0.0f;
+    float caustics_tiling[2] = {0.0f, 0.0f};
+    float caustics_fps = 0.0f;
 };
 
 namespace detail {
@@ -48,6 +51,9 @@ inline std::unordered_map<std::string, WaterMaterial> water_type_materials(casc:
                                                                            const std::vector<std::uint8_t>* map_xml = nullptr) {
     std::unordered_map<std::string, WaterMaterial> out;
     std::unordered_map<std::string, bool> receives;
+    float caus_tiling[2] = {0.0f, 0.0f}, caus_fps = 0.0f;
+    bool caus_tiling_set = false, caus_fps_set = false;
+    std::unordered_map<std::string, float> caus_falloff;
     static const char* kMods[] = {nullptr, "void", "swarm", "liberty", "core"};
     for (const char* m : kMods) {
         std::string xml;
@@ -62,6 +68,8 @@ inline std::unordered_map<std::string, WaterMaterial> water_type_materials(casc:
                 continue;
             }
         }
+        if (!caus_tiling_set) caus_tiling_set = detail::water_field(xml, 0, xml.size(), "CausticsTilingFreq", caus_tiling, 2);
+        if (!caus_fps_set) caus_fps_set = detail::water_field(xml, 0, xml.size(), "CausticsFPS", &caus_fps, 1);
         for (std::size_t rp = 0;;) {
             const std::size_t rtag = xml.find("<CWater id=\"", rp);
             if (rtag == std::string::npos) break;
@@ -72,6 +80,7 @@ inline std::unordered_map<std::string, WaterMaterial> water_type_materials(casc:
             if (rend == std::string::npos || (rnext != std::string::npos && rnext < rend)) rend = rnext == std::string::npos ? xml.size() : rnext;
             float rv[1];
             const std::string rid = xml.substr(rid0, rid1 - rid0);
+            if (!caus_falloff.count(rid) && detail::water_field(xml, rid1, rend, "CausticsFallOff", rv, 1)) caus_falloff[rid] = rv[0];
             if (!receives.count(rid) && detail::water_field(xml, rid1, rend, "ReceiveShadows", rv, 1)) receives[rid] = rv[0] != 0.0f;
             rp = rid1 + 1;
         }
@@ -110,6 +119,7 @@ inline std::unordered_map<std::string, WaterMaterial> water_type_materials(casc:
                 if (detail::water_field(xml, stateStart, stateEnd, "MeshRoughness", one, 1)) w.mesh_roughness = one[0];
                 detail::water_field(xml, stateStart, stateEnd, "UvRate", w.uv_rate, 4);
                 if (detail::water_field(xml, stateStart, stateEnd, "UvRotate", one, 1)) w.uv_rotate = one[0];
+                if (detail::water_field(xml, stateStart, stateEnd, "CausticsFallOff", one, 1)) w.caustics_falloff = one[0];
                 if (w.has) out.emplace(id, w);
             }
             pos = blockEnd + 9;
@@ -118,6 +128,13 @@ inline std::unordered_map<std::string, WaterMaterial> water_type_materials(casc:
     for (auto& kv : out) {
         const auto r = receives.find(kv.first);
         if (r != receives.end()) kv.second.receive_shadows = r->second;
+        if (kv.second.caustics_falloff <= 0.0f) {
+            const auto cf = caus_falloff.find(kv.first);
+            if (cf != caus_falloff.end()) kv.second.caustics_falloff = cf->second;
+        }
+        kv.second.caustics_tiling[0] = caus_tiling[0];
+        kv.second.caustics_tiling[1] = caus_tiling[1];
+        kv.second.caustics_fps = caus_fps;
     }
     return out;
 }

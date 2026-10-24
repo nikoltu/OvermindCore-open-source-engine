@@ -1,9 +1,33 @@
 #include "sc2/app/match_result.hpp"
 
+#include <cstdlib>
+
 namespace sc2::app {
+
+bool MatchResult::sole_player_rule() {
+    return std::getenv("SC2_MELEE_SOLE_PLAYER_WIN") != nullptr;
+}
+
+bool MatchResult::viewer_defeated(const sim::World& w, int human_player) {
+    return w.player(human_player).defeated || w.defeat_holders(human_player) == 0;
+}
 
 MatchResult::Outcome MatchResult::evaluate(const sim::World& w, int human_player, int stalemate_ticks) {
     if (stalemate_ticks > 0 && w.tick() - w.last_progress_tick() >= stalemate_ticks) return Outcome::Draw;
+    if (!sole_player_rule()) {
+        const int32_t viewer_key = w.alliance_key(human_player);
+        bool viewer_stands = false, other_stands = false;
+        for (const sim::Unit& u : w.units()) {
+            if (!u.alive || u.player < 0) continue;
+            if (w.defeat_rule_authored() && !u.prevent_defeat) continue;
+            if (w.player(u.player).defeated) continue;
+            if (w.alliance_key(u.player) == viewer_key) viewer_stands = true;
+            else other_stands = true;
+            if (viewer_stands && other_stands) return Outcome::Ongoing;
+        }
+        if (viewer_stands) return Outcome::Victory;
+        return other_stands ? Outcome::Defeat : Outcome::Ongoing;
+    }
     const int sole = w.winner();
     if (sole >= 0 && sole == human_player) return Outcome::Victory;
 

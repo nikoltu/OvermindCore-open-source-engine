@@ -1,5 +1,6 @@
 #include "sc2/casc/encoding.hpp"
 
+#include <algorithm>
 #include <stdexcept>
 #include <string>
 
@@ -15,6 +16,8 @@ static uint16_t rd_u16be(const uint8_t* p) {
 
 void Encoding::parse(const std::vector<uint8_t>& blob) {
     map_.clear();
+    sorted_.clear();
+    const bool old = casc_index_maps_old();
     const uint8_t* b = blob.data();
     const size_t n = blob.size();
     if (n < 22 || b[0] != 'E' || b[1] != 'N')
@@ -29,7 +32,8 @@ void Encoding::parse(const std::vector<uint8_t>& blob) {
     if (page == 0 || pages_off + size_t(ckey_page_count) * page > n)
         throw std::runtime_error("encoding: table out of range");
 
-    map_.reserve(size_t(ckey_page_count) * 8);
+    if (old) map_.reserve(size_t(ckey_page_count) * 8);
+    else sorted_.reserve(size_t(ckey_page_count) * 8);
     for (uint32_t pg = 0; pg < ckey_page_count; ++pg) {
         size_t p = pages_off + size_t(pg) * page;
         const size_t end = p + page;
@@ -42,15 +46,25 @@ void Encoding::parse(const std::vector<uint8_t>& blob) {
             for (int i = 0; i < 16; ++i) ck[i] = b[p + 6 + i];
             EKey ek;
             for (int i = 0; i < 16; ++i) ek[i] = b[p + 22 + i];
-            map_.emplace(ck, ek);
+            if (old) map_.emplace(ck, ek);
+            else sorted_.emplace_back(ck, ek);
             p += 22 + size_t(kc) * 16;
         }
+    }
+    if (!old) {
+        std::stable_sort(sorted_.begin(), sorted_.end(), [](const auto& a, const auto& b) { return a.first < b.first; });
+        sorted_.erase(std::unique(sorted_.begin(), sorted_.end(), [](const auto& a, const auto& b) { return a.first == b.first; }), sorted_.end());
+        sorted_.shrink_to_fit();
     }
 }
 
 const EKey* Encoding::find(const CKey& ckey) const {
-    auto it = map_.find(ckey);
-    return it == map_.end() ? nullptr : &it->second;
+    if (!map_.empty()) {
+        auto it = map_.find(ckey);
+        return it == map_.end() ? nullptr : &it->second;
+    }
+    auto it = std::lower_bound(sorted_.begin(), sorted_.end(), ckey, [](const auto& e, const CKey& k) { return e.first < k; });
+    return it != sorted_.end() && it->first == ckey ? &it->second : nullptr;
 }
 
 CKey Encoding::key_from_hex(const std::string& hex) {

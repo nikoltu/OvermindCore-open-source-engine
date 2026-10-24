@@ -1,5 +1,6 @@
 #include "sc2/casc/storage.hpp"
 
+#include <algorithm>
 #include <cctype>
 #include <cstdio>
 #include <cstring>
@@ -135,6 +136,7 @@ std::string to_lower(std::string s) {
 }
 
 void Storage::set_overlay(std::unordered_map<std::string, std::vector<uint8_t>> files) {
+    std::lock_guard<std::mutex> lk(names_lock_.m);
     overlay_ = std::move(files);
     if (std::getenv("SC2_MAP_ASSETS_TRACE")) std::fprintf(stderr, "[mapassets] overlay set, %zu files\n", overlay_.size());
     overlay_names_.clear();
@@ -155,6 +157,11 @@ const std::vector<uint8_t>* Storage::overlay_find(const std::string& path, std::
 }
 
 const std::string* Storage::resolve_name_ci(const std::string& path) const {
+    std::lock_guard<std::mutex> lk(names_lock_.m);
+    return resolve_name_ci_locked(path);
+}
+
+const std::string* Storage::resolve_name_ci_locked(const std::string& path) const {
     {
         std::string key;
         if (overlay_find(path, &key)) {
@@ -163,6 +170,23 @@ const std::string* Storage::resolve_name_ci(const std::string& path) const {
         }
     }
     if (!has_mndx_) return nullptr;
+    if (!casc_index_maps_old()) {
+        if (!ci_built_) {
+            ci_hash_.resize(mndx_.size());
+            std::size_t i = 0;
+            for (const auto& entry : mndx_.enumerate()) ci_hash_[i] = {fnv1a64(to_lower(entry.first)), std::uint32_t(i)}, ++i;
+            std::stable_sort(ci_hash_.begin(), ci_hash_.end(), [](const auto& a, const auto& b) { return a.first < b.first; });
+            ci_built_ = true;
+        }
+        const std::string lp = to_lower(path);
+        const std::uint64_t h = fnv1a64(lp);
+        auto it = std::lower_bound(ci_hash_.begin(), ci_hash_.end(), h, [](const auto& e, std::uint64_t k) { return e.first < k; });
+        for (; it != ci_hash_.end() && it->first == h; ++it) {
+            std::string canon = mndx_.name(it->second);
+            if (to_lower(canon) == lp) return &ci_hits_.emplace(it->second, std::move(canon)).first->second;
+        }
+        return nullptr;
+    }
     if (!ci_built_) {
         for (const auto& entry : mndx_.enumerate())
             ci_names_.emplace(to_lower(entry.first), entry.first);
@@ -172,21 +196,39 @@ const std::string* Storage::resolve_name_ci(const std::string& path) const {
     return it == ci_names_.end() ? nullptr : &it->second;
 }
 
+std::size_t Storage::memory_bytes(std::size_t* idx, std::size_t* enc, std::size_t* names, std::size_t* ci) const {
+    const std::size_t a = idx_.memory_bytes(), b = encoding_.memory_bytes(), c = mndx_.memory_bytes();
+    std::lock_guard<std::mutex> lk(names_lock_.m);
+    std::size_t d = ci_hash_.capacity() * sizeof(ci_hash_[0]);
+    for (const auto& kv : ci_names_) d += 64 + kv.first.capacity() + kv.second.capacity();
+    for (const auto& kv : ci_hits_) d += 64 + kv.second.capacity();
+    if (idx) *idx = a;
+    if (enc) *enc = b;
+    if (names) *names = c;
+    if (ci) *ci = d;
+    return a + b + c + d;
+}
+
 std::vector<uint8_t> Storage::read_by_name(const std::string& path) const {
-    if (const std::vector<uint8_t>* ov = overlay_find(path)) {
-        if (std::getenv("SC2_MAP_ASSETS_TRACE")) std::fprintf(stderr, "[mapassets] read %s from the map\n", path.c_str());
-        return *ov;
+    CKey key{};
+    {
+        std::lock_guard<std::mutex> lk(names_lock_.m);
+        if (const std::vector<uint8_t>* ov = overlay_find(path)) {
+            if (std::getenv("SC2_MAP_ASSETS_TRACE")) std::fprintf(stderr, "[mapassets] read %s from the map\n", path.c_str());
+            return *ov;
+        }
+        if (std::getenv("SC2_MAP_ASSETS_TRACE") && to_lower(path).find(".m3") != std::string::npos)
+            std::fprintf(stderr, "[mapassets] read %s from the stores\n", path.c_str());
+        if (!has_mndx_) throw std::runtime_error("storage: MNDX names not loaded");
+        const CKey* ck = mndx_.resolve(path);
+        if (!ck) {
+            if (const std::string* canon = resolve_name_ci_locked(path))
+                ck = mndx_.resolve(*canon);
+        }
+        if (!ck) throw std::runtime_error("storage: name not in MNDX root");
+        key = *ck;
     }
-    if (std::getenv("SC2_MAP_ASSETS_TRACE") && to_lower(path).find(".m3") != std::string::npos)
-        std::fprintf(stderr, "[mapassets] read %s from the stores\n", path.c_str());
-    if (!has_mndx_) throw std::runtime_error("storage: MNDX names not loaded");
-    const CKey* ck = mndx_.resolve(path);
-    if (!ck) {
-        if (const std::string* canon = resolve_name_ci(path))
-            ck = mndx_.resolve(*canon);
-    }
-    if (!ck) throw std::runtime_error("storage: name not in MNDX root");
-    return read_by_ckey(*ck);
+    return read_by_ckey(key);
 }
 
 std::vector<uint8_t> Storage::read_root() const {

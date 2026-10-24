@@ -109,6 +109,7 @@ void Catalog::ingest(const std::vector<uint8_t>& xml) {
         }
     }
     resolved_cache_.clear();
+    resolved_copies_.clear();
 }
 
 const std::vector<core::XmlNode>& Catalog::singleton_fields(const std::string& family) const {
@@ -164,29 +165,54 @@ std::vector<std::string> Catalog::ids(const std::string& family) const {
     return oit->second;
 }
 
-const std::vector<XmlNode>& Catalog::resolved(const std::string& family,
-                                              const std::string& id) const {
-    const std::vector<XmlNode>& r = resolve_chain(family, id);
+const core::XmlNodeList& Catalog::resolved(const std::string& family, const std::string& id) const {
+    const core::XmlNodeList& r = resolve_chain(family, id);
     if (field_touch_log_)
         for (const XmlNode& c : r) field_touch_log_->emplace(family, c.name);
     return r;
 }
 
-const std::vector<XmlNode>& Catalog::resolve_chain(const std::string& family, const std::string& id) const {
+std::size_t Catalog::memory_bytes(std::size_t* entries, std::size_t* resolved_cache) const {
+    std::size_t e = 0, r = 0;
+    for (const auto& fam : families_)
+        for (const auto& kv : fam.second) {
+            e += sizeof(Entry) + 64 + kv.second.own.capacity() * sizeof(XmlNode);
+            for (const XmlNode& n : kv.second.own) e += core::xml_node_heap_bytes(n);
+        }
+    for (const auto* m : {&singletons_, &tag_defaults_, &tag_default_indexed_})
+        for (const auto& kv : *m)
+            for (const XmlNode& n : kv.second) e += sizeof(XmlNode) + core::xml_node_heap_bytes(n);
+    for (const auto& kv : resolved_cache_) r += 64 + kv.first.capacity() + kv.second.memory_bytes();
+    for (const auto& kv : resolved_copies_)
+        for (const XmlNode& n : kv.second) r += sizeof(XmlNode) + core::xml_node_heap_bytes(n);
+    if (entries) *entries = e;
+    if (resolved_cache) *resolved_cache = r;
+    return e + r;
+}
+
+const core::XmlNodeList& Catalog::resolve_chain(const std::string& family, const std::string& id) const {
     std::string key = family + "\x1f" + id;
     auto cit = resolved_cache_.find(key);
     if (cit != resolved_cache_.end()) return cit->second;
+    static const bool kCopies = std::getenv("SC2_CATALOG_RESOLVED_COPIES") != nullptr;
 
-    std::vector<XmlNode> out;
+    core::XmlNodeList out;
+    std::vector<XmlNode> copies;
     const Entry* e = find(family, id);
     if (e) {
-        resolved_cache_.emplace(key, std::vector<XmlNode>{});
+        resolved_cache_.emplace(key, core::XmlNodeList{});
         if (!e->parent.empty() && e->parent != id) {
             const std::string& pf = find(family, e->parent) ? family : sibling_actor_family(family, e->parent);
             const auto& base = resolve_chain(pf, e->parent);
-            out.insert(out.end(), base.begin(), base.end());
+            if (kCopies) for (const XmlNode& n : base) copies.push_back(n);
+            else out.append(base);
         }
-        out.insert(out.end(), e->own.begin(), e->own.end());
+        if (kCopies) copies.insert(copies.end(), e->own.begin(), e->own.end());
+        else for (const XmlNode& n : e->own) out.push_back(&n);
+    }
+    if (kCopies) {
+        std::vector<XmlNode>& held = resolved_copies_[key] = std::move(copies);
+        for (const XmlNode& n : held) out.push_back(&n);
     }
     return resolved_cache_[key] = std::move(out);
 }
@@ -267,15 +293,19 @@ std::vector<Catalog::NodeSlot> Catalog::resolve_node_slots(const std::string& fa
     long counter = 0;
     long next_append = 0;
     long cur_decl = -1;
+    std::vector<long> decl_index_keys;
+    static const bool kPlainOverIndex = std::getenv("SC2_ARRAY_PLAIN_OVER_INDEX") != nullptr;
     for (size_t k = 0; k < e->own.size(); ++k) {
         if (e->own[k].name != field) {
             if (k < e->own_decl.size() && long(e->own_decl[k]) != cur_decl) {
                 cur_decl = long(e->own_decl[k]); counter = next_append;
+                decl_index_keys.clear();
             }
             continue;
         }
         if (k < e->own_decl.size() && long(e->own_decl[k]) != cur_decl) {
             cur_decl = long(e->own_decl[k]); counter = next_append;
+            decl_index_keys.clear();
         }
         const XmlNode& c = e->own[k];
         int rm_state = -1;
@@ -288,8 +318,12 @@ std::vector<Catalog::NodeSlot> Catalog::resolve_node_slots(const std::string& fa
         }
         long key;
         bool is_pos;
-        if (has_index) { key = index; is_pos = false; }
-        else { key = counter; is_pos = true; ++counter; }
+        if (has_index) { key = index; is_pos = false; decl_index_keys.push_back(index); }
+        else {
+            if (!kPlainOverIndex)
+                while (std::find(decl_index_keys.begin(), decl_index_keys.end(), counter) != decl_index_keys.end()) ++counter;
+            key = counter; is_pos = true; ++counter;
+        }
         if (key + 1 > next_append) next_append = key + 1;
         auto it = own_at.find(key);
         if (it == own_at.end()) {
@@ -468,6 +502,23 @@ std::optional<Catalog::BehaviorBuff> Catalog::behavior_buff(const std::string& b
             if (g.name == "DecelerationMultiplier")
                 if (const std::string v2 = g.attr_or("value", ""); !v2.empty())
                     bb.decel_mult *= std::strtod(v2.c_str(), nullptr);
+        if (const std::string* v = n.attr("AccelerationMultiplier"); v && !v->empty())
+            bb.accel_mult *= std::strtod(v->c_str(), nullptr);
+        for (const core::XmlNode& g : n.children) {
+            if (g.name == "AccelerationMultiplier")
+                if (const std::string v2 = g.attr_or("value", ""); !v2.empty())
+                    bb.accel_mult *= std::strtod(v2.c_str(), nullptr);
+            if (g.name == "DamageDealtAttributeScaled") {
+                const std::string idx = g.attr_or("index", "");
+                const std::string v2 = g.attr_or("value", "");
+                if (idx.empty() || v2.empty()) continue;
+                const double amt = std::strtod(v2.c_str(), nullptr);
+                bool put = false;
+                for (auto& [a, x] : bb.damage_attr_bonus)
+                    if (a == idx) { x = amt; put = true; }
+                if (!put) bb.damage_attr_bonus.emplace_back(idx, amt);
+            }
+        }
         if (const std::string* v = n.attr("MoveSpeedMaximum"); v && !v->empty())
             bb.move_speed_max = std::strtod(v->c_str(), nullptr);
         for (const core::XmlNode& g : n.children)
@@ -517,6 +568,7 @@ std::optional<Catalog::BehaviorBuff> Catalog::behavior_buff(const std::string& b
                 if (idx == "Uncommandable" && on) bb.uncommandable = true;
                 if (idx == "Untargetable" && on) bb.untargetable = true;
                 if (idx == "SuppressCloak" && on) bb.suppress_cloak = true;
+                if (idx == "Cloak" && on) bb.cloak = true;
                 if (idx == "SuppressCollision" && on) bb.suppress_collision = true;
                 if (idx == "SuppressPassenger" && on) bb.suppress_passenger = true;
                 if (idx == "Benign" && on) bb.benign = true;
@@ -1097,7 +1149,7 @@ double Catalog::weapon_turret_yaw_rate(const std::string& unit_id) const {
     return 0.0;
 }
 
-std::vector<Catalog::MissileMover> Catalog::effect_missile_movers(const std::string& eff) const {
+std::vector<Catalog::MissileMover> Catalog::effect_missile_movers(const std::string& eff, const char* field) const {
     std::vector<MissileMover> out;
     const Entry* ee = find("CEffect", eff);
     if (!ee || ee->tag != "CEffectLaunchMissile") return out;
@@ -1126,8 +1178,9 @@ std::vector<Catalog::MissileMover> Catalog::effect_missile_movers(const std::str
         }
         if (any) out.push_back(m);
     };
+    const std::string fld = field ? field : "Movers";
     for (const core::XmlNode& n : resolved("CEffect", eff)) {
-        if (n.name != "Movers") continue;
+        if (n.name != fld) continue;
         const std::string* link = n.attr("Link");
         if (!link || link->empty()) link = n.attr("value");
         if (!link || link->empty()) continue;
@@ -1135,7 +1188,7 @@ std::vector<Catalog::MissileMover> Catalog::effect_missile_movers(const std::str
         if (const std::string* r = n.attr("IfRangeLTE")) { try { lte = std::stod(*r); } catch (...) {} }
         kinematics(*link, lte);
     }
-    if (!out.empty()) return out;
+    if (!out.empty() || fld != "Movers") return out;
     std::string mover;
     {
         std::string au = scalar("CEffect", eff, "AmmoUnit").value_or("");
@@ -1823,6 +1876,8 @@ std::optional<Catalog::MorphSpec> Catalog::morph_spec(const std::string& abil_id
     const Stage* prev = nullptr;
     for (const Stage& st : stages) {
         if (st.unit.empty() || st.unit.find("##") != std::string::npos) continue;
+        static const bool kSameUnitOne = std::getenv("SC2_MORPH_SAME_UNIT_STAGES") == nullptr;
+        if (kDropRepeats && kSameUnitOne && prev && prev->unit == st.unit) continue;
         if (kDropRepeats && prev && prev->unit == st.unit && prev->secs.size() == st.secs.size()) {
             bool same = true;
             for (std::size_t k = 0; k < st.secs.size() && same; ++k)
@@ -2114,6 +2169,98 @@ std::vector<Catalog::ActorRule> Catalog::actor_rules(const std::string& actor_id
         out.push_back(std::move(r));
     }
     return out;
+}
+
+const std::vector<Catalog::ActorSubscription>& Catalog::actors_on(const std::string& head, const std::string& subject,
+                                                                  const std::string& sub) const {
+    static const std::vector<ActorSubscription> kNone;
+    if (!actors_on_built_) {
+        actors_on_built_ = true;
+        std::vector<std::string> fams;
+        for (const auto& [name, idmap] : families_)
+            if (name.rfind("CActor", 0) == 0) fams.push_back(name);
+        std::sort(fams.begin(), fams.end());
+        for (const std::string& fam : fams)
+            for (const std::string& id : ids(fam)) {
+                const Entry* e = find(fam, id);
+                if (!e || e->is_default) continue;
+                bool cand = false;
+                for (const XmlNode& n : resolved(fam, id)) {
+                    if (n.name == "Macros") cand = true;
+                    if (n.name == "On")
+                        if (const std::string* s = n.attr("Send"); s && on_trim(*s) == "Create") cand = true;
+                    if (cand) break;
+                }
+                if (!cand) continue;
+                for (const ActorRule& r : actor_rules(id, fam)) {
+                    if (r.verb != "Create" || !r.args.empty() || !r.target.empty() || r.head.empty()) continue;
+                    actors_on_[r.head + "." + r.subject + "." + r.sub].push_back({id, fam, r.filters});
+                }
+            }
+    }
+    auto it = actors_on_.find(head + "." + subject + "." + sub);
+    return it == actors_on_.end() ? kNone : it->second;
+}
+
+std::optional<Catalog::MorphTransition> Catalog::morph_transition(const std::string& to_unit) const {
+    if (to_unit.empty()) return std::nullopt;
+    ensure_actor_by_unit();
+    const auto own = actor_by_unit_.find(to_unit);
+    for (const ActorSubscription& s : actors_on("AbilMorph", "*", "Start")) {
+        if (s.family != "CActorUnit" || (own != actor_by_unit_.end() && own->second == s.actor)) continue;
+        bool to = false;
+        for (const auto& f : s.filters)
+            if (f.first == "MorphTo" && f.second == to_unit) to = true;
+        if (!to) continue;
+        const std::optional<std::string> model = scalar("CActorUnit", s.actor, "Model");
+        if (!model || model->empty() || model->find("##") != std::string::npos) continue;
+        MorphTransition t;
+        t.actor = s.actor;
+        t.model = *model;
+        for (const ActorRule& r : actor_rules(s.actor)) {
+            if (r.head != "AbilMorph" || r.sub != "Start" || r.verb != "AnimPlay" || r.args.size() < 2) continue;
+            bool rto = false;
+            for (const auto& f : r.filters)
+                if (f.first == "MorphTo" && f.second == to_unit) rto = true;
+            if (!rto) continue;
+            t.slot = r.args[0];
+            std::size_t p = 0;
+            const std::string& a = r.args[1];
+            while (p <= a.size()) {
+                const std::size_t e = a.find(',', p);
+                const std::string tok = a.substr(p, e == std::string::npos ? std::string::npos : e - p);
+                if (!tok.empty()) t.props.push_back(tok);
+                if (e == std::string::npos) break;
+                p = e + 1;
+            }
+            for (std::size_t k = 2; k < r.args.size(); ++k)
+                if (r.args[k].find("PlayForever") != std::string::npos) t.play_forever = true;
+            break;
+        }
+        if (t.props.empty()) continue;
+        return t;
+    }
+    return std::nullopt;
+}
+
+std::pair<double, double> Catalog::morph_actor_section(const std::string& abil_id) const {
+    for (const XmlNode& info : resolved("CAbil", abil_id)) {
+        if (info.name != "InfoArray") continue;
+        for (const XmlNode& sec : info.children) {
+            if (sec.name != "SectionArray" || sec.attr_or("index", "") != "Actor") continue;
+            double delay = 0.0, dur = 0.0;
+            for (const XmlNode& d : sec.children) {
+                if (d.name != "DurationArray") continue;
+                const std::string* v = d.attr("value");
+                const double val = v ? std::atof(v->c_str()) : 0.0;
+                const std::string idx = d.attr_or("index", "");
+                if (idx == "Delay") delay = val;
+                else if (idx == "Duration") dur = val;
+            }
+            return {delay, dur};
+        }
+    }
+    return {0.0, 0.0};
 }
 
 std::array<float, 3> Catalog::unit_render_scale(const std::string& unit_id) const {

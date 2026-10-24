@@ -77,9 +77,12 @@ struct LayoutSet {
     struct Doc {
         std::string name;
         std::string path;
-        Layout layout;
+        mutable Layout layout;
+        mutable bool frames_dropped = false;
     };
     std::vector<Doc> docs;
+    std::function<std::string(const std::string& path)> reader;
+    void drop_frames(Doc& d) const;
 
     static std::vector<std::string> parse_includes(const std::string& xml);
 

@@ -146,6 +146,15 @@ std::vector<uint8_t> UnitOverlay::render_status(const sim::World& w, const Mat4&
     auto selected = [&](uint32_t id) {
         return o.selection && std::find(o.selection->begin(), o.selection->end(), id) != o.selection->end();
     };
+    static const bool kResearchRowOld = std::getenv("SC2_RESEARCH_PANE_OLD") != nullptr;
+    auto queue_progress = [&](uint32_t id, sim::Fixed& f) {
+        if (w.pending_progress(id, f)) return true;
+        if (kResearchRowOld) return false;
+        const std::vector<sim::World::ResearchSlotView> r = w.research_at(id);
+        if (r.empty()) return false;
+        f = sim::Fixed::from_double(double(r.front().progress));
+        return true;
+    };
     auto segments_of = [](const sim::Fixed& max) {
         const double m = max.to_double();
         int n = int(std::ceil(m / double(kStatusSegmentValue)));
@@ -153,12 +162,12 @@ std::vector<uint8_t> UnitOverlay::render_status(const sim::World& w, const Mat4&
     };
 
     for (const sim::Unit& u : w.units()) {
-        if (!u.alive || u.player < 0 || u.loaded || u.hp_max.raw() <= 0) continue;
+        if (!u.alive || u.player < 0 || u.loaded || u.in_gas_structure || u.hp_max.raw() <= 0) continue;
         const float bar_off = (o.bar_offset && u.id < o.bar_offset->size()) ? (*o.bar_offset)[u.id] : 0.0f;
         if (bar_off > 0.0f) {
             const bool own = o.own_rows && u.player == o.viewer_player && !u.constructing;
             sim::Fixed tpf;
-            const bool training = own && w.pending_progress(u.id, tpf);
+            const bool training = own && queue_progress(u.id, tpf);
             const bool cargo = own && u.cargo_space > 0 && (!o.cargo_ok || u.id >= o.cargo_ok->size() || (*o.cargo_ok)[u.id]);
             const bool shield = u.shields_max.raw() > 0, energy = u.energy_max.raw() > 0;
             const bool hurt = u.hp < u.hp_max || (shield && u.shields < u.shields_max) || (energy && u.energy < u.energy_max);
@@ -170,7 +179,10 @@ std::vector<uint8_t> UnitOverlay::render_status(const sim::World& w, const Mat4&
                 case Mode::Normal:
                 case Mode::Targeting: vitals = vitals || (selected(u.id) && (hurt || !o.own_rows)); break;
             }
-            if (!vitals && !cargo && !training) continue;
+            static const bool kSalvageBarOld = std::getenv("SC2_SALVAGE_BAR_OLD") != nullptr;
+            const bool salvaging = !kSalvageBarOld && u.salvage_timer.raw() > 0 && u.salvage_total.raw() > 0 &&
+                                   o.viewer_player >= 0 && (u.player == o.viewer_player || w.are_allied(u.player, o.viewer_player));
+            if (!vitals && !cargo && !training && !salvaging) continue;
             const float ox = float(u.x.to_double()), oy = float(u.y.to_double());
             const float oz = (o.anchor_z && u.id < o.anchor_z->size()) ? (*o.anchor_z)[u.id] : 0.0f;
             float spx, spy;
@@ -191,7 +203,7 @@ std::vector<uint8_t> UnitOverlay::render_status(const sim::World& w, const Mat4&
             constexpr Color kScreenLife[4] = {{141, 63, 71, 255}, {160, 115, 76, 255}, {147, 145, 73, 255}, {64, 165, 76, 255}};
             constexpr Color kScreenEmpty{70, 72, 92, 255};
             struct Row { double frac; Color fill; Color empty; int segs; double trail; };
-            Row rows[6];
+            Row rows[8];
             int n = 0;
             static const bool kWholeStack = std::getenv("SC2_STATUS_DAMAGED_WHOLE_STACK") != nullptr;
             const bool short_only = !kWholeStack && o.mode == Mode::Damaged && !o.reveal_all && !selected(u.id);
@@ -228,11 +240,14 @@ std::vector<uint8_t> UnitOverlay::render_status(const sim::World& w, const Mat4&
                 draw_shaded_row(rgba, view_w, view_h, left, last_top + 18, row_w, f, Color{45, 141, 165, 255}, kScreenEmpty, 1, -1.0,
                                 Color{0, 0, 0, 255});
             }
+            if (salvaging)
+                draw_shaded_row(rgba, view_w, view_h, left, last_top + 8, row_w, u.salvage_timer.to_double() / u.salvage_total.to_double(),
+                                treated(kDuration), treated(Color{40, 40, 40, 255}), 1, -1.0, Color{0, 0, 0, 255});
             continue;
         }
         if (o.own_rows && u.player == o.viewer_player && !u.constructing) {
             sim::Fixed pf;
-            const bool training = w.pending_progress(u.id, pf);
+            const bool training = queue_progress(u.id, pf);
             if (u.cargo_space > 0 || training) {
                 const float ax = float(u.x.to_double()), ay = float(u.y.to_double());
                 const float az = (o.anchor_z && u.id < o.anchor_z->size()) ? (*o.anchor_z)[u.id] : 0.0f;

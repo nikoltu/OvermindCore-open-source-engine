@@ -1,6 +1,7 @@
 #include "sc2/app/melee.hpp"
 
 #include <algorithm>
+#include <cstdlib>
 
 #include <utility>
 
@@ -43,18 +44,41 @@ MeleeLayout build_melee(sim::World& w, const MeleeSetup& s) {
         layout.unit_facing_set[id] = 1;
     };
 
+    for (size_t p = 0; p < nplayers; ++p)
+        if (s.players[p].team >= 0) w.player(int32_t(p)).team = s.players[p].team;
+    auto hostile = [&](size_t a, size_t b) {
+        return a != b && (s.players[a].team < 0 || s.players[a].team != s.players[b].team);
+    };
+
     for (size_t p = 0; p < nplayers; ++p) {
         const MeleePlayerSetup& ps = s.players[p];
-        const MeleePlayerSetup& enemy = s.players[(p + 1) % nplayers];
+        size_t enemy_ix = (p + 1) % nplayers;
+        if (nplayers > 2) {
+            std::int64_t best = -1;
+            for (size_t q = 0; q < nplayers; ++q) {
+                if (!hostile(p, q)) continue;
+                const std::int64_t dx = std::int64_t(s.players[q].start.x.raw()) - ps.start.x.raw();
+                const std::int64_t dy = std::int64_t(s.players[q].start.y.raw()) - ps.start.y.raw();
+                const std::int64_t d2 = dx * dx + dy * dy;
+                if (best < 0 || d2 < best) {
+                    best = d2;
+                    enemy_ix = q;
+                }
+            }
+        }
+        const MeleePlayerSetup& enemy = s.players[enemy_ix];
         MeleePlayerLayout out;
+        out.config.match_players = int(nplayers);
 
-        Unit hall = ps.town_hall;
-        hall.player = int32_t(p);
-        hall.x = ps.start.x;
-        hall.y = ps.start.y;
-        hall.speed = Fixed();
-        out.town_hall = add(std::move(hall), "CommandCenter");
-        face(out.town_hall, ps.town_hall_facing);
+        if (!ps.no_town_hall) {
+            Unit hall = ps.town_hall;
+            hall.player = int32_t(p);
+            hall.x = ps.start.x;
+            hall.y = ps.start.y;
+            hall.speed = Fixed();
+            out.town_hall = add(std::move(hall), "CommandCenter");
+            face(out.town_hall, ps.town_hall_facing);
+        }
 
         for (std::size_t i = 0; i < ps.mineral_positions.size(); ++i) {
             const MeleePos& mp = ps.mineral_positions[i];
@@ -206,6 +230,10 @@ MeleeLayout build_melee(sim::World& w, const MeleeSetup& s) {
             ai::BuildItem{prod_proto, ps.producer_mineral_cost, ps.producer_gas_cost,
                           ps.producer_build_time, false};
         out.config.has_producer = true;
+        if (ps.supply_unit.supply_provides.raw() > 0 && !std::getenv("SC2_AI_NO_SUPPLY")) {
+            out.config.supply_unit = ai::BuildItem{ps.supply_unit, ps.supply_mineral_cost, 0, ps.supply_build_time, false};
+            out.config.has_supply = true;
+        }
         if (!s.expansion_sites.empty()) {
             Unit hall_proto = ps.town_hall;
             hall_proto.speed = Fixed();

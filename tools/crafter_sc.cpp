@@ -1,8 +1,11 @@
 #include <algorithm>
+#include <cctype>
+#include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <fstream>
 #include <iterator>
+#include <thread>
 #include <map>
 #include <string>
 #include <vector>
@@ -24,12 +27,15 @@
 #include "sc2/formats/mpq.hpp"
 #include "sc2/formats/replay_events.hpp"
 #include "sc2/formats/png.hpp"
+#include "sc2/render/frame_prof.hpp"
 #include "sc2/render/game_window.hpp"
 #include "sc2/render/input_script.hpp"
 #include "sc2/render/offscreen.hpp"
 #include "sc2/render/overlay_pass.hpp"
 #include "sc2/render/scene.hpp"
 #include "sc2/render/terrain_tex.hpp"
+#include "sc2/render/texture_decode.hpp"
+#include "sc2/render/vk_helpers.hpp"
 
 using namespace sc2;
 namespace platform = sc2::app::platform;
@@ -294,6 +300,7 @@ int main(int argc, char** argv) {
     std::vector<ScriptedMods> mods_at;
     std::vector<ScriptedKey> text_at;
     std::vector<std::pair<int, float>> damage_at;
+    std::vector<std::pair<int, std::string>> create_at;
     bool no_fog = false;
     bool no_hud = false;
     float cam_hoff = 0.0f;
@@ -301,6 +308,28 @@ int main(int argc, char** argv) {
     float cam_dist = 0.0f;
     std::string want_map;
     int api_port = sc2::api::kDefaultPort;
+    std::vector<std::string> script_args;
+    if (const char* sp = std::getenv("SC2_INPUT_SCRIPT"); sp && sp[0]) {
+        std::ifstream sf(sp);
+        std::string line;
+        while (std::getline(sf, line)) {
+            if (const std::size_t h = line.find('#'); h != std::string::npos) line.resize(h);
+            std::size_t q = 0;
+            while (q < line.size()) {
+                while (q < line.size() && std::isspace(static_cast<unsigned char>(line[q]))) ++q;
+                std::size_t e = q;
+                while (e < line.size() && !std::isspace(static_cast<unsigned char>(line[e]))) ++e;
+                if (e > q) script_args.push_back(line.substr(q, e - q));
+                q = e;
+            }
+        }
+        std::printf("crafter-sc: SC2_INPUT_SCRIPT %s: %zu tokens\n", sp, script_args.size());
+    }
+    std::vector<char*> all_args(argv, argv + argc);
+    for (std::string& sa : script_args) all_args.push_back(sa.data());
+    {
+    const int argc = int(all_args.size());
+    char** argv = all_args.data();
     for (int i = 1; i < argc; ++i) {
         const std::string arg = argv[i];
         if (arg == "--listen") want_listen = true;
@@ -334,6 +363,11 @@ int main(int argc, char** argv) {
             float cx = 0, cy = 0;
             int n = 0;
             if (std::sscanf(spec.c_str(), "%d:%f,%f", &n, &cx, &cy) == 3) cam_at.push_back({n, {cx, cy}});
+        }
+        else if (arg == "--create-at" && i + 1 < argc) {
+            const std::string spec = argv[++i];
+            const std::size_t c0 = spec.find(':');
+            if (c0 != std::string::npos) create_at.push_back({std::atoi(spec.c_str()), spec.substr(c0 + 1)});
         }
         else if (arg == "--damage-at" && i + 1 < argc) {
             int n = 0;
@@ -409,10 +443,22 @@ int main(int argc, char** argv) {
         }
         else if (arg == "--api-port" && i + 1 < argc) api_port = std::atoi(argv[++i]);
     }
+    }
     std::stable_sort(click_at.begin(), click_at.end(), [](const ScriptedClick& a, const ScriptedClick& b) { return a.frame < b.frame; });
     app::InstallInfo info = resolve_install();
     if (!info.valid) return 0;
 
+    double mem_prev = 0.0;
+    auto mem_mark = [&](const std::string& stage) {
+        if (!std::getenv("SC2_MEM_TRACE")) return;
+        double ws = 0.0, pv = 0.0;
+        platform::process_memory_mb(ws, pv);
+        std::printf("crafter-sc: mem stage %-28s private %7.1f MB (+%6.1f)  working set %7.1f MB\n", stage.c_str(), pv, pv - mem_prev, ws);
+        std::fflush(stdout);
+        mem_prev = pv;
+    };
+    mem_mark("process start");
+    if (std::getenv("SC2_MEM_TRACE")) render::mem_mark_fn() = [&](const char* s) { mem_mark(s); };
     casc::Storage store;
     data::Catalog cat;
     app::MeleeModels models;
@@ -424,6 +470,23 @@ int main(int argc, char** argv) {
         for (std::size_t i = 0; i < plan.size(); ++i) {
             splash.progress(float(i) / float(plan.size()), plan[i].label);
             app::run_startup_step(plan[i], info.data_dir, store, cat, models);
+            if (i + 1 == plan.size() || plan[i + 1].kind != plan[i].kind) {
+                const char* k = plan[i].kind == app::StartupStep::Kind::OpenStore ? "store indexes"
+                                : plan[i].kind == app::StartupStep::Kind::MeleeCatalog ? "melee catalog"
+                                : plan[i].kind == app::StartupStep::Kind::CatalogFile ? "extra catalog documents"
+                                                                                      : "boot models";
+                mem_mark(k);
+            }
+        }
+        if (std::getenv("SC2_MEM_TRACE")) {
+            std::size_t ix = 0, en = 0, nm = 0, ci = 0, nmod = 0;
+            store.memory_bytes(&ix, &en, &nm, &ci);
+            const std::size_t mb = models.memory_bytes(&nmod);
+            std::printf("crafter-sc: mem parts after boot: store idx %.1f MB, encoding %.1f MB, names %.1f MB, lower-case index %.1f MB; "
+                        "%zu models %.1f MB\n", ix / 1048576.0, en / 1048576.0, nm / 1048576.0, ci / 1048576.0, nmod, mb / 1048576.0);
+            std::size_t ce = 0, cr = 0;
+            cat.memory_bytes(&ce, &cr);
+            std::printf("crafter-sc: mem parts after boot: catalog entries %.1f MB, catalog resolved cache %.1f MB\n", ce / 1048576.0, cr / 1048576.0);
         }
         splash.progress(1.0f, "Preparing menu");
     } catch (const std::exception& e) {
@@ -433,6 +496,7 @@ int main(int argc, char** argv) {
 
     app::TestMap map = app::TestMap::generate(72.0f, 72.0f);
     app::FrontEnd fe(cat, models, store, map);
+    mem_mark("front end");
     fe.set_config_io(platform::get_config, platform::set_config);
     fe.set_menu_data_dir(info.data_dir);
 
@@ -590,7 +654,38 @@ int main(int argc, char** argv) {
             if (r == "Zerg") human_race = app::Race::Zerg;
             else if (r == "Protoss") human_race = app::Race::Protoss;
         }
-        const bool ok = !bytes.empty() && fe.begin_match(std::move(bytes), human_race, app::Race::Terran);
+        app::Race other_race = app::Race::Terran;
+        if (const char* rc = std::getenv("SC2_MAP_RACE2")) {
+            const std::string r = rc;
+            if (r == "Zerg") other_race = app::Race::Zerg;
+            else if (r == "Protoss") other_race = app::Race::Protoss;
+        }
+        fe.set_observe_next(std::getenv("SC2_MAP_AI_VS_AI") != nullptr);
+        fe.set_portrait_full_rate(!png_at.empty());
+        const bool ok = !bytes.empty() && fe.begin_match(std::move(bytes), human_race, other_race);
+        mem_mark("match begun (map, setup)");
+        if (const char* wt = std::getenv("SC2_WARM_TYPES"); wt && fe.active_match()) {
+            const auto t0 = std::chrono::steady_clock::now();
+            std::vector<const formats::Model*> ms;
+            std::string all = wt;
+            for (std::size_t p = 0; p < all.size();) {
+                std::size_t e = all.find(',', p);
+                if (e == std::string::npos) e = all.size();
+                if (const formats::Model* m = models.ensure(store, all.substr(p, e - p))) ms.push_back(m);
+                p = e + 1;
+            }
+            const auto t1 = std::chrono::steady_clock::now();
+            for (bool ready = false; !ready;) {
+                ready = true;
+                for (const formats::Model* m : ms) ready = render::request_model_textures(*m, &store, "", 0) && ready;
+                if (!ready) std::this_thread::sleep_for(std::chrono::milliseconds(2));
+            }
+            const auto t2 = std::chrono::steady_clock::now();
+            const render::TextureDecodePool* pool = render::TextureDecodePool::existing();
+            std::printf("crafter-sc: SC2_WARM_TYPES %zu models: read %.0f ms, textures decoded %.0f ms, %.1f MB held decoded\n", ms.size(),
+                        std::chrono::duration<double, std::milli>(t1 - t0).count(), std::chrono::duration<double, std::milli>(t2 - t1).count(),
+                        pool ? double(pool->bytes()) / 1048576.0 : 0.0);
+        }
         if (const char* dc = std::getenv("SC2_DEBUG_CREATE"); dc && fe.active_match()) {
             const std::string all = dc;
             std::size_t p = 0;
@@ -640,6 +735,40 @@ int main(int argc, char** argv) {
                 if (want && cam_dist > 0.0f) g->camera_control().distance = cam_dist;
                 if (want && cam_hoff_set) g->camera_control().height_offset = cam_hoff;
             }
+            if (cam_frame == 2 || cam_frame % 60 == 0) {
+                double ws = 0.0, pv = 0.0;
+                platform::process_memory_mb(ws, pv);
+                const double gl = double(render::gpu_alloc_bytes()[0].load()) / 1048576.0, gh = double(render::gpu_alloc_bytes()[1].load()) / 1048576.0;
+                const render::TextureDecodePool* dp = render::TextureDecodePool::existing();
+                const double pool_mb = dp ? double(dp->bytes()) / 1048576.0 : 0.0;
+                render::frame_prof_count("mem.ram_mb", ws);
+                render::frame_prof_count("mem.private_mb", pv);
+                render::frame_prof_count("mem.gpu_local_mb", gl);
+                render::frame_prof_count("mem.gpu_host_mb", gh);
+                render::frame_prof_count("mem.decode_pool_mb", pool_mb);
+                if (std::getenv("SC2_MEM_TRACE") && (cam_frame == 2 || cam_frame % 3600 == 0)) {
+                    app::MeleeGame* mg = fe.active_match();
+                    std::printf("crafter-sc: mem frame %d tick %u units %zu: ram %.0f MB (private %.0f), gpu local %.0f MB host %.0f MB, decode pool %.0f MB\n",
+                                cam_frame, mg ? unsigned(mg->world().tick()) : 0u, mg ? mg->world().units().size() : std::size_t(0), ws, pv, gl, gh, pool_mb);
+                    std::size_t ix = 0, en = 0, nm = 0, ci = 0, nmod = 0;
+                    store.memory_bytes(&ix, &en, &nm, &ci);
+                    const std::size_t mb = models.memory_bytes(&nmod);
+                    std::printf("crafter-sc: mem parts frame %d: store idx %.1f MB, encoding %.1f MB, names %.1f MB, lower-case index %.1f MB; "
+                                "%zu models %.1f MB\n", cam_frame, ix / 1048576.0, en / 1048576.0, nm / 1048576.0, ci / 1048576.0, nmod, mb / 1048576.0);
+                    std::size_t ce = 0, cr = 0;
+                    cat.memory_bytes(&ce, &cr);
+                    std::printf("crafter-sc: mem parts frame %d: catalog entries %.1f MB, catalog resolved cache %.1f MB\n", cam_frame, ce / 1048576.0, cr / 1048576.0);
+                    std::fflush(stdout);
+                }
+            }
+            if (app::MeleeGame* g = fe.active_match(); g && !create_at.empty())
+                for (const auto& ca : create_at)
+                    if (ca.first == cam_frame) {
+                        const std::string& s = ca.second;
+                        const std::size_t c1 = s.find(':'), c2 = c1 == std::string::npos ? c1 : s.find(':', c1 + 1);
+                        if (c2 != std::string::npos)
+                            g->debug_create(s.substr(0, c1), std::strtof(s.c_str() + c1 + 1, nullptr), std::strtof(s.c_str() + c2 + 1, nullptr));
+                    }
             if (app::MeleeGame* g = fe.active_match(); g && !damage_at.empty())
                 for (const auto& da : damage_at)
                     if (da.first == cam_frame)
@@ -656,6 +785,11 @@ int main(int argc, char** argv) {
                 scripted.mouse_x = (drag && k >= 1) ? ck.x1 : ck.x0;
                 scripted.mouse_y = (drag && k >= 1) ? ck.y1 : ck.y0;
                 scripted.mouse_dx = scripted.mouse_dy = 0.0f;
+                if (k == 0) {
+                    char mk[96];
+                    std::snprintf(mk, sizeof(mk), "%s@%.0f;%.0f", ck.hover ? "hover" : ck.right ? "rclick" : drag ? "drag" : "click", double(ck.x0), double(ck.y0));
+                    render::frame_prof_mark(mk);
+                }
                 if (ck.hover) continue;
                 const int up = drag ? 3 : 1;
                 scripted.left_pressed = !ck.right && k == 0;
@@ -670,6 +804,7 @@ int main(int argc, char** argv) {
             for (const auto& ka : key_at)
                 if (cam_frame == ka.frame) {
                     render::apply_key_spec(scripted, ka.spec);
+                    render::frame_prof_mark("key:" + ka.spec);
                     std::printf("crafter-sc: frame %d: key %s\n", cam_frame, ka.spec.c_str());
                     std::fflush(stdout);
                 }
@@ -681,7 +816,7 @@ int main(int argc, char** argv) {
                 fe.active_match()->set_status_bar_mode(s == "Always" ? M::Always : s == "Damaged" ? M::Damaged : s == "Selected" ? M::Selected : s == "Targeting" ? M::Targeting : M::Normal);
                 fe.active_match()->set_keep_status_layer(true);
             }
-            cont = fe.step(scripted, dt_ms, scene, cam);
+            { SC2_PROF_SCOPE("fe.step"); cont = fe.step(scripted, dt_ms, scene, cam); }
             fe.build_overlay(in.view_w, in.view_h, overlay);
             render::set_os_cursor_hidden(fe.cursor_drawn());
             frame_failures = 0;
@@ -817,6 +952,7 @@ int main(int argc, char** argv) {
     fe.set_reveal_map(no_fog);
     fe.set_ground_fog(!no_fog);
     fe.set_software_cursor(png_at.empty());
+    fe.set_portrait_full_rate(!png_at.empty());
     if (headless && exit_after > 0) {
         render::InputState hin{};
         hin.view_w = canvas_w;
@@ -826,10 +962,18 @@ int main(int argc, char** argv) {
         std::vector<render::SceneInstance> hscene;
         render::Camera hcam;
         std::vector<std::uint8_t> hoverlay;
+        static const bool kUnpaced = std::getenv("SC2_HEADLESS_UNPACED") != nullptr;
         for (std::uint32_t f = 0; f < exit_after; ++f) {
             hscene.clear();
-            if (!frame(hin, 1000.0f / 60.0f, hscene, hcam, hoverlay)) break;
+            bool go = false;
+            { SC2_PROF_SCOPE("frame_cb"); go = frame(hin, 1000.0f / 60.0f, hscene, hcam, hoverlay); }
+            render::frame_prof_count("units", fe.active_match() ? double(fe.active_match()->world().units().size()) : 0.0);
+            render::frame_prof_count("instances", double(hscene.size()));
+            render::frame_prof_tick();
+            if (!go) break;
+            if (want_listen && !kUnpaced) std::this_thread::sleep_for(std::chrono::milliseconds(4));
         }
+        render::frame_prof_flush();
         return 0;
     }
     try {

@@ -55,6 +55,10 @@ inline PortraitDof& portrait_dof() {
     static PortraitDof d;
     return d;
 }
+inline int& portrait_load_mode() {
+    static int m = 0;
+    return m;
+}
 std::vector<std::uint8_t> render_portrait(casc::Storage& store, const formats::Model& model, float fov_rad,
                                           int cam_bone, float znear, float zfar, std::uint32_t w, std::uint32_t h,
                                           const data::EnvLight* env = nullptr);

@@ -1,5 +1,9 @@
 #include "sc2/data/economy.hpp"
 
+#include <algorithm>
+#include <cstdlib>
+#include <vector>
+
 namespace sc2::data {
 
 using sim::Fixed;
@@ -26,6 +30,30 @@ UnitCost unit_cost(const Catalog& cat, const std::string& unit_id) {
     c.gas = cost_resource(cat, unit_id, "Vespene");
     Fixed f = food(cat, unit_id);
     if (f.raw() < 0) c.supply = -f;
+    return c;
+}
+
+UnitCost build_charge(const Catalog& cat, const std::string& structure, std::string builder, std::string abil) {
+    UnitCost c = unit_cost(cat, structure);
+    static const bool kOld = std::getenv("SC2_ZERG_BUILD_FULL_COST") != nullptr;
+    if (kOld) return c;
+    if (abil.empty()) abil = cat.build_ability_of(structure);
+    if (abil.empty() || !cat.ability_flag(abil, "PeonKillFinish")) return c;
+    if (builder.empty()) {
+        std::vector<std::string> ids = cat.ids("CUnit");
+        std::sort(ids.begin(), ids.end());
+        for (const std::string& id : ids) {
+            const std::vector<std::string> ab = cat.array_links("CUnit", id, "AbilArray");
+            if (std::find(ab.begin(), ab.end(), abil) != ab.end()) {
+                builder = id;
+                break;
+            }
+        }
+    }
+    if (builder.empty()) return c;
+    const UnitCost b = unit_cost(cat, builder);
+    c.minerals = std::max(0, c.minerals - b.minerals);
+    c.gas = std::max(0, c.gas - b.gas);
     return c;
 }
 

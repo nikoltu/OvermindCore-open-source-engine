@@ -36,7 +36,43 @@ bool screen_result(Ui& ui, ShellCtx& ctx) {
 
     theme::Rgb tc0{}, tc1{};
     const bool have0 = ctx.team_color(0, tc0), have1 = ctx.team_color(1, tc1);
-    {
+    const bool many = v.players && v.players->size() > 2;
+    if (many) {
+        const std::vector<MatchPlayerCard>& ps = *v.players;
+        std::vector<int> teams;
+        for (const MatchPlayerCard& c : ps) teams.push_back(c.team);
+        const std::vector<std::vector<int>> cols = team_columns(teams);
+        const float x0 = L::kYourCard.x, x1 = L::kOpponentCard.x + L::kOpponentCard.w;
+        const float y0 = L::kYourCard.y, h = L::kYourCard.h, gap = 32.0f;
+        std::size_t deepest = 1;
+        for (const auto& c : cols) deepest = std::max(deepest, c.size());
+        const float col_w = (x1 - x0 - gap * float(cols.size() - 1)) / float(cols.size());
+        const float card_h = (h - 12.0f * float(deepest - 1)) / float(deepest);
+        int you = -1;
+        for (std::size_t p = 0; p < ps.size(); ++p)
+            if (ps[p].controller == MeleeSlot::Controller::Human && you < 0) you = int(p);
+        for (std::size_t c = 0; c < cols.size(); ++c) {
+            const float cx = x0 + (col_w + gap) * float(c);
+            for (std::size_t k = 0; k < cols[c].size(); ++k) {
+                const int p = cols[c][k];
+                const MatchPlayerCard& pc = ps[std::size_t(p)];
+                const Rect card = ui.at(cx, y0 + (card_h + 12.0f) * float(k), col_w, card_h);
+                ui.panel(card);
+                if (pc.won) ui.edge(card, v2::kAccent);
+                ui.publish_region("result/player" + std::to_string(p), card, pc.won ? "WINNER" : "");
+                theme::Rgb tc{};
+                if (ctx.team_color(p, tc)) ui.fill(Rect{card.x0, card.y0, card.x0 + ui.px(8.0f), card.y1}, tc);
+                std::string name = p == you ? ctx.player_name() : std::string("A.I.");
+                if (p != you && pc.difficulty > 0) name += std::string(" - ") + ShellSettings::difficulty_name(pc.difficulty);
+                const int pad = ui.px(24.0f);
+                ui.text(Rect{card.x0 + pad, card.y0 + ui.px(12.0f), card.x1 - ui.px(12.0f), card.y0 + ui.px(48.0f)}, name, v2::kH3, pc.won ? v2::kTextHi : v2::kTextMuted);
+                ui.text(Rect{card.x0 + pad, card.y0 + ui.px(52.0f), card.x1 - ui.px(12.0f), card.y0 + ui.px(80.0f)}, race_word(pc.race), v2::kBody, v2::kTextBody);
+                if (pc.won && card.h() > ui.px(110.0f))
+                    ui.text(Rect{card.x0 + pad, card.y0 + ui.px(84.0f), card.x1 - ui.px(12.0f), card.y0 + ui.px(108.0f)}, "WINNER", v2::kLabel, v2::kOk);
+            }
+        }
+    }
+    if (!many) {
         const Rect card = ui.at(L::kYourCard);
         ui.panel(card);
         if (v.victory) ui.edge(card, v2::kAccent);
@@ -48,7 +84,7 @@ bool screen_result(Ui& ui, ShellCtx& ctx) {
         ui.text(Rect{nr.x0, nr.y1 + ui.px(12.0f), nr.x1, nr.y1 + ui.px(40.0f)}, race_word(v.race[0]), v2::kBody, v2::kTextBody);
         if (v.victory) ui.text(Rect{nr.x0, nr.y1 + ui.px(56.0f), nr.x1, nr.y1 + ui.px(80.0f)}, "WINNER", v2::kLabel, v2::kOk);
     }
-    {
+    if (!many) {
         const Rect card = ui.at(L::kOpponentCard);
         ui.panel(card);
         if (!v.victory) ui.edge(card, v2::kAccent);
@@ -77,7 +113,7 @@ bool screen_result(Ui& ui, ShellCtx& ctx) {
             ui.text(t, "No score was recorded for this match.", v2::kBody, v2::kTextMuted, Align::Centre);
         } else {
             ui.text(Rect{bx0 - val_w, t.y0, bx0 - pad, t.y0 + head}, "YOU", v2::kLabel, v2::kTextMuted, Align::Right);
-            ui.text(Rect{bx0 + bar_w + pad, t.y0, bx0 + bar_w + val_w, t.y0 + head}, "OPPONENT", v2::kLabel, v2::kTextMuted);
+            ui.text(Rect{bx0 + bar_w + pad, t.y0, bx0 + bar_w + val_w, t.y0 + head}, many ? "PLAYER 2" : "OPPONENT", v2::kLabel, v2::kTextMuted);
             ui.fill(Rect{t.x0, t.y0 + head - std::max(1, ui.px(2.0f)), t.x1, t.y0 + head}, v2::kLine1);
             const int shown = std::min(int(rows.size()), (t.h() - head) / std::max(1, rh));
             for (int i = 0; i < shown; ++i) {

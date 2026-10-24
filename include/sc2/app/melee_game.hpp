@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstdint>
+#include <cstdlib>
 #include <map>
 #include <set>
 #include <memory>
@@ -26,6 +27,7 @@
 #include "sc2/app/camera_follow_data.hpp"
 #include "sc2/render/camera_follow.hpp"
 #include "sc2/render/fog_field.hpp"
+#include "sc2/render/texture_decode.hpp"
 #include "sc2/app/console_panel.hpp"
 #include "sc2/app/hud_layout.hpp"
 #include "sc2/app/hud_buttons.hpp"
@@ -46,6 +48,7 @@
 #include "sc2/data/actor_catalog.hpp"
 #include "sc2/render/actor.hpp"
 #include "sc2/render/actor_rules.hpp"
+#include "sc2/app/effect_actor_host.hpp"
 #include "sc2/render/camera_control.hpp"
 #include "sc2/render/decals.hpp"
 #include "sc2/render/fog.hpp"
@@ -182,6 +185,7 @@ struct MeleeGameConfig {
     std::uint64_t seed = 1;
     int ai_period_ticks = 8;
     int ai_difficulty = 0;
+    std::vector<int> slot_difficulty;
     bool no_victory = false;
     float pan_speed = 68.5f;
     float edge_margin = 6.0f;
@@ -201,6 +205,7 @@ class MeleeGame {
 public:
     explicit MeleeGame(MeleeGameConfig cfg = {});
     ~MeleeGame() {
+        if (render::TextureDecodePool* pool = render::TextureDecodePool::existing()) pool->drain();
         if (draw::active_font() == &overlay_font_) draw::set_active_font(nullptr);
         for (const auto& kv : style_faces_)
             if (draw::active_font() == &kv.second) draw::set_active_font(nullptr);
@@ -282,6 +287,15 @@ public:
                                                                      int cam_bone, float znear, float zfar, std::uint32_t w, std::uint32_t h,
                                                                      const data::EnvLight* env)>;
     void set_portrait_renderer(PortraitRenderer fn) { portrait_renderer_ = std::move(fn); }
+    void set_selection_warm(bool on) { selection_warm_ = on; }
+    void set_portrait_hz(float hz) { portrait_hz_ = hz > 0.0f ? hz : 0.0f; }
+    void set_portrait_async(bool on) { portrait_async_ = on; }
+    void set_warm_foreign(bool on) { warm_foreign_ = on; }
+    void set_card_cache(bool on) { card_cache_on_ = on; }
+    void set_morph_transition_models(bool on) { morph_transition_models_ = on; }
+    void set_construction_child_team(bool on) { construction_child_team_ = on; }
+    std::size_t card_cache_hits() const { return card_cache_hits_; }
+    float portrait_hz() const { return portrait_hz_; }
 
     float ground_z_at(float wx, float wy) const;
     float formation_diameter_[2] = {6.0f, 8.0f};
@@ -300,8 +314,37 @@ public:
                          std::int32_t player) const {
         Control c(mvp, view_w, view_h, player);
         c.set_ground_height(&ground_height_);
+        if (!std::getenv("SC2_PICK_EXTENT_OLD")) c.set_pick_volumes(&pick_volumes_);
+        if (select_rules_672_) {
+            Control::BoxRules br;
+            br.on = true;
+            br.rank = [this](const sim::Unit& u) { return select_rank(u); };
+            c.set_box_rules(std::move(br));
+        }
         return c;
     }
+    void set_select_rules_672(bool on) { select_rules_672_ = on; }
+    int select_rank(const sim::Unit& u) const;
+
+    struct PickPose {
+        const formats::Model* model = nullptr;
+        render::Mat4 world;
+        int seq = -1;
+        float time_ms = 0.0f;
+        std::uint64_t frame = 0;
+    };
+    const std::vector<PickPose>& pick_poses() const { return pick_pose_; }
+    std::uint32_t click_select_at(const Control& ctrl, const ScreenPoint& p) const;
+    struct PickVolumesOf : PickVolumes {
+        explicit PickVolumesOf(const MeleeGame* g) : game(g) {}
+        const MeleeGame* game = nullptr;
+        bool volumes(std::uint32_t id, std::vector<PickVolume>& out) const override;
+        bool may_hit(std::uint32_t id, const float* o, const float* d) const override;
+        bool broadphase = true;
+        mutable std::map<std::pair<const formats::Model*, int>, float> reach;
+    };
+    void set_pick_broadphase(bool on) { pick_volumes_.broadphase = on; }
+    const PickVolumes& pick_volumes_for_test() const { return pick_volumes_; }
 
     void set_spawn_models(int player, const formats::Model* worker, const formats::Model* army,
                           const formats::Model* producer);
@@ -328,7 +371,8 @@ public:
         if (auto v = cat.scalar_num("CAlert", "Attack", "OverlapGlobalCount")) ov.global_count = int(*v);
         alerts_.set_overlap(ov);
     }
-    void begin_research(int player, const std::string& id, sim::Fixed delay);
+    void begin_research(int player, const std::string& id, sim::Fixed delay, std::uint32_t producer = sim::kNoTarget,
+                        int minerals = 0, int gas = 0);
 
     struct AiResearchPlan {
         std::vector<std::string> upgrades;
@@ -364,6 +408,30 @@ public:
     bool human_cast(const std::string& abil_id, std::uint32_t target_id);
     bool human_cast_point(const std::string& abil_id, sim::Fixed px, sim::Fixed py);
     std::size_t effect_doodad_count() const { return effect_doodads_.size(); }
+    const EffectActorHost& effect_actors() const { return fx_host_; }
+    void set_placement_ghost(const std::string& unit_id, sim::Fixed x, sim::Fixed y, bool rules_ok);
+    void clear_placement_ghost() { ghost_.active = false; }
+    bool placement_ghost_active() const { return ghost_.active; }
+    const auto& placement_ghost() const { return ghost_; }
+    std::size_t placement_ghost_cells(std::size_t* green = nullptr) const {
+        if (green) {
+            *green = 0;
+            for (char c : ghost_.cell_ok) *green += c ? 1u : 0u;
+        }
+        return ghost_.cells.size();
+    }
+    const formats::Model* placement_ghost_model() const;
+    std::string card_unit_id(const sim::Unit& u) const;
+    bool land_site(std::uint32_t id, sim::Fixed& x, sim::Fixed& y) const;
+    struct PaneQueueSlot {
+        std::string subject;
+        float progress = 0.0f;
+        std::string activity;
+    };
+    std::vector<PaneQueueSlot> pane_queue(std::uint32_t sel) const;
+    bool morph_blocks_queue(std::uint32_t id) const;
+    bool human_cancel_morph(const std::string& morph_abil);
+    bool morph_start_blocked(std::uint32_t id, const std::string& morph_abil) const;
     std::string effect_doodad_model_id(std::size_t i) const { return i < effect_doodads_.size() ? effect_doodads_[i].model_id : std::string(); }
 
     std::vector<AbilityCardEntry> selection_ability_entries() const;
@@ -405,6 +473,7 @@ public:
         int card = 0;
     };
     bool human_build(std::uint32_t worker, const std::string& structure_unit_id);
+    bool human_land_addon(std::uint32_t host, sim::Fixed x, sim::Fixed y, const std::string& addon);
     std::vector<BuildCardEntry> selection_build_card();
 
     std::vector<BuildCardEntry> selection_build_products() const { return selection_build_entries(); }
@@ -476,9 +545,13 @@ public:
         snap.total_ticks = world_.tick();
         return snap;
     }
-    void set_replay_meta(std::string map_id, std::vector<std::int32_t> races) {
+    void set_replay_meta(std::string map_id, std::vector<std::int32_t> races, std::vector<std::int32_t> teams = {},
+                         std::vector<std::int32_t> controllers = {}, bool any_start_pair = false) {
+        replay_log_.any_start_pair = any_start_pair;
         replay_log_.map_id = std::move(map_id);
         replay_log_.player_races = std::move(races);
+        replay_log_.player_teams = std::move(teams);
+        replay_log_.player_controllers = std::move(controllers);
     }
     bool write_replay(const std::string& path) const {
         return write_order_log_file(current_replay_log(), path);
@@ -500,6 +573,7 @@ public:
     MatchResult::Outcome outcome() const { return outcome_; }
     void surrender(int player);
     int surrendered_player() const { return surrendered_player_; }
+    bool viewer_defeated() const;
     void set_stalemate(sim::Fixed test_s, sim::Fixed warning_s) {
         stalemate_ticks_ = int(((test_s + warning_s) * sim::Fixed::from_int(sim::World::kTicksPerSecond)).round());
     }
@@ -650,6 +724,7 @@ public:
     const MeleeLayout& layout() const { return layout_; }
     const render::ActorDriver& actors() const { return driver_; }
     const std::vector<uint32_t>& selection() const { return selection_; }
+    bool geyser_covered(const sim::Unit& u) const;
     void set_selection(std::vector<uint32_t> sel) {
         selection_ = std::move(sel);
         card_page_ = 0;
@@ -743,6 +818,7 @@ private:
                           PauseRect& quit) const;
     void snapshot_positions(std::vector<render::Vec3>& out) const;
     void rebuild_subgroups();
+    void warm_selection_assets(std::uint32_t view_w, std::uint32_t view_h);
     std::vector<std::uint32_t> subgroup_ordered_selection() const;
     std::uint32_t human_lead_caster() const;
     data::TechState human_tech_state(std::uint32_t producer = sim::kNoTarget) const {
@@ -884,7 +960,9 @@ private:
         float reflection_distortion = 0, refraction_distortion = 0, uv_rotate = 0;
         float tiling[2] = {0.125f, 0.125f};
         float scroll[4] = {0.03f, 0.03f, -0.03f, -0.03f};
+        float caustics_falloff = 0, caustics_tiling = 0, caustics_fps = 0;
     } water_look_;
+    std::vector<formats::Model> water_caustics_models_;
     std::vector<std::uint8_t> map_water_xml_;
     formats::Model water_fx_model_;
     const formats::Model* water_fx_source_ = nullptr;
@@ -905,6 +983,8 @@ private:
     float accum_ms_ = 0;
     GameClock clock_;
     int tick_counter_ = 0;
+    std::vector<int> ai_own_period_;
+    std::vector<int> ai_own_counter_;
 
     std::vector<render::Vec3> prev_pos_;
     std::vector<render::Vec3> curr_pos_;
@@ -924,6 +1004,10 @@ private:
     std::uint32_t vertex_w_ = 0, vertex_h_ = 0;
     std::uint32_t ground_w_ = 0, ground_h_ = 0;
     GroundZ ground_height_{this};
+    PickVolumesOf pick_volumes_{this};
+    bool select_rules_672_ = true;
+    std::vector<PickPose> pick_pose_;
+    std::uint64_t pick_frame_ = 0;
     std::unique_ptr<MeleeAudio> audio_;
     render::AudioSink audio_sink_;
     void ensure_audio();
@@ -937,6 +1021,53 @@ private:
     int audio_sel_repeat_ = 0;
     bool select_click_ = false;
     IconAtlas icons_;
+    IconResampleCache icon_resample_;
+    std::set<std::string> warmed_types_;
+    bool warming_ = false;
+    bool selection_warm_ = true;
+    float portrait_hz_ = 0.0f;
+    struct PortraitCache {
+        std::string path;
+        std::uint32_t w = 0, h = 0;
+        double at_ms = -1.0;
+        std::vector<std::uint8_t> img;
+    };
+    PortraitCache portrait_cache_;
+    bool portrait_async_ = false;
+    std::uint32_t prefetch_tick_ = 0;
+    bool mem_marked_ = false;
+    bool mem_step_marked_ = false;
+    std::set<std::string> prefetched_types_;
+    bool warm_foreign_ = false;
+    bool warm_started_ = false;
+    std::vector<std::uint8_t> warm_seen_;
+    struct PendingWarm {
+        std::uint32_t id = 0;
+        std::string type;
+    };
+    std::vector<PendingWarm> warm_pending_;
+    std::uint32_t last_portrait_w_ = 0, last_portrait_h_ = 0;
+    std::vector<std::uint8_t> portrait_call(const std::string& pid, int mode);
+    bool card_cache_on_ = false;
+    struct CardCache {
+        bool valid = false;
+        std::uint64_t hash = 0;
+        std::vector<std::uint32_t> selection;
+        int page = 0;
+        std::uint32_t producer = 0;
+        std::size_t units = 0;
+        std::size_t active = 0, groups = 0;
+        CommandCard card;
+        std::vector<BuildCardEntry> builds;
+        std::vector<AbilityCardEntry> abils;
+        std::vector<TrainCardEntry> trains;
+        std::vector<SubmenuCardEntry> submenus;
+    };
+    CardCache card_cache_;
+    std::size_t card_cache_hits_ = 0;
+    CommandCard compose_command_card_cached(std::vector<BuildCardEntry>& builds, std::vector<AbilityCardEntry>& abils,
+                                            std::vector<TrainCardEntry>& trains, std::vector<SubmenuCardEntry>& submenus);
+    std::unordered_map<std::string, float> display_h_cache_;
     render::OverlayFont overlay_font_;
     bool overlay_font_tried_ = false;
     std::map<std::string, render::OverlayFont> style_faces_;
@@ -1020,6 +1151,9 @@ private:
     };
     std::vector<EffectDoodad> effect_doodads_;
     void spawn_effect_doodads(const std::string& abil_id, sim::Fixed px, sim::Fixed py, int player);
+    EffectActorHost fx_host_;
+    std::unordered_map<std::string, std::string> addon_ids_;
+    std::vector<float> addon_total_ms_;
     struct BeamFx {
         const formats::Model* model = nullptr;
         std::uint32_t attacker = 0xFFFFFFFFu, target = 0xFFFFFFFFu;
@@ -1036,6 +1170,7 @@ private:
         float to[3] = {0, 0, 0};
     };
     std::vector<BeamFx> beams_;
+    std::unordered_map<std::string, std::string> recharge_beam_;
     struct BurnFx {
         int state = -1;
         std::vector<int> points;
@@ -1096,10 +1231,13 @@ private:
     bool pending_patrol_ = false;
     bool pending_move_ = false;
     bool consume_modal_target(sim::Fixed wx, sim::Fixed wy);
+    bool card_smart_click(const std::string& tag, const Control& ctrl, const ScreenPoint& p, bool queued);
+    bool human_load_all(const std::string& abil_id);
     bool pending_defender_ = false;
     std::uint32_t pending_liberator_ = sim::kNoTarget;
     bool pending_land_ = false;
     std::uint32_t pending_land_unit_ = sim::kNoTarget;
+    std::string pending_land_addon_;
     bool pending_unload_ = false;
     std::uint32_t pending_unload_unit_ = sim::kNoTarget;
     bool pending_build_ = false;
@@ -1114,6 +1252,27 @@ private:
     sim::Fixed build_time_;
     bool build_valid_ = false;
     sim::Fixed build_px_, build_py_;
+    struct PlacementGhost {
+        bool active = false;
+        std::string unit_id;
+        float x = 0.0f, y = 0.0f;
+        bool ok = false;
+        std::vector<std::pair<int, int>> cells;
+        std::vector<char> cell_ok;
+    };
+    PlacementGhost ghost_;
+    std::unordered_map<std::uint32_t, std::string> morph_abil_;
+    std::unordered_map<std::uint32_t, std::pair<std::int32_t, std::int32_t>> morph_paid_;
+    struct MorphShow {
+        const formats::Model* model = nullptr;
+        int seq = -1;
+        float len_ms = 0.0f;
+        double delay_s = 0.0;
+    };
+    bool morph_transition_models_ = false;
+    bool construction_child_team_ = true;
+    std::unordered_map<std::string, MorphShow> morph_show_;
+    const MorphShow* morph_show(const sim::Unit& u);
     struct QueuedBuild {
         std::uint32_t worker;
         sim::Fixed x, y;

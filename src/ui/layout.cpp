@@ -199,12 +199,28 @@ std::string LayoutSet::resolve(const std::string& value) const {
                            [this](const std::string& n) { return constant(n); }, value);
 }
 
+void LayoutSet::drop_frames(Doc& d) const {
+    if (!reader || d.frames_dropped) return;
+    std::vector<Frame>().swap(d.layout.frames);
+    d.frames_dropped = true;
+}
+
 const Frame* LayoutSet::find_template(const std::string& path) const {
     std::vector<std::string> seg = split_path(path);
     if (seg.size() < 2) return nullptr;
     const Layout* doc = nullptr;
     for (auto it = docs.rbegin(); it != docs.rend(); ++it)
-        if (it->name == seg[0]) { doc = &it->layout; break; }
+        if (it->name == seg[0]) {
+            if (it->frames_dropped && reader) {
+                try {
+                    it->layout.frames = parse_layout(reader(it->path)).frames;
+                } catch (const std::exception&) {
+                }
+                it->frames_dropped = false;
+            }
+            doc = &it->layout;
+            break;
+        }
     if (!doc) return nullptr;
     const Frame* cur = nullptr;
     for (const Frame& f : doc->frames)

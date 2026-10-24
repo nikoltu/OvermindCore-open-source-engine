@@ -1,5 +1,6 @@
 #pragma once
 
+#include <cstdlib>
 #include <string>
 #include <unordered_map>
 #include <utility>
@@ -33,6 +34,8 @@ inline std::vector<AbilityCardEntry> build_ability_card_entries(
         if (is_universal_ability(b.ability)) continue;
         if (const data::Catalog::Entry* ce = cat.find("CAbil", b.ability)) {
             if (ce->tag == "CAbilTrain" || ce->tag == "CAbilWarpTrain") continue;
+            static const bool kNukeArmOld = std::getenv("SC2_NUKE_ARM_CARD_OLD") != nullptr;
+            if (!kNukeArmOld && cat.calldown_magazine(b.ability)) continue;
             if (ce->tag == "CAbilBuild" && !cat.build_spec(b.ability).has_value()) continue;
         }
         const std::string req = cat.button_requirement(b.ability, b.command);

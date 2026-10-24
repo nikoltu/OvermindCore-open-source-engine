@@ -317,7 +317,8 @@ inline constexpr int32_t kNavFFCost = 30;
 inline void find_path(const NavGrid& g, int sx, int sy, int gx, int gy,
                       std::vector<NavCell>& out, bool can_jump = false, bool crush_ff = false,
                       bool can_walk_cliffs = false, const Fixed* goal_point_x = nullptr,
-                      const Fixed* goal_point_y = nullptr, Fixed radius = Fixed()) {
+                      const Fixed* goal_point_y = nullptr, Fixed radius = Fixed(), int leap_cells = 1,
+                      bool nearest_fallback = false) {
     out.clear();
     if (!g.in_bounds(sx, sy) || !g.in_bounds(gx, gy)) return;
     int64_t goal_px = 0, goal_py = 0;
@@ -375,9 +376,13 @@ inline void find_path(const NavGrid& g, int sx, int sy, int gx, int gy,
         });
         constexpr std::size_t kMaxCandidates = 8;
         for (std::size_t c = 0; c < cands.size() && c < kMaxCandidates; ++c) {
-            find_path(g, sx, sy, cands[c].x, cands[c].y, out, can_jump, crush_ff, can_walk_cliffs, nullptr, nullptr, radius);
+            find_path(g, sx, sy, cands[c].x, cands[c].y, out, can_jump, crush_ff, can_walk_cliffs, nullptr, nullptr, radius,
+                      leap_cells, false);
             if (!out.empty()) return;
         }
+        if (nearest_fallback)
+            find_path(g, sx, sy, cands[0].x, cands[0].y, out, can_jump, crush_ff, can_walk_cliffs, nullptr, nullptr,
+                      radius, leap_cells, true);
         return;
     }
 
@@ -421,11 +426,18 @@ inline void find_path(const NavGrid& g, int sx, int sy, int gx, int gy,
     static const int DY[8] = {-1, -1, -1, 0, 0, 1, 1, 1};
 
     bool found = false;
+    int best_idx = -1;
+    int32_t best_h = kInf, best_g = kInf;
     while (!open.empty()) {
         const QN cur = open.top();
         open.pop();
         if (closed[size_t(cur.idx)]) continue;
         closed[size_t(cur.idx)] = 1;
+        if (cur.h < best_h || (cur.h == best_h && gscore[size_t(cur.idx)] < best_g)) {
+            best_h = cur.h;
+            best_g = gscore[size_t(cur.idx)];
+            best_idx = cur.idx;
+        }
         if (cur.idx == goal) {
             found = true;
             break;
@@ -460,7 +472,30 @@ inline void find_path(const NavGrid& g, int sx, int sy, int gx, int gy,
                 open.push(QN{tentative + hh, hh, ni});
             }
         }
-        if (can_jump && g.has_cliffs()) {
+        if (can_jump && g.has_cliffs() && leap_cells > 1) {
+            for (int k = 0; k < 8; ++k) {
+                int run = 0, lx = cx, ly = cy;
+                for (;;) {
+                    lx += DX[k];
+                    ly += DY[k];
+                    if (!g.in_bounds(lx, ly) || !g.is_cliff_cell(lx, ly)) break;
+                    if (++run > leap_cells) break;
+                }
+                if (run < 1 || run > leap_cells) continue;
+                if (!g.in_bounds(lx, ly) || g.is_blocked_cell(lx, ly)) continue;
+                if (!g.admits(lx, ly, radius) && index(lx, ly) != goal) continue;
+                const int li = index(lx, ly);
+                if (closed[size_t(li)]) continue;
+                const bool diag = DX[k] != 0 && DY[k] != 0;
+                const int32_t tentative = gscore[size_t(cur.idx)] + (diag ? 14 : 10) * (run + 1) + kNavJumpCost;
+                if (tentative < gscore[size_t(li)]) {
+                    gscore[size_t(li)] = tentative;
+                    came[size_t(li)] = cur.idx;
+                    const int32_t hh = heur(lx, ly);
+                    open.push(QN{tentative + hh, hh, li});
+                }
+            }
+        } else if (can_jump && g.has_cliffs()) {
             static const int JX[4] = {0, -1, 1, 0};
             static const int JY[4] = {-1, 0, 0, 1};
             for (int k = 0; k < 4; ++k) {
@@ -481,9 +516,13 @@ inline void find_path(const NavGrid& g, int sx, int sy, int gx, int gy,
         }
     }
 
-    if (!found) return;
+    int end = goal;
+    if (!found) {
+        if (!nearest_fallback || best_idx < 0) return;
+        end = best_idx;
+    }
     std::vector<NavCell> rev;
-    for (int at = goal; at != -1; at = came[size_t(at)])
+    for (int at = end; at != -1; at = came[size_t(at)])
         rev.push_back(NavCell{at % W, at / W});
     for (size_t i = rev.size(); i-- > 0;) out.push_back(rev[i]);
 }

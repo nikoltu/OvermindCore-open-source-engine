@@ -36,6 +36,7 @@ struct CActorUnit {
     std::optional<double> walk_anim_move_speed;
     std::vector<std::pair<std::string, std::string>> baselines;
     std::vector<ActorDeath> death_array;
+    std::vector<ActorDeath> death_customs;
     std::vector<std::string> macros;
     std::vector<ActorRule> on;
 };

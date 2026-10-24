@@ -559,6 +559,12 @@ sim::Unit make_unit(const data::Catalog& cat, const std::string& unit_id,
     }
     u.speed_mult_creep = field(cat, "CUnit", unit_id, "SpeedMultiplierCreep", Fixed::from_int(1));
     if (auto mv = cat.scalar("CUnit", unit_id, "Mover"); mv && *mv == "CliffJumper") u.can_jump = true;
+    if (u.can_jump)
+        for (const std::string& b : cat.array_links("CUnit", unit_id, "BehaviorArray")) {
+            const data::Catalog::Entry* e = b.empty() ? nullptr : cat.find("CBehavior", b);
+            if (!e || e->tag != "CBehaviorJump") continue;
+            if (auto r = cat.scalar_num("CBehavior", b, "JumpRangeMax")) u.jump_range = Fixed::from_double(*r);
+        }
     if (auto mv = cat.scalar("CUnit", unit_id, "Mover"); mv && !mv->empty())
         if (auto pm = cat.scalar("CMover", *mv, "PathMode"); pm && *pm == "Scaler") u.walks_cliffs = true;
     if ((u.attributes & sim::kAttrMassive) && !u.flying) u.crushes_ff = true;
@@ -626,6 +632,26 @@ sim::Unit make_unit(const data::Catalog& cat, const std::string& unit_id,
             u.load_block_behaviors.push_back(app::behavior_id_hash(b));
     }
     u.prevent_defeat = cat.unit_flag(unit_id, "PreventDefeat");
+    if (!std::getenv("SC2_NO_FLAG_CLOAK")) u.cloaked = cat.unit_flag(unit_id, "Cloaked");
+    if (!std::getenv("SC2_NO_FLAG_CLOAK"))
+        for (const std::string& beh : cat.array_links("CUnit", unit_id, "BehaviorArray")) {
+            const std::string pe = cat.scalar("CBehavior", beh, "PeriodicEffect").value_or("");
+            if (pe.empty()) continue;
+            const auto area = cat.effect_enum_area(pe);
+            if (!area || area->radius <= 0.0 || area->child.empty()) continue;
+            const std::string applied = cat.scalar("CEffect", area->child, "Behavior").value_or("");
+            if (applied.empty()) continue;
+            const auto bb = cat.behavior_buff(applied);
+            if (!bb || !bb->cloak) continue;
+            u.cloak_field_radius = sim::Fixed::from_double(area->radius);
+            for (const std::string& vid : cat.array_links("CEffect", area->child, "ValidatorArray")) {
+                const data::Catalog::Entry* ve = vid.empty() ? nullptr : cat.find("CValidator", vid);
+                if (!ve || ve->tag != "CValidatorUnitType") continue;
+                const auto find_s = cat.scalar("CValidator", vid, "Find");
+                if (find_s && *find_s == "0" && cat.scalar("CValidator", vid, "Value").value_or("") == unit_id)
+                    u.cloak_field_self = false;
+            }
+        }
     u.unselectable = cat.unit_flag(unit_id, "Unselectable");
     u.invulnerable_flag = cat.unit_flag(unit_id, "Invulnerable");
     u.magazine_ammo = cat.calldown_ammo_unit(unit_id);
@@ -635,6 +661,7 @@ sim::Unit make_unit(const data::Catalog& cat, const std::string& unit_id,
         u.return_delay = sim::Fixed::from_double(*rd);
     if (const int content = cat.resource_content(unit_id); content > 0) u.resource_left = content;
     if (auto rt = cat.scalar("CUnit", unit_id, "ResourceType"); rt && *rt == "Vespene") u.is_gas = true;
+    if (auto rs = cat.scalar("CUnit", unit_id, "ResourceState"); rs && *rs == "Raw") u.resource_raw = true;
     if (u.resource_left > 0) {
         if (auto ideal = cat.resource_ideal_harvesters(unit_id)) u.miners_max = *ideal;
         else u.miners_max = u.is_gas ? 3 : 2;

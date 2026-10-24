@@ -228,8 +228,21 @@ void main() {
             const float dWat = zn * zf / (zf - gl_FragCoord.z * (zf - zn));
             tintBlend = clamp(F.head.w * max(0.0, dBed - dWat), tintBlend, 1.0);
         }
-        vec3 col = g.keySpec.w > 0.5 ? mix(bed, F.p0.rgb, tintBlend) * lightW
-                                     : mix(bed, F.p0.rgb * lightW, tintBlend);
+        vec3 bedC = bed;
+        if (F.emisUV.y > 0.0 && g.creepParams.z > 0.0) {
+            const float zn = g.creepParams.z, zf = g.creepParams.w;
+            const float dBedC = zn * zf / (zf - texelFetch(sceneDepth, ivec2(gl_FragCoord.xy), 0).r * (zf - zn));
+            const float dWatC = zn * zf / (zf - gl_FragCoord.z * (zf - zn));
+            const float depthC = max(0.0, dBedC - dWatC);
+            const vec3 eyeDir = normalize(vWorldPos - g.eyePos.xyz);
+            const vec3 bottom = vWorldPos + eyeDir * depthC;
+            vec2 cuv = F.emisUV.x * bottom.xy;
+            cuv.y = 1.0 - cuv.y;
+            const vec3 caus = (F.emisUV.z > 0.5 ? texture(alphaMask, cuv).rgb : texture(diffuse, cuv).rgb) * shW;
+            bedC += caus * clamp(F.emisUV.y * depthC, 0.0, 1.0);
+        }
+        vec3 col = g.keySpec.w > 0.5 ? mix(bedC, F.p0.rgb, tintBlend) * lightW
+                                     : mix(bedC, F.p0.rgb * lightW, tintBlend);
         const vec3 v = normalize(g.eyePos.xyz - vWorldPos);
         const float fres = clamp(pow(1.0 - max(dot(wn, v), 0.0), max(F.p1.z, 1.0)) + F.p1.w, 0.0, 1.0);
         const vec3 envc = g.rigAmbient.w > 0.5 ? g.rigAmbient.rgb + g.rigColor[0].rgb * 0.5 : vec3(0.5);

@@ -39,7 +39,7 @@ void VisionGrid::compute(const World& world, int32_t player, Fixed sight_radius,
     const Fixed half = Fixed::from_raw(cell_.raw() / 2);
 
     for (const Unit& u : world.units()) {
-        if (!u.alive || u.player != player) continue;
+        if (!u.alive || !world.are_allied(u.player, player)) continue;
 
         const Fixed sr = u.sight.raw() > 0 ? u.sight : sight_radius;
         const Fixed reach = sr + half;

@@ -2,6 +2,8 @@
 
 #include <utility>
 #include <algorithm>
+#include <cstdio>
+#include <cstdlib>
 #include <vector>
 
 #include "sc2/ai/defense.hpp"
@@ -85,10 +87,36 @@ void MeleeAI::run_workers(sim::World& w) {
     }
 }
 
+const bool MeleeAI::kSupplyAfterProducer = std::getenv("SC2_AI_SUPPLY_AFTER_PRODUCER") != nullptr;
+
+int MeleeAI::own_pending(const sim::World& w) const {
+    static const bool kWorld = std::getenv("SC2_AI_WORLD_PENDING") != nullptr;
+    return int(kWorld ? w.pending_count() : w.pending_count(player_));
+}
+
+bool MeleeAI::run_supply(sim::World& w) {
+    if (!cfg_.has_supply || kSupplyAfterProducer) return false;
+    const Fixed used = w.supply_used(player_), cap = w.supply_max(player_);
+    if (cap >= Fixed::from_int(200) || used + cfg_.supply_margin < cap) return false;
+    const std::string& sid = cfg_.supply_unit.proto.catalog_id;
+    for (const Unit& u : w.units())
+        if (u.alive && u.player == player_ && u.constructing && u.supply_provides.raw() > 0) return false;
+    for (const SiteBuild& s : site_builds_)
+        if (s.id == sid) return false;
+    if (!sid.empty() && w.pending_of_type(player_, sid) > 0) return false;
+    if (!afford(w, cfg_.supply_unit)) return false;
+    const bool morph_at_hall = base_.depot < w.units().size() && w.unit(base_.depot).spawner_proto >= 0 &&
+                               cfg_.supply_unit.proto.speed.raw() > 0;
+    const bool has_producer = base_.producer < w.units().size() && w.unit(base_.producer).alive;
+    return make_item(w, morph_at_hall || !has_producer ? base_.depot : base_.producer, cfg_.supply_unit);
+}
+
 void MeleeAI::run_production(sim::World& w) {
+    if (run_supply(w)) return;
+
     if (cfg_.worker_target > 0 && base_.depot < w.units().size() &&
         w.unit(base_.depot).alive && worker_count(w) < cfg_.worker_target &&
-        int(w.pending_count()) < cfg_.max_pending && afford(w, cfg_.worker_unit) &&
+        own_pending(w) < cfg_.max_pending && afford(w, cfg_.worker_unit) &&
         supply_ok(w, cfg_.worker_unit)) {
         uint32_t hall = base_.depot;
         Unit wp = cfg_.worker_unit.proto;
@@ -130,7 +158,7 @@ void MeleeAI::run_production(sim::World& w) {
             return;
         }
     }
-    if (int(w.pending_count()) >= cfg_.max_pending) return;
+    if (own_pending(w) >= cfg_.max_pending) return;
     if (stock_active()) return;
 
     if (cfg_.has_army_unit2 && !cfg_.tech_chain.empty() && base_.depot < w.units().size() &&
@@ -166,7 +194,7 @@ void MeleeAI::run_production(sim::World& w) {
         }
     }
 
-    if (cfg_.has_supply) {
+    if (cfg_.has_supply && kSupplyAfterProducer) {
         Fixed used = w.supply_used(player_), cap = w.supply_max(player_);
         if (cap < Fixed::from_int(200) && used + cfg_.supply_margin >= cap &&
             afford(w, cfg_.supply_unit)) {
@@ -202,11 +230,33 @@ bool MeleeAI::army_unit2_gate_ok(const sim::World& w) const {
     return false;
 }
 
+int32_t MeleeAI::target_player(const sim::World& w, bool* several) const {
+    int32_t best_player = -1, first = -1;
+    std::int64_t best = -1;
+    if (several) *several = false;
+    for (const Unit& u : w.units()) {
+        if (!u.alive || u.player < 0 || u.player == player_) continue;
+        if (w.are_allied(u.player, player_) || w.player(u.player).defeated) continue;
+        if (first < 0) first = u.player;
+        else if (several && u.player != first) *several = true;
+        const std::int64_t dx = std::int64_t(u.x.raw()) - cfg_.enemy_x.raw(), dy = std::int64_t(u.y.raw()) - cfg_.enemy_y.raw();
+        const std::int64_t d2 = dx * dx + dy * dy;
+        if (best < 0 || d2 < best) {
+            best = d2;
+            best_player = u.player;
+        }
+    }
+    return best_player;
+}
+
 bool MeleeAI::enemy_target(const sim::World& w, Fixed& tx, Fixed& ty) const {
     Fixed sx, sy;
     int n = 0;
+    bool several = false;
+    const int32_t foe = cfg_.match_players > 2 ? target_player(w, &several) : -1;
     for (const Unit& u : w.units()) {
         if (!u.alive || u.player < 0 || u.player == player_) continue;
+        if (w.are_allied(u.player, player_) || w.player(u.player).defeated || (several && u.player != foe)) continue;
         sx = sx + u.x;
         sy = sy + u.y;
         ++n;
@@ -232,9 +282,15 @@ void MeleeAI::run_army(sim::World& w) {
         if (count > 0 && since_combat >= (600 - 2 * count) * sim::World::kTicksPerSecond) launch_at = std::min(launch_at, count);
     }
     if (!attacking_ && count >= launch_at) {
-        int32_t enemy = -1;
-        for (const Unit& u : w.units())
-            if (u.alive && u.player >= 0 && u.player != player_) { enemy = u.player; break; }
+        int32_t enemy = cfg_.match_players > 2 ? target_player(w) : -1;
+        if (cfg_.match_players <= 2) {
+            for (const Unit& u : w.units())
+                if (u.alive && u.player >= 0 && u.player != player_ && !w.are_allied(u.player, player_) &&
+                    !w.player(u.player).defeated) {
+                    enemy = u.player;
+                    break;
+                }
+        }
         const Fixed mine = army_power(w, player_);
         const Fixed theirs = enemy >= 0 ? army_power(w, enemy) : Fixed();
         if (should_engage(mine, theirs, cfg_.attack_caution)) {
@@ -458,6 +514,19 @@ bool MeleeAI::place_structure(sim::World& w, const BuildItem& item) {
         site_builds_.push_back({item.proto.catalog_id, builder});
         return true;
     }
+    if (item.proto.needs_power && cfg_.has_supply && cfg_.supply_unit.proto.power_radius.raw() > 0 &&
+        !std::getenv("SC2_AI_NO_POWER_FIRST")) {
+        bool own_field = false;
+        for (const Unit& o : w.units())
+            if (o.alive && o.player == player_ && o.power_radius.raw() > 0) { own_field = true; break; }
+        if (!own_field) {
+            const bool placed = afford(w, cfg_.supply_unit) && place_structure(w, cfg_.supply_unit);
+            if (std::getenv("SC2_AI_TRACE"))
+                std::fprintf(stderr, "[ai] p%d tick %d %s needs power: no field - supply first %s\n", int(player_), int(w.tick()),
+                             item.proto.catalog_id.c_str(), placed ? "PLACED" : "not placed");
+            return false;
+        }
+    }
     Fixed mx, my;
     bool has_mineral = false;
     if (base_.mineral < U && w.unit(base_.mineral).alive) {
@@ -491,6 +560,14 @@ bool MeleeAI::place_structure(sim::World& w, const BuildItem& item) {
         }
         return false;
     };
+    static const bool kAnyLevel = std::getenv("SC2_AI_ANY_LEVEL_SITE") != nullptr;
+    const sim::NavGrid& nav = w.nav();
+    int hall_level = -1;
+    if (!kAnyLevel && nav.configured() && nav.has_levels()) {
+        int cx = 0, cy = 0;
+        nav.to_cell(hx, hy, cx, cy);
+        hall_level = nav.level_cell(cx, cy);
+    }
     const int r0 = int((w.unit(base_.depot).radius + item.proto.radius).to_double()) + 2;
     for (int r = r0; r <= r0 + 14; ++r) {
         for (int dy = -r; dy <= r; ++dy)
@@ -500,6 +577,11 @@ bool MeleeAI::place_structure(sim::World& w, const BuildItem& item) {
                 if (has_mineral && (Fixed::from_int(dx) * mx + Fixed::from_int(dy) * my).raw() > 0) continue;
                 const Fixed x = hx + Fixed::from_int(dx), y = hy + Fixed::from_int(dy);
                 if (x.raw() <= 0 || y.raw() <= 0) continue;
+                if (hall_level >= 0) {
+                    int cx = 0, cy = 0;
+                    nav.to_cell(x, y, cx, cy);
+                    if (nav.level_cell(cx, cy) != hall_level) continue;
+                }
                 if (slot_conflict(x, y)) continue;
                 if (w.issue_worker_build(builder, x, y, proto, item.minerals, item.gas, item.build_time,
                                          Fixed::from_int(2), w.unit(builder).build_verb)) {
@@ -508,6 +590,16 @@ bool MeleeAI::place_structure(sim::World& w, const BuildItem& item) {
                 }
             }
     }
+    if (item.proto.needs_power && w.last_error() == sim::CmdError::CantBuildTooFarFromBuildPowerSource && cfg_.has_supply &&
+        cfg_.supply_unit.proto.power_radius.raw() > 0 && !std::getenv("SC2_AI_NO_POWER_FIRST")) {
+        bool rising = false;
+        for (const Unit& o : w.units())
+            if (o.alive && o.player == player_ && o.power_radius.raw() > 0 && o.constructing) { rising = true; break; }
+        if (!rising && afford(w, cfg_.supply_unit)) place_structure(w, cfg_.supply_unit);
+    }
+    if (std::getenv("SC2_AI_TRACE"))
+        std::fprintf(stderr, "[ai] p%d tick %d %s: no site accepted (last refusal %s, minerals %d)\n", int(player_), int(w.tick()),
+                     item.proto.catalog_id.c_str(), sim::cmd_error_key(w.last_error()), int(w.player(player_).minerals));
     return false;
 }
 
@@ -544,7 +636,7 @@ void MeleeAI::run_stock(sim::World& w) {
             return;
         }
         if (owned_or_pending(w, s.id) >= s.count) { ++stock_idx_; continue; }
-        if (int(w.pending_count()) >= cfg_.max_pending) return;
+        if (own_pending(w) >= cfg_.max_pending) return;
         if (!afford(w, s.item) || !supply_ok(w, s.item)) return;
         const bool hall_ok = base_.depot < U && w.unit(base_.depot).alive;
         const bool prod_ok = base_.producer < U && w.unit(base_.producer).alive;

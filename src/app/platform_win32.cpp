@@ -8,6 +8,7 @@
 #endif
 #include <windows.h>
 
+#include <psapi.h>
 #include <shellapi.h>
 #include <shlobj.h>
 #include <winsock2.h>
@@ -109,6 +110,16 @@ std::string pick_folder(const std::string& title) {
 
 void alert(const std::string& title, const std::string& message) {
     ::MessageBoxW(nullptr, widen(message).c_str(), widen(title).c_str(), MB_OK | MB_ICONWARNING);
+}
+
+void process_memory_mb(double& working_set, double& private_bytes) {
+    working_set = private_bytes = 0.0;
+    PROCESS_MEMORY_COUNTERS_EX pmc{};
+    pmc.cb = sizeof(pmc);
+    if (::K32GetProcessMemoryInfo(::GetCurrentProcess(), reinterpret_cast<PROCESS_MEMORY_COUNTERS*>(&pmc), sizeof(pmc))) {
+        working_set = double(pmc.WorkingSetSize) / (1024.0 * 1024.0);
+        private_bytes = double(pmc.PrivateUsage) / (1024.0 * 1024.0);
+    }
 }
 
 std::vector<MapEntry> list_maps(const std::string& root, int max_depth) {

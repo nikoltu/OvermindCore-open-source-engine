@@ -590,7 +590,121 @@ std::vector<std::uint8_t> HudRender::render(const HudContent& content, const sim
                           backdrop->fog->size() >=
                               std::size_t(backdrop->fw) * std::size_t(backdrop->fh);
     const auto t_mm0 = std::chrono::steady_clock::now();
-    if (have_terrain && mm.w() > 1 && mm.h() > 1) {
+    static const bool mm_uncached = std::getenv("SC2_MINIMAP_TEXEL_UNCACHED") != nullptr;
+    struct MmTexel { float r, g, b, ax, ay; int x0, y0, x1, y1; };
+    struct MmCache {
+        const void* terrain = nullptr;
+        std::size_t tsize = 0, tprobe = 0;
+        int tw = 0, th = 0, fw = 0, fh = 0, mw = 0, mh = 0;
+        float ext[4] = {0, 0, 0, 0}, text[4] = {0, 0, 0, 0}, mapw = 0, maph = 0;
+        bool fog = false, nearest = false;
+        std::vector<MmTexel> t;
+    };
+    static MmCache mmc;
+    if (have_terrain && mm.w() > 1 && mm.h() > 1 && !mm_uncached) {
+        const int mw = mm.w(), mh = mm.h();
+        static const bool mm_nearest_c = std::getenv("SC2_MINIMAP_NEAREST") != nullptr;
+        const std::vector<std::uint8_t>& tv = *backdrop->terrain;
+        std::size_t probe = 1469598103u;
+        for (std::size_t i = 0; i < tv.size(); i += 997) probe = (probe ^ tv[i]) * 1099511628211ull;
+        const MinimapExtent& te = backdrop->terrain_extent;
+        const bool same = mmc.terrain == static_cast<const void*>(tv.data()) && mmc.tsize == tv.size() && mmc.tprobe == probe &&
+                          mmc.tw == backdrop->tw && mmc.th == backdrop->th && mmc.mw == mw && mmc.mh == mh &&
+                          mmc.fw == (have_fog ? backdrop->fw : 0) && mmc.fh == (have_fog ? backdrop->fh : 0) && mmc.fog == have_fog &&
+                          mmc.nearest == mm_nearest_c && mmc.ext[0] == mext.x0 && mmc.ext[1] == mext.y0 && mmc.ext[2] == mext.x1 &&
+                          mmc.ext[3] == mext.y1 && mmc.text[0] == te.x0 && mmc.text[1] == te.y0 && mmc.text[2] == te.x1 && mmc.text[3] == te.y1 &&
+                          mmc.mapw == map_w && mmc.maph == map_h;
+        if (!same) {
+            mmc.terrain = tv.data();
+            mmc.tsize = tv.size();
+            mmc.tprobe = probe;
+            mmc.tw = backdrop->tw;
+            mmc.th = backdrop->th;
+            mmc.mw = mw;
+            mmc.mh = mh;
+            mmc.fw = have_fog ? backdrop->fw : 0;
+            mmc.fh = have_fog ? backdrop->fh : 0;
+            mmc.fog = have_fog;
+            mmc.nearest = mm_nearest_c;
+            mmc.ext[0] = mext.x0; mmc.ext[1] = mext.y0; mmc.ext[2] = mext.x1; mmc.ext[3] = mext.y1;
+            mmc.text[0] = te.x0; mmc.text[1] = te.y0; mmc.text[2] = te.x1; mmc.text[3] = te.y1;
+            mmc.mapw = map_w;
+            mmc.maph = map_h;
+            mmc.t.assign(std::size_t(mw) * std::size_t(mh), MmTexel{});
+            for (int py = 0; py < mh; ++py)
+                for (int px = 0; px < mw; ++px) {
+                    MmTexel& k = mmc.t[std::size_t(py) * std::size_t(mw) + std::size_t(px)];
+                    float fx = float(px) / float(mw - 1), fy = 1.0f - float(py) / float(mh - 1);
+                    if (map_w > 0.0f && map_h > 0.0f && mext.ok()) {
+                        fx = (mext.x0 + fx * (mext.x1 - mext.x0)) / map_w;
+                        fy = (mext.y0 + fy * (mext.y1 - mext.y0)) / map_h;
+                        fx = fx < 0.0f ? 0.0f : (fx > 1.0f ? 1.0f : fx);
+                        fy = fy < 0.0f ? 0.0f : (fy > 1.0f ? 1.0f : fy);
+                    }
+                    float tfx = fx, tfy = fy;
+                    if (te.ok() && map_w > 0.0f && map_h > 0.0f) {
+                        tfx = (fx * map_w - te.x0) / (te.x1 - te.x0);
+                        tfy = (fy * map_h - te.y0) / (te.y1 - te.y0);
+                        tfx = tfx < 0.0f ? 0.0f : (tfx > 1.0f ? 1.0f : tfx);
+                        tfy = tfy < 0.0f ? 0.0f : (tfy > 1.0f ? 1.0f : tfy);
+                    }
+                    int sx = int(tfx * float(backdrop->tw));
+                    int sy = int(tfy * float(backdrop->th));
+                    if (sx >= backdrop->tw) sx = backdrop->tw - 1;
+                    if (sy >= backdrop->th) sy = backdrop->th - 1;
+                    const std::size_t si = (std::size_t(sy) * std::size_t(backdrop->tw) + std::size_t(sx)) * 3;
+                    k.r = tv[si];
+                    k.g = tv[si + 1];
+                    k.b = tv[si + 2];
+                    if (!mm_nearest_c) {
+                        const float ux = tfx * float(backdrop->tw) - 0.5f, uy = tfy * float(backdrop->th) - 0.5f;
+                        const int x0i = std::max(0, std::min(backdrop->tw - 1, int(std::floor(ux)))), y0i = std::max(0, std::min(backdrop->th - 1, int(std::floor(uy))));
+                        const int x1i = std::min(backdrop->tw - 1, x0i + 1), y1i = std::min(backdrop->th - 1, y0i + 1);
+                        const float ax = std::max(0.0f, std::min(1.0f, ux - float(x0i))), ay = std::max(0.0f, std::min(1.0f, uy - float(y0i)));
+                        auto tx = [&](int x, int y, int c) { return float(tv[(std::size_t(y) * std::size_t(backdrop->tw) + std::size_t(x)) * 3 + std::size_t(c)]); };
+                        float c[3];
+                        for (int q = 0; q < 3; ++q)
+                            c[q] = (tx(x0i, y0i, q) * (1.0f - ax) + tx(x1i, y0i, q) * ax) * (1.0f - ay) + (tx(x0i, y1i, q) * (1.0f - ax) + tx(x1i, y1i, q) * ax) * ay;
+                        k.r = c[0]; k.g = c[1]; k.b = c[2];
+                    }
+                    k.x0 = k.y0 = k.x1 = k.y1 = 0;
+                    k.ax = k.ay = 0.0f;
+                    if (have_fog && !mm_nearest_c) {
+                        const float ux = fx * float(backdrop->fw) - 0.5f, uy = fy * float(backdrop->fh) - 0.5f;
+                        k.x0 = std::max(0, std::min(backdrop->fw - 1, int(std::floor(ux))));
+                        k.y0 = std::max(0, std::min(backdrop->fh - 1, int(std::floor(uy))));
+                        k.x1 = std::min(backdrop->fw - 1, k.x0 + 1);
+                        k.y1 = std::min(backdrop->fh - 1, k.y0 + 1);
+                        k.ax = std::max(0.0f, std::min(1.0f, ux - float(k.x0)));
+                        k.ay = std::max(0.0f, std::min(1.0f, uy - float(k.y0)));
+                    } else if (have_fog) {
+                        int cx = int(fx * float(backdrop->fw));
+                        int cy = int(fy * float(backdrop->fh));
+                        if (cx >= backdrop->fw) cx = backdrop->fw - 1;
+                        if (cy >= backdrop->fh) cy = backdrop->fh - 1;
+                        k.x0 = cx;
+                        k.y0 = cy;
+                    }
+                }
+        }
+        const std::vector<std::uint8_t>* fogv = have_fog ? backdrop->fog : nullptr;
+        const std::size_t fwz = have_fog ? std::size_t(backdrop->fw) : 0;
+        for (int py = 0; py < mh; ++py)
+            for (int px = 0; px < mw; ++px) {
+                const MmTexel& k = mmc.t[std::size_t(py) * std::size_t(mw) + std::size_t(px)];
+                float r = k.r, g = k.g, b = k.b;
+                if (fogv && !mm_nearest_c) {
+                    auto ff = [&](int x, int y) { return hud_minimap_fog_factor((*fogv)[std::size_t(y) * fwz + std::size_t(x)]); };
+                    const float f = (ff(k.x0, k.y0) * (1.0f - k.ax) + ff(k.x1, k.y0) * k.ax) * (1.0f - k.ay) + (ff(k.x0, k.y1) * (1.0f - k.ax) + ff(k.x1, k.y1) * k.ax) * k.ay;
+                    r *= f; g *= f; b *= f;
+                } else if (fogv) {
+                    const float f = hud_minimap_fog_factor((*fogv)[std::size_t(k.y0) * fwz + std::size_t(k.x0)]);
+                    r *= f; g *= f; b *= f;
+                }
+                blend(img, out_w, out_h, mm.x0 + px, mm.y0 + py, std::uint8_t(r + 0.5f), std::uint8_t(g + 0.5f), std::uint8_t(b + 0.5f), 1.0f);
+            }
+        render::frame_prof_add("hud.minimap_terrain", std::chrono::duration_cast<std::chrono::duration<double, std::milli>>(std::chrono::steady_clock::now() - t_mm0).count());
+    } else if (have_terrain && mm.w() > 1 && mm.h() > 1) {
         const int mw = mm.w(), mh = mm.h();
         for (int py = 0; py < mh; ++py) {
             for (int px = 0; px < mw; ++px) {
@@ -678,6 +792,8 @@ std::vector<std::uint8_t> HudRender::render(const HudContent& content, const sim
             if (blip_id >= world.units().size()) continue;
             const sim::Unit& u = world.units()[blip_id];
             if (!u.alive) continue;
+            if (u.in_gas_structure) continue;
+            if (u.loaded && world.cargo_hidden()) continue;
             float fx = float(u.x.to_double()) / map_w;
             float fy = float(u.y.to_double()) / map_h;
             if (fx < 0.0f) fx = 0.0f;

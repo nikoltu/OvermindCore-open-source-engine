@@ -12,6 +12,7 @@
 #include <vector>
 
 #include "sc2/casc/storage.hpp"
+#include "sc2/formats/dds.hpp"
 #include "sc2/formats/m3.hpp"
 #include "sc2/formats/map_archive.hpp"
 #include "sc2/render/scene.hpp"
@@ -136,6 +137,38 @@ inline CliffField place_cliffs(casc::Storage& store, const formats::LoadedMap& m
         if (i + 1 < tier_z.size()) return tier_z[i + 1] - tier_z[i];
         return tier_z[tier_z.size() - 1] - tier_z[tier_z.size() - 2];
     };
+    std::vector<float> sculpt_of_level, pure_of_level;
+    if (!std::getenv("SC2_CLIFF_SCULPT_TWICE") && map.quantize.found && map.heightmap.width > 0 && map.heightmap.height > 0) {
+        const float stdh = float(map.quantize.standard_height);
+        const float zoff_pure = formats::engine_z_offset(map);
+        std::map<int, std::vector<float>> by_level, pure_by_level;
+        for (std::uint32_t r = 1; r < cm.height; ++r)
+            for (std::uint32_t c = 1; c < cm.width; ++c) {
+                const std::size_t k = std::size_t(r) * cm.width + c;
+                const int L = cm.levels[k];
+                if (cm.levels[k - 1] != L || cm.levels[k - cm.width] != L || cm.levels[k - cm.width - 1] != L) continue;
+                if (have_raw && ((cm.raw[k] | cm.raw[k - 1] | cm.raw[k - cm.width] | cm.raw[k - cm.width - 1]) & 63)) continue;
+                by_level[L].push_back(formats::map_sculpt_height(map, c, r) - stdh);
+                pure_by_level[L].push_back(formats::vertex_ground_z(map, tier_z, zoff_pure, c, r) - by_level[L].back());
+            }
+        for (auto& kv : pure_by_level) {
+            if (kv.first < 0 || kv.second.empty()) continue;
+            std::nth_element(kv.second.begin(), kv.second.begin() + std::ptrdiff_t(kv.second.size() / 2), kv.second.end());
+            if (pure_of_level.size() <= std::size_t(kv.first)) pure_of_level.resize(std::size_t(kv.first) + 1, 1e30f);
+            pure_of_level[std::size_t(kv.first)] = kv.second[kv.second.size() / 2];
+        }
+        for (auto& kv : by_level) {
+            if (kv.first < 0 || kv.second.empty()) continue;
+            std::nth_element(kv.second.begin(), kv.second.begin() + std::ptrdiff_t(kv.second.size() / 2), kv.second.end());
+            if (sculpt_of_level.size() <= std::size_t(kv.first)) sculpt_of_level.resize(std::size_t(kv.first) + 1, 0.0f);
+            sculpt_of_level[std::size_t(kv.first)] = kv.second[kv.second.size() / 2];
+        }
+    }
+    auto pure_top = [&](int L) -> float {
+        const std::size_t i = L < 0 ? 0 : std::size_t(L);
+        if (i < pure_of_level.size() && pure_of_level[i] < 1e29f) return pure_of_level[i];
+        return tier_top(L) - (i < sculpt_of_level.size() ? sculpt_of_level[i] : 0.0f);
+    };
     const float sign = (order & 1) ? -1.0f : 1.0f;
 
     auto load_piece = [&](int& si, const std::string& code, int var) -> const formats::Model* {
@@ -155,6 +188,45 @@ inline CliffField place_cliffs(casc::Storage& store, const formats::LoadedMap& m
                 for (formats::M3Material& mat : m.materials) { mat.layers = S.skin; mat.blend_mode = S.blend; }
             m.vertex_alpha_coverage = true;
             m.cliff_skin_opaque = (m.vertex_flags & 0x200u) == 0;
+            static const bool kSolidMasked = std::getenv("SC2_CLIFF_SOLID_MASKED") != nullptr;
+            if (m.cliff_skin_opaque && !kSolidMasked && m.vertex_count && !m.materials.empty() &&
+                formats::material_alpha_mask_channel(m.materials[0]) >= 1 && formats::material_alpha_mask_channel(m.materials[0]) <= 4) {
+                const formats::M3Layer* ml = formats::material_alpha_mask(m.materials[0]);
+                const int ch = formats::material_alpha_mask_channel(m.materials[0]);
+                const std::vector<float>& uv = ml->word40 == 1 && m.uvs1.size() >= std::size_t(m.vertex_count) * 2 ? m.uvs1 : m.uvs;
+                static std::map<std::string, std::pair<formats::DdsInfo, std::vector<std::uint8_t>>> masks;
+                auto mit = masks.find(ml->image_path);
+                if (mit == masks.end()) {
+                    std::pair<formats::DdsInfo, std::vector<std::uint8_t>> d;
+                    std::string ip = ml->image_path;
+                    for (char& c : ip)
+                        if (c == '\\') c = '/';
+                    for (const char* r : {"mods/liberty.sc2mod/base.sc2assets/", "mods/core.sc2mod/base.sc2assets/", "mods/swarm.sc2mod/base.sc2assets/", "mods/void.sc2mod/base.sc2assets/", ""}) {
+                        try { d.second = formats::dds_decode_rgba(store.read_by_name(std::string(r) + ip), d.first); } catch (...) { d.second.clear(); }
+                        if (!d.second.empty()) break;
+                    }
+                    mit = masks.emplace(ml->image_path, std::move(d)).first;
+                }
+                const formats::DdsInfo& di = mit->second.first;
+                const std::vector<std::uint8_t>& px = mit->second.second;
+                if (!px.empty() && di.width && di.height && uv.size() >= std::size_t(m.vertex_count) * 2 &&
+                    px.size() >= std::size_t(di.width) * di.height * 4) {
+                    const float tu = ml->anim.uv_tiling[0] != 0.0f ? ml->anim.uv_tiling[0] : 1.0f, tv = ml->anim.uv_tiling[1] != 0.0f ? ml->anim.uv_tiling[1] : 1.0f;
+                    const float mul = ml->raw_record.empty() ? 1.0f : ml->anim.bright_mult, add = ml->raw_record.empty() ? 0.0f : ml->anim.midtone_offset;
+                    const int sel = ch == 1 ? 3 : ch - 2;
+                    m.vertex_colors.assign(std::size_t(m.vertex_count) * 4, 255);
+                    for (std::uint32_t v = 0; v < m.vertex_count; ++v) {
+                        float fu = uv[std::size_t(v) * 2] * tu, fv = uv[std::size_t(v) * 2 + 1] * tv;
+                        fu -= std::floor(fu); fv -= std::floor(fv);
+                        const std::uint32_t x = std::min(di.width - 1, std::uint32_t(fu * float(di.width)));
+                        const std::uint32_t y = std::min(di.height - 1, std::uint32_t(fv * float(di.height)));
+                        const float a = std::clamp(float(px[(std::size_t(y) * di.width + x) * 4 + std::size_t(sel)]) / 255.0f * mul + add, 0.0f, 1.0f);
+                        m.vertex_colors[std::size_t(v) * 4 + 3] = std::uint8_t(a * 255.0f + 0.5f);
+                    }
+                    m.vertex_flags |= 0x200u;
+                    m.cliff_skin_opaque = false;
+                }
+            }
             it = cf.pieces.emplace(key, std::move(m)).first;
         }
         return &it->second;
@@ -194,7 +266,10 @@ inline CliffField place_cliffs(casc::Storage& store, const formats::LoadedMap& m
         for (char ch : code) abs_code = abs_code && ch >= 'A' && ch <= 'D';
         float base_z = tier_top(mn);
         float shear[3] = {0.0f, 0.0f, 0.0f};
+        bool on_pure = false;
         if (!std::getenv("SC2_CLIFF_TIER_BASE")) {
+            on_pure = !sculpt_of_level.empty();
+            if (on_pure) base_z = pure_top(mn);
             const float off = formats::engine_z_offset(map);
             const float stdh = map.quantize.found ? float(map.quantize.standard_height) : 0.0f;
             const bool has_sculpt = map.heightmap.width > 0 && map.heightmap.height > 0 && map.quantize.found;
@@ -208,7 +283,16 @@ inline CliffField place_cliffs(casc::Storage& store, const formats::LoadedMap& m
                     const int vx = int(std::lround(wx + dx)), vy = int(std::lround(wy + dy));
                     if (vx < 0 || vy < 0 || vx > int(cm.width) || vy > int(cm.height)) continue;
                     const float delta = has_sculpt ? formats::map_sculpt_height(map, std::uint32_t(vx), std::uint32_t(vy)) - stdh : 0.0f;
-                    lowest = std::min(lowest, formats::vertex_ground_z(map, tier_z, off, std::uint32_t(vx), std::uint32_t(vy)) - delta);
+                    bool uniform = true;
+                    if (on_pure)
+                        for (int oy = -1; oy <= 0 && uniform; ++oy)
+                            for (int ox = -1; ox <= 0 && uniform; ++ox) {
+                                const int cx2 = std::clamp(vx + ox, 0, int(cm.width) - 1), cy2 = std::clamp(vy + oy, 0, int(cm.height) - 1);
+                                const std::size_t k = std::size_t(cy2) * cm.width + std::size_t(cx2);
+                                uniform = int(cm.levels[k]) == lvl(std::clamp(vx, 0, int(cm.width) - 1), std::clamp(vy, 0, int(cm.height) - 1)) &&
+                                          !(have_raw && (cm.raw[k] & 63));
+                            }
+                    if (uniform) lowest = std::min(lowest, formats::vertex_ground_z(map, tier_z, off, std::uint32_t(vx), std::uint32_t(vy)) - delta);
                     sx += dx * delta; sy += dy * delta; sm += delta; sxx += dx * dx;
                     ++cnt;
                 }
@@ -239,7 +323,10 @@ inline CliffField place_cliffs(casc::Storage& store, const formats::LoadedMap& m
                 shear[2] = sm / float(cnt);
             }
         }
-        const float rise = (span > 1 ? tier_top(mn + span) : tier_top(mn) + tier_rise(mn)) - base_z;
+        const float top_z = !on_pure ? (span > 1 ? tier_top(mn + span) : tier_top(mn) + tier_rise(mn))
+                            : span > 1 || std::size_t(mn) + 1 < tier_z.size() ? pure_top(mn + span)
+                                                                               : pure_top(mn) + tier_rise(mn);
+        const float rise = top_z - base_z;
         const float native = abs_code || span > 1 || S.native <= 0.0f ? piece->bounds_max[2] : S.native;
         const float zscale = native > 1e-3f ? (rise > 1e-3f ? rise : tier_h) / native : 1.0f;
         inst.world = render::translation(wx, wy, base_z) *
@@ -398,9 +485,40 @@ inline CliffField place_cliffs(casc::Storage& store, const formats::LoadedMap& m
                 render::SceneInstance inst;
                 inst.model = piece;
                 float base_z = tier_top(lo) - zscale * piece->bounds_min[2], zs = zscale;
+                float fshear[3] = {0.0f, 0.0f, 0.0f};
                 if (!kOldFlanks) {
-                    const float zlo = std::min(std::min(corner_z[0], corner_z[1]), std::min(corner_z[2], corner_z[3]));
-                    const float zhi = std::max(std::max(corner_z[0], corner_z[1]), std::max(corner_z[2], corner_z[3]));
+                    float cz[4] = {corner_z[0], corner_z[1], corner_z[2], corner_z[3]};
+                    static const bool kFlankSculptOld = std::getenv("SC2_CLIFF_SCULPT_TWICE") != nullptr;
+                    const bool has_sculpt = !kFlankSculptOld && map.heightmap.width > 0 && map.heightmap.height > 0 && map.quantize.found;
+                    if (has_sculpt) {
+                        const float stdh = float(map.quantize.standard_height);
+                        auto delta_at = [&](float x, float y) {
+                            const long vx = std::lround(x), vy = std::lround(y);
+                            if (vx < 0 || vy < 0 || vx > long(cm.width) || vy > long(cm.height)) return 0.0f;
+                            return formats::map_sculpt_height(map, std::uint32_t(vx), std::uint32_t(vy)) - stdh;
+                        };
+                        for (int k = 0; k < 4; ++k) {
+                            const float x = f.cx + sgn_r[k] * f.w * f.rx + sgn_u[k] * f.h * f.ux;
+                            const float y = f.cy + sgn_r[k] * f.w * f.ry + sgn_u[k] * f.h * f.uy;
+                            cz[k] -= delta_at(x, y);
+                        }
+                        const int ex = int(std::ceil(std::max(std::fabs(f.w * f.rx) + std::fabs(f.h * f.ux), std::fabs(f.w * f.ry) + std::fabs(f.h * f.uy))));
+                        float sx = 0.0f, sy = 0.0f, sm = 0.0f, sxx = 0.0f, syy = 0.0f;
+                        int cnt = 0;
+                        for (int j = -ex; j <= ex; ++j)
+                            for (int i = -ex; i <= ex; ++i) {
+                                const float d = delta_at(f.cx + float(i), f.cy + float(j));
+                                sx += float(i) * d; sy += float(j) * d; sm += d; sxx += float(i * i); syy += float(j * j);
+                                ++cnt;
+                            }
+                        if (cnt) {
+                            fshear[0] = sxx > 0.0f ? sx / sxx : 0.0f;
+                            fshear[1] = syy > 0.0f ? sy / syy : 0.0f;
+                            fshear[2] = sm / float(cnt);
+                        }
+                    }
+                    const float zlo = std::min(std::min(cz[0], cz[1]), std::min(cz[2], cz[3]));
+                    const float zhi = std::max(std::max(cz[0], cz[1]), std::max(cz[2], cz[3]));
                     base_z = zlo;
                     zs = hi > lo && zhi - zlo > 1e-3f ? (zhi - zlo) / (2.0f * float(hi - lo)) : 1.0f;
                 }
@@ -408,6 +526,9 @@ inline CliffField place_cliffs(casc::Storage& store, const formats::LoadedMap& m
                              render::rotation_z(std::atan2(f.ry, f.rx) +
                                                 sign * float(yaw) * 1.5707963f) *
                              render::scaling(1.0f, 1.0f, zs);
+                inst.world.m[2] += fshear[0] * inst.world.m[0] + fshear[1] * inst.world.m[1];
+                inst.world.m[6] += fshear[0] * inst.world.m[4] + fshear[1] * inst.world.m[5];
+                inst.world.m[14] += fshear[2];
                 inst.team = {0, 0, 0, -1.0f};
                 inst.seq = -1;
                 if (std::getenv("SC2_RAMP_TRACE"))

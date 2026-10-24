@@ -1,6 +1,8 @@
 #include "sc2/casc/mndx.hpp"
 
+#include <algorithm>
 #include <array>
+#include <cstdlib>
 #include <cstring>
 #include <memory>
 #include <stdexcept>
@@ -607,6 +609,12 @@ struct CKeyEntry {
 void Mndx::parse(const std::vector<uint8_t>& root_blob) {
     entries_.clear();
     by_path_.clear();
+    by_hash_.clear();
+    resolve_ck_.clear();
+    fc_.clear();
+    restart_.clear();
+    first_ck_.clear();
+    fc_count_ = 0;
 
     const uint8_t* buf = root_blob.data();
     const size_t size = root_blob.size();
@@ -700,11 +708,139 @@ void Mndx::parse(const std::vector<uint8_t>& root_blob) {
         else
             ins.first->second = ck;
     });
+    if (casc_index_maps_old()) return;
+    resolve_ck_.resize(entries_.size());
+    by_hash_.resize(entries_.size());
+    for (std::size_t i = 0; i < entries_.size(); ++i) {
+        resolve_ck_[i] = by_path_.find(entries_[i].first)->second;
+        by_hash_[i] = {fnv1a64(entries_[i].first), std::uint32_t(i)};
+    }
+    std::sort(by_hash_.begin(), by_hash_.end());
+    std::unordered_map<std::string, CKey>().swap(by_path_);
+    static const bool kPlainNames = std::getenv("SC2_CASC_NAMES_PLAIN") != nullptr;
+    if (kPlainNames) {
+        entries_.shrink_to_fit();
+        return;
+    }
+    const std::size_t n = entries_.size();
+    std::size_t blob = 0;
+    for (std::size_t i = 0; i < n; ++i) {
+        std::size_t shared = 0;
+        if (i % kRestart) {
+            const std::string& a = entries_[i - 1].first;
+            const std::string& s = entries_[i].first;
+            const std::size_t lim = std::min(a.size(), s.size());
+            while (shared < lim && a[shared] == s[shared]) ++shared;
+        }
+        blob += 6 + entries_[i].first.size() - shared;
+    }
+    fc_.reserve(blob);
+    restart_.reserve(n / kRestart + 1);
+    auto put_varint = [this](std::uint32_t v) {
+        while (v >= 0x80) {
+            fc_.push_back(std::uint8_t(v | 0x80));
+            v >>= 7;
+        }
+        fc_.push_back(std::uint8_t(v));
+    };
+    for (std::size_t i = 0; i < n; ++i) {
+        const std::string& s = entries_[i].first;
+        if (entries_[i].second != resolve_ck_[i]) first_ck_.emplace_back(std::uint32_t(i), entries_[i].second);
+        std::size_t shared = 0;
+        if (i % kRestart == 0) {
+            restart_.push_back(std::uint32_t(fc_.size()));
+        } else {
+            const std::string& a = entries_[i - 1].first;
+            const std::size_t lim = std::min(a.size(), s.size());
+            while (shared < lim && a[shared] == s[shared]) ++shared;
+        }
+        put_varint(std::uint32_t(shared));
+        put_varint(std::uint32_t(s.size() - shared));
+        fc_.insert(fc_.end(), s.begin() + std::ptrdiff_t(shared), s.end());
+    }
+    fc_.shrink_to_fit();
+    first_ck_.shrink_to_fit();
+    fc_count_ = n;
+    std::vector<std::pair<std::string, CKey>>().swap(entries_);
+}
+
+namespace {
+std::uint32_t get_varint(const std::vector<std::uint8_t>& b, std::size_t& p) {
+    std::uint32_t v = 0;
+    for (int shift = 0; p < b.size(); shift += 7) {
+        const std::uint8_t c = b[p++];
+        v |= std::uint32_t(c & 0x7f) << shift;
+        if (!(c & 0x80)) break;
+    }
+    return v;
+}
+
+void fc_step(const std::vector<std::uint8_t>& b, std::size_t& p, std::string& s) {
+    const std::uint32_t shared = get_varint(b, p);
+    const std::uint32_t rest = get_varint(b, p);
+    s.resize(std::min<std::size_t>(shared, s.size()));
+    const std::size_t take = std::min<std::size_t>(rest, b.size() - std::min(p, b.size()));
+    s.append(reinterpret_cast<const char*>(b.data() + p), take);
+    p += take;
+}
+}
+
+std::string Mndx::name(std::size_t i) const {
+    if (!fc_count_) return i < entries_.size() ? entries_[i].first : std::string();
+    if (i >= fc_count_) return {};
+    std::size_t p = restart_[i / kRestart];
+    std::string s;
+    for (std::size_t k = (i / kRestart) * kRestart; k <= i; ++k) fc_step(fc_, p, s);
+    return s;
+}
+
+const CKey& Mndx::key(std::size_t i) const {
+    if (!fc_count_) return entries_[i].second;
+    auto it = std::lower_bound(first_ck_.begin(), first_ck_.end(), std::uint32_t(i),
+                               [](const std::pair<std::uint32_t, CKey>& e, std::uint32_t k) { return e.first < k; });
+    return it != first_ck_.end() && it->first == i ? it->second : resolve_ck_[i];
+}
+
+void Mndx::Range::iterator::load() {
+    if (i_ >= m_->size()) return;
+    if (!m_->fc_count_) {
+        cur_ = m_->entries_[i_];
+        return;
+    }
+    if (pos_ == 0 || i_ % kRestart == 0) {
+        pos_ = m_->restart_[i_ / kRestart];
+        cur_.first.clear();
+        for (std::size_t k = (i_ / kRestart) * kRestart; k <= i_; ++k) fc_step(m_->fc_, pos_, cur_.first);
+    } else {
+        fc_step(m_->fc_, pos_, cur_.first);
+    }
+    cur_.second = m_->key(i_);
 }
 
 const CKey* Mndx::resolve(const std::string& path) const {
+    if (!by_hash_.empty() || by_path_.empty()) {
+        const std::uint64_t h = fnv1a64(path);
+        auto it = std::lower_bound(by_hash_.begin(), by_hash_.end(), std::make_pair(h, std::uint32_t(0)));
+        for (; it != by_hash_.end() && it->first == h; ++it)
+            if (name(it->second) == path) return &resolve_ck_[it->second];
+        return nullptr;
+    }
     auto it = by_path_.find(path);
     return it == by_path_.end() ? nullptr : &it->second;
+}
+
+std::size_t Mndx::memory_bytes() const {
+    std::size_t b = entries_.capacity() * sizeof(entries_[0]) + by_hash_.capacity() * sizeof(by_hash_[0]) +
+                    resolve_ck_.capacity() * sizeof(CKey) + fc_.capacity() + restart_.capacity() * sizeof(restart_[0]) +
+                    first_ck_.capacity() * sizeof(first_ck_[0]);
+    for (const auto& e : entries_) b += e.first.capacity() > 15 ? e.first.capacity() + 1 : 0;
+    for (const auto& kv : by_path_) b += 64 + sizeof(kv) + (kv.first.capacity() > 15 ? kv.first.capacity() + 1 : 0);
+    return b;
+}
+
+bool casc_index_maps_old() {
+    static const bool old = std::getenv("SC2_CASC_INDEX_MAPS") != nullptr;
+    return old;
 }
 
 }

@@ -38,8 +38,9 @@ public:
         return kNone;
     }
 
-    void begin(int player, const std::string& id, Fixed delay) {
-        if (world_) world_->begin_research(player, id, delay);
+    void begin(int player, const std::string& id, Fixed delay, std::uint32_t producer = sim::kNoTarget,
+               int minerals = 0, int gas = 0) {
+        if (world_) world_->begin_research(player, id, delay, producer, minerals, gas);
     }
 
     void grant(int player, const std::string& id) {

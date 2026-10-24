@@ -1,5 +1,7 @@
+#include <functional>
 #include <set>
 #include <tuple>
+#include <unordered_map>
 #include "sc2/render/frame_prof.hpp"
 #include "sc2/render/scene_renderer.hpp"
 
@@ -16,6 +18,7 @@
 #include "sc2/formats/dds.hpp"
 #include "sc2/render/anim.hpp"
 #include "sc2/render/terrain_tex.hpp"
+#include "sc2/render/texture_decode.hpp"
 
 static const uint32_t kSceneVertSpv[] =
 #include "scene.vert.spv.h"
@@ -167,9 +170,93 @@ struct GlobalsUBO {
     float rigSpec[3][4];
 };
 
+std::vector<Mat4> reach_bone_deltas(const SceneInstance& inst, const std::vector<Mat4>& bwm) {
+    const formats::Model& m = *inst.model;
+    const size_t n = m.bones.size();
+    if (inst.reach_tip_bone < 0 || inst.reach_root_bone < 0 || bwm.size() != n || size_t(inst.reach_tip_bone) >= n ||
+        size_t(inst.reach_root_bone) >= n)
+        return {};
+    std::vector<int> chain;
+    for (int p = inst.reach_tip_bone, guard = 0; p >= 0 && guard <= int(n); ++guard) {
+        chain.push_back(p);
+        if (p == inst.reach_root_bone) break;
+        p = m.bones[size_t(p)].parent;
+    }
+    if (chain.empty() || chain.back() != inst.reach_root_bone) return {};
+    auto at = [&](int b) { const Mat4& w = bwm[size_t(b)]; return Vec3{w.m[12], w.m[13], w.m[14]}; };
+    const Vec3 dw{inst.reach_target[0] - inst.world.m[12], inst.reach_target[1] - inst.world.m[13], inst.reach_target[2] - inst.world.m[14]};
+    float tm[3];
+    for (int c = 0; c < 3; ++c) {
+        const float* col = &inst.world.m[size_t(c) * 4];
+        const float l2 = col[0] * col[0] + col[1] * col[1] + col[2] * col[2];
+        tm[c] = l2 > 1e-12f ? (col[0] * dw.x + col[1] * dw.y + col[2] * dw.z) / l2 : 0.0f;
+    }
+    const Vec3 p0 = at(inst.reach_root_bone), p1 = at(inst.reach_tip_bone), tgt{tm[0], tm[1], tm[2]};
+    const Vec3 dp = sub(p1, p0), dl = sub(tgt, p0);
+    const float lp2 = dot(dp, dp), ll = std::sqrt(dot(dl, dl));
+    if (!(lp2 > 1e-8f && ll > 1e-4f)) return {};
+    const Vec3 a = normalize(dp);
+    const auto turn = [&](const Vec3& to) {
+        const Vec3 ax = cross(a, to);
+        const float s = std::sqrt(dot(ax, ax)), c = dot(a, to);
+        Mat4 R = Mat4::identity();
+        if (s > 1e-6f) {
+            const Vec3 k{ax.x / s, ax.y / s, ax.z / s};
+            const float t = 1.0f - c;
+            const float r[9] = {t * k.x * k.x + c, t * k.x * k.y - s * k.z, t * k.x * k.z + s * k.y,
+                                t * k.x * k.y + s * k.z, t * k.y * k.y + c, t * k.y * k.z - s * k.x,
+                                t * k.x * k.z - s * k.y, t * k.y * k.z + s * k.x, t * k.z * k.z + c};
+            for (int row = 0; row < 3; ++row)
+                for (int col = 0; col < 3; ++col) R.m[size_t(col) * 4 + size_t(row)] = r[row * 3 + col];
+        } else if (c < 0.0f) {
+            R = scaling(-1.0f, -1.0f, 1.0f);
+        }
+        return R;
+    };
+    const Mat4 R = turn(normalize(dl));
+    static const float kArch = std::getenv("SC2_TENTACLE_ARCH") ? float(std::atof(std::getenv("SC2_TENTACLE_ARCH"))) : 0.0f;
+    std::vector<Mat4> delta(n, Mat4::identity());
+    std::vector<char> moved(n, 0);
+    for (int b : chain) {
+        if (b == inst.reach_root_bone) continue;
+        const Vec3 pk = at(b);
+        const float tk = std::clamp(dot(sub(pk, p0), dp) / lp2, 0.0f, 1.0f);
+        Vec3 np{p0.x + dl.x * tk, p0.y + dl.y * tk, p0.z + dl.z * tk};
+        Mat4 Rk = R;
+        if (kArch != 0.0f) {
+            const float h = kArch * ll;
+            np.z += 4.0f * h * tk * (1.0f - tk);
+            Rk = turn(normalize(Vec3{dl.x, dl.y, dl.z + 4.0f * h * (1.0f - 2.0f * tk)}));
+        }
+        delta[size_t(b)] = translation(np.x, np.y, np.z) * Rk * translation(-pk.x, -pk.y, -pk.z);
+        moved[size_t(b)] = 1;
+    }
+    static const bool kRibbonRootStays = std::getenv("SC2_REACH_RIBBON_ROOT_STAYS") != nullptr;
+    if (!kRibbonRootStays && chain.size() >= 2) {
+        for (const formats::M3Ribbon& rb : m.ribbons)
+            if (rb.bone < n && m.bones[rb.bone].parent == inst.reach_root_bone && !moved[rb.bone]) {
+                const Vec3 pr = at(int(rb.bone));
+                delta[rb.bone] = translation(p0.x, p0.y, pr.z) * R * translation(-pr.x, -pr.y, -pr.z);
+                moved[rb.bone] = 1;
+            }
+    }
+    if (inst.reach_weapon_bone >= 0 && size_t(inst.reach_weapon_bone) < n) {
+        const Vec3 pw = at(inst.reach_weapon_bone);
+        delta[size_t(inst.reach_weapon_bone)] = translation(tgt.x - pw.x, tgt.y - pw.y, tgt.z - pw.z);
+        moved[size_t(inst.reach_weapon_bone)] = 1;
+    }
+    std::vector<Mat4> out(n, Mat4::identity());
+    for (size_t b = 0; b < n; ++b)
+        for (int p = int(b), guard = 0; p >= 0 && guard <= int(n); ++guard, p = m.bones[size_t(p)].parent)
+            if (moved[size_t(p)]) { out[b] = delta[size_t(p)]; break; }
+    return out;
+}
+
 std::vector<Mat4> instance_bones_world(const SceneInstance& inst, const std::vector<Mat4>& bw) {
     std::vector<Mat4> out(bw.size());
-    for (size_t i = 0; i < bw.size(); ++i) out[i] = inst.world * bw[i];
+    static const bool kReachRibbons = std::getenv("SC2_NO_REACH_RIBBONS") == nullptr;
+    const std::vector<Mat4> rd = kReachRibbons && inst.reach_tip_bone >= 0 ? reach_bone_deltas(inst, bw) : std::vector<Mat4>{};
+    for (size_t i = 0; i < bw.size(); ++i) out[i] = i < rd.size() ? inst.world * rd[i] * bw[i] : inst.world * bw[i];
     const formats::Model& m = *inst.model;
     if (inst.beam_bone >= 0 && size_t(inst.beam_bone) < out.size() && m.bones.size() == out.size()) {
         const Mat4& a = out[size_t(inst.beam_bone)];
@@ -186,6 +273,35 @@ std::vector<Mat4> instance_bones_world(const SceneInstance& inst, const std::vec
         }
     }
     return out;
+}
+
+struct BirthPoseKey {
+    const formats::Model* model;
+    const void* bones;
+    std::size_t nbones;
+    std::uint32_t seq;
+    int q;
+    bool operator==(const BirthPoseKey& o) const {
+        return model == o.model && bones == o.bones && nbones == o.nbones && seq == o.seq && q == o.q;
+    }
+};
+struct BirthPoseKeyHash {
+    std::size_t operator()(const BirthPoseKey& k) const {
+        std::size_t h = std::hash<const void*>()(k.model) ^ (std::hash<const void*>()(k.bones) << 1);
+        h = h * 1000003u ^ k.nbones;
+        h = h * 1000003u ^ std::size_t(k.seq);
+        h = h * 1000003u ^ std::size_t(std::uint32_t(k.q));
+        return h;
+    }
+};
+const std::vector<Mat4>& birth_pose_cached(const formats::Model& m, std::uint32_t seq, int q, float tq, double& misses) {
+    static std::unordered_map<BirthPoseKey, std::vector<Mat4>, BirthPoseKeyHash> cache;
+    const BirthPoseKey key{&m, m.bones.data(), m.bones.size(), seq, q};
+    auto it = cache.find(key);
+    if (it != cache.end()) return it->second;
+    if (cache.size() >= 8192) cache.clear();
+    misses += 1;
+    return cache.emplace(key, pose_world(m, seq, tq)).first->second;
 }
 
 void particle_rng(uint32_t emitter, int particle, float& u1, float& u2, float& u3) {
@@ -742,7 +858,25 @@ int SceneRenderer::upload_texture(uint32_t w, uint32_t h, const std::vector<uint
                            VK_IMAGE_ASPECT_COLOR_BIT, w, h, mips);
     Buffer stg = make_buffer(pd_, dev_, rgba.size(), VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
                              const_cast<uint8_t*>(rgba.data()));
-    one_time([&](VkCommandBuffer cb) {
+    static const bool kUnbatched = std::getenv("SC2_UPLOAD_UNBATCHED") != nullptr;
+    const bool batched = upload_batch_ > 0 && !kUnbatched;
+    auto submit = [&](const std::function<void(VkCommandBuffer)>& rec) {
+        if (!batched) { one_time(rec); return; }
+        if (batch_cb_ == VK_NULL_HANDLE) {
+            VkCommandBufferAllocateInfo ab{};
+            ab.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
+            ab.commandPool = cmdPool_.get();
+            ab.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+            ab.commandBufferCount = 1;
+            check(vkAllocateCommandBuffers(dev_, &ab, &batch_cb_), "vkAllocateCommandBuffers(upload batch)");
+            VkCommandBufferBeginInfo bi{};
+            bi.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+            bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+            check(vkBeginCommandBuffer(batch_cb_, &bi), "vkBeginCommandBuffer(upload batch)");
+        }
+        rec(batch_cb_);
+    };
+    submit([&](VkCommandBuffer cb) {
         VkImageMemoryBarrier b{};
         b.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
         b.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
@@ -793,7 +927,134 @@ int SceneRenderer::upload_texture(uint32_t w, uint32_t h, const std::vector<uint
                              0, 0, nullptr, 0, nullptr, 1, &b);
     });
     textures_.push_back(std::move(img));
+    texture_bytes_ += std::size_t(w) * h * 4 * 4 / 3;
+    if (batched) {
+        batch_keep_.push_back(std::move(stg));
+        batch_keep_bytes_ += rgba.size();
+        const std::size_t budget = tun_.upload_batch_mb * 1048576u;
+        if (budget && batch_keep_bytes_ >= budget) flush_upload_batch();
+    }
     return idx;
+}
+
+void SceneRenderer::flush_upload_batch() {
+    if (batch_cb_ == VK_NULL_HANDLE) return;
+    check(vkEndCommandBuffer(batch_cb_), "vkEndCommandBuffer(upload batch)");
+    VkSubmitInfo si{};
+    si.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+    si.commandBufferCount = 1;
+    si.pCommandBuffers = &batch_cb_;
+    {
+        SC2_PROF_SCOPE("sr.upload_wait");
+        check(vkQueueSubmit(queue_, 1, &si, VK_NULL_HANDLE), "vkQueueSubmit(upload batch)");
+        check(vkQueueWaitIdle(queue_), "vkQueueWaitIdle(upload batch)");
+    }
+    vkFreeCommandBuffers(dev_, cmdPool_.get(), 1, &batch_cb_);
+    batch_cb_ = VK_NULL_HANDLE;
+    batch_keep_.clear();
+    batch_keep_bytes_ = 0;
+    frame_prof_count("upload.batches", 1.0);
+}
+
+void SceneRenderer::end_upload_batch() {
+    if (upload_batch_ > 0) --upload_batch_;
+    if (upload_batch_ == 0) {
+        batch_taken_.clear();
+        batch_shared_keys_.clear();
+    }
+    if (upload_batch_ > 0) return;
+    flush_upload_batch();
+}
+
+std::shared_ptr<DecodedTexture> SceneRenderer::take_decoded(const std::string& key) {
+    if (auto it = batch_taken_.find(key); it != batch_taken_.end()) return it->second;
+    TextureDecodePool* pool = TextureDecodePool::existing();
+    if (!pool) return nullptr;
+    auto t = pool->take(key);
+    if (!t) return nullptr;
+    auto d = std::make_shared<DecodedTexture>(std::move(*t));
+    keep_decoded(key, d);
+    return d;
+}
+
+void SceneRenderer::keep_decoded(const std::string& key, const std::shared_ptr<DecodedTexture>& d) {
+    if (upload_batch_ > 0 && texture_take_once() && batch_shared_keys_.count(key)) batch_taken_.emplace(key, d);
+}
+
+std::size_t SceneRenderer::gpu_bytes_estimate() const {
+    std::size_t b = texture_bytes_;
+    if (shadow_ == &shadowMap_) b += std::size_t(tun_.shadow_dim) * tun_.shadow_dim * 4;
+    b += std::size_t(width_) * height_ * (8 + 8 + 4 + 4 + 4) + std::size_t(bloom_w_) * bloom_h_ * 8 * 2;
+    return b;
+}
+
+static bool layer_triplanar(const formats::Model& m, int material, const char* usage) {
+    const std::string u = usage ? usage : "";
+    static const bool kTriNormal = std::getenv("SC2_TRIPLANAR_NORMAL") != nullptr;
+    static const bool kTriDiffuseOnly = std::getenv("SC2_TRIPLANAR_DIFFUSE_ONLY") != nullptr;
+    static const bool kNoTri = std::getenv("SC2_NO_TRIPLANAR") != nullptr;
+    if ((u == "Diffuse" || ((u == "Normal" || u == "Specular") && kTriNormal && !kTriDiffuseOnly)) && !kNoTri)
+        if (const formats::M3Layer* tl = layer_ptr_of(m, material, usage))
+            return !tl->raw_record.empty() && tl->word40 >= 16 && tl->word40 <= 18;
+    return false;
+}
+
+struct ModelTexReq {
+    std::string key, path;
+    bool normal = false, tri = false, env = false;
+};
+static std::vector<ModelTexReq> model_texture_reqs(const formats::Model& m, uint32_t max_dim) {
+    std::vector<ModelTexReq> out;
+    static const char* const kUsages[] = {"Diffuse", "Normal", "Emissive", "Specular", "AlphaMask", "EnvironmentVIOMask",
+                                          "Decal", "AmbientOcclusion", "AlphaMask2", "Emissive2"};
+    for (int mat = 0; mat < int(m.materials.size()); ++mat) {
+        for (const char* usage : kUsages) {
+            if (const formats::M3Layer* layer = layer_ptr_of(m, mat, usage))
+                if (!layer->inline_rgba.empty() && layer->inline_w && layer->inline_h) continue;
+            ModelTexReq r;
+            r.path = layer_of(m, mat, usage);
+            if (r.path.empty()) continue;
+            r.normal = std::string(usage) == "Normal";
+            r.tri = layer_triplanar(m, mat, usage);
+            r.key = texture_key_2d(r.path, r.normal, r.tri, max_dim);
+            out.push_back(std::move(r));
+        }
+        ModelTexReq e;
+        e.path = layer_of(m, mat, "EnvironmentVIO");
+        if (e.path.empty()) continue;
+        e.env = true;
+        e.key = texture_key_env(e.path);
+        out.push_back(std::move(e));
+    }
+    return out;
+}
+
+static std::vector<std::string> model_texture_keys(const formats::Model& m, uint32_t max_dim) {
+    std::vector<std::string> keys;
+    for (ModelTexReq& r : model_texture_reqs(m, max_dim)) keys.push_back(std::move(r.key));
+    return keys;
+}
+
+bool SceneRenderer::request_model_textures(const formats::Model& m, const casc::Storage* storage, const std::string& texture_root,
+                                           uint32_t max_dim) {
+    if (!storage) return true;
+    TextureDecodePool& pool = TextureDecodePool::instance();
+    bool ready = true;
+    for (const ModelTexReq& r : model_texture_reqs(m, max_dim)) {
+        if (pool.ready(r.key)) continue;
+        ready = false;
+        const std::string root = texture_root, path = r.path;
+        const bool normal = r.normal, tri = r.tri;
+        if (r.env)
+            pool.request(r.key, [storage, root, path] { return decode_texture_env(*storage, root, path); });
+        else
+            pool.request(r.key, [storage, root, path, normal, tri, max_dim] { return decode_texture_2d(*storage, root, path, normal, tri, max_dim); });
+    }
+    return ready;
+}
+
+bool request_model_textures(const formats::Model& m, const casc::Storage* storage, const std::string& texture_root, uint32_t max_dim) {
+    return SceneRenderer::request_model_textures(m, storage, texture_root, max_dim);
 }
 
 int SceneRenderer::resolve_texture(const formats::Model& m, int material, const char* usage,
@@ -815,13 +1076,37 @@ int SceneRenderer::resolve_texture(const formats::Model& m, int material, const 
     std::string path = layer_of(m, material, usage);
     if (path.empty() || !storage_) return def;
     bool triplanar = false;
-    if ((u == "Diffuse" || ((u == "Normal" || u == "Specular") && std::getenv("SC2_TRIPLANAR_NORMAL") && !std::getenv("SC2_TRIPLANAR_DIFFUSE_ONLY"))) && !std::getenv("SC2_NO_TRIPLANAR"))
+    static const bool kTriNormal = std::getenv("SC2_TRIPLANAR_NORMAL") != nullptr;
+    static const bool kTriDiffuseOnly = std::getenv("SC2_TRIPLANAR_DIFFUSE_ONLY") != nullptr;
+    static const bool kNoTri = std::getenv("SC2_NO_TRIPLANAR") != nullptr;
+    if ((u == "Diffuse" || ((u == "Normal" || u == "Specular") && kTriNormal && !kTriDiffuseOnly)) && !kNoTri)
         if (const formats::M3Layer* tl = layer_ptr_of(m, material, usage))
             triplanar = !tl->raw_record.empty() && tl->word40 >= 16 && tl->word40 <= 18;
     const std::string cache_key = (srgb ? path + "#srgb" : path) + (triplanar ? "#tri" : "");
     auto it = tex_index_.find(cache_key);
     if (it != tex_index_.end()) return it->second;
     int idx = def;
+    static const bool kDecodeOld = std::getenv("SC2_TEX_DECODE_OLD") != nullptr;
+    if (!kDecodeOld) {
+        const bool normal = u == "Normal";
+        const std::string pool_key = texture_key_2d(path, normal, triplanar, tun_.max_texture_dim);
+        std::shared_ptr<DecodedTexture> taken = take_decoded(pool_key);
+        if (!taken) {
+            SC2_PROF_SCOPE("sr.sync_decode");
+            frame_prof_count("sr.sync_decodes", 1.0);
+            if (std::getenv("SC2_TEX_TRACE")) std::fprintf(stderr, "texsync %s %s\n", usage ? usage : "", pool_key.c_str());
+            taken = std::make_shared<DecodedTexture>(decode_texture_2d(*storage_, texture_root_, path, normal, triplanar, tun_.max_texture_dim));
+            keep_decoded(pool_key, taken);
+        }
+        const DecodedTexture& d = *taken;
+        if (d.ok) {
+            SC2_PROF_SCOPE("sr.tex_upload");
+            try { idx = upload_texture(d.w, d.h, d.rgba, srgb); } catch (const std::exception&) {}
+        }
+        if (idx == def && std::getenv("SC2_TEX_TRACE")) std::fprintf(stderr, "texmiss %s %s\n", usage ? usage : "", path.c_str());
+        tex_index_[cache_key] = idx;
+        return idx;
+    }
     std::vector<std::string> roots = {texture_root_};
     for (const char* r : {"mods/liberty.sc2mod/base.sc2assets/", "mods/core.sc2mod/base.sc2assets/",
                           "mods/void.sc2mod/base.sc2assets/", "mods/swarm.sc2mod/base.sc2assets/", "",
@@ -884,6 +1169,29 @@ int SceneRenderer::resolve_env_texture(const formats::Model& m, int material) {
     const std::string key = path + "#envll";
     if (auto it = tex_index_.find(key); it != tex_index_.end()) return it->second;
     int idx = kDefaultEmissive;
+    static const bool kDecodeOld = std::getenv("SC2_TEX_DECODE_OLD") != nullptr;
+    if (!kDecodeOld) {
+        const std::string pool_key = texture_key_env(path);
+        std::shared_ptr<DecodedTexture> taken = take_decoded(pool_key);
+        if (!taken) {
+            SC2_PROF_SCOPE("sr.sync_decode");
+            frame_prof_count("sr.sync_decodes", 1.0);
+            if (std::getenv("SC2_TEX_TRACE")) std::fprintf(stderr, "texsync env %s\n", pool_key.c_str());
+            taken = std::make_shared<DecodedTexture>(decode_texture_env(*storage_, texture_root_, path));
+            keep_decoded(pool_key, taken);
+        }
+        const DecodedTexture& d = *taken;
+        if (d.ok) {
+            SC2_PROF_SCOPE("sr.tex_upload");
+            try {
+                idx = upload_texture(d.w, d.h, d.rgba, true);
+                if (d.sphere) env_sphere_tex_.insert(idx);
+            } catch (const std::exception&) {}
+        }
+        if (idx == kDefaultEmissive && std::getenv("SC2_TEX_TRACE")) std::fprintf(stderr, "envmiss %s\n", path.c_str());
+        tex_index_[key] = idx;
+        return idx;
+    }
     std::vector<std::string> roots = {texture_root_};
     for (const char* r : {"mods/liberty.sc2mod/base.sc2assets/", "mods/core.sc2mod/base.sc2assets/",
                           "mods/void.sc2mod/base.sc2assets/", "mods/swarm.sc2mod/base.sc2assets/", ""})
@@ -971,6 +1279,11 @@ static const ClipLayers* glayers(const SceneInstance& inst) {
 static void material_anim(const formats::Model& m, int mi, int seq, float time_ms, float out[4], const ClipLayers* gl = nullptr) {
     out[0] = 0.0f; out[1] = 0.0f; out[2] = 1.0f; out[3] = 1.0f;
     if (mi < 0 || std::size_t(mi) >= m.materials.size()) return;
+    static const bool kNoEmisSelect = std::getenv("SC2_NO_EMIS_SELECT") != nullptr;
+    static const bool kNoEmisAdd = std::getenv("SC2_NO_EMIS_ADD") != nullptr;
+    static const bool kNoBrightMult = std::getenv("SC2_NO_BRIGHTMULT") != nullptr;
+    static const std::string kBrightTraceValue = std::getenv("SC2_BRIGHT_TRACE") ? std::getenv("SC2_BRIGHT_TRACE") : "";
+    static const char* const kBrightTrace = std::getenv("SC2_BRIGHT_TRACE") ? kBrightTraceValue.c_str() : nullptr;
     const formats::M3Material& mat = m.materials[std::size_t(mi)];
     const uint32_t s = seq >= 0 ? uint32_t(seq) : UINT32_MAX;
     for (const formats::M3Layer& L : mat.layers) {
@@ -989,27 +1302,27 @@ static void material_anim(const formats::Model& m, int mi, int seq, float time_m
                 out[2] = a.bright_mult;
             if (!L.raw_record.empty() && L.word44 == 0) out[2] *= std::max(out[2] + a.midtone_offset, 0.0f);
             static const bool kTeamClampOld = std::getenv("SC2_EMIS_TEAM_CLAMP_AFTER_MULT") != nullptr;
-            if (kTeamClampOld || mat.emis_op != 4 || std::getenv("SC2_NO_EMIS_SELECT"))
+            if (kTeamClampOld || mat.emis_op != 4 || kNoEmisSelect)
                 out[2] *= mat.emis_mult;
             static const bool kBrightStatic = std::getenv("SC2_EMIS_BRIGHTNESS_STATIC") != nullptr;
             if (!L.raw_record.empty()) {
                 float br = a.brightness;
                 if (!kBrightStatic && seq >= 0 && a.brightness_flags) animated_layer_field(m, s, a.brightness_interp, a.brightness_flags, a.brightness_id, time_ms, 1, &a.brightness, &br, gl);
-                if (const char* bt = std::getenv("SC2_BRIGHT_TRACE"); bt && mat.name == bt) {
+                if (const char* bt = kBrightTrace; bt && mat.name == bt) {
                     static int nb = 0;
                     if (nb++ < 40) std::fprintf(stderr, "[emisbright] %s seq %d t %.0f brightness init %.3f null %.3f now %.3f flags %u | mult init %.3f null %.3f flags %u\n", mat.name.c_str(), seq, double(time_ms), double(a.brightness), double(a.brightness_null), double(br), unsigned(a.brightness_flags), double(a.bright_mult), double(a.bright_mult_null), unsigned(a.bright_mult_flags));
                 }
                 out[2] *= br;
             }
             static const bool kPosAdd = std::getenv("SC2_NO_EMIS_ADD_POS") == nullptr;
-            if (!L.raw_record.empty() && L.word44 == 0 && a.bright_mult > 0.0f && out[2] < 999.0f && !std::getenv("SC2_NO_EMIS_ADD") &&
+            if (!L.raw_record.empty() && L.word44 == 0 && a.bright_mult > 0.0f && out[2] < 999.0f && !kNoEmisAdd &&
                 (a.midtone_offset < 0.0f || (kPosAdd && a.midtone_offset > 0.0f))) {
                 const float k = std::floor(std::max(-400.0f, std::min(100.0f, -a.midtone_offset / a.bright_mult * 100.0f)) + 0.5f);
                 out[2] = std::max(out[2], 0.0f) + 1000.0f * k;
             }
         }
     }
-    if (const char* bt = std::getenv("SC2_BRIGHT_TRACE"); bt && mat.name == bt) {
+    if (const char* bt = kBrightTrace; bt && mat.name == bt) {
         static int n = 0;
         if (n++ < 12)
             for (const formats::M3Layer& L : mat.layers)
@@ -1022,9 +1335,9 @@ static void material_anim(const formats::Model& m, int mi, int seq, float time_m
                                  double(L.anim.bright_mult), unsigned(L.anim.bright_mult_flags), unsigned(L.anim.bright_mult_id), int(got != none), unsigned(L.anim.uv_offset_flags));
                 }
     }
-    if (std::getenv("SC2_BRIGHT_TRACE") && (out[3] > 1.01f || out[2] > 1.01f))
+    if (kBrightTrace && (out[3] > 1.01f || out[2] > 1.01f))
         std::fprintf(stderr, "bright mat=%s diffuse=%.2f emissive=%.2f\n", mat.name.c_str(), out[3], out[2]);
-    if (std::getenv("SC2_NO_BRIGHTMULT")) { out[2] = 1.0f; out[3] = 1.0f; }
+    if (kNoBrightMult) { out[2] = 1.0f; out[3] = 1.0f; }
 }
 
 static bool material_uv_xform(const formats::Model& m, int mi, int seq, float time_ms, float out[3], const ClipLayers* gl = nullptr) {
@@ -1079,6 +1392,43 @@ VkDescriptorSet SceneRenderer::alloc_set(Unique<VkDescriptorPool>& main, std::ve
     return set;
 }
 
+bool SceneRenderer::preload_model_textures(const formats::Model& m, std::size_t byte_budget) {
+    if (has_mesh(&m)) return true;
+    const std::size_t start = texture_bytes_;
+    struct BatchEnd {
+        SceneRenderer& r;
+        ~BatchEnd() {
+            try { r.end_upload_batch(); } catch (...) {}
+        }
+    };
+    begin_upload_batch();
+    BatchEnd batch_end{*this};
+    bool done = true;
+    auto over = [&] { return byte_budget > 0 && texture_bytes_ - start >= byte_budget; };
+    for (int mat = 0; mat < int(m.materials.size()); ++mat) {
+        const bool adds = formats::material_is_additive(m.materials[std::size_t(mat)]);
+        const std::function<void()> steps[] = {
+            [&] { resolve_texture(m, mat, "Diffuse", adds ? kDefaultEmissive : kDefaultWhite); },
+            [&] { resolve_texture(m, mat, "Normal", kDefaultNormal); },
+            [&] { resolve_texture(m, mat, "Emissive", kDefaultEmissive); },
+            [&] { resolve_texture(m, mat, "Specular", kDefaultSpecular); },
+            [&] { resolve_texture(m, mat, "AlphaMask", kDefaultWhite); },
+            [&] { resolve_env_texture(m, mat); },
+            [&] { resolve_texture(m, mat, "EnvironmentVIOMask", kDefaultWhite); },
+            [&] { if (!std::getenv("SC2_NO_DECAL_LAYER")) resolve_texture(m, mat, "Decal", kDefaultClear); },
+            [&] { if (std::getenv("SC2_AO_LAYER")) resolve_texture(m, mat, "AmbientOcclusion", kDefaultWhite); },
+            [&] { resolve_texture(m, mat, "AlphaMask2", kDefaultWhite); },
+            [&] { if (!std::getenv("SC2_NO_EMISSIVE2")) resolve_texture(m, mat, "Emissive2", kDefaultEmissive); },
+        };
+        for (const auto& s : steps) {
+            if (over()) { done = false; break; }
+            s();
+        }
+        if (!done) break;
+    }
+    return done;
+}
+
 SceneRenderer::Mesh& SceneRenderer::ensure_mesh(const formats::Model& m, std::uint64_t version) {
     auto it = mesh_cache_.find(&m);
     if (it != mesh_cache_.end()) {
@@ -1089,8 +1439,13 @@ SceneRenderer::Mesh& SceneRenderer::ensure_mesh(const formats::Model& m, std::ui
     }
     Mesh mesh;
     mesh.version = version;
-    std::vector<uint32_t> tri = resolve_indices(m, mesh.draws);
-    std::vector<Vertex> verts = build_vertices(m, tri);
+    std::vector<uint32_t> tri;
+    std::vector<Vertex> verts;
+    {
+        SC2_PROF_SCOPE("sr.mesh_build");
+        tri = resolve_indices(m, mesh.draws);
+        verts = build_vertices(m, tri);
+    }
     mesh.lmin = {1e30f, 1e30f, 1e30f};
     mesh.lmax = {-1e30f, -1e30f, -1e30f};
     for (uint32_t i = 0; i < m.vertex_count; ++i)
@@ -1101,6 +1456,21 @@ SceneRenderer::Mesh& SceneRenderer::ensure_mesh(const formats::Model& m, std::ui
         }
     if (mesh.lmin.x > mesh.lmax.x) { mesh.lmin = {0, 0, 0}; mesh.lmax = {0, 0, 0}; }
     mesh.draw_tex.resize(mesh.draws.size());
+    struct BatchScope {
+        SceneRenderer& r;
+        const formats::Model& m;
+        explicit BatchScope(SceneRenderer& rr, const formats::Model& mm) : r(rr), m(mm) {
+            r.begin_upload_batch();
+            std::set<std::string> once;
+            for (const ModelTexReq& q : model_texture_reqs(m, r.tun_.max_texture_dim))
+                if (!once.insert(q.key).second) r.batch_shared_keys_.insert(q.key);
+        }
+        ~BatchScope() {
+            try { r.end_upload_batch(); } catch (...) {}
+            if (TextureDecodePool* pool = TextureDecodePool::existing())
+                for (const std::string& k : model_texture_keys(m, r.tun_.max_texture_dim)) pool->erase(k);
+        }
+    } batch_scope(*this, m);
     for (size_t i = 0; i < mesh.draws.size(); ++i) {
         int mat = mesh.draws[i].material;
         const bool adds = mat >= 0 && std::size_t(mat) < m.materials.size() && formats::material_is_additive(m.materials[std::size_t(mat)]);
@@ -1185,10 +1555,13 @@ SceneRenderer::Mesh& SceneRenderer::ensure_mesh(const formats::Model& m, std::ui
                 mesh.any_fres = true;
             }
         }
-    mesh.vbuf = make_buffer(pd_, dev_, sizeof(Vertex) * verts.size(),
-                            VK_BUFFER_USAGE_VERTEX_BUFFER_BIT, verts.data());
-    mesh.ibuf = make_buffer(pd_, dev_, sizeof(uint32_t) * tri.size(),
-                            VK_BUFFER_USAGE_INDEX_BUFFER_BIT, tri.data());
+    {
+        SC2_PROF_SCOPE("sr.mesh_upload");
+        mesh.vbuf = make_buffer(pd_, dev_, sizeof(Vertex) * verts.size(),
+                                VK_BUFFER_USAGE_VERTEX_BUFFER_BIT, verts.data());
+        mesh.ibuf = make_buffer(pd_, dev_, sizeof(uint32_t) * tri.size(),
+                                VK_BUFFER_USAGE_INDEX_BUFFER_BIT, tri.data());
+    }
     mesh.draw_uvx.assign(mesh.draws.size(), 0);
     for (size_t i = 0; i < mesh.draws.size(); ++i) {
         const int mat = mesh.draws[i].material;
@@ -1202,10 +1575,16 @@ SceneRenderer::Mesh& SceneRenderer::ensure_mesh(const formats::Model& m, std::ui
             }
     }
     mesh.draw_masklv.assign(mesh.draws.size(), {0.0f, 0.0f});
+    mesh.draw_masklv_anim.assign(mesh.draws.size(), 0);
     for (size_t i = 0; i < mesh.draws.size(); ++i) {
         const int mat = mesh.draws[i].material;
         if (mat < 0 || std::size_t(mat) >= m.materials.size()) continue;
         const formats::M3Layer* L = formats::material_alpha_mask(m.materials[std::size_t(mat)]);
+        static const bool kMaskAnim = std::getenv("SC2_SHIELD_FLARE_OLD") == nullptr;
+        if (kMaskAnim && L && L->usage == "AlphaMask" && !L->raw_record.empty() && (L->anim.bright_mult_flags != 0 || L->anim.midtone_flags != 0)) {
+            mesh.draw_masklv_anim[i] = 1;
+            mesh.any_masklv = true;
+        }
         if (!L) L = formats::material_const_alpha_layer(m.materials[std::size_t(mat)]);
         if (L && !L->raw_record.empty()) {
             float mul = L->anim.bright_mult;
@@ -1754,9 +2133,14 @@ SceneRenderer::SceneRenderer(VkPhysicalDevice pd, VkDevice dev, VkQueue queue,
     check(vkCreateDescriptorSetLayout(dev_, &tmli, nullptr, &rawTmLayout), "vkCreateDescriptorSetLayout(tonemap)");
     tmLayout_ = Unique<VkDescriptorSetLayout>(rawTmLayout, [dev](VkDescriptorSetLayout l) { vkDestroyDescriptorSetLayout(dev, l, nullptr); });
 
-    shadowMap_ = make_image(pd_, dev_, kDepthF,
-                            VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,
-                            VK_IMAGE_ASPECT_DEPTH_BIT, tun_.shadow_dim, tun_.shadow_dim);
+    if (tun_.shared_shadow) {
+        shadow_ = tun_.shared_shadow.get();
+    } else {
+        shadowMap_ = make_image(pd_, dev_, kDepthF,
+                                VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,
+                                VK_IMAGE_ASPECT_DEPTH_BIT, tun_.shadow_dim, tun_.shadow_dim);
+        shadow_ = &shadowMap_;
+    }
 
     GlobalsUBO zero{};
     globalsBuf_ = make_buffer(pd_, dev_, sizeof(GlobalsUBO), VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT, &zero);
@@ -1781,7 +2165,7 @@ SceneRenderer::SceneRenderer(VkPhysicalDevice pd, VkDevice dev, VkQueue queue,
         gdsa.pSetLayouts = &gl;
         check(vkAllocateDescriptorSets(dev_, &gdsa, &global_set_), "vkAllocateDescriptorSets(global)");
         VkDescriptorBufferInfo ubi{globalsBuf_.buf.get(), 0, sizeof(GlobalsUBO)};
-        VkDescriptorImageInfo smi2{shadowSampler_.get(), shadowMap_.view.get(),
+        VkDescriptorImageInfo smi2{shadowSampler_.get(), shadow_->view.get(),
                                    VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL};
         VkDescriptorImageInfo fgi{fogSampler_.get(), fogImg_.view.get(), VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL};
         VkWriteDescriptorSet gw[3]{};
@@ -2145,7 +2529,7 @@ SceneRenderer::SceneRenderer(VkPhysicalDevice pd, VkDevice dev, VkQueue queue,
     check(vkCreateRenderPass(dev_, &srpi, nullptr, &rawShadowPass), "vkCreateRenderPass(shadow)");
     shadowPass_ = Unique<VkRenderPass>(rawShadowPass, [dev](VkRenderPass p) { vkDestroyRenderPass(dev, p, nullptr); });
     {
-        VkImageView sfbView = shadowMap_.view.get();
+        VkImageView sfbView = shadow_->view.get();
         VkFramebufferCreateInfo sfbi{};
         sfbi.sType = VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO;
         sfbi.renderPass = rawShadowPass;
@@ -2525,6 +2909,8 @@ void SceneRenderer::prepare(const std::vector<const SceneInstance*>& live, const
             break;
         }
     frame_lights_.clear();
+    const bool env_light_trace = std::getenv("SC2_LIGHT_TRACE") != nullptr;
+    const bool env_light_no_scale = std::getenv("SC2_LIGHT_NO_SCALE") != nullptr;
     std::vector<const SceneInstance*> lit(live.begin(), live.end());
     if (light_only) lit.insert(lit.end(), light_only->begin(), light_only->end());
     for (const SceneInstance* instp : lit) {
@@ -2544,7 +2930,7 @@ void SceneRenderer::prepare(const std::vector<const SceneInstance*>& live, const
                 ref.anim_id = L.intensity_id;
                 intensity = animated_scalar(m, seq, ref, inst.time_ms, L.intensity, glayers(inst));
             }
-            if (std::getenv("SC2_LIGHT_TRACE") && L.intensity_flags && inst.seq >= 0) {
+            if (env_light_trace && L.intensity_flags && inst.seq >= 0) {
                 formats::M3AnimRef ref;
                 ref.interp = L.intensity_interp;
                 ref.anim_flags = L.intensity_flags;
@@ -2569,7 +2955,7 @@ void SceneRenderer::prepare(const std::vector<const SceneInstance*>& live, const
             intensity *= kLightGain;
             f.col = {L.color[0] * intensity, L.color[1] * intensity, L.color[2] * intensity};
             float lscale = 1.0f;
-            if (!std::getenv("SC2_LIGHT_NO_SCALE")) {
+            if (!env_light_no_scale) {
                 const float sx = std::sqrt(mb.m[0] * mb.m[0] + mb.m[1] * mb.m[1] + mb.m[2] * mb.m[2]);
                 const float sy = std::sqrt(mb.m[4] * mb.m[4] + mb.m[5] * mb.m[5] + mb.m[6] * mb.m[6]);
                 const float sz = std::sqrt(mb.m[8] * mb.m[8] + mb.m[9] * mb.m[9] + mb.m[10] * mb.m[10]);
@@ -2589,7 +2975,7 @@ void SceneRenderer::prepare(const std::vector<const SceneInstance*>& live, const
                     f.cone_scale = 1.0f / std::max(ci - f.cos_outer, 1e-3f);
                 }
             }
-            if (std::getenv("SC2_LIGHT_TRACE")) std::fprintf(stderr, "light type=%u hot=%.3f fall=%.3f X=(%.2f,%.2f,%.2f) Y=(%.2f,%.2f,%.2f) Z=(%.2f,%.2f,%.2f) flags=%08x col=%.2f,%.2f,%.2f int=%.2f near=%.2f far=%.2f z=%.2f at %.2f %.2f init %.2f animflags %u seq %d t %.0f\n", L.type, double(L.hotspot), double(L.falloff), mb.m[0], mb.m[1], mb.m[2], mb.m[4], mb.m[5], mb.m[6], mb.m[8], mb.m[9], mb.m[10], L.flags, L.color[0], L.color[1], L.color[2], intensity, L.attenuation_near, L.attenuation_far, f.pos.z, double(f.pos.x), double(f.pos.y), double(L.intensity), unsigned(L.intensity_flags), inst.seq, double(inst.time_ms));
+            if (env_light_trace) std::fprintf(stderr, "light type=%u hot=%.3f fall=%.3f X=(%.2f,%.2f,%.2f) Y=(%.2f,%.2f,%.2f) Z=(%.2f,%.2f,%.2f) flags=%08x col=%.2f,%.2f,%.2f int=%.2f near=%.2f far=%.2f z=%.2f at %.2f %.2f init %.2f animflags %u seq %d t %.0f\n", L.type, double(L.hotspot), double(L.falloff), mb.m[0], mb.m[1], mb.m[2], mb.m[4], mb.m[5], mb.m[6], mb.m[8], mb.m[9], mb.m[10], L.flags, L.color[0], L.color[1], L.color[2], intensity, L.attenuation_near, L.attenuation_far, f.pos.z, double(f.pos.x), double(f.pos.y), double(L.intensity), unsigned(L.intensity_flags), inst.seq, double(inst.time_ms));
                         frame_lights_.push_back(f);
         }
     }
@@ -2629,7 +3015,7 @@ void SceneRenderer::prepare(const std::vector<const SceneInstance*>& live, const
             }
         }
         inst_aabb_[li] = {imn, imx};
-        if (std::getenv("SC2_LIGHT_TRACE") && (imx.x - imn.x > 300.0f || imx.z - imn.z > 300.0f))
+        if (env_light_trace && (imx.x - imn.x > 300.0f || imx.z - imn.z > 300.0f))
             std::fprintf(stderr, "huge instance: %s verts=%u seq=%d local (%.1f,%.1f,%.1f)-(%.1f,%.1f,%.1f) world (%.1f,%.1f,%.1f)-(%.1f,%.1f,%.1f)\n",
                          m.name.c_str(), m.vertex_count, inst->seq, lmn.x, lmn.y, lmn.z, lmx.x, lmx.y, lmx.z, imn.x, imn.y, imn.z, imx.x, imx.y, imx.z);
         for (int a = 0; a < 3; ++a) {
@@ -2695,6 +3081,16 @@ void SceneRenderer::record(VkCommandBuffer cmd, const std::vector<const SceneIns
                            const Camera& cam, const std::vector<ParticleVertex>& pverts,
                            const std::vector<ParticleGroup>& pgroups) {
     SC2_PROF_SCOPE("SceneRenderer::record");
+    const bool env_alpha_mask_no_invert = std::getenv("SC2_ALPHA_MASK_NO_INVERT") != nullptr;
+    const char* const env_specm_trace = std::getenv("SC2_SPECM_TRACE");
+    const bool env_no_envio = std::getenv("SC2_NO_ENVIO") != nullptr;
+    const char* const env_draw_trace = std::getenv("SC2_DRAW_TRACE");
+    const bool env_ground_casts = std::getenv("SC2_GROUND_CASTS") != nullptr;
+    const bool env_no_ground_doodad_shadow = std::getenv("SC2_NO_GROUND_DOODAD_SHADOW") != nullptr;
+    const char* const env_ao_uv = std::getenv("SC2_AO_UV");
+    const bool env_no_blended = std::getenv("SC2_NO_BLENDED") != nullptr;
+    const bool env_no_unshaded = std::getenv("SC2_NO_UNSHADED") != nullptr;
+    const bool env_no_depth_prepass = std::getenv("SC2_NO_DEPTH_PREPASS") != nullptr;
     flush_pending_fog(cmd);
     Mat4 view_proj = cam.view_proj(float(width_) / float(height_));
     static const bool kSsaoEnv = std::getenv("SC2_SSAO") != nullptr;
@@ -2919,10 +3315,26 @@ void SceneRenderer::record(VkCommandBuffer cmd, const std::vector<const SceneIns
             float uvx[3] = {1.0f, 1.0f, 0.0f};
             const bool has_uvx = mesh.any_uvx && mesh.draw_uvx[d] &&
                                  material_uv_xform(*inst.model, mesh.draws[d].material, inst.seq, inst.time_ms, uvx, &inst.global_layers);
-            const bool has_lv = ext_free && mesh.any_masklv && d < mesh.draw_masklv.size() &&
-                                (mesh.draw_masklv[d][0] != 0.0f || mesh.draw_masklv[d][1] != 0.0f);
+            std::array<float, 2> lv = d < mesh.draw_masklv.size() ? mesh.draw_masklv[d] : std::array<float, 2>{0.0f, 0.0f};
+            if (inst.seq >= 0 && d < mesh.draw_masklv_anim.size() && mesh.draw_masklv_anim[d]) {
+                const int lmi = mesh.draws[d].material;
+                if (const formats::M3Layer* L = formats::material_alpha_mask(inst.model->materials[std::size_t(lmi)])) {
+                    const formats::M3Layer::AnimRefs& a = L->anim;
+                    float mul = a.bright_mult, add = a.midtone_offset;
+                    animated_layer_field(*inst.model, std::uint32_t(inst.seq), a.bright_mult_interp, a.bright_mult_flags, a.bright_mult_id, inst.time_ms, 1, &a.bright_mult, &mul,
+                                         &inst.global_layers);
+                    animated_layer_field(*inst.model, std::uint32_t(inst.seq), a.midtone_interp, a.midtone_flags, a.midtone_id, inst.time_ms, 1, &a.midtone_offset, &add,
+                                         &inst.global_layers);
+                    if (!env_alpha_mask_no_invert && (L->word36 & 0x10u) != 0) {
+                        add = mul + add;
+                        mul = -mul;
+                    }
+                    lv = {mul - 1.0f, add};
+                }
+            }
+            const bool has_lv = ext_free && mesh.any_masklv && (lv[0] != 0.0f || lv[1] != 0.0f);
             const bool has_sm = ext_free && mesh.any_specm && d < mesh.draw_specm.size() && mesh.draw_specm[d] != 0.0f;
-            if (const char* st = std::getenv("SC2_SPECM_TRACE"); st && mesh.draws[d].material >= 0 &&
+            if (const char* st = env_specm_trace; st && mesh.draws[d].material >= 0 &&
                 inst.model->materials[std::size_t(mesh.draws[d].material)].name == st) {
                 static int nst = 0;
                 if (nst++ < 200)
@@ -2930,7 +3342,7 @@ void SceneRenderer::record(VkCommandBuffer cmd, const std::vector<const SceneIns
                                  d < mesh.draw_specm.size() ? double(mesh.draw_specm[d]) : -9.0, int(has_sm), int(ext_free), int(mesh.any_specm));
             }
             const bool has_env = ext_free && mesh.any_env && d < mesh.draw_env.size() && mesh.draw_env[d][0] > 0.0f &&
-                                 !std::getenv("SC2_NO_ENVIO");
+                                 !env_no_envio;
             const std::uint16_t uvsrc = mesh.any_uvsrc && d < mesh.draw_uvsrc.size() ? mesh.draw_uvsrc[d] : std::uint16_t(0);
             const bool has_mx = mesh.any_maskx && d < mesh.draw_maskx.size() && (mesh.draw_maskx[d][3] > 0.5f || mesh.draw_maskx[d][7] > 0.5f || mesh.draw_maskx[d][10] > 0.0f);
             const bool has_fr = mesh.any_fres && d < mesh.draw_fres.size() &&
@@ -2973,7 +3385,7 @@ void SceneRenderer::record(VkCommandBuffer cmd, const std::vector<const SceneIns
                         e2[2] = br * em.emis_mult;
                         e2[3] = float(em.emis2_op + 16u * sel + (L.word40 == 1 ? 256u : 0u));
                         has_e2 = true;
-                        if (const char* dt = std::getenv("SC2_DRAW_TRACE"); dt && em.name.find(dt) != std::string::npos) {
+                        if (const char* dt = env_draw_trace; dt && em.name.find(dt) != std::string::npos) {
                             static int ne2 = 0;
                             if (ne2++ < 6)
                                 std::fprintf(stderr, "[drawtrace] '%s' emissive2 '%s' mult %.3f add %.3f brightness %.3f emisMult %.2f op %u (emissive op %u) select %u seq %d t %.0f\n", em.name.c_str(),
@@ -3032,8 +3444,8 @@ void SceneRenderer::record(VkCommandBuffer cmd, const std::vector<const SceneIns
                     f.fres_em[k] = mesh.draw_fres[d][std::size_t(20 + k)];
                 }
             if (has_lv) {
-                f.ext[0] = mesh.draw_masklv[d][0];
-                f.ext[1] = mesh.draw_masklv[d][1];
+                f.ext[0] = lv[0];
+                f.ext[1] = lv[1];
             }
             static const bool kTeamClampOld = std::getenv("SC2_EMIS_TEAM_CLAMP_AFTER_MULT") != nullptr;
             if ((uvsrc & 64) != 0 && ext_free && (inst.team_emissive[3] >= 0.0f || !kTeamClampOld)) {
@@ -3177,7 +3589,7 @@ void SceneRenderer::record(VkCommandBuffer cmd, const std::vector<const SceneIns
         const bool billboarded = kBillboards && !inst.model->billboards.empty();
         static const bool kGlBones = std::getenv("SC2_NO_GLOBAL_LAYER_BONES") == nullptr;
         const ClipLayers* glb = kGlBones && !inst.global_layers.empty() ? &inst.global_layers : nullptr;
-        const bool cacheable_inst = inst.beam_bone < 0 && !blending && !billboarded && !glb;
+        const bool cacheable_inst = inst.beam_bone < 0 && inst.reach_tip_bone < 0 && !blending && !billboarded && !glb;
         PoseKey pkey{};
         if (cacheable_inst) {
             pkey = PoseKey{static_cast<const void*>(inst.model), inst.seq,
@@ -3209,6 +3621,10 @@ void SceneRenderer::record(VkCommandBuffer cmd, const std::vector<const SceneIns
                     }
                 }
             }
+        }
+        if (inst.reach_tip_bone >= 0) {
+            const std::vector<Mat4> rd = reach_bone_deltas(inst, pose_world(*inst.model, uint32_t(inst.seq), inst.time_ms, inst.turret_bone, inst.turret_yaw, glb));
+            for (size_t b = 0; b < bone_mats.size() && b < rd.size(); ++b) bone_mats[b] = rd[b] * bone_mats[b];
         }
         if (billboarded && inst.model->bones.size() == bone_mats.size()) {
             const std::vector<Mat4> bwm = pose_world(*inst.model, uint32_t(inst.seq), inst.time_ms, inst.turret_bone, inst.turret_yaw, glb);
@@ -3333,8 +3749,8 @@ void SceneRenderer::record(VkCommandBuffer cmd, const std::vector<const SceneIns
         if (inst.model->vertex_count == 0 && !inst.model->has_splat_payload()) continue;
         if (inst.team[3] >= 1.5f || inst.fx.kind == FxKind::Cloak || inst.fx.kind == FxKind::Water || inst.fx.kind == FxKind::Creep) continue;
         std::size_t caster_first = 0, caster_end = std::size_t(-1);
-        if (tun_.gamma_space && tun_.rig.present && inst.model->has_splat_payload() && !std::getenv("SC2_GROUND_CASTS")) {
-            if (inst.model->caster_region_end <= inst.model->caster_region_first || std::getenv("SC2_NO_GROUND_DOODAD_SHADOW")) continue;
+        if (tun_.gamma_space && tun_.rig.present && inst.model->has_splat_payload() && !env_ground_casts) {
+            if (inst.model->caster_region_end <= inst.model->caster_region_first || env_no_ground_doodad_shadow) continue;
             caster_first = inst.model->caster_region_first;
             caster_end = inst.model->caster_region_end;
         }
@@ -3489,7 +3905,7 @@ void SceneRenderer::record(VkCommandBuffer cmd, const std::vector<const SceneIns
             const int mi = mesh.draws[d].material;
             if (material_hidden(*inst.model, mi)) continue;
             if (!region_visible(*inst.model, inst.seq, inst.time_ms, d, glayers(inst))) continue;
-            if (const char* dt = std::getenv("SC2_DRAW_TRACE"); dt && dt[0] == '*' && mi >= 0 && std::size_t(mi) < inst.model->materials.size()) {
+            if (const char* dt = env_draw_trace; dt && dt[0] == '*' && mi >= 0 && std::size_t(mi) < inst.model->materials.size()) {
                 static std::set<std::string> names;
                 if (names.insert(inst.model->materials[mi].name + "#" + std::to_string(inst.model->vertex_count)).second) {
                     std::fprintf(stderr, "[drawtrace] material '%s' (model verts %u, team.a %.2f, flags 0x%08x, blend %u, spec %.1f)\n", inst.model->materials[mi].name.c_str(), inst.model->vertex_count, double(inst.team[3]),
@@ -3501,7 +3917,7 @@ void SceneRenderer::record(VkCommandBuffer cmd, const std::vector<const SceneIns
                                                                     unsigned(L.anim.uv_offset_flags), unsigned(L.anim.uv_offset_id), double(L.anim.uv_tiling[0]), double(L.anim.uv_tiling[1]));
                 }
             }
-            if (const char* dt = std::getenv("SC2_DRAW_TRACE"); dt && mi >= 0 && std::size_t(mi) < inst.model->materials.size() &&
+            if (const char* dt = env_draw_trace; dt && mi >= 0 && std::size_t(mi) < inst.model->materials.size() &&
                 inst.model->materials[mi].name.find(dt) != std::string::npos) {
                 static int seen = 0;
                 if (seen++ < 4)
@@ -3521,7 +3937,7 @@ void SceneRenderer::record(VkCommandBuffer cmd, const std::vector<const SceneIns
                     mpc[0] += 300000.0f;
                 for (const formats::M3Layer& aol : inst.model->materials[mi].layers)
                     if (aol.usage == "AmbientOcclusion" && aol.word40 == 1) mpc[2] = 0.25f;
-                if (const char* au = std::getenv("SC2_AO_UV")) {
+                if (const char* au = env_ao_uv) {
                     const std::string m = au;
                     mpc[2] = m == "uv1" ? 0.25f : m == "uv1v" ? 0.5f : m == "uv0v" ? 0.75f : 0.0f;
                 }
@@ -3767,7 +4183,7 @@ void SceneRenderer::record(VkCommandBuffer cmd, const std::vector<const SceneIns
         for (const BlendedDraw& bd : blended) {
             const SceneInstance& inst = *live[bd.inst];
             Mesh& mesh = ensure_mesh(*inst.model, inst.mesh_version);
-            if (std::getenv("SC2_NO_BLENDED") && inst.team[3] <= -1.5f) continue;
+            if (env_no_blended && inst.team[3] <= -1.5f) continue;
             const int mi = mesh.draws[bd.draw].material;
             if (material_hidden(*inst.model, mi)) continue;
             if (!region_visible(*inst.model, inst.seq, inst.time_ms, bd.draw, glayers(inst))) continue;
@@ -3802,7 +4218,7 @@ void SceneRenderer::record(VkCommandBuffer cmd, const std::vector<const SceneIns
                         break;
                     }
             vkCmdPushConstants(cmd, layout_.get(), VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0, 80, pc);
-            const bool unshaded = (mat.flags & 0x10u) != 0 && !std::getenv("SC2_NO_UNSHADED");
+            const bool unshaded = (mat.flags & 0x10u) != 0 && !env_no_unshaded;
             static const bool kAddAlpha = std::getenv("SC2_ADD_DIFFUSE_NO_ALPHA") == nullptr;
             float add_alpha = (kAddAlpha && mat.blend_mode == formats::kBlendAdd && mi >= 0) ? 0.25f : 0.0f;
             static const bool kMaskCover = std::getenv("SC2_MASK_DIFFUSE_TEST") == nullptr;
@@ -3832,7 +4248,7 @@ void SceneRenderer::record(VkCommandBuffer cmd, const std::vector<const SceneIns
             float ao_uv1 = 0.0f;
             for (const formats::M3Layer& aol : mat.layers)
                 if (aol.usage == "AmbientOcclusion" && aol.word40 == 1) ao_uv1 = 0.25f;
-            if (const char* au = std::getenv("SC2_AO_UV")) {
+            if (const char* au = env_ao_uv) {
                 const std::string m = au;
                 ao_uv1 = m == "uv1" ? 0.25f : m == "uv1v" ? 0.5f : m == "uv0v" ? 0.75f : 0.0f;
             }
@@ -3859,7 +4275,7 @@ void SceneRenderer::record(VkCommandBuffer cmd, const std::vector<const SceneIns
                 mpc[2] = kDisplaceScale;
                 mpc[3] = (!mat.layers.empty() && mat.layers[0].word40 == 1) ? 1.0f : 0.0f;
             }
-            if (const char* dt = std::getenv("SC2_DRAW_TRACE"); dt && mat.name.find(dt) != std::string::npos) {
+            if (const char* dt = env_draw_trace; dt && mat.name.find(dt) != std::string::npos) {
                 static int printed = 0;
                 if (printed++ < 4)
                     std::fprintf(stderr, "[drawtrace] '%s' mat %.3f %.3f %.3f %.3f masklv %.3f %.3f team %.2f %.2f %.2f %.2f tex diffuse %d mask %d\n", mat.name.c_str(), double(mpc[0]),
@@ -3881,7 +4297,7 @@ void SceneRenderer::record(VkCommandBuffer cmd, const std::vector<const SceneIns
             vkCmdBindIndexBuffer(cmd, mesh.ibuf.buf.get(), 0, VK_INDEX_TYPE_UINT32);
             vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, layout_.get(), 1, 1, &bone_set[bd.inst], 0, nullptr);
             vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, layout_.get(), 0, 1, &mesh.draw_set[bd.draw], 0, nullptr);
-            if ((mat.flags & 0x100u) != 0 && want == alphaBlendPipeline_.get() && !inst_alpha && !std::getenv("SC2_NO_DEPTH_PREPASS")) {
+            if ((mat.flags & 0x100u) != 0 && want == alphaBlendPipeline_.get() && !inst_alpha && !env_no_depth_prepass) {
                 vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, depthPrepassPipeline_.get());
                 vkCmdDrawIndexed(cmd, mesh.draws[bd.draw].index_count, 1, mesh.draws[bd.draw].first_index, 0, 0);
                 vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, alphaBlendEqualPipeline_.get());
@@ -4077,6 +4493,25 @@ void build_particles(SceneRenderer& sr, const std::vector<const SceneInstance*>&
                      std::vector<SceneRenderer::ParticleVertex>& pverts,
                      std::vector<SceneRenderer::ParticleGroup>& pgroups) {
     if (std::getenv("SC2_NO_PARTICLES")) return;
+    const char* const env_par_trace_verts = std::getenv("SC2_PAR_TRACE_VERTS");
+    const char* const env_par_trace_near = std::getenv("SC2_PAR_TRACE_NEAR");
+    const char* const env_par_trace_active = std::getenv("SC2_PAR_TRACE_ACTIVE");
+    const bool env_no_particle_emissive = std::getenv("SC2_NO_PARTICLE_EMISSIVE") != nullptr;
+    const bool env_glow_alphablend = std::getenv("SC2_GLOW_ALPHABLEND") != nullptr;
+    const bool env_par_cover_trace = std::getenv("SC2_PAR_COVER_TRACE") != nullptr;
+    const bool env_particle_unlit = std::getenv("SC2_PARTICLE_UNLIT") != nullptr;
+    const bool env_no_particle_fog = std::getenv("SC2_NO_PARTICLE_FOG") != nullptr;
+    const bool env_no_particle_mask = std::getenv("SC2_NO_PARTICLE_MASK") != nullptr;
+    const bool env_particle_no_mask2 = std::getenv("SC2_PARTICLE_NO_MASK2") != nullptr;
+    const bool env_shot_trace = std::getenv("SC2_SHOT_TRACE") != nullptr;
+    struct ParCount {
+        double instances = 0, poses_now = 0, poses_birth = 0;
+        ~ParCount() {
+            frame_prof_count("par.instances", instances);
+            frame_prof_count("par.poses_now", poses_now);
+            frame_prof_count("par.poses_birth", poses_birth);
+        }
+    } par_count;
     Vec3 fwd = normalize(sub(cam.center, cam.eye));
     Vec3 right = normalize(cross(fwd, cam.up));
     Vec3 upc = cross(right, fwd);
@@ -4102,16 +4537,18 @@ void build_particles(SceneRenderer& sr, const std::vector<const SceneInstance*>&
     std::vector<std::array<float, 4>> pemis_table{{0.0f, 0.0f, 0.0f, 0.0f}};
     std::vector<int> pemis_tex{-1};
     uint32_t emitter_uid = 0;
+    FrameProfLap plap;
     for (const SceneInstance* instp : live) {
         const SceneInstance& inst = *instp;
         const formats::Model& m = *inst.model;
         if (m.particles.empty() && m.ribbons.empty()) continue;
-        if (const char* tv = std::getenv("SC2_PAR_TRACE_VERTS"); tv && std::atoi(tv) == 0) {
+        plap.lap("par.particles");
+        if (const char* tv = env_par_trace_verts; tv && std::atoi(tv) == 0) {
             static std::set<const formats::Model*> seen;
             if (seen.insert(&m).second)
                 std::fprintf(stderr, "[par] model verts %u particles %zu ribbons %zu seq %d at %.1f %.1f\n", m.vertex_count, m.particles.size(), m.ribbons.size(), inst.seq, double(inst.world.m[12]), double(inst.world.m[13]));
         }
-        if (const char* tn = std::getenv("SC2_PAR_TRACE_NEAR")) {
+        if (const char* tn = env_par_trace_near) {
             float nx = 0.0f, ny = 0.0f, nr = 0.0f;
             static std::set<const SceneInstance*> seen_near;
             if (std::sscanf(tn, "%f,%f,%f", &nx, &ny, &nr) == 3 && std::fabs(inst.world.m[12] - nx) <= nr && std::fabs(inst.world.m[13] - ny) <= nr &&
@@ -4129,9 +4566,13 @@ void build_particles(SceneRenderer& sr, const std::vector<const SceneInstance*>&
         uint32_t pseq = inst.seq >= 0 ? uint32_t(inst.seq) : UINT32_MAX;
         float ptime = inst.seq >= 0 ? inst.time_ms : 0.0f;
         const std::vector<Mat4> bw = instance_bones_world(inst, pose_world(m, pseq, ptime, -1, 0.0f, glayers(inst)));
+        par_count.instances += 1;
+        par_count.poses_now += 1;
+        plap.lap("par.pose_now");
         float tsec = inst.time_ms / 1000.0f;
         std::map<int, std::vector<Mat4>> birth_pose;
         for (const formats::M3Particle& pe : m.particles) {
+            plap.lap("par.particles");
             ++emitter_uid;
             if (pe.lifetime <= 0.0f) continue;
             if (material_hidden(m, formats::particle_material(m, pe))) continue;
@@ -4211,7 +4652,7 @@ void build_particles(SceneRenderer& sr, const std::vector<const SceneInstance*>&
                         }
                     }
                 }
-                if (std::string(used) == "Diffuse" && !std::getenv("SC2_NO_PARTICLE_EMISSIVE")) {
+                if (std::string(used) == "Diffuse" && !env_no_particle_emissive) {
                     const formats::M3Layer* dl = nullptr;
                     const formats::M3Layer* el = nullptr;
                     for (const formats::M3Layer& L : m.materials[size_t(pm)].layers) {
@@ -4236,18 +4677,18 @@ void build_particles(SceneRenderer& sr, const std::vector<const SceneInstance*>&
                             (m.materials[size_t(pm)].flags & 0x10u) != 0;
                     static const bool kPlumeProduct = std::getenv("SC2_PLUME_COVER_PRODUCT") != nullptr;
                     pmask_alone = dl && el && !el->image_path.empty() && dl->image_path == el->image_path && !kPlumeProduct;
-                    if (pblend != formats::kBlendAdd && pblend != formats::kBlendAlphaAdd && !std::getenv("SC2_GLOW_ALPHABLEND")) pglow = false;
+                    if (pblend != formats::kBlendAdd && pblend != formats::kBlendAlphaAdd && !env_glow_alphablend) pglow = false;
                     if (pglow) pmask_alone = true;
-                    if (pmask_alone && !pglow && std::getenv("SC2_PAR_COVER_TRACE"))
+                    if (pmask_alone && !pglow && env_par_cover_trace)
                         std::fprintf(stderr, "[parcover] '%s' flags %#x painted through %s, diffuse '%s' emissive '%s', verts %u\n", m.materials[size_t(pm)].name.c_str(),
                                      unsigned(m.materials[size_t(pm)].flags), used, dl ? dl->image_path.c_str() : "-", el ? el->image_path.c_str() : "-", m.vertex_count);
                     plit = std::string(used) == "Diffuse" && !(dl && el && !el->image_path.empty() && dl->image_path == el->image_path) &&
                            (m.materials[size_t(pm)].flags & 0x10u) == 0 && pblend != formats::kBlendAdd && pblend != formats::kBlendAlphaAdd &&
-                           sr.tunables().rig.present && !std::getenv("SC2_PARTICLE_UNLIT");
+                           sr.tunables().rig.present && !env_particle_unlit;
                 }
-                if (!(m.materials[size_t(pm)].flags & 0x4u) && !std::getenv("SC2_NO_PARTICLE_FOG"))
+                if (!(m.materials[size_t(pm)].flags & 0x4u) && !env_no_particle_fog)
                     pfog = (pblend == formats::kBlendAdd || pblend == formats::kBlendAlphaAdd) ? 2 : 1;
-                if (!std::getenv("SC2_NO_PARTICLE_MASK")) {
+                if (!env_no_particle_mask) {
                     const formats::M3Material& pmat = m.materials[size_t(pm)];
                     const int code = formats::material_alpha_mask_channel(pmat);
                     if (const formats::M3Layer* ML = formats::material_alpha_mask(pmat); ML && code > 0) {
@@ -4259,7 +4700,7 @@ void build_particles(SceneRenderer& sr, const std::vector<const SceneInstance*>&
                         }
                     }
                     for (const formats::M3Layer& L2 : pmat.layers) {
-                        if (std::getenv("SC2_PARTICLE_NO_MASK2")) break;
+                        if (env_particle_no_mask2) break;
                         if (L2.usage != "AlphaMask2" || L2.word44 < 2 || L2.word44 > 5) continue;
                         pmask2 = sr.resolve_texture(m, pm, "AlphaMask2", -1);
                         if (pmask2 >= 0) {
@@ -4312,7 +4753,7 @@ void build_particles(SceneRenderer& sr, const std::vector<const SceneInstance*>&
                     emitted += std::max(0.0f, animated_scalar(m, pseq, rate_ref, t0 + dt * (float(k) + 0.5f), pe.emission_rate)) * dt / 1000.0f;
                 n = std::min(n, int(std::lround(emitted)));
             }
-            if (const char* ta = std::getenv("SC2_PAR_TRACE_ACTIVE"); ta && unsigned(std::atoi(ta)) == m.vertex_count && pe.emission_rate == 0.0f && live_rate > 0.0f) {
+            if (const char* ta = env_par_trace_active; ta && unsigned(std::atoi(ta)) == m.vertex_count && pe.emission_rate == 0.0f && live_rate > 0.0f) {
                 static int act = 0;
                 if (act < 30) {
                     ++act;
@@ -4321,7 +4762,7 @@ void build_particles(SceneRenderer& sr, const std::vector<const SceneInstance*>&
                                  double(live_rate), n, unsigned(pe.rate_anim_id));
                 }
             }
-            if (const char* tv = std::getenv("SC2_PAR_TRACE_VERTS"); tv && unsigned(std::atoi(tv)) == m.vertex_count) {
+            if (const char* tv = env_par_trace_verts; tv && unsigned(std::atoi(tv)) == m.vertex_count) {
                 static int traced = 0;
                 if (traced < 40) {
                     ++traced;
@@ -4392,6 +4833,7 @@ void build_particles(SceneRenderer& sr, const std::vector<const SceneInstance*>&
                     n = std::min(int(peak + 0.5f), formats::particle_cap(pe));
                 }
             }
+            plap.lap("par.material");
             if (n <= 0) continue;
             static const bool kTrailQuads = std::getenv("SC2_PAR_TRAIL_AS_QUADS") != nullptr;
             struct TrailPt { float age; Vec3 c; float size; float rgb[3]; float fade; };
@@ -4431,7 +4873,17 @@ void build_particles(SceneRenderer& sr, const std::vector<const SceneInstance*>&
                 if (kBirthPose && birth_at >= 0.0f && pe.bone < bw.size()) {
                     const int q = int(birth_at / 33.333f);
                     auto bp = birth_pose.find(q);
-                    if (bp == birth_pose.end()) bp = birth_pose.emplace(q, instance_bones_world(inst, pose_world(m, pseq, (float(q) + 0.5f) * 33.333f))).first;
+                    if (bp == birth_pose.end()) {
+                        static const bool kBirthUncached = std::getenv("SC2_PAR_BIRTH_POSE_UNCACHED") != nullptr;
+                        const float tq = (float(q) + 0.5f) * 33.333f;
+                        if (kBirthUncached) {
+                            bp = birth_pose.emplace(q, instance_bones_world(inst, pose_world(m, pseq, tq))).first;
+                            par_count.poses_birth += 1;
+                        } else {
+                            const std::vector<Mat4>& local = birth_pose_cached(m, pseq, q, tq, par_count.poses_birth);
+                            bp = birth_pose.emplace(q, instance_bones_world(inst, local)).first;
+                        }
+                    }
                     if (pe.bone < bp->second.size()) {
                         mb = bp->second[pe.bone];
                         origin = {mb.m[12], mb.m[13], mb.m[14]};
@@ -4462,7 +4914,7 @@ void build_particles(SceneRenderer& sr, const std::vector<const SceneInstance*>&
                 if (inst.path_speed > 0.0f && pe.trailing_flag) {
                     const Vec3 back{inst.path_from.x - origin_now.x, inst.path_from.y - origin_now.y, inst.path_from.z - origin_now.z};
                     const float flown = std::sqrt(dot(back, back)), d = inst.path_speed * (age - inst.path_ended_s);
-                    if (std::getenv("SC2_SHOT_TRACE") && inst.path_speed > 0.0f) {
+                    if (env_shot_trace && inst.path_speed > 0.0f) {
                         static int told = 0;
                         if (told++ < 60)
                             std::fprintf(stderr, "[shotpath] addflags 0x%x emitter %zu type %u particle %d speed %.2f flown %.2f age %.3f life %.3f n %d kept %d now %.2f %.2f %.2f from %.2f %.2f %.2f\n", unsigned(pe.additional_flags), std::size_t(&pe - m.particles.data()), unsigned(pe.ptype), i,
@@ -4488,7 +4940,7 @@ void build_particles(SceneRenderer& sr, const std::vector<const SceneInstance*>&
                     dir = turn(turn(axis, t1, pe.angle[0]), t2, pe.angle[1]);
                     dir = turn(turn(dir, t1, pe.spread[0] * (2.0f * u2 - 1.0f)), t2,
                                pe.spread[1] * (2.0f * u3 - 1.0f));
-                    if (const char* tv = std::getenv("SC2_PAR_TRACE_VERTS"); tv && unsigned(std::atoi(tv)) == m.vertex_count) {
+                    if (const char* tv = env_par_trace_verts; tv && unsigned(std::atoi(tv)) == m.vertex_count) {
                         static int traced_dir = 0;
                         if (traced_dir++ < 6)
                             std::fprintf(stderr, "[par]   particle %d axis %.2f %.2f %.2f dir %.2f %.2f %.2f speed %.2f life %.2f age %.2f\n", i, double(axis.x), double(axis.y),
@@ -4603,7 +5055,7 @@ void build_particles(SceneRenderer& sr, const std::vector<const SceneInstance*>&
                 const float pgain = pbright * (pblend == formats::kBlendAdd ? fade : 1.0f);
                 for (float& ch : rgb) ch *= pgain;
                 if (plit) for (int ch = 0; ch < 3; ++ch) rgb[ch] *= lit_shade[ch];
-                if (const char* tv = std::getenv("SC2_PAR_TRACE_VERTS"); tv && unsigned(std::atoi(tv)) == m.vertex_count) {
+                if (const char* tv = env_par_trace_verts; tv && unsigned(std::atoi(tv)) == m.vertex_count) {
                     static int traced_col = 0;
                     if (i < 3 && traced_col++ < 27)
                         std::fprintf(stderr, "[par]   colour %d lit %d shade %.3f %.3f %.3f gain %.3f rgb %.3f %.3f %.3f alpha %.3f life %.2f glow %d fog %d exposure %.3f\n", i, int(plit), double(lit_shade[0]),
@@ -4670,12 +5122,15 @@ void build_particles(SceneRenderer& sr, const std::vector<const SceneInstance*>&
                         h = normalize(h);
                         static const bool kFlatTurn = std::getenv("SC2_PAR_FLAT_TURN") != nullptr;
                         if (kFlatTurn) h = Vec3{-h.y, h.x, 0.0f};
-                        const Vec3 s2{-h.y, h.x, 0.0f};
+                        static const bool kFlatFlip = std::getenv("SC2_PAR_FLAT_FLIP") != nullptr;
+                        static const bool kFlatAnchor = std::getenv("SC2_PAR_FLAT_ANCHOR") != nullptr;
+                        const Vec3 s2 = kFlatFlip ? Vec3{h.y, -h.x, 0.0f} : Vec3{-h.y, h.x, 0.0f};
                         static const float kFlatScale = std::getenv("SC2_PAR_FLAT_SCALE") ? float(std::atof(std::getenv("SC2_PAR_FLAT_SCALE"))) : 1.0f;
                         const float fs = size * kFlatScale;
+                        const float sh = kFlatAnchor ? fs : 0.0f;
                         for (int k = 0; k < 4; ++k) {
-                            q[k].pos[0] = c.x + h.x * fs * corner[k][0] + s2.x * fs * corner[k][1];
-                            q[k].pos[1] = c.y + h.y * fs * corner[k][0] + s2.y * fs * corner[k][1];
+                            q[k].pos[0] = c.x + h.x * fs * corner[k][0] + s2.x * (fs * corner[k][1] + sh);
+                            q[k].pos[1] = c.y + h.y * fs * corner[k][0] + s2.y * (fs * corner[k][1] + sh);
                             q[k].pos[2] = c.z;
                         }
                     }
@@ -4766,6 +5221,7 @@ void build_particles(SceneRenderer& sr, const std::vector<const SceneInstance*>&
             }
         }
     }
+    plap.lap("par.particles");
     for (const SceneInstance* instp : live) {
         const SceneInstance& inst = *instp;
         const formats::Model& m = *inst.model;
@@ -4841,7 +5297,17 @@ void build_particles(SceneRenderer& sr, const std::vector<const SceneInstance*>&
             Vec3 T0 = ab, T1 = ab;
             if (spline) {
                 static const float kTanScale = std::getenv("SC2_RIBBON_TANGENT_SCALE") ? float(std::atof(std::getenv("SC2_RIBBON_TANGENT_SCALE"))) : 1.5f;
-                const float len = std::sqrt(dot(ab, ab)) * kTanScale;
+                float chord = std::sqrt(dot(ab, ab));
+                static const bool kReachChord = std::getenv("SC2_RIBBON_REACH_TANGENT_CHORD") != nullptr;
+                if (!kReachChord && inst.reach_tip_bone >= 0) {
+                    const std::vector<Mat4> raw = pose_world(m, rseq, inst.seq >= 0 ? inst.time_ms : 0.0f, -1, 0.0f, glayers(inst));
+                    if (rb.bone < raw.size() && size_t(rb.end_bone) < raw.size()) {
+                        const Mat4 r0 = inst.world * raw[rb.bone], r1 = inst.world * raw[size_t(rb.end_bone)];
+                        const Vec3 d0{r1.m[12] - r0.m[12], r1.m[13] - r0.m[13], r1.m[14] - r0.m[14]};
+                        chord = std::min(chord, std::sqrt(dot(d0, d0)));
+                    }
+                }
+                const float len = chord * kTanScale;
                 const Mat4& rbm = bw[rb.bone];
                 const Vec3 z0 = normalize(Vec3{rbm.m[8], rbm.m[9], rbm.m[10]});
                 const Vec3 z1 = normalize(Vec3{eb.m[8], eb.m[9], eb.m[10]});
@@ -4939,6 +5405,8 @@ void build_particles(SceneRenderer& sr, const std::vector<const SceneInstance*>&
             }
         }
     }
+    plap.lap("par.ribbons");
+    struct FlattenLap { FrameProfLap& l; ~FlattenLap() { l.lap("par.flatten"); } } flatten_lap{plap};
     for (auto& kv : bytex) {
         if (kv.second.empty()) continue;
         const uint32_t blend = std::get<0>(kv.first);

@@ -133,8 +133,8 @@ public:
     void set_field_touch_log(FieldReadLog* log) const { field_touch_log_ = log; }
     FieldReadLog authored_field_pairs() const;
 
-    const std::vector<core::XmlNode>& resolved(const std::string& family,
-                                               const std::string& id) const;
+    const core::XmlNodeList& resolved(const std::string& family, const std::string& id) const;
+    std::size_t memory_bytes(std::size_t* entries, std::size_t* resolved_cache) const;
 
     std::optional<std::string> scalar(const std::string& family,
                                       const std::string& id,
@@ -581,12 +581,15 @@ public:
         bool uncommandable = false;
         bool untargetable = false;
         bool suppress_cloak = false, benign = false, passive = false;
+        bool cloak = false;
         bool disable_abils = false;
         bool disable_production = false, disable_spawner = false;
         bool disable_morph = false, disable_transport = false;
         double weapon_range_bonus = 0.0;
         double move_speed_max = -1.0;
         double decel_mult = 1.0;
+        double accel_mult = 1.0;
+        std::vector<std::pair<std::string, double>> damage_attr_bonus;
         bool suppress_collision = false;
         bool suppress_passenger = false;
         std::vector<std::string> disabled_weapons;
@@ -837,6 +840,24 @@ public:
 
     std::vector<ActorRule> actor_rules(const std::string& actor_id,
                                        const std::string& family = "CActorUnit", bool with_macros = true) const;
+
+    struct ActorSubscription {
+        std::string actor;
+        std::string family;
+        std::vector<std::pair<std::string, std::string>> filters;
+    };
+    const std::vector<ActorSubscription>& actors_on(const std::string& head, const std::string& subject,
+                                                    const std::string& sub) const;
+
+    struct MorphTransition {
+        std::string actor;
+        std::string model;
+        std::string slot;
+        std::vector<std::string> props;
+        bool play_forever = false;
+    };
+    std::optional<MorphTransition> morph_transition(const std::string& to_unit) const;
+    std::pair<double, double> morph_actor_section(const std::string& abil_id) const;
 
     std::optional<std::array<int, 3>> ability_rally_color(const std::string& ability_id) const {
         if (ability_id.empty()) return std::nullopt;
@@ -1501,6 +1522,16 @@ public:
         return {};
     }
 
+    std::string land_ability(const std::string& unit_id) const {
+        for (const std::string& ab : array_links("CUnit", unit_id, "AbilArray")) {
+            if (ab.empty()) continue;
+            const Entry* e = find("CAbil", ab);
+            if (!e || e->tag != "CAbilMorphPlacement") continue;
+            if (auto k = scalar("CAbil", ab, "ActorKey"); k && *k == "LiftOffLand") return ab;
+        }
+        return {};
+    }
+
     std::string liftoff_target(const std::string& unit_id) const {
         const std::string ab = liftoff_ability(unit_id);
         if (ab.empty()) return {};
@@ -1820,6 +1851,10 @@ public:
         for (const std::string& w : array_links("CUnit", unit_id, "WeaponArray"))
             if (!w.empty() && !weapon_hidden(w) && (include_disabled || !weapon_disabled(w)))
                 out.push_back(w);
+        if (out.empty() && !std::getenv("SC2_HIDDEN_ONLY_WEAPON_OFF"))
+            for (const std::string& w : array_links("CUnit", unit_id, "WeaponArray"))
+                if (!w.empty() && weapon_hidden(w) && (include_disabled || !weapon_disabled(w)))
+                    out.push_back(w);
         return out;
     }
 
@@ -2860,6 +2895,22 @@ public:
                 on = n.attr_or("value", "1") != "0";
         return on;
     }
+    bool transport_unload_targeted(const std::string& unit_id) const {
+        const std::string ab = transport_ability(unit_id);
+        if (ab.empty()) return false;
+        bool at_hidden = false, all_hidden = false;
+        for (const core::XmlNode& n : resolved("CAbil", ab)) {
+            if (n.name != "CmdButtonArray") continue;
+            const std::string idx = n.attr_or("index", "");
+            for (const core::XmlNode& c : n.children) {
+                if (c.name != "Flags" || c.attr_or("index", "") != "Hidden") continue;
+                const bool h = c.attr_or("value", "1") != "0";
+                if (idx == "UnloadAt") at_hidden = h;
+                else if (idx == "UnloadAll") all_hidden = h;
+            }
+        }
+        return !at_hidden && all_hidden;
+    }
     double transport_field(const std::string& unit_id, const char* field) const {
         const std::string ab = transport_ability(unit_id);
         if (ab.empty()) return 0.0;
@@ -2891,7 +2942,7 @@ public:
         };
         TurretSpec ts{num("YawArc"), num("YawRate"), num("YawIdleRate"), num("YawStart"), str("Idle")};
         std::map<std::string, double> chance;
-        auto scan = [&](const std::vector<core::XmlNode>& nodes) {
+        auto scan = [&](const auto& nodes) {
             for (const core::XmlNode& fn : nodes) {
                 if (fn.name != "Fidget") continue;
                 auto take = [&](const char* a, double& out) {
@@ -3245,7 +3296,7 @@ public:
         double accel = 0.0;
         double max_speed = 0.0;
     };
-    std::vector<MissileMover> effect_missile_movers(const std::string& effect_id) const;
+    std::vector<MissileMover> effect_missile_movers(const std::string& effect_id, const char* field = "Movers") const;
     double weapon_turret_yaw_rate(const std::string& unit_id) const;
 
     std::optional<std::string> weapon_missile_model_id(const std::string& weapon_id) const;
@@ -3276,7 +3327,7 @@ public:
     }
     std::optional<double> refund_fraction(const std::string& abil_id, const std::string& resource) const {
         std::optional<double> v;
-        auto scan = [&](const std::vector<core::XmlNode>& nodes) {
+        auto scan = [&](const auto& nodes) {
             for (const core::XmlNode& rf : nodes) {
                 if (rf.name != "RefundFraction") continue;
                 for (const core::XmlNode& r : rf.children)
@@ -3690,7 +3741,7 @@ private:
 
     mutable FieldReadLog* field_read_log_ = nullptr;
     mutable FieldReadLog* field_touch_log_ = nullptr;
-    const std::vector<core::XmlNode>& resolve_chain(const std::string& family, const std::string& id) const;
+    const core::XmlNodeList& resolve_chain(const std::string& family, const std::string& id) const;
     std::string sibling_actor_family(const std::string& family, const std::string& id) const;
     std::vector<std::string> load_skips_;
     bool add_only_ = false;
@@ -3707,7 +3758,8 @@ private:
     StringTable hotkeys_;
     StringTable assets_;
 
-    mutable std::unordered_map<std::string, std::vector<core::XmlNode>> resolved_cache_;
+    mutable std::unordered_map<std::string, core::XmlNodeList> resolved_cache_;
+    mutable std::unordered_map<std::string, std::vector<core::XmlNode>> resolved_copies_;
     mutable std::unordered_set<std::string> spawner_trained_;
     mutable bool spawner_trained_built_ = false;
     mutable std::unordered_set<std::string> calldown_ammo_;
@@ -3716,6 +3768,8 @@ private:
     mutable std::unordered_map<std::string, double> abil_rings_;
     mutable bool range_rings_built_ = false;
     void build_range_rings() const;
+    mutable std::unordered_map<std::string, std::vector<ActorSubscription>> actors_on_;
+    mutable bool actors_on_built_ = false;
 
     mutable std::unordered_map<std::string, std::string> actor_by_unit_;
     mutable bool actor_by_unit_built_ = false;

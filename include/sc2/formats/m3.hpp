@@ -466,6 +466,13 @@ struct M3Attachment {
     uint32_t bone = 0;
 };
 
+struct M3HitShape {
+    uint32_t shape = 0;
+    int bone = -1;
+    float m[16] = {1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1};
+    float size[3] = {0, 0, 0};
+};
+
 struct Model {
     std::string name;
     uint32_t vertex_flags = 0;
@@ -506,6 +513,9 @@ struct Model {
 
     std::vector<M3Attachment> attachments;
     std::vector<uint16_t> attachment_lookup;
+    std::vector<M3HitShape> hit_fuzzy;
+    M3HitShape hit_tight;
+    bool has_tight_hit = false;
 
     std::vector<M3Particle> particles;
 

@@ -3,6 +3,8 @@
 #include "sc2/render/actor.hpp"
 
 #include <cmath>
+#include <cstdio>
+#include <set>
 
 #include "sc2/render/actor_rules.hpp"
 #include "sc2/render/anim_select.hpp"
@@ -327,11 +329,17 @@ void ActorInstance::pump(float dt_ms) {
                 if (r.verb == "AnimBracketStart" && r.args.size() >= 3 && r.args[2] != "IGNORE")
                     content = split(r.args[2]);
                 anim_play(slot_name, opening,   false,   1);
+                bool once = false;
+                if (host_owned && r.verb == "AnimBracketStart")
+                    for (std::size_t ai = 4; ai < r.args.size(); ++ai)
+                        for (const std::string& fl : split(r.args[ai]))
+                            if (fl == "ContentPlayOnce") once = true;
                 for (AnimSlot& sl : slots)
                     if (sl.name == slot_name) {
                         sl.group = slot_name;
                         sl.closing = closing;
                         sl.content = content;
+                        sl.content_once = once;
                         if (sl.global && sl.sequence < 0 && model && !content.empty()) {
                             const int cseq = select_sequence(*model, content, seed);
                             if (cseq >= 0) {
@@ -345,6 +353,16 @@ void ActorInstance::pump(float dt_ms) {
             } else if ((r.verb == "AnimGroupRemove" || r.verb == "AnimBracketStop") &&
                        !r.args.empty()) {
                 const std::string tgt = r.args[0];
+                if (host_owned && r.verb == "AnimBracketStop") {
+                    bool deferred = false;
+                    for (AnimSlot& sl : slots)
+                        if ((sl.name == tgt || sl.group == tgt) && !sl.closing_phase && !sl.content_playing &&
+                            !sl.content.empty() && sl.sequence >= 0) {
+                            sl.stop_pending = true;
+                            deferred = true;
+                        }
+                    if (deferred) continue;
+                }
                 static const bool kRemoveClosing = std::getenv("SC2_ANIM_REMOVE_CLOSING") != nullptr;
                 if (!kRemoveClosing) {
                     bool any = false, all_closing = true;
@@ -372,14 +390,17 @@ void ActorInstance::pump(float dt_ms) {
                     else
                         ++k;
                 }
+                bool closed_now = closing.empty();
                 if (!closing.empty()) {
                     anim_play(tgt, closing,   false,   1);
                     for (AnimSlot& sl : slots)
                         if (sl.name == tgt) {
                             sl.group = tgt;
                             sl.closing_phase = true;
+                            if (sl.sequence < 0) closed_now = true;
                         }
                 }
+                if (host_owned && closed_now && r.verb == "AnimBracketStop") bracket_closed(tgt);
             } else if ((r.verb == "StatusSet" || r.verb == "StatusIncrement" || r.verb == "StatusDecrement") &&
                        !r.args.empty()) {
                 const auto it = status.find(r.args[0]);
@@ -421,6 +442,14 @@ void ActorInstance::pump(float dt_ms) {
                     if (child_rules) ch.rules = child_rules(ch.name);
                     children.push_back(std::move(ch));
                 }
+            } else if (host_owned && r.verb == "Destroy" && r.args.empty()) {
+                self_destroyed = true;
+            } else if (host_owned && r.verb == "Create" && r.args.empty()) {
+            } else if (host_owned && r.verb == "SetScale" && !r.args.empty()) {
+                bus_scale = float(std::atof(r.args[0].c_str()));
+                bus_scale_set = true;
+            } else if (host_owned && r.verb == "ModelSwap" && !r.args.empty()) {
+                if (bus_model_swap.empty()) bus_model_swap = r.args[0];
             } else {
                 ++unhandled_verbs;
             }
@@ -443,6 +472,10 @@ void ActorInstance::pump(float dt_ms) {
         }
     }
     queued.clear();
+}
+
+void ActorInstance::bracket_closed(const std::string& slot) {
+    raise("AnimBracketState", std::string(), "AfterClosing", {{"AnimName", slot}, {"AnimBracketExitReason", "Stop"}});
 }
 
 void ActorInstance::set_status(const std::string& name, int value, bool raise_set) {
@@ -569,10 +602,76 @@ void ActorInstance::note_pose(int seq, float time_ms) {
     (void)time_ms;
 }
 
+void ActorInstance::close_bracket_now(const std::string& name) {
+    std::vector<std::string> closing;
+    for (const AnimSlot& s : slots)
+        if (s.name == name) closing = s.closing;
+    for (std::size_t k = 0; k < slots.size();)
+        if (slots[k].name == name) slots.erase(slots.begin() + long(k));
+        else ++k;
+    bool closed = closing.empty();
+    if (!closing.empty()) {
+        anim_play(name, closing,   false,   1);
+        for (std::size_t k = 0; k < slots.size();) {
+            AnimSlot& s2 = slots[k];
+            if (s2.name != name) { ++k; continue; }
+            s2.group = name;
+            s2.closing_phase = true;
+            if (s2.sequence < 0) {
+                closed = true;
+                slots.erase(slots.begin() + long(k));
+            } else {
+                ++k;
+            }
+        }
+    }
+    if (closed) bracket_closed(name);
+}
+
+void ActorInstance::settle_brackets() {
+    for (int guard = 0; guard < 4; ++guard) {
+        bool changed = false;
+        for (std::size_t k = 0; k < slots.size(); ++k) {
+            AnimSlot& s = slots[k];
+            if (s.global || s.sequence >= 0) continue;
+            const std::string name = s.name;
+            if (s.closing_phase) {
+                slots.erase(slots.begin() + long(k));
+                bracket_closed(name);
+                changed = true;
+                break;
+            }
+            if (!s.content.empty()) {
+                const int cseq = model ? select_sequence(*model, s.content, seed) : -1;
+                const std::vector<std::string> content = s.content;
+                s.content.clear();
+                if (cseq >= 0) {
+                    s.props = content;
+                    s.sequence = cseq;
+                    s.looping = !s.content_once;
+                    s.time_ms = 0.0f;
+                    s.content_playing = true;
+                } else if (s.content_once) {
+                    close_bracket_now(name);
+                }
+                changed = true;
+                break;
+            }
+            if (s.content_once) {
+                close_bracket_now(name);
+                changed = true;
+                break;
+            }
+        }
+        if (!changed) break;
+    }
+}
+
 void ActorInstance::advance(float dt_ms) {
     for (ActorChild& ch : children)
         if (ch.rig) ch.rig->advance(dt_ms);
     last_events.clear();
+    if (host_owned) settle_brackets();
     if (turret_bone >= 0 && turret_rate_rad > 0.0f) {
         const float dt = dt_ms / 1000.0f;
         const float two_pi = 6.2831853f;
@@ -671,6 +770,16 @@ void ActorInstance::advance(float dt_ms) {
         const std::string finished_slot = just_finished ? sl->name : std::string();
         if (to >= len) to = sl->looping ? to - len * float(int(to / len)) : len;
         sl->time_ms = to;
+        const bool closing_done = just_finished && host_owned && sl->closing_phase;
+        bool once_done = just_finished && host_owned && sl->content_once && sl->content_playing && !sl->closing_phase;
+        if (just_finished && host_owned && !sl->closing_phase && !sl->content_playing && !sl->content.empty()) {
+            raise("AnimBracketState", std::string(), "AfterOpening", {{"AnimName", finished_slot}});
+            if (sl->stop_pending) {
+                raise("AnimDone", std::string(), "Complete", {{"AnimName", finished_slot}});
+                close_bracket_now(finished_slot);
+                return;
+            }
+        }
         if (just_finished && !sl->closing_phase && !sl->content.empty()) {
             int cseq = select_sequence(*model, sl->content, seed);
             static const bool kContentTakes = std::getenv("SC2_NO_SLOT_TAKES") == nullptr;
@@ -678,13 +787,21 @@ void ActorInstance::advance(float dt_ms) {
             if (cseq >= 0) {
                 sl->props = sl->content;
                 sl->sequence = cseq;
-                sl->looping = true;
+                sl->looping = !(host_owned && sl->content_once);
                 sl->time_ms = 0.0f;
+                sl->content_playing = true;
+            } else if (host_owned && sl->content_once) {
+                once_done = true;
             }
             sl->content.clear();
         }
         if (just_finished)
             raise("AnimDone", std::string(), "Complete", {{"AnimName", finished_slot}});
+        if (closing_done) {
+            bracket_closed(finished_slot);
+        } else if (once_done) {
+            close_bracket_now(sl->name);
+        }
         return;
     }
     const int seq = sequence_of(current());
@@ -740,10 +857,40 @@ bool ActorInstance::attachment(const std::string& name, Mat4& out) {
     return attachment_transform(*model, name, uint32_t(current_sequence()), current_time(), out);
 }
 
+static std::vector<std::pair<std::string, std::string>> creation_ctx(
+    const ActorInstance& a, int player, const std::function<int(int, const std::string&)>& validate) {
+    std::vector<std::pair<std::string, std::string>> ctx;
+    if (!validate) return ctx;
+    for (const ActorEventRule& r : a.event_rules)
+        for (const auto& f : r.filters) {
+            if (f.first != "ValidatePlayer" || f.second.empty()) continue;
+            bool have = false;
+            for (const auto& c : ctx)
+                if (c.second == f.second) have = true;
+            if (!have && validate(player, f.second) == 1) ctx.emplace_back("ValidatePlayer", f.second);
+        }
+    return ctx;
+}
+
 void ActorDriver::observe(const sim::World& world, float dt_ms, bool sim_ticked) {
     const std::vector<sim::Unit>& units = world.units();
     if (shadows.size() < units.size()) shadows.resize(units.size());
     if (actors.size() < units.size()) actors.resize(units.size());
+
+    static const bool kUpgradeEvents = std::getenv("SC2_NO_UPGRADE_EVENTS") == nullptr;
+    if (kUpgradeEvents && validate_player) {
+        std::set<int> players;
+        for (const sim::Unit& u : units)
+            if (u.alive && u.player >= 0) players.insert(u.player);
+        for (int p : players) {
+            const std::vector<std::string>& done = world.researched(p);
+            std::size_t& seen = upgrades_seen[p];
+            for (; seen < done.size(); ++seen)
+                for (std::size_t i = 0; i < units.size() && i < shadows.size(); ++i)
+                    if (shadows[i].known && units[i].alive && units[i].player == p)
+                        actors[i].raise("Upgrade", done[seen], "Add");
+        }
+    }
 
     for (size_t i = 0; i < units.size(); ++i) {
         const sim::Unit& u = units[i];
@@ -774,7 +921,7 @@ void ActorDriver::observe(const sim::World& world, float dt_ms, bool sim_ticked)
                 a.facing_known = true;
             }
             if (!s.created_raised) {
-                a.raise("ActorCreation", u.catalog_id, std::string());
+                a.raise("ActorCreation", u.catalog_id, std::string(), creation_ctx(a, u.player, validate_player));
                 s.created_raised = true;
                 if (u.constructing) a.raise("UnitConstruction", u.catalog_id, "Start");
             }
@@ -996,7 +1143,8 @@ void ActorDriver::observe(const sim::World& world, float dt_ms, bool sim_ticked)
                                 a.birth_clips.clear();
                                 for (int& cs : a.cached_seq) cs = -2;
                                 a.bind_event_rules(nr);
-                                a.raise("ActorCreation", u.catalog_id, std::string());
+                                a.raise("ActorCreation", u.catalog_id, std::string(),
+                                        creation_ctx(a, u.player, validate_player));
                                 a.apply_birth_groups(u.catalog_id);
                             }
                         }

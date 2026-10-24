@@ -106,6 +106,8 @@ struct SceneInstance {
     InstanceFX fx;
     int beam_bone = -1;
     std::array<float, 3> beam_target = {0.0f, 0.0f, 0.0f};
+    int reach_tip_bone = -1, reach_root_bone = -1, reach_weapon_bone = -1;
+    std::array<float, 3> reach_target = {0.0f, 0.0f, 0.0f};
     const FogField* coverage = nullptr;
     std::uint32_t trail_id = 0;
     float trail_time_s = 0.0f;
@@ -140,7 +142,12 @@ struct Camera {
 };
 
 RenderResult render_scene_session(const std::string& key, const std::vector<SceneInstance>& instances, uint32_t width, uint32_t height,
-                                  const Camera& cam, const casc::Storage* storage, const data::EnvLight* env);
+                                  const Camera& cam, const casc::Storage* storage, const data::EnvLight* env,
+                                  std::size_t preload_budget = 0, bool* preload_done = nullptr);
+bool render_scene_session_exists(const std::string& key, uint32_t width, uint32_t height);
+void release_scene_sessions();
+bool request_model_textures(const formats::Model& m, const casc::Storage* storage, const std::string& texture_root, uint32_t max_dim);
+uint32_t render_scene_session_texture_max();
 
 RenderResult render_scene(const std::vector<SceneInstance>& instances,
                           uint32_t width, uint32_t height,

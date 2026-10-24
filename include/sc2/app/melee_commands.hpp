@@ -28,7 +28,7 @@ struct MeleeCommands {
 
     static bool train(sim::World& w, uint32_t producer, const sim::Unit& proto,
                       int mineral_cost, int gas_cost, sim::Fixed build_time,
-                      int pending_cap = kPendingCap);
+                      int pending_cap = kPendingCap, int count = 1);
 
     static ActionCheck can_build(const sim::World& w, int player,
                                  const sim::Unit& proto, int mineral_cost,

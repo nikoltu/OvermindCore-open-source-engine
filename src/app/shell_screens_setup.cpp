@@ -22,6 +22,79 @@ std::string lower(std::string s) {
     return s;
 }
 
+constexpr layout::R kFormatLabel{736, 808, 300, 24};
+constexpr layout::R kFormat{736, 840, 741, 64};
+constexpr float kRowsTop = 160.0f, kRowsHead = 32.0f, kRowPitch = 64.0f, kRowH = 56.0f;
+constexpr float kColChip = 736.0f, kColCtl = 760.0f, kColRace = 968.0f, kColDiff = 1146.0f, kColTeam = 1354.0f, kColEnd = 1477.0f;
+
+const char* race_word(LobbyRace r) {
+    return r == LobbyRace::Protoss ? "Protoss" : (r == LobbyRace::Zerg ? "Zerg" : (r == LobbyRace::Random ? "Random" : "Terran"));
+}
+
+void team_rows(Ui& ui, ShellCtx& ctx) {
+    const int rows = ctx.lobby_rows();
+    const float hy = kRowsTop;
+    ui.text(ui.at(kColCtl, hy, kColRace - kColCtl - 8.0f, 24.0f), "PLAYER", v2::kLabel, v2::kTextMuted);
+    ui.text(ui.at(kColRace, hy, kColDiff - kColRace - 8.0f, 24.0f), "RACE", v2::kLabel, v2::kTextMuted);
+    ui.text(ui.at(kColDiff, hy, kColTeam - kColDiff - 8.0f, 24.0f), "DIFFICULTY", v2::kLabel, v2::kTextMuted);
+    ui.text(ui.at(kColTeam, hy, kColEnd - kColTeam, 24.0f), "TEAM", v2::kLabel, v2::kTextMuted);
+    static const std::vector<std::string> kCtl = {"Human", "A.I.", "Closed"};
+    static const std::vector<std::string> kRace = {"Terran", "Zerg", "Protoss", "Random"};
+    static const std::vector<std::string> kTeam = {"-", "Team 1", "Team 2", "Team 3", "Team 4"};
+    std::vector<std::string> diffs;
+    for (int t = 1; t <= 7; ++t) diffs.push_back(ShellSettings::difficulty_name(t));
+    int player = 0;
+    for (int i = 0; i < rows; ++i) {
+        int ctl = 2, race = 0, diff = 0, team = -1;
+        ctx.lobby_row(i, ctl, race, diff, team);
+        const float y = kRowsTop + kRowsHead + kRowPitch * float(i);
+        const std::string id = "setup/slot" + std::to_string(i);
+        const bool open = ctl != 2, ai = ctl == 1;
+        theme::Rgb tc{};
+        if (open && ctx.team_color(player, tc)) ui.fill(ui.at(kColChip, y + 8.0f, 12.0f, kRowH - 16.0f), tc);
+        if (open) ++player;
+        int c = ctl, r = race_cell(LobbyRace(race)), d = std::max(1, diff) - 1, t = team + 1;
+        Opts oc;
+        oc.hint = "Human: you. A.I.: the computer. Closed: nobody plays this start.";
+        bool changed = ui.dropdown(id + "/controller", ui.at(kColCtl, y, kColRace - kColCtl - 8.0f, kRowH), kCtl, c, oc);
+        Opts orc;
+        orc.enabled = open;
+        orc.hint = "This player's race. Random is drawn at START, from the match's own seed.";
+        changed = ui.dropdown(id + "/race", ui.at(kColRace, y, kColDiff - kColRace - 8.0f, kRowH), kRace, r, orc) || changed;
+        Opts od;
+        od.enabled = ai;
+        od.hint = "This A.I.'s tier, Very Easy .. Elite.";
+        if (ai) changed = ui.dropdown(id + "/difficulty", ui.at(kColDiff, y, kColTeam - kColDiff - 8.0f, kRowH), diffs, d, od) || changed;
+        else ui.text(ui.at(kColDiff + 16.0f, y, kColTeam - kColDiff - 24.0f, kRowH), ctl == 0 ? ctx.player_name() : std::string(), v2::kBody, v2::kTextMuted);
+        Opts ot;
+        ot.enabled = open;
+        ot.hint = "Players on one team are allies: shared vision, and they win together. '-' plays alone.";
+        changed = ui.dropdown(id + "/team", ui.at(kColTeam, y, kColEnd - kColTeam, kRowH), kTeam, t, ot) || changed;
+        if (changed) ctx.set_lobby_row(i, c, int(kRaceCells[std::max(0, std::min(3, r))]), c == 1 ? d + 1 : 0, t - 1);
+    }
+}
+
+std::string team_matchup(const ShellCtx& ctx) {
+    std::vector<std::pair<int, std::string>> sides;
+    for (int i = 0; i < ctx.lobby_rows(); ++i) {
+        int ctl = 2, race = 0, diff = 0, team = -1;
+        ctx.lobby_row(i, ctl, race, diff, team);
+        if (ctl == 2) continue;
+        const int key = team >= 0 ? team : -(i + 2);
+        const std::string who = std::string(ctl == 0 ? "You" : "A.I.") + " (" + race_word(LobbyRace(race)) + ")";
+        bool found = false;
+        for (auto& s : sides)
+            if (s.first == key) {
+                s.second += " + " + who;
+                found = true;
+            }
+        if (!found) sides.emplace_back(key, who);
+    }
+    std::string out;
+    for (std::size_t s = 0; s < sides.size(); ++s) out += (s ? " vs " : "") + sides[s].second;
+    return out.empty() ? std::string("Nobody plays - open a row") : out;
+}
+
 }
 
 bool screen_setup(Ui& ui, ShellCtx& ctx) {
@@ -118,7 +191,22 @@ bool screen_setup(Ui& ui, ShellCtx& ctx) {
     }
 
     ui.text(ui.at(L::kLabelPlayers), "PLAYERS", v2::kLabel, v2::kTextMuted);
+    const int starts = ctx.map_start_count(selected);
     {
+        ui.text(ui.at(kFormatLabel), "FORMAT", v2::kLabel, v2::kTextMuted);
+        ui.text(ui.at(kFormatLabel.x + 160.0f, kFormatLabel.y, kFormatLabel.w + 281.0f, kFormatLabel.h),
+                std::to_string(starts) + " start locations on this map", v2::kSmall, v2::kTextFaint, Align::Right);
+        int fmt = ctx.lobby_format();
+        Opts o;
+        o.hint = "1v1, a team game or a free-for-all. A format needs as many start locations as it has players.";
+        if (ui.segmented("setup/format", ui.at(kFormat), {"1v1", "2v2", "3v3", "4v4", "FFA"}, fmt, o) && !ctx.set_lobby_format(fmt))
+            ctx.fx.toast(std::string(fmt == 4 ? "FFA" : std::to_string(fmt + 1) + "v" + std::to_string(fmt + 1)) + " needs " +
+                             std::to_string(fmt == 4 ? 3 : 2 * (fmt + 1)) + " start locations - this map has " + std::to_string(starts),
+                         true);
+    }
+    const bool team_mode = ctx.lobby_format() != 0 && ctx.lobby_rows() > 0;
+    if (team_mode) team_rows(ui, ctx);
+    if (!team_mode) {
         ui.panel(ui.at(L::kSlotCardYou));
         theme::Rgb tc{};
         const bool have_tc = ctx.team_color(0, tc);
@@ -135,8 +223,8 @@ bool screen_setup(Ui& ui, ShellCtx& ctx) {
             !ctx.settings.set_profile_race(kRaceCells[cell]))
             ctx.fx.toast("Setting could not be saved", true);
     }
-    ui.text(ui.at(L::kVs), "VS", v2::kLabel, v2::kTextFaint, Align::Centre);
-    {
+    if (!team_mode) ui.text(ui.at(L::kVs), "VS", v2::kLabel, v2::kTextFaint, Align::Centre);
+    if (!team_mode) {
         ui.panel(ui.at(L::kSlotCardOpponent));
         theme::Rgb tc{};
         const bool have_tc = ctx.team_color(1, tc);
@@ -173,7 +261,7 @@ bool screen_setup(Ui& ui, ShellCtx& ctx) {
              !have_sel ? "No map selected" : (sel_arena ? "The built-in arena has no picture" : "No preview in this map"), 2.0f);
     ui.text(ui.at(L::kMapName), sel_name, v2::kH3, v2::kTextHi);
     if (have_sel)
-        ui.text(ui.at(L::kSize), sel_arena ? std::string("72 x 72 - 2 starts - built-in") : (maps[std::size_t(selected)].casc ? std::string("INSTALL") : maps[std::size_t(selected)].path),
+        ui.text(ui.at(L::kSize), sel_arena ? std::string("72 x 72 - 2 mains + 2 naturals - built-in") : (maps[std::size_t(selected)].casc ? std::string("INSTALL") : maps[std::size_t(selected)].path),
                 v2::kSmall, v2::kTextMuted);
     ui.text(ui.at(L::kLabelGameSpeed), "GAME SPEED", v2::kLabel, v2::kTextMuted);
     {
@@ -188,11 +276,14 @@ bool screen_setup(Ui& ui, ShellCtx& ctx) {
         const Rect card = ui.at(L::kSummaryMatchup);
         ui.panel(card);
         const int pad = ui.px(24.0f);
-        const std::string matchup = std::string(lobby_race_name(ctx.settings.profile_race())) + " vs " + lobby_race_name(ctx.settings.opponent_race()) + " A.I. (" +
-                                    ShellSettings::difficulty_name(ctx.settings.ai_difficulty()) + ")";
+        const std::string matchup = team_mode ? team_matchup(ctx)
+                                              : std::string(lobby_race_name(ctx.settings.profile_race())) + " vs " + lobby_race_name(ctx.settings.opponent_race()) +
+                                                    " A.I. (" + ShellSettings::difficulty_name(ctx.settings.ai_difficulty()) + ")";
         ui.text(Rect{card.x0 + pad, card.y0 + ui.px(16.0f), card.x1 - pad, card.y0 + ui.px(48.0f)}, matchup, v2::kBody, v2::kTextHi);
+        static const char* kFormatWords[5] = {"1v1", "2v2", "3v3", "4v4", "FFA"};
         ui.text(Rect{card.x0 + pad, card.y0 + ui.px(50.0f), card.x1 - pad, card.y0 + ui.px(80.0f)},
-                std::string("1v1 MELEE - ") + ShellSettings::speed_name(ctx.settings.game_speed()), v2::kSmall, v2::kTextMuted);
+                std::string(kFormatWords[std::max(0, std::min(4, ctx.lobby_format()))]) + " MELEE - " + ShellSettings::speed_name(ctx.settings.game_speed()), v2::kSmall,
+                v2::kTextMuted);
     }
     {
         Opts o;

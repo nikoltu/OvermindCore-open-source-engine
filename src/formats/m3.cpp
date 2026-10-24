@@ -908,6 +908,48 @@ void M3::decode_animation(Model& m) const {
             }
         }
     }
+
+    {
+        auto read_shape = [&](size_t b, M3HitShape& s) -> bool {
+            if (b + 108 > data.size()) return false;
+            s.shape = rd32(&data[b]);
+            s.bone = int(int16_t(rd16(&data[b + 4])));
+            for (int i = 0; i < 16; ++i) s.m[i] = rd_f32(&data[b + 8 + size_t(i) * 4]);
+            for (int i = 0; i < 3; ++i) s.size[i] = rd_f32(&data[b + 96 + size_t(i) * 4]);
+            return s.shape <= 2 && s.bone >= 0 && size_t(s.bone) < m.bones.size() && std::isfinite(s.size[0]) &&
+                   s.size[0] > 0.0f;
+        };
+        const uint32_t ssgs = find_tag("SSGS");
+        size_t fref = 0;
+        const size_t modl_span = section_bytes(modl_index).size();
+        if (ssgs != UINT32_MAX) {
+            for (size_t off = mo + 4; off + 12 <= mo + modl_span; off += 4) {
+                const M3Ref r = read_ref(off);
+                if (r.index == ssgs && r.count == sections[ssgs].count && r.count > 0) {
+                    fref = off;
+                    break;
+                }
+            }
+        } else {
+            const uint32_t v = modl->version;
+            const size_t slot = v == 23 ? 696 : v == 25 ? 720 : v == 29 ? 768 : 0;
+            if (slot && slot + 12 <= modl_span) fref = mo + slot;
+        }
+        if (fref >= mo + 108) {
+            M3HitShape t;
+            if (read_shape(fref - 108, t)) {
+                m.hit_tight = t;
+                m.has_tight_hit = true;
+            }
+            if (ssgs != UINT32_MAX) {
+                const M3Section* fs = section_by_index(ssgs);
+                for (uint32_t i = 0; fs && i < fs->count; ++i) {
+                    M3HitShape s;
+                    if (read_shape(size_t(fs->offset) + size_t(i) * 108, s)) m.hit_fuzzy.push_back(s);
+                }
+            }
+        }
+    }
 }
 
 std::vector<M3Event> Model::events_for_sequence(size_t seq) const {

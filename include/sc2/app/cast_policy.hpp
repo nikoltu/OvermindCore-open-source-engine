@@ -54,6 +54,10 @@ public:
         e.point_cast = (eff_kind == sim::EffectKind::CreatePersistent ||
                         eff_kind == sim::EffectKind::EnumArea);
         if (e.point_cast) e.aoe_radius = rn ? rn->radius : b->def.radius;
+        if (rn && rn->kind == sim::EffectKind::UseCalldown && std::getenv("SC2_AI_CAST_UNARMED_CALLDOWN") == nullptr) {
+            e.calldown_unit = rn->calldown_unit;
+            e.calldown_count = rn->calldown_count;
+        }
         entries_.push_back(std::move(e));
         return true;
     }
@@ -140,7 +144,18 @@ public:
                 const std::uint32_t tgt = e.support ? wounded_ally(world, u, e.engage_range, e.heal_vital)
                                                     : best_target(world, u, e);
                 if (tgt == sim::kNoTarget) continue;
+                static const bool kResumeOld = std::getenv("SC2_AUTOCAST_RESUME_OLD") != nullptr;
+                sim::Order resume;
+                bool has_resume = false;
+                if (!kResumeOld && !u.orders.empty()) {
+                    const sim::OrderType t = u.orders.front().type;
+                    if (t == sim::OrderType::Move || t == sim::OrderType::AttackMove || t == sim::OrderType::Patrol) {
+                        resume = u.orders.front();
+                        has_resume = true;
+                    }
+                }
                 if (abils_.try_cast(world, ci, e.slot, tgt)) {
+                    if (has_resume) world.issue(ci, resume,  true,  false);
                     ++casts;
                     break;
                 }
@@ -158,6 +173,12 @@ public:
             for (const Entry& e : entries_) {
                 if (e.unit_id != u.catalog_id) continue;
                 if (!abils_.ready(world, ci, e.slot)) continue;
+                if (!e.calldown_unit.empty()) {
+                    int stock = 0;
+                    for (const sim::Unit& s : units)
+                        if (s.alive && s.player == u.player && s.catalog_id == e.calldown_unit) ++stock;
+                    if (stock < e.calldown_count) continue;
+                }
                 bool cast = false;
                 if (e.self_cast) {
                     cast = enemy_within(world, u, e.engage_range) && abils_.try_cast(world, ci, e.slot, ci);
@@ -205,8 +226,23 @@ public:
         if (e->requires_spawner && t.spawner_proto < 0) return false;
         const Fixed dx = t.x - c.x, dy = t.y - c.y;
         const Fixed reach = e->range + c.radius + t.radius;
-        if (dx * dx + dy * dy > reach * reach) return false;
-        return abils_.try_cast(world, caster_id, e->slot, target_id);
+        static const bool kRangeOld = std::getenv("SC2_CAST_RANGE_REFUSE_OLD") != nullptr;
+        const bool walks = !kRangeOld && (c.speed.raw() > 0 || (c.flying && c.speed_air.raw() > 0)) && !c.burrowed;
+        if (!walks && dx * dx + dy * dy > reach * reach) return false;
+        static const bool no_pool = [] { const char* v = std::getenv("SC2_NO_CHARGE_POOL"); return v && v[0] == '1'; }();
+        const data::ChargeSpec ch = no_pool ? data::ChargeSpec{} : data::ability_cost_charge(*cat_, abil_id);
+        const bool pooled = ch.found && ch.location == "Player" && ch.count_max > 0.0;
+        const int32_t use = pooled ? std::max<int32_t>(1, int32_t(ch.count_use)) : 0;
+        auto ticks = [](double s) { return int(s * double(sim::World::kTicksPerSecond) + 0.5); };
+        const std::string link = ch.link.empty() ? abil_id : ch.link;
+        const int32_t start = ch.count_start > 0.0 ? int32_t(ch.count_start) : int32_t(ch.count_max);
+        if (pooled && world.charge_pool_count(c.player, link, start, int32_t(ch.count_max), ticks(ch.time_start),
+                                              ticks(ch.time_use)) < use)
+            return false;
+        if (!abils_.try_cast(world, caster_id, e->slot, target_id)) return false;
+        if (pooled)
+            world.charge_pool_take(c.player, link, start, int32_t(ch.count_max), ticks(ch.time_start), ticks(ch.time_use), use);
+        return true;
     }
 
     bool cast_now_point(sim::World& world, std::uint32_t caster_id, const std::string& abil_id, Fixed px,
@@ -216,12 +252,18 @@ public:
         if (caster_id >= world.units().size()) return false;
         const sim::Unit& c = world.units()[caster_id];
         if (!c.alive) return false;
+        bool walk_point = false;
         if (e->requires_creep) {
             if (!world.creep().is_creep(px, py)) return false;
         } else if (e->range.raw() > 0) {
             const Fixed dx = px - c.x, dy = py - c.y;
             const Fixed reach = e->range + c.radius;
-            if (dx * dx + dy * dy > reach * reach) return false;
+            static const bool kRangeOldPt = std::getenv("SC2_CAST_RANGE_REFUSE_OLD") != nullptr;
+            const bool walks_pt = !kRangeOldPt && (c.speed.raw() > 0 || (c.flying && c.speed_air.raw() > 0)) && !c.burrowed;
+            if (dx * dx + dy * dy > reach * reach) {
+                if (!walks_pt) return false;
+                walk_point = true;
+            }
         }
         static const bool no_pool = [] { const char* v = std::getenv("SC2_NO_CHARGE_POOL"); return v && v[0] == '1'; }();
         const data::ChargeSpec ch = no_pool ? data::ChargeSpec{} : data::ability_cost_charge(*cat_, abil_id);
@@ -234,6 +276,9 @@ public:
                                               ticks(ch.time_use)) < use)
             return false;
         if (!abils_.try_cast_point(world, caster_id, e->slot, px, py)) return false;
+        if (walk_point && !world.units()[caster_id].orders.empty() &&
+            world.units()[caster_id].orders.front().type == sim::OrderType::Cast)
+            world.unit(caster_id).orders.front().walk_in = true;
         if (pooled)
             world.charge_pool_take(c.player, link, start, int32_t(ch.count_max), ticks(ch.time_start), ticks(ch.time_use), use);
         return true;
@@ -264,6 +309,8 @@ private:
         bool requires_ground = false;
         bool rel_authored = false;
         std::uint8_t exc_rel = 0;
+        std::string calldown_unit;
+        int32_t calldown_count = 1;
         bool requires_spawner = false;
     };
 
@@ -278,7 +325,7 @@ private:
 
     static bool enemy_within(const sim::World& world, const sim::Unit& caster, Fixed range) {
         for (const sim::Unit& c : world.units()) {
-            if (!c.alive || c.player == caster.player || c.player < 0) continue;
+            if (!c.alive || world.are_allied(c.player, caster.player) || c.player < 0) continue;
             const Fixed dx = c.x - caster.x, dy = c.y - caster.y;
             const Fixed reach = range + caster.radius + c.radius;
             if (dx * dx + dy * dy <= reach * reach) return true;
@@ -339,6 +386,7 @@ private:
         spec.req_attr_mask = b.req_attr_mask;
         spec.exc_attr_mask = b.exc_attr_mask;
         spec.require_energy = b.require_energy;
+        spec.require_energy_pool = b.require_energy_pool;
         spec.vital_gates = b.vital_gates;
         Entry e;
         e.unit_id = unit_id;
@@ -404,6 +452,15 @@ private:
         if (b->from_effect_tree && b->target_rel_authored) {
             e.rel_authored = true;
             e.exc_rel = b->target_exc_rel;
+        } else {
+            static const bool kRelOld = std::getenv("SC2_CAST_FILTER_REL_OLD") != nullptr;
+            bool authored = false;
+            const bool harmful = kind == sim::EffectKind::Damage;
+            const std::uint8_t m = (kRelOld || harmful) ? 0 : ability_target_excluded_rel(*cat_, abil_id, authored);
+            if (authored) {
+                e.rel_authored = true;
+                e.exc_rel = m;
+            }
         }
         return &(ondemand_[key] = std::move(e));
     }
@@ -415,13 +472,13 @@ private:
         int best_cov = 0;
         const Fixed r2 = e.aoe_radius * e.aoe_radius;
         for (const sim::Unit& c : units) {
-            if (!c.alive || c.player == caster.player || c.player < 0) continue;
+            if (!c.alive || world.are_allied(c.player, caster.player) || c.player < 0) continue;
             const Fixed dx = c.x - caster.x, dy = c.y - caster.y;
             const Fixed reach = e.range + caster.radius + c.radius;
             if (dx * dx + dy * dy > reach * reach) continue;
             int cov = 0;
             for (const sim::Unit& o : units) {
-                if (!o.alive || o.player == caster.player || o.player < 0) continue;
+                if (!o.alive || world.are_allied(o.player, caster.player) || o.player < 0) continue;
                 const Fixed ex = o.x - c.x, ey = o.y - c.y;
                 if (ex * ex + ey * ey <= r2) ++cov;
             }
@@ -440,7 +497,7 @@ private:
         Fixed best_d2;
         const auto& units = world.units();
         for (const sim::Unit& o : units) {
-            if (!o.alive || o.player == caster.player || o.player < 0) continue;
+            if (!o.alive || world.are_allied(o.player, caster.player) || o.player < 0) continue;
             if (o.loaded) continue;
             if ((o.attributes & e.req_attr) != e.req_attr) continue;
             if (o.attributes & e.exc_attr) continue;

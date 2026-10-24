@@ -118,7 +118,7 @@ void ActorCatalog::build(const Catalog& cat) {
             a.model = expand(cat, *mv, a.unit_name, id);
         a.walk_anim_move_speed = cat.scalar_num("CActorUnit", id, "WalkAnimMoveSpeed");
 
-        const std::vector<XmlNode>& fields = cat.resolved("CActorUnit", id);
+        const auto& fields = cat.resolved("CActorUnit", id);
 
         for (const XmlNode& c : fields) {
             if (c.name != "Baselines") continue;
@@ -146,6 +146,21 @@ void ActorCatalog::build(const Catalog& cat) {
                 row->model_link = expand(cat, *v, a.unit_name, id);
             if (auto v = prop(c, "SoundLink"))
                 row->sound_link = expand(cat, *v, a.unit_name, id);
+        }
+
+        for (const XmlNode& c : fields) {
+            if (c.name != "DeathCustoms") continue;
+            const std::string nm = c.attr_or("Name", "");
+            if (nm.empty()) continue;
+            ActorDeath* row = nullptr;
+            for (auto& d : a.death_customs)
+                if (d.index == nm) { row = &d; break; }
+            if (!row) {
+                a.death_customs.push_back(ActorDeath{nm, "", "", ""});
+                row = &a.death_customs.back();
+            }
+            if (auto v = prop(c, "ModelLink")) row->model_link = expand(cat, *v, a.unit_name, id);
+            if (auto v = prop(c, "SoundLink")) row->sound_link = expand(cat, *v, a.unit_name, id);
         }
 
         for (const XmlNode& c : fields) {

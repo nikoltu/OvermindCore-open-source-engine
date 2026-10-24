@@ -33,7 +33,10 @@
 #include <vector>
 
 #include "sc2/casc/storage.hpp"
+#include "sc2/render/device.hpp"
+#include "sc2/render/scene.hpp"
 #include "sc2/render/scene_renderer.hpp"
+#include "sc2/render/texture_decode.hpp"
 #include "sc2/render/vk_helpers.hpp"
 #include "sc2/render/vk_raii.hpp"
 #include "sc2/render/wsi_device.hpp"
@@ -258,6 +261,17 @@ WindowResult run_game_window(const GameFrameFn& frame, const casc::Storage* stor
     uint32_t gfx = wsi.gfx_family;
     VkDevice dev = wsi.device.get();
     VkQueue queue = wsi.queue;
+    Device::offer_window_device(wsi.instance.get(), pd, dev, wsi.side_queue, gfx);
+    struct OfferGuard {
+        VkDevice dev;
+        ~OfferGuard() {
+            if (Device::shared_is_adopted()) {
+                vkDeviceWaitIdle(dev);
+                release_scene_sessions();
+            }
+            Device::withdraw_window_device();
+        }
+    } offer_guard{dev};
 
     {
         VkSurfaceCapabilitiesKHR caps0{};
@@ -288,8 +302,11 @@ WindowResult run_game_window(const GameFrameFn& frame, const casc::Storage* stor
     tun.camera_fit_shadow = true;
     tun.shadow_clip = shadow_clip;
     tun.clear_color[0] = tun.clear_color[1] = tun.clear_color[2] = 0.0f;
+    mem_mark("window: device + swapchain");
     SceneRenderer scene_renderer(pd, dev, queue, gfx, width, height, fmt.format, storage,
                                  texture_root, tun);
+    mem_mark("window: scene renderer");
+    bool first_present_marked = false;
 
     VkCommandPoolCreateInfo cpi{};
     cpi.sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO;
@@ -702,6 +719,7 @@ WindowResult run_game_window(const GameFrameFn& frame, const casc::Storage* stor
         double cb_ms = 0.0;
         bool cont;
         { SC2_PROF_SCOPE("frame_cb"); cont = frame(in, dt_ms, scene, cam, overlay); }
+        if (result.frames_presented == 0) mem_mark("first frame: step + overlay (callback)");
         (void)cb_ms;
         if (!cont || accum.quit) running = false;
         const bool has_overlay = overlay.size() == size_t(sc_w) * size_t(sc_h) * 4;
@@ -723,19 +741,37 @@ WindowResult run_game_window(const GameFrameFn& frame, const casc::Storage* stor
         for (const SceneInstance& s : scene)
             if (s.model && s.model->vertex_count && !s.model->indices.empty()) live.push_back(&s);
 
+        std::unordered_map<const formats::Model*, bool> model_ready;
+        auto ready_to_draw = [&](const formats::Model* m) {
+            if (!world_async_loads() || !storage || result.frames_presented == 0 || scene_renderer.has_mesh(m)) return true;
+            auto it = model_ready.find(m);
+            if (it != model_ready.end()) return it->second;
+            const bool r = SceneRenderer::request_model_textures(*m, storage, texture_root, 0);
+            model_ready.emplace(m, r);
+            return r;
+        };
+        live.erase(std::remove_if(live.begin(), live.end(), [&](const SceneInstance* s) { return !ready_to_draw(s->model); }), live.end());
+        {
+            std::size_t waiting = 0;
+            for (const auto& kv : model_ready) waiting += kv.second ? 0 : 1;
+            frame_prof_count("world.models_waiting", double(waiting));
+        }
+
         std::vector<const SceneInstance*> light_only;
         for (const SceneInstance& s : scene)
             if (s.model && !(s.model->vertex_count && !s.model->indices.empty()) && !s.model->lights.empty()) light_only.push_back(&s);
-        scene_renderer.prepare(live, &light_only);
+        { SC2_PROF_SCOPE("prepare"); scene_renderer.prepare(live, &light_only); }
+        if (result.frames_presented == 0) mem_mark("first frame: world meshes + textures (prepare)");
 
         std::vector<SceneRenderer::ParticleVertex> pverts;
         std::vector<SceneRenderer::ParticleGroup> pgroups;
         std::vector<const SceneInstance*> emitting = live;
         for (const SceneInstance& s : scene)
             if (s.model && !(s.model->vertex_count && !s.model->indices.empty()) &&
-                (!s.model->particles.empty() || !s.model->ribbons.empty()))
+                (!s.model->particles.empty() || !s.model->ribbons.empty()) && ready_to_draw(s.model))
                 emitting.push_back(&s);
-        build_particles(scene_renderer, emitting, cam, pverts, pgroups);
+        { SC2_PROF_SCOPE("particles"); build_particles(scene_renderer, emitting, cam, pverts, pgroups); }
+        frame_prof_count("instances", double(scene.size()));
 
         VkSwapchainKHR cur_swap = swapchain.get();
         uint32_t idx = 0;
@@ -871,8 +907,13 @@ WindowResult run_game_window(const GameFrameFn& frame, const casc::Storage* stor
         ppi.swapchainCount = 1;
         ppi.pSwapchains = &cur_swap;
         ppi.pImageIndices = &idx;
-        VkResult pr = vkQueuePresentKHR(queue, &ppi);
+        VkResult pr = VK_SUCCESS;
+        { SC2_PROF_SCOPE("present"); pr = vkQueuePresentKHR(queue, &ppi); }
         if (pr == VK_SUCCESS || pr == VK_SUBOPTIMAL_KHR) ++result.frames_presented;
+        if (result.frames_presented == 1 && !first_present_marked) {
+            first_present_marked = true;
+            mem_mark("first frame: record + submit + present");
+        }
         frame_prof_tick();
         if (pr == VK_ERROR_OUT_OF_DATE_KHR || pr == VK_SUBOPTIMAL_KHR || accum.resized) {
             accum.resized = false;

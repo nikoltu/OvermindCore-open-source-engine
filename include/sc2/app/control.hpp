@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstdint>
+#include <functional>
 #include <vector>
 
 #include "sc2/render/mat4.hpp"
@@ -22,6 +23,21 @@ struct GroundHeight {
     virtual float z_at(float wx, float wy) const = 0;
     virtual float max_z() const = 0;
 };
+
+struct PickVolume {
+    std::uint32_t shape = 0;
+    bool tight = false;
+    render::Mat4 inv;
+    float size[3] = {0, 0, 0};
+};
+struct PickVolumes {
+    virtual ~PickVolumes() = default;
+    virtual bool volumes(std::uint32_t id, std::vector<PickVolume>& out) const = 0;
+    virtual bool may_hit(std::uint32_t  , const float*  , const float*  ) const { return true; }
+};
+
+bool invert_mat4(const render::Mat4& m, render::Mat4& out);
+float ray_volume_t(const PickVolume& v, const float o[3], const float d[3]);
 
 enum class CommandKind {
     None,
@@ -84,7 +100,38 @@ public:
 
     float ground_z(float x, float y) const { return ground_ ? ground_->z_at(x, y) : 0.0f; }
 
+    struct RayHit {
+        std::uint32_t id = sim::kNoTarget;
+        float t = 0.0f;
+        bool tight = false;
+        float tight_t = 0.0f;
+        bool fuzzy = false;
+        float fuzzy_t = 0.0f;
+    };
+    std::vector<RayHit> ray_hits(const sim::World& world, const ScreenPoint& p) const;
+    enum class ClickRule { Nearest, TightFirst, OwnFirst, TightOnly, FuzzyOnly };
+    std::uint32_t click_pick(const sim::World& world, const ScreenPoint& p, ClickRule rule = ClickRule::TightFirst) const;
+    bool has_pick_volumes() const { return volumes_ != nullptr; }
+    bool body_has_volumes(std::uint32_t id) const {
+        std::vector<PickVolume> v;
+        return volumes_ && volumes_->volumes(id, v);
+    }
+
+    bool view_ray(const ScreenPoint& p, float o[3], float d[3]) const;
+    void set_pick_volumes(const PickVolumes* v) { volumes_ = v; }
+
+    static constexpr std::size_t kSelectionCap = 500;
+    struct BoxRules {
+        bool on = false;
+        std::function<int(const sim::Unit&)> rank;
+    };
+    void set_box_rules(BoxRules r) { box_rules_ = std::move(r); }
+    const BoxRules& box_rules() const { return box_rules_; }
+    bool volume_screen_rect(std::uint32_t id, ScreenRect& r, int which = 1) const;
+
 private:
+    std::vector<uint32_t> box_select_672(const sim::World& world, const ScreenRect& rect) const;
+    BoxRules box_rules_;
     render::Mat4 mvp_;
     render::Mat4 inv_mvp_;
     bool invertible_ = false;
@@ -92,6 +139,7 @@ private:
     int32_t player_ = 0;
     sim::Fixed pick_radius_ = sim::Fixed::from_ratio(1, 2);
     const GroundHeight* ground_ = nullptr;
+    const PickVolumes* volumes_ = nullptr;
 
 };
 

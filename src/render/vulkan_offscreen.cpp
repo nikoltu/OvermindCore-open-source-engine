@@ -13,6 +13,9 @@
 
 #include "sc2/app/console_panel.hpp"
 #include "sc2/data/catalog.hpp"
+#include "sc2/render/frame_prof.hpp"
+#include "sc2/render/scene_renderer.hpp"
+#include "sc2/render/texture_decode.hpp"
 #include "sc2/formats/m3.hpp"
 #include "sc2/render/mat4.hpp"
 #include "sc2/app/ui_canvas.hpp"
@@ -215,6 +218,19 @@ std::vector<std::uint8_t> render_portrait(casc::Storage& store, const formats::M
         char key[160];
         std::snprintf(key, sizeof(key), "portrait:%p:%p:%s:%.4f:%zu", static_cast<const void*>(&model), static_cast<const void*>(&store),
                       pe ? pe->light_id.c_str() : "-", pe ? pe->hdr_exposure : 0.0, pe ? pe->params.size() : std::size_t(0));
+        if (const int mode = portrait_load_mode(); mode == 1 || mode == 2) {
+            const bool ready = render::render_scene_session_exists(key, w, h) ||
+                               render::SceneRenderer::request_model_textures(model, &store, std::string(), render::render_scene_session_texture_max());
+            if (mode == 2) {
+                if (!ready) return {};
+                static const std::size_t kBudget = std::size_t(std::getenv("SC2_PORTRAIT_UPLOAD_MB") ? std::max(0, std::atoi(std::getenv("SC2_PORTRAIT_UPLOAD_MB"))) : 0) * 1048576u;
+                if (kBudget == 0 || w <= 1 || h <= 1) return std::vector<std::uint8_t>{1};
+                bool up = false;
+                render::render_scene_session(key, scene, w, h, cam, &store, pe, kBudget, &up);
+                return up ? std::vector<std::uint8_t>{1} : std::vector<std::uint8_t>{};
+            }
+            if (!ready) return {};
+        }
         const render::RenderResult r = render::render_scene_session(key, scene, w, h, cam, &store, pe);
         if (r.rgba.size() == std::size_t(w) * h * 4) return r.rgba;
     } catch (...) {
@@ -327,7 +343,9 @@ ConsoleTexture render_console_models(casc::Storage& store, const data::Catalog& 
                     }
             }
             try {
+                if (render::mem_lap_marks()) render::mem_mark("console: three models decoded");
                 render::RenderResult r = render::render_scene(one_view, out_w, out_h, &cam, &store, "", false, env.found ? &env : nullptr);
+                if (render::mem_lap_marks()) render::mem_mark("console: renderer released");
                 if (r.rgba.size() == std::size_t(out_w) * out_h * 4) {
                     for (std::size_t q = 0; q + 3 < r.rgba.size(); q += 4)
                         if (r.rgba[q + 3] >= 250 && r.rgba[q] <= 2 && r.rgba[q + 1] <= 2 && r.rgba[q + 2] <= 2) {

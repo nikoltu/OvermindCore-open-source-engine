@@ -34,6 +34,9 @@ struct AnimSlot {
     std::vector<std::string> closing;
     std::vector<std::string> content;
     bool closing_phase = false;
+    bool content_once = false;
+    bool content_playing = false;
+    bool stop_pending = false;
     bool global = false;
 };
 
@@ -87,6 +90,15 @@ struct ActorInstance {
     float blend_left_ms = 0, blend_total_ms = 0;
     int noted_seq = -1;
     bool turret_bound = false;
+    bool reach_bound = false;
+    int reach_tip = -1, reach_root = -1, reach_weapon = -1;
+    bool reach_live = false;
+    float reach_last_x = 0.0f, reach_last_y = 0.0f, retract_t0 = -1.0f, retract_from_x = 0.0f, retract_from_y = 0.0f, retract_dist = 0.0f;
+    std::uint32_t reach_target_id = 0;
+    bool reach_has_target = false;
+    float retract_delay = 0.0f, retract_v0 = 0.0f, retract_acc = 0.0f, retract_vmax = 0.0f;
+    float ret_lte[2] = {0.0f, 0.0f}, ret_v0[2] = {0.0f, 0.0f}, ret_acc[2] = {0.0f, 0.0f}, ret_vmax[2] = {0.0f, 0.0f};
+    int ret_n = 0;
     int turret_bone = -1;
     float turret_yaw = 0.0f;
     float turret_goal = 0.0f;
@@ -134,6 +146,14 @@ struct ActorInstance {
     std::size_t unhandled_verbs = 0;
     float bus_tint[3] = {1.0f, 1.0f, 1.0f};
     bool bus_tint_set = false;
+    bool host_owned = false;
+    bool self_destroyed = false;
+    void bracket_closed(const std::string& slot);
+    void close_bracket_now(const std::string& slot);
+    void settle_brackets();
+    float bus_scale = 1.0f;
+    bool bus_scale_set = false;
+    std::string bus_model_swap;
     std::size_t unanswerable_filters = 0;
     std::map<std::string, int> status;
     void set_status(const std::string& name, int value, bool raise_set);
@@ -190,6 +210,8 @@ struct ActorDriver {
     std::function<BurrowPair(const std::string&)> burrow_pair;
     std::function<BurrowPair(const std::string&)> depot_pair;
     std::function<std::string(uint32_t)> morph_target;
+    std::function<int(int, const std::string&)> validate_player;
+    std::map<int, std::size_t> upgrades_seen;
 
     struct Shadow {
         bool known = false;

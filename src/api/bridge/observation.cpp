@@ -21,9 +21,10 @@ int api_owner(int sim_owner) {
     return sim_owner == kSimNeutralOwner ? kApiNeutralOwner : sim_owner + 1;
 }
 
-SC2APIProtocol::Alliance alliance_of(int sim_owner, int joined_sim_side) {
+SC2APIProtocol::Alliance alliance_of(const sim::World& world, int sim_owner, int joined_sim_side) {
     if (sim_owner == kSimNeutralOwner) return SC2APIProtocol::Neutral;
-    return sim_owner == joined_sim_side ? SC2APIProtocol::Self : SC2APIProtocol::Enemy;
+    if (sim_owner == joined_sim_side) return SC2APIProtocol::Self;
+    return world.are_allied(sim_owner, joined_sim_side) ? SC2APIProtocol::Ally : SC2APIProtocol::Enemy;
 }
 
 constexpr float kApiFacingTurn = 6.283185307179586f;
@@ -63,6 +64,7 @@ void fill_observation(Host& host, const View& view, SC2APIProtocol::ResponseObse
     for (const sim::Unit& u : world.units()) {
         if (!u.alive) continue;
         if (u.loaded) continue;
+        if (u.in_gas_structure) continue;
         if (!unscoped && u.player != joined_sim_side &&
             vision.state_at(u.x, u.y) != sim::Visibility::Visible)
             continue;
@@ -71,7 +73,7 @@ void fill_observation(Host& host, const View& view, SC2APIProtocol::ResponseObse
 
         SC2APIProtocol::Unit* out_u = raw->add_units();
         out_u->set_display_type(SC2APIProtocol::Visible);
-        out_u->set_alliance(alliance_of(u.player, joined_sim_side));
+        out_u->set_alliance(alliance_of(world, u.player, joined_sim_side));
         out_u->set_tag(std::uint64_t(u.id));
         out_u->set_unit_type(row->second);
         out_u->set_owner(api_owner(u.player));
@@ -92,7 +94,7 @@ void fill_observation(Host& host, const View& view, SC2APIProtocol::ResponseObse
         out_u->set_energy_max(float(u.energy_max.to_double()));
         out_u->set_is_flying(u.flying);
         out_u->set_is_burrowed(u.burrowed);
-        if (alliance_of(u.player, joined_sim_side) == SC2APIProtocol::Self)
+        if (alliance_of(world, u.player, joined_sim_side) == SC2APIProtocol::Self)
             fill_unit_orders(*game, u, abilities, *out_u);
 
         if (u.resource_left > 0) {

@@ -1,6 +1,8 @@
 #pragma once
 #include <array>
 #include <cmath>
+#include <stdexcept>
+#include <vector>
 
 #include <string>
 
@@ -85,7 +87,7 @@ inline void apply_race_costs(MeleePlayerSetup& p, const data::Catalog& cat, Race
         return t > 0.0 ? Fixed::from_raw(int(t * double(Fixed::kOne) + 0.5)) : Fixed::from_int(fallback);
     };
     const data::UnitCost wcost = data::unit_cost(cat, u.worker);
-    const data::UnitCost pcost = data::unit_cost(cat, u.producer);
+    const data::UnitCost pcost = data::build_charge(cat, u.producer, u.worker);
     const data::UnitCost dcost = data::unit_cost(cat, u.supply);
     const data::UnitCost acost = data::unit_cost(cat, u.army);
     p.worker_mineral_cost = wcost.minerals > 0 ? wcost.minerals : 50;
@@ -103,10 +105,10 @@ inline void apply_race_costs(MeleePlayerSetup& p, const data::Catalog& cat, Race
     const int race_ix = r == Race::Terran ? 0 : r == Race::Protoss ? 1 : 2;
     for (int t = 0; t < 5; ++t) p.wave_ladders[std::size_t(t)] = low_tier_wave_ladder(race_ix, t);
     p.wave_phases = low_tier_wave_ladder(race_ix, 2);
-    const data::UnitCost hcost = data::unit_cost(cat, u.hall);
+    const data::UnitCost hcost = data::build_charge(cat, u.hall, u.worker);
     p.town_hall_mineral_cost = hcost.minerals > 0 ? hcost.minerals : 300;
     p.town_hall_build_time = secs(u.hall, 100);
-    const data::UnitCost tcost = data::unit_cost(cat, u.tech);
+    const data::UnitCost tcost = data::build_charge(cat, u.tech, u.worker);
     p.tech_unit = make_unit(cat, u.tech, 0);
     p.tech_unit.speed = Fixed();
     p.tech_mineral_cost = tcost.minerals > 0 ? tcost.minerals : 125;
@@ -142,7 +144,8 @@ inline void apply_race_costs(MeleePlayerSetup& p, const data::Catalog& cat, Race
                         sim::Unit proto = make_unit(cat, id, 0);
                         const bool mobile = proto.speed.raw() > 0;
                         if (!mobile) proto.speed = Fixed();
-                        st.item = ai::BuildItem{proto, c.minerals, c.gas, secs(id.c_str(), 30), mobile};
+                        const data::UnitCost bc = mobile ? c : data::build_charge(cat, id, u.worker);
+                        st.item = ai::BuildItem{proto, bc.minerals, bc.gas, secs(id.c_str(), 30), mobile};
                         st.item.count = prod.train_count(id);
                         if (id == u.supply) st.kind = ai::StockKind::Supply;
                         else if (id == u.producer) st.kind = ai::StockKind::Producer;
@@ -269,25 +272,48 @@ inline void snap_base_to_real_resources(const formats::LoadedMap& map, const dat
     }
 }
 
+inline std::vector<MeleeSlot> melee_active_slots(const std::vector<MeleeSlot>& slots) {
+    std::vector<MeleeSlot> out;
+    for (const MeleeSlot& sl : slots)
+        if (sl.controller != MeleeSlot::Controller::Closed) out.push_back(sl);
+    return out;
+}
+
+inline int melee_human_player(const std::vector<MeleeSlot>& slots) {
+    const std::vector<MeleeSlot> act = melee_active_slots(slots);
+    for (std::size_t p = 0; p < act.size(); ++p)
+        if (act[p].controller == MeleeSlot::Controller::Human) return int(p);
+    return -1;
+}
+
+inline std::vector<int> melee_slot_difficulties(const std::vector<MeleeSlot>& slots) {
+    std::vector<int> out;
+    for (const MeleeSlot& sl : melee_active_slots(slots)) out.push_back(sl.difficulty);
+    return out;
+}
+
 inline MeleeSetup melee_setup_for_map(const formats::LoadedMap& map, const data::Catalog& cat,
-                                      Race r0, Race r1, int worker_count = -1, int patches = 8,
-                                      std::uint64_t start_seed = 0) {
-    const MapMeleeStarts st = map_melee_starts(map, start_seed);
+                                      const std::vector<MeleeSlot>& slots, int worker_count = -1, int patches = 8,
+                                      std::uint64_t start_seed = 0, bool any_pair = true) {
+    const std::vector<MeleeSlot> act = melee_active_slots(slots);
+    if (act.size() < 2) throw std::invalid_argument("melee_setup_for_map: a melee needs two active slots or more");
+    std::vector<int> teams;
+    for (const MeleeSlot& sl : act) teams.push_back(sl.team);
+    const MapMeleeStarts st = act.size() <= 2 ? map_melee_starts(map, start_seed, any_pair) : map_melee_starts(map, teams, start_seed);
     data::Production prod;
     prod.build(cat);
 
     MeleeSetup s;
     for (const auto& pu : map.objects.units)
         if (pu.variation >= 0) s.placed_variations.push_back({pu.unit_type, double(pu.x), double(pu.y), pu.variation});
-    const Race races[2] = {r0, r1};
     std::vector<char> consumed(map.objects.units.size(), 0);
-    for (int side = 0; side < 2; ++side) {
-        const Race r = races[side];
+    for (int side = 0; side < int(act.size()); ++side) {
+        const Race r = act[std::size_t(side)].race;
         const MeleeProtos pr = race_protos(cat, r);
-        const int sx = side ? st.s1x : st.s0x, sy = side ? st.s1y : st.s0y;
+        const int sx = st.cells[std::size_t(side)].first, sy = st.cells[std::size_t(side)].second;
         MeleePlayerSetup p = map_melee_player(pr, sx, sy, st.cx, st.cy,
                                               worker_count >= 0 ? worker_count : pr.worker_count, patches);
-        snap_base_to_real_resources(map, cat, sx, sy, p, consumed);
+        if (!map_startless_retail(map)) snap_base_to_real_resources(map, cat, sx, sy, p, consumed);
         if (std::getenv("SC2_ENV_TRACE"))
             std::fprintf(stderr, "start: side %d cell %d,%d hall at %.2f,%.2f\n", side, sx, sy, p.start.x.to_double(), p.start.y.to_double());
         if (map_startless_halls(map)) {
@@ -298,13 +324,24 @@ inline MeleeSetup melee_setup_for_map(const formats::LoadedMap& map, const data:
             p.worker_count = 0;
             p.start_extras.clear();
         }
+        if (map_startless_retail(map)) {
+            p.mineral_positions.clear();
+            p.mineral_protos.clear();
+            p.geyser_positions.clear();
+            p.geyser_protos.clear();
+            p.worker_count = 0;
+            p.start_extras.clear();
+            p.no_town_hall = true;
+            s.no_melee_end = true;
+        }
         apply_race_costs(p, cat, r, prod);
+        p.team = act[std::size_t(side)].team;
         s.players.push_back(p);
     }
 
     {
         using sim::Fixed;
-        const MeleeProtos npr = race_protos(cat, r0);
+        const MeleeProtos npr = race_protos(cat, act[0].race);
         for (std::size_t ui = 0; ui < map.objects.units.size(); ++ui) {
             const auto& u = map.objects.units[ui];
             if (consumed[ui]) continue;
@@ -403,6 +440,15 @@ inline MeleeSetup melee_setup_for_map(const formats::LoadedMap& map, const data:
         }
     }
     return s;
+}
+
+inline MeleeSetup melee_setup_for_map(const formats::LoadedMap& map, const data::Catalog& cat,
+                                      Race r0, Race r1, int worker_count = -1, int patches = 8,
+                                      std::uint64_t start_seed = 0, bool any_pair = true) {
+    std::vector<MeleeSlot> slots(2);
+    slots[0].race = r0;
+    slots[1].race = r1;
+    return melee_setup_for_map(map, cat, slots, worker_count, patches, start_seed, any_pair);
 }
 
 }

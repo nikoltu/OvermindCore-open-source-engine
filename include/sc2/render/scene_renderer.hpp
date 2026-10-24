@@ -5,6 +5,7 @@
 #include <array>
 #include <cstdint>
 #include <functional>
+#include <memory>
 #include <set>
 #include <string>
 #include <unordered_map>
@@ -25,6 +26,8 @@ struct EnvLight;
 }
 
 namespace sc2::render {
+
+struct DecodedTexture;
 
 class SceneRenderer {
 public:
@@ -90,7 +93,15 @@ public:
         bool height_fog = false;
         float fog_color[3] = {0, 0, 0};
         float fog_density = 0.0f, fog_falloff = 0.0f, fog_start = 0.0f;
+        std::shared_ptr<Image> shared_shadow;
+        uint32_t max_texture_dim = 0;
+        std::size_t upload_batch_mb = 0;
     };
+    static bool request_model_textures(const formats::Model& m, const casc::Storage* storage, const std::string& texture_root,
+                                       uint32_t max_dim);
+    std::size_t gpu_bytes_estimate() const;
+    bool has_mesh(const formats::Model* m) const { return mesh_cache_.count(m) != 0; }
+    bool preload_model_textures(const formats::Model& m, std::size_t byte_budget);
 
     SceneRenderer(VkPhysicalDevice pd, VkDevice dev, VkQueue queue, uint32_t gfx_family,
                   uint32_t width, uint32_t height, VkFormat ldr_format,
@@ -162,6 +173,7 @@ private:
         bool any_uvx = false;
         std::vector<std::array<float, 2>> draw_masklv;
         bool any_masklv = false;
+        std::vector<std::uint8_t> draw_masklv_anim;
         std::vector<float> draw_specm;
         bool any_specm = false;
         std::vector<std::array<float, 3>> draw_specl;
@@ -204,6 +216,19 @@ private:
     int kDefaultWhite = 0, kDefaultNormal = 1, kDefaultEmissive = 2, kDefaultSpecular = 3, kDefaultClear = 4;
 
     std::vector<Image> textures_;
+    std::size_t texture_bytes_ = 0;
+    int upload_batch_ = 0;
+    VkCommandBuffer batch_cb_ = VK_NULL_HANDLE;
+    std::vector<Buffer> batch_keep_;
+    std::size_t batch_keep_bytes_ = 0;
+    void flush_upload_batch();
+    std::unordered_map<std::string, std::shared_ptr<DecodedTexture>> batch_taken_;
+    std::set<std::string> batch_shared_keys_;
+    std::shared_ptr<DecodedTexture> take_decoded(const std::string& key);
+    void keep_decoded(const std::string& key, const std::shared_ptr<DecodedTexture>& d);
+    void begin_upload_batch() { ++upload_batch_; }
+    void end_upload_batch();
+    const Image* shadow_ = nullptr;
     std::unordered_map<std::string, int> tex_index_;
     std::unordered_map<const void*, int> inline_index_;
     std::unordered_map<const formats::Model*, Mesh> mesh_cache_;

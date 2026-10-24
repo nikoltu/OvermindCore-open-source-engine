@@ -28,7 +28,7 @@ std::string asset_file(const XmlNode& e) {
     return {};
 }
 
-std::vector<SoundAsset> resolve_assets(const std::vector<XmlNode>& fields,
+std::vector<SoundAsset> resolve_assets(const core::XmlNodeList& fields,
                                        const std::string& id) {
     std::vector<std::string> order;
     std::unordered_map<std::string, SoundAsset> byidx;
@@ -110,7 +110,7 @@ void AudioCatalog::build(const Catalog& cat) {
             s.is_default = e->is_default;
         }
 
-        const std::vector<XmlNode>& fields = cat.resolved("CSound", id);
+        const auto& fields = cat.resolved("CSound", id);
         s.assets = resolve_assets(fields, id);
 
         s.volume = cat.scalar("CSound", id, "Volume");

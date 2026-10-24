@@ -1,5 +1,6 @@
 #include "sc2/app/boot.hpp"
 
+#include <cstdlib>
 #include <string>
 #include <vector>
 
@@ -35,6 +36,7 @@ void run_startup_step(const StartupStep& step, const std::string& data_dir, casc
             break;
         case StartupStep::Kind::Model:
         default:
+            if (!std::getenv("SC2_MODELS_OWN_CATALOG")) models.share_catalog(&cat);
             models.ensure(store, step.arg);
             break;
     }

@@ -34,7 +34,8 @@ public:
     const Location* find(const EKey9& key) const;
     const Location* find_hex(const std::string& ekey_hex) const;
 
-    size_t size() const { return map_.size(); }
+    size_t size() const { return map_.empty() ? sorted_.size() : map_.size(); }
+    size_t memory_bytes() const { return sorted_.capacity() * sizeof(sorted_[0]) + map_.size() * (sizeof(EKey9) + sizeof(Location) + 24); }
     const std::string& data_dir() const { return data_dir_; }
 
     static std::vector<std::pair<EKey9, Location>> parse_idx(
@@ -43,6 +44,7 @@ public:
 private:
     std::string data_dir_;
     std::unordered_map<EKey9, Location, EKey9Hash> map_;
+    std::vector<std::pair<EKey9, Location>> sorted_;
 };
 
 EKey9 ekey9_from_hex(const std::string& hex);

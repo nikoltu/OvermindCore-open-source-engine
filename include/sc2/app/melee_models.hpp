@@ -136,7 +136,15 @@ private:
 public:
     const formats::Model* ensure_variation(casc::Storage& store, const std::string& token, unsigned pick);
 
+    void share_catalog(data::Catalog* cat) { shared_catalog_ = cat; }
+    std::size_t memory_bytes(std::size_t* count) const;
+    bool prefetch(casc::Storage& store, const std::string& token);
+    bool prefetch_portrait(casc::Storage& store, const std::string& unit_id);
+
 private:
+    data::Catalog* shared_catalog_ = nullptr;
+    std::vector<std::string> unit_candidates(casc::Storage& store, const std::string& token, bool& story, std::string& model_id);
+    bool portrait_source(casc::Storage& store, const std::string& unit_id, std::string& expand_id, std::string& rel);
     std::string doodad_key(const std::string& type, int variation) const {
         std::string k = variation > 0 ? type + '#' + std::to_string(variation) : type;
         if (!texture_prop_.empty()) k += '@' + texture_prop_;

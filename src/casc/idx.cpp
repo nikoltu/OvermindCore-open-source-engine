@@ -1,6 +1,9 @@
 #include "sc2/casc/idx.hpp"
 
+#include <algorithm>
 #include <stdexcept>
+
+#include "sc2/casc/encoding.hpp"
 
 #include "sc2/core/byte_reader.hpp"
 #include "sc2/platform/file.hpp"
@@ -70,15 +73,30 @@ std::vector<std::pair<EKey9, Location>> IdxIndex::parse_idx(
 void IdxIndex::build(const std::string& data_dir) {
     data_dir_ = data_dir;
     map_.clear();
+    sorted_.clear();
+    const bool old = casc_index_maps_old();
     for (const auto& path : platform::list_dir(data_dir, ".idx")) {
         auto blob = platform::read_file(path);
-        for (auto& [key, loc] : parse_idx(blob)) map_[key] = loc;
+        for (auto& [key, loc] : parse_idx(blob)) {
+            if (old) map_[key] = loc;
+            else sorted_.emplace_back(key, loc);
+        }
+    }
+    if (!old) {
+        std::reverse(sorted_.begin(), sorted_.end());
+        std::stable_sort(sorted_.begin(), sorted_.end(), [](const auto& a, const auto& b) { return a.first < b.first; });
+        sorted_.erase(std::unique(sorted_.begin(), sorted_.end(), [](const auto& a, const auto& b) { return a.first == b.first; }), sorted_.end());
+        sorted_.shrink_to_fit();
     }
 }
 
 const Location* IdxIndex::find(const EKey9& key) const {
-    auto it = map_.find(key);
-    return it == map_.end() ? nullptr : &it->second;
+    if (!map_.empty()) {
+        auto it = map_.find(key);
+        return it == map_.end() ? nullptr : &it->second;
+    }
+    auto it = std::lower_bound(sorted_.begin(), sorted_.end(), key, [](const auto& e, const EKey9& k) { return e.first < k; });
+    return it != sorted_.end() && it->first == key ? &it->second : nullptr;
 }
 
 const Location* IdxIndex::find_hex(const std::string& ekey_hex) const {

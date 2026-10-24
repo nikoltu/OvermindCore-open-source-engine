@@ -77,6 +77,25 @@ public:
     void set_open_folder_callback(std::function<bool(const std::string&)> cb) { open_folder_cb_ = std::move(cb); }
     int lobby_ai_difficulty() const { return settings_.ai_difficulty(); }
     GameClock::Speed lobby_speed() const { return settings_.game_speed(); }
+
+    enum class LobbyFormat { OneVsOne, TwoVsTwo, ThreeVsThree, FourVsFour, FreeForAll };
+    struct LobbySlot {
+        LobbyRace pick = LobbyRace::Terran;
+        MeleeSlot::Controller controller = MeleeSlot::Controller::AI;
+        int difficulty = 0;
+        int team = -1;
+    };
+    static const char* lobby_format_name(LobbyFormat f);
+    static int lobby_format_players(LobbyFormat f, int starts);
+    static std::vector<LobbySlot> lobby_preset(LobbyFormat f, int rows, LobbyRace you, LobbyRace ai, int tier);
+    bool set_lobby_format(LobbyFormat f);
+    LobbyFormat lobby_format() const { return lobby_format_; }
+    std::vector<LobbySlot>& lobby_slots() { return lobby_slots_; }
+    const std::vector<LobbySlot>& lobby_slots() const { return lobby_slots_; }
+    int map_start_count(int index);
+    const std::vector<MeleeSlot>& match_slots() const { return slots_; }
+    using PlayerCard = MatchPlayerCard;
+    const std::vector<PlayerCard>& last_players() const { return last_players_; }
     bool options_engine_page() const { return options_engine_page_; }
     static std::string option_key(const std::string& checkbox_name);
     bool option_checked(const std::string& checkbox_name) const;
@@ -104,6 +123,7 @@ public:
     void build_overlay(std::uint32_t view_w, std::uint32_t view_h, std::vector<std::uint8_t>& out);
     void set_software_cursor(bool on) { software_cursor_ = on; }
     bool cursor_drawn() const { return cursor_drawn_; }
+    void set_portrait_full_rate(bool on) { portrait_full_rate_ = on; }
 
     const data::EnvLight& current_environment() const { return current_env_; }
     void set_ground_fog(bool on) { ground_fog_ = on; if (skirmish_) skirmish_->set_ground_fog(on); }
@@ -135,10 +155,12 @@ public:
 
     bool begin_match(std::vector<std::uint8_t> map_bytes, Race p0, Race p1) {
         api_map_bytes_ = std::move(map_bytes);
-        p0_race_ = p0;
-        p1_race_ = p1;
+        set_two_player_races(p0, p1);
+        if (observe_next_)
+            for (MeleeSlot& sl : slots_) sl.controller = MeleeSlot::Controller::AI;
         return begin_match();
     }
+    void set_observe_next(bool on) { observe_next_ = on; }
     bool begin_match();
     void end_match() {
         release_match();
@@ -253,6 +275,8 @@ private:
     IconAtlas cursor_icons_;
     float cursor_x_ = -1.0f, cursor_y_ = -1.0f;
     bool software_cursor_ = false, cursor_drawn_ = false;
+    bool portrait_full_rate_ = false;
+    bool observe_next_ = false;
     void build_overlay_body(std::uint32_t view_w, std::uint32_t view_h, std::vector<std::uint8_t>& out);
     std::string preview_failed_;
     int lobby_rows_per_page(std::uint32_t view_h) const;
@@ -266,6 +290,7 @@ private:
     ScreenRouter router_;
     void release_match() {
         capture_score();
+        capture_players();
         skirmish_.reset();
         real_map_.reset();
         real_ground_ = formats::Model{};
@@ -356,9 +381,24 @@ private:
     std::string match_error_;
     std::vector<ScoreRow> last_score_;
     void capture_score();
-    Race p0_race_ = Race::Terran;
-    Race p1_race_ = Race::Terran;
+    std::vector<MeleeSlot> slots_ = two_player_slots(Race::Terran, Race::Terran);
+    static std::vector<MeleeSlot> two_player_slots(Race r0, Race r1) {
+        std::vector<MeleeSlot> s(2);
+        s[0].race = r0;
+        s[0].controller = MeleeSlot::Controller::Human;
+        s[1].race = r1;
+        return s;
+    }
+    void set_two_player_races(Race r0, Race r1) { slots_ = two_player_slots(r0, r1); }
+    Race race_of(std::size_t p) const { return p < slots_.size() ? slots_[p].race : Race::Terran; }
+    void slots_from_log(const OrderLog& log);
     LobbyRace p0_pick_ = LobbyRace::Terran, p1_pick_ = LobbyRace::Terran;
+    std::vector<LobbySlot> lobby_slots_;
+    LobbyFormat lobby_format_ = LobbyFormat::OneVsOne;
+    std::map<std::string, int> map_starts_cache_;
+    std::vector<PlayerCard> last_players_;
+    bool match_any_pair_ = false;
+    void capture_players();
 
     std::unique_ptr<formats::LoadedMap> real_map_;
     std::vector<std::uint8_t> api_map_bytes_;

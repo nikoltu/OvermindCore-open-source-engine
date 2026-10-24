@@ -340,11 +340,18 @@ sim::Command get_command(Reader& r, uint32_t version) {
 
 void write_order_log(const OrderLog& log, std::vector<uint8_t>& out) {
     out.insert(out.end(), kOrderLogMagic, kOrderLogMagic + 8);
-    put_u32(out, kOrderLogVersion);
+    const bool v6 = log.needs_v6_header();
+    put_u32(out, v6 ? kOrderLogVersion : kOrderLogVersionTeamless);
     put_u64(out, log.seed);
     put_str(out, log.map_id);
     put_u32(out, uint32_t(log.player_races.size()));
     for (int32_t r : log.player_races) put_i32(out, r);
+    if (v6) {
+        put_u32(out, uint32_t(log.player_teams.size()));
+        for (int32_t t : log.player_teams) put_i32(out, t);
+        put_u32(out, uint32_t(log.player_controllers.size()));
+        for (int32_t c : log.player_controllers) put_i32(out, c);
+    }
     put_i32(out, log.total_ticks);
     put_u32(out, uint32_t(log.initial_units.size()));
     for (const sim::Unit& u : log.initial_units) put_unit(out, u);
@@ -372,6 +379,13 @@ bool read_order_log(const uint8_t* data, size_t len, OrderLog& out) {
         log.map_id = r.str();
         uint32_t nr = r.u32();
         for (uint32_t i = 0; i < nr && r.ok; ++i) log.player_races.push_back(r.i32());
+    }
+    log.any_start_pair = version >= 6;
+    if (version >= 6) {
+        uint32_t nt = r.u32();
+        for (uint32_t i = 0; i < nt && r.ok; ++i) log.player_teams.push_back(r.i32());
+        uint32_t nc = r.u32();
+        for (uint32_t i = 0; i < nc && r.ok; ++i) log.player_controllers.push_back(r.i32());
     }
     log.total_ticks = r.i32();
     uint32_t nu = r.u32();

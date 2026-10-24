@@ -7,6 +7,8 @@
 #include <array>
 #include <cmath>
 #include <cstdint>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <map>
 #include <memory>
@@ -19,7 +21,9 @@
 #include "sc2/formats/dds.hpp"
 #include "sc2/render/anim.hpp"
 #include "sc2/render/device.hpp"
+#include "sc2/render/frame_prof.hpp"
 #include "sc2/render/scene_renderer.hpp"
+#include "sc2/render/texture_decode.hpp"
 #include "sc2/render/vk_helpers.hpp"
 #include "sc2/render/vk_raii.hpp"
 #include "mesh_build.hpp"
@@ -77,6 +81,8 @@ RenderResult render_scene(const std::vector<SceneInstance>& instances,
     if (live.empty()) throw std::runtime_error("render_scene: no drawable instances");
 
     Device& gpu = Device::shared_headless("render_scene");
+    const bool marks = mem_lap_marks();
+    if (marks) mem_mark(Device::shared_is_adopted() ? "render_scene: device (the window's)" : "render_scene: device (its own)");
     const VkPhysicalDevice pd = gpu.physical();
     const VkDevice dev = gpu.device();
     const VkQueue queue = gpu.graphics_queue();
@@ -88,16 +94,19 @@ RenderResult render_scene(const std::vector<SceneInstance>& instances,
         tun.shadow_clip = *window_shadow_clip;
         tun.clear_color[0] = tun.clear_color[1] = tun.clear_color[2] = 0.0f;
     }
+    tun.upload_batch_mb = upload_batch_budget_mb();
     SceneRenderer sr(pd, dev, queue, gfx, resize_from ? resize_from : width, resize_from ? resize_from : height,
                      VK_FORMAT_R8G8B8A8_UNORM, storage, texture_root, tun);
     if (resize_from) sr.resize(width, height);
     if (env) sr.set_environment(*env);
     if (fog) sr.set_fog(*fog);
+    if (marks) mem_mark("render_scene: renderer (pipelines, targets)");
     std::vector<const SceneInstance*> light_only;
     for (const auto& inst : instances)
         if (inst.model && !(inst.model->vertex_count && !inst.model->indices.empty()) && !inst.model->lights.empty())
             light_only.push_back(&inst);
     sr.prepare(live, &light_only);
+    if (marks) mem_mark("render_scene: prepare (meshes, textures)");
 
     Camera cam;
     if (cam_in) {
@@ -191,11 +200,29 @@ RenderResult render_scene(const std::vector<SceneInstance>& instances,
     check(vkMapMemory(dev, readback.mem.get(), 0, rbytes, 0, &mapped), "vkMapMemory(readback)");
     std::memcpy(out.rgba.data(), mapped, size_t(rbytes));
     vkUnmapMemory(dev, readback.mem.get());
+    if (marks) mem_mark("render_scene: drawn + read back");
     return out;
 }
 
+static bool (*g_session_find)(const std::string&, uint32_t, uint32_t) = nullptr;
+static void (*g_session_release)() = nullptr;
+
+void release_scene_sessions() {
+    if (g_session_release) g_session_release();
+}
+
+bool render_scene_session_exists(const std::string& key, uint32_t width, uint32_t height) {
+    return g_session_find && g_session_find(key, width, height);
+}
+
+uint32_t render_scene_session_texture_max() {
+    static const uint32_t v = std::getenv("SC2_PORTRAIT_TEX_MAX") ? uint32_t(std::max(0, std::atoi(std::getenv("SC2_PORTRAIT_TEX_MAX")))) : 1024u;
+    return v;
+}
+
 RenderResult render_scene_session(const std::string& key, const std::vector<SceneInstance>& instances, uint32_t width, uint32_t height,
-                                  const Camera& cam, const casc::Storage* storage, const data::EnvLight* env) {
+                                  const Camera& cam, const casc::Storage* storage, const data::EnvLight* env,
+                                  std::size_t preload_budget, bool* preload_done) {
     std::vector<const SceneInstance*> live;
     for (const auto& inst : instances)
         if (inst.model && inst.model->vertex_count && !inst.model->indices.empty()) live.push_back(&inst);
@@ -216,15 +243,68 @@ RenderResult render_scene_session(const std::string& key, const std::vector<Scen
         VkCommandBuffer cmd = VK_NULL_HANDLE;
         Unique<VkFence> fence;
     };
-    static std::unique_ptr<Session> session;
-    if (!session || session->key != key || session->w != width || session->h != height) {
-        if (session) vkDeviceWaitIdle(dev);
-        session.reset();
+    static const std::size_t kKeep = std::getenv("SC2_PORTRAIT_SESSION_ONE") ? 1u : 24u;
+    static const bool kOwnShadow = std::getenv("SC2_PORTRAIT_SHADOW_OWN") != nullptr;
+    static std::shared_ptr<Image> shared_shadow;
+    static std::vector<std::unique_ptr<Session>> sessions;
+    struct KeysOf {
+        static bool find(const std::string& k, uint32_t w, uint32_t h) {
+            for (const auto& s : sessions)
+                if (s->key == k && s->w == w && s->h == h) return true;
+            return false;
+        }
+    };
+    g_session_find = &KeysOf::find;
+    struct ReleaseAll {
+        static void run() {
+            if (!sessions.empty() || shared_shadow) {
+                vkDeviceWaitIdle(Device::shared_headless("render_scene").device());
+                sessions.clear();
+                shared_shadow.reset();
+            }
+        }
+    };
+    g_session_release = &ReleaseAll::run;
+    auto sessions_bytes = [&]() {
+        std::size_t b = 0;
+        if (shared_shadow)
+            for (const auto& s : sessions) { b += std::size_t(s->sr->tunables().shadow_dim) * s->sr->tunables().shadow_dim * 4; break; }
+        for (const auto& s : sessions) b += s->sr->gpu_bytes_estimate();
+        return b;
+    };
+    const std::size_t bytes_before = sessions_bytes();
+    bool made = false;
+    std::size_t hit = sessions.size();
+    for (std::size_t i = 0; i < sessions.size(); ++i)
+        if (sessions[i]->key == key && sessions[i]->w == width && sessions[i]->h == height) { hit = i; break; }
+    if (hit < sessions.size()) {
+        std::rotate(sessions.begin(), sessions.begin() + std::ptrdiff_t(hit), sessions.begin() + std::ptrdiff_t(hit) + 1);
+    } else {
+        SC2_PROF_SCOPE("ps.new");
+        made = true;
+        if (sessions.size() >= kKeep) {
+            vkDeviceWaitIdle(dev);
+            sessions.resize(kKeep - 1);
+        }
         auto s = std::make_unique<Session>();
         s->key = key;
         s->w = width;
         s->h = height;
         SceneRenderer::Tunables tun;
+        tun.max_texture_dim = render_scene_session_texture_max();
+        if (!kOwnShadow) {
+            uint32_t dim = tun.shadow_dim;
+            if (const char* sd = std::getenv("SC2_SHADOW_DIM")) {
+                const int v = std::atoi(sd);
+                if (v >= 1024 && v <= 8192) dim = uint32_t(v);
+            }
+            tun.shadow_dim = dim;
+            if (!shared_shadow)
+                shared_shadow = std::make_shared<Image>(make_image(pd, dev, VK_FORMAT_D32_SFLOAT,
+                                                                   VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,
+                                                                   VK_IMAGE_ASPECT_DEPTH_BIT, dim, dim));
+            tun.shared_shadow = shared_shadow;
+        }
         s->sr = std::make_unique<SceneRenderer>(pd, dev, queue, gfx, width, height, VK_FORMAT_R8G8B8A8_UNORM, storage, std::string(), tun);
         if (env) s->sr->set_environment(*env);
         s->readback = make_buffer(pd, dev, VkDeviceSize(width) * height * 4, VK_BUFFER_USAGE_TRANSFER_DST_BIT, nullptr);
@@ -246,11 +326,24 @@ RenderResult render_scene_session(const std::string& key, const std::vector<Scen
         VkFence rawFence = VK_NULL_HANDLE;
         check(vkCreateFence(dev, &fi, nullptr, &rawFence), "vkCreateFence(session)");
         s->fence = Unique<VkFence>(rawFence, [dev](VkFence f) { vkDestroyFence(dev, f, nullptr); });
-        session = std::move(s);
+        sessions.insert(sessions.begin(), std::move(s));
     }
-    Session& S = *session;
+    Session& S = *sessions.front();
     SceneRenderer& sr = *S.sr;
-    sr.prepare(live, nullptr);
+    if (preload_done) {
+        SC2_PROF_SCOPE("ps.preload");
+        bool done = true;
+        for (const SceneInstance* inst : live) done = sr.preload_model_textures(*inst->model, preload_budget) && done;
+        *preload_done = done;
+        return RenderResult{};
+    }
+    { SC2_PROF_SCOPE("ps.prepare"); sr.prepare(live, nullptr); }
+    if (made) {
+        const double d = (double(sessions_bytes()) - double(bytes_before)) / (1024.0 * 1024.0);
+        frame_prof_count("ps.mb_add", d);
+        if (std::getenv("SC2_PORTRAIT_MEM_TRACE"))
+            std::fprintf(stderr, "portrait sessions: %zu, %.1f MB (+%.1f)\n", sessions.size(), double(sessions_bytes()) / (1024.0 * 1024.0), d);
+    }
 
     const VkDeviceSize rbytes = VkDeviceSize(width) * height * 4;
     check(vkResetCommandBuffer(S.cmd, 0), "vkResetCommandBuffer(session)");
@@ -282,8 +375,11 @@ RenderResult render_scene_session(const std::string& key, const std::vector<Scen
     si.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
     si.commandBufferCount = 1;
     si.pCommandBuffers = &S.cmd;
-    check(vkQueueSubmit(queue, 1, &si, fence), "vkQueueSubmit(session)");
-    check(vkWaitForFences(dev, 1, &fence, VK_TRUE, UINT64_MAX), "vkWaitForFences(session)");
+    {
+        SC2_PROF_SCOPE("ps.gpu");
+        check(vkQueueSubmit(queue, 1, &si, fence), "vkQueueSubmit(session)");
+        check(vkWaitForFences(dev, 1, &fence, VK_TRUE, UINT64_MAX), "vkWaitForFences(session)");
+    }
 
     RenderResult out;
     out.width = width;

@@ -6,7 +6,8 @@ namespace sc2::data {
 
 using core::XmlNode;
 
-static const XmlNode* child(const std::vector<XmlNode>& children,
+template <class Nodes>
+static const XmlNode* child(const Nodes& children,
                             const std::string& name) {
     const XmlNode* last = nullptr;
     for (const XmlNode& c : children)
@@ -14,7 +15,8 @@ static const XmlNode* child(const std::vector<XmlNode>& children,
     return last;
 }
 
-static std::string count_attr(const std::vector<XmlNode>& children, const char* attr, const char* def) {
+template <class Nodes>
+static std::string count_attr(const Nodes& children, const char* attr, const char* def) {
     const std::string* v = nullptr;
     for (const XmlNode& c : children)
         if (c.name == "Count")

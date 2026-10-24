@@ -16,6 +16,8 @@ struct UnitCost {
 };
 
 UnitCost unit_cost(const Catalog& cat, const std::string& unit_id);
+UnitCost build_charge(const Catalog& cat, const std::string& structure, std::string builder = {},
+                      std::string abil = {});
 sim::Fixed supply_provided(const Catalog& cat, const std::string& unit_id);
 
 struct PlayerEconomy {

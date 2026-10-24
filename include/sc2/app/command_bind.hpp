@@ -27,6 +27,8 @@ struct MeleeCommandContext {
     bool combat_selected = false;
     bool mobile_selected = false;
     bool commandable_selected = false;
+    bool authored_layout = false;
+    bool opener_keys_old = false;
     bool can_afford_producer = true;
     bool can_afford_supply = true;
     bool can_afford_factory = true;
@@ -120,7 +122,7 @@ inline CommandCard build_melee_command_card(const MeleeCommandContext& ctx) {
         e.icon = ctx.univ_burrow.icon.empty() ? std::string("btn-ability-zerg-burrow")
                                               : ctx.univ_burrow.icon;
         e.name = "Burrow";
-        e.hotkey = "R";
+        e.hotkey = ctx.univ_burrow.hotkey.empty() || ctx.opener_keys_old ? std::string("R") : ctx.univ_burrow.hotkey;
         e.ability = kMeleeAbilBurrow;
         e.requirement_met = ctx.burrow_requirement_met;
         entries.push_back(e);
@@ -131,7 +133,7 @@ inline CommandCard build_melee_command_card(const MeleeCommandContext& ctx) {
         e.icon = ctx.univ_unburrow.icon.empty() ? std::string("btn-ability-zerg-burrowup")
                                                 : ctx.univ_unburrow.icon;
         e.name = "Unburrow";
-        e.hotkey = "R";
+        e.hotkey = ctx.univ_unburrow.hotkey.empty() || ctx.opener_keys_old ? std::string("R") : ctx.univ_unburrow.hotkey;
         e.ability = kMeleeAbilUnburrow;
         e.requirement_met = true;
         entries.push_back(e);
@@ -190,7 +192,7 @@ inline CommandCard build_melee_command_card(const MeleeCommandContext& ctx) {
         entries.push_back(e);
     }
 
-    if (ctx.mobile_selected && ctx.commandable_selected) {
+    if (ctx.commandable_selected && (ctx.mobile_selected || ctx.authored_layout)) {
         struct Univ { int slot; const char* icon; const char* name; const char* hotkey; std::uint32_t ability;
                       const MeleeCommandContext::UniversalCell* authored; };
         const Univ kUniv[] = {
@@ -202,7 +204,8 @@ inline CommandCard build_melee_command_card(const MeleeCommandContext& ctx) {
         };
         for (const Univ& u : kUniv) {
             CardEntry e;
-            e.slot = u.authored->slot >= 0 ? u.authored->slot : (ctx.worker_selected ? -1 : u.slot);
+            e.slot = u.authored->slot >= 0 ? u.authored->slot
+                                           : ((ctx.worker_selected || ctx.authored_layout) ? -1 : u.slot);
             if (e.slot < 0) continue;
             bool clash = false;
             for (const CardEntry& prior : entries)

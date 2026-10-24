@@ -14,6 +14,8 @@ std::string pick_folder(const std::string& title);
 
 void alert(const std::string& title, const std::string& message);
 
+void process_memory_mb(double& working_set, double& private_bytes);
+
 bool attach_parent_console();
 double double_click_ms();
 std::string clipboard_text();

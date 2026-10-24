@@ -30,9 +30,23 @@ struct OrderLog {
     uint64_t seed = 1;
     std::string map_id;
     std::vector<int32_t> player_races;
+    std::vector<int32_t> player_teams;
+    std::vector<int32_t> player_controllers;
+    bool any_start_pair = false;
     std::vector<sim::Unit> initial_units;
     std::vector<TimedOrder> orders;
     int total_ticks = 0;
+
+    int32_t team_of(std::size_t p) const { return p < player_teams.size() ? player_teams[p] : -1; }
+    int32_t controller_of(std::size_t p) const { return p < player_controllers.size() ? player_controllers[p] : (p == 0 ? 0 : 1); }
+    bool needs_v6_header() const {
+        if (any_start_pair) return true;
+        for (int32_t t : player_teams)
+            if (t != -1) return true;
+        for (std::size_t p = 0; p < player_controllers.size(); ++p)
+            if (player_controllers[p] != (p == 0 ? 0 : 1)) return true;
+        return false;
+    }
 };
 
 struct ReplayTrace {
@@ -123,7 +137,8 @@ private:
 };
 
 inline constexpr char kOrderLogMagic[8] = {'S', 'C', '2', 'R', 'L', 'O', 'G', '\0'};
-inline constexpr uint32_t kOrderLogVersion = 5;
+inline constexpr uint32_t kOrderLogVersion = 6;
+inline constexpr uint32_t kOrderLogVersionTeamless = 5;
 
 void write_order_log(const OrderLog& log, std::vector<uint8_t>& out);
 bool read_order_log(const uint8_t* data, size_t len, OrderLog& out);

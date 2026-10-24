@@ -1,5 +1,6 @@
 #include <cstdio>
 #include "sc2/app/front_end.hpp"
+#include "sc2/render/frame_prof.hpp"
 #include "sc2/ui/layout.hpp"
 #include "sc2/app/shell_emblem.hpp"
 #include "sc2/app/ui_canvas.hpp"
@@ -1320,11 +1321,11 @@ void FrontEnd::activate(const Button& b, float mx, std::uint32_t view_w, std::ui
         }
         else if (b.action == kActP0Race) {
             p0_pick_ = lobby_race_cycle(p0_pick_);
-            if (p0_pick_ != LobbyRace::Random) p0_race_ = Race(int(p0_pick_));
+            if (p0_pick_ != LobbyRace::Random) slots_[0].race = Race(int(p0_pick_));
             settings_.set(ShellSettings::kProfileRaceKey, std::to_string(int(p0_pick_)));
         } else if (b.action == kActP1Race) {
             p1_pick_ = lobby_race_cycle(p1_pick_);
-            if (p1_pick_ != LobbyRace::Random) p1_race_ = Race(int(p1_pick_));
+            if (p1_pick_ != LobbyRace::Random) slots_[1].race = Race(int(p1_pick_));
             if (!shell_v1()) settings_.set_opponent_race(p1_pick_);
         } else if (b.action == kActAiDiff) settings_.cycle_ai_difficulty(1);
         else if (b.action == kActSpeed) settings_.cycle_game_speed(1);
@@ -1338,8 +1339,7 @@ void FrontEnd::activate(const Button& b, float mx, std::uint32_t view_w, std::ui
         else if (b.action == kActStart) {
             match_seed_ = new_match_seed();
             const std::uint64_t match_seed = match_seed_ ? match_seed_ : MeleeGameConfig{}.seed;
-            p0_race_ = resolve_lobby_race(p0_pick_, match_seed, 0);
-            p1_race_ = resolve_lobby_race(p1_pick_, match_seed, 1);
+            set_two_player_races(resolve_lobby_race(p0_pick_, match_seed, 0), resolve_lobby_race(p1_pick_, match_seed, 1));
             match_error_.clear();
             loading_frames_ = 0;
             load_plan_.reset();
@@ -1359,10 +1359,7 @@ void FrontEnd::activate(const Button& b, float mx, std::uint32_t view_w, std::ui
                 sel_map_ = 0;
                 for (std::size_t i = 0; i < maps_.size(); ++i)
                     if (!replay_log_pending_.map_id.empty() && maps_[i].path == replay_log_pending_.map_id) sel_map_ = int(i);
-                if (replay_log_pending_.player_races.size() >= 2) {
-                    p0_race_ = Race(std::max(0, std::min(2, int(replay_log_pending_.player_races[0]))));
-                    p1_race_ = Race(std::max(0, std::min(2, int(replay_log_pending_.player_races[1]))));
-                }
+                slots_from_log(replay_log_pending_);
                 match_error_.clear();
                 loading_frames_ = 0;
                 load_plan_.reset();
@@ -1389,7 +1386,7 @@ void FrontEnd::activate(const Button& b, float mx, std::uint32_t view_w, std::ui
         else if (b.action == kActProfileRace) {
             settings_.cycle_profile_race(1);
             p0_pick_ = settings_.profile_race();
-            if (p0_pick_ != LobbyRace::Random) p0_race_ = Race(int(p0_pick_));
+            if (p0_pick_ != LobbyRace::Random) slots_[0].race = Race(int(p0_pick_));
         } else if (b.action == kActBack) { profile_editing_ = false; router_.follow("BackButton"); }
         return;
     }
@@ -1500,7 +1497,7 @@ void FrontEnd::shell_keyboard(const render::InputState& in, std::uint32_t view_w
             if (skirmish_) apply_settings_to_match();
         } else if (b.action == kActAiDiff) settings_.cycle_ai_difficulty(dir);
         else if (b.action == kActSpeed) settings_.cycle_game_speed(dir);
-        else if (b.action == kActProfileRace) { settings_.cycle_profile_race(dir); p0_pick_ = settings_.profile_race(); if (p0_pick_ != LobbyRace::Random) p0_race_ = Race(int(p0_pick_)); }
+        else if (b.action == kActProfileRace) { settings_.cycle_profile_race(dir); p0_pick_ = settings_.profile_race(); if (p0_pick_ != LobbyRace::Random) slots_[0].race = Race(int(p0_pick_)); }
         else activate(b, float(b.x0 + b.x1) * 0.5f, view_w, view_h);
         return;
     }
@@ -1799,6 +1796,141 @@ void FrontEnd::scan_replays() {
     std::sort(replays_.begin(), replays_.end(), [](const ReplayEntry& a, const ReplayEntry& b) { return a.name > b.name; });
 }
 
+static void stamp_replay_meta(MeleeGame& g, const std::string& map_id, const std::vector<MeleeSlot>& slots, bool any_start_pair) {
+    std::vector<std::int32_t> races, teams, ctls;
+    for (const MeleeSlot& sl : slots) {
+        races.push_back(std::int32_t(sl.race));
+        teams.push_back(sl.team);
+        ctls.push_back(sl.controller == MeleeSlot::Controller::Human ? 0 : 1);
+    }
+    g.set_replay_meta(map_id, std::move(races), std::move(teams), std::move(ctls), any_start_pair);
+}
+
+static bool arena_sites(const TestMap& m, const std::vector<MeleeSlot>& slots, std::vector<const TestMap::Base*>& out) {
+    out.clear();
+    if (slots.size() < 2 || slots.size() > 4 || m.players.size() < 2) return false;
+    if (slots.size() == 2) {
+        out = {&m.players[0].main, &m.players[1].main};
+        return true;
+    }
+    const TestMap::Base* side_sites[2][2] = {{&m.players[0].main, &m.players[0].natural}, {&m.players[1].main, &m.players[1].natural}};
+    int used[2] = {0, 0};
+    std::vector<std::pair<int, int>> key_side;
+    for (std::size_t p = 0; p < slots.size(); ++p) {
+        const int key = slots[p].team >= 0 ? slots[p].team : -(int(p) + 2);
+        int side = -1;
+        for (const auto& ks : key_side)
+            if (ks.first == key) side = ks.second;
+        if (side < 0) {
+            side = key_side.empty() ? 0 : (key_side.size() == 1 ? 1 : (used[1] < used[0] ? 1 : 0));
+            key_side.emplace_back(key, side);
+        }
+        if (used[side] >= 2) side = 1 - side;
+        out.push_back(side_sites[side][used[side]++]);
+    }
+    return true;
+}
+
+void FrontEnd::slots_from_log(const OrderLog& log) {
+    if (log.player_races.size() < 2) return;
+    slots_.clear();
+    for (std::size_t p = 0; p < log.player_races.size(); ++p) {
+        MeleeSlot sl;
+        sl.race = Race(std::max(0, std::min(2, int(log.player_races[p]))));
+        sl.team = log.team_of(p);
+        sl.controller = log.controller_of(p) == 0 ? MeleeSlot::Controller::Human : MeleeSlot::Controller::AI;
+        slots_.push_back(sl);
+    }
+}
+
+void FrontEnd::capture_players() {
+    if (!skirmish_) return;
+    const sim::World& w = skirmish_->world();
+    const std::int32_t wk = w.winning_team();
+    last_players_.clear();
+    for (std::size_t p = 0; p < slots_.size(); ++p) {
+        PlayerCard c;
+        c.race = slots_[p].race;
+        c.team = slots_[p].team;
+        c.controller = slots_[p].controller;
+        c.difficulty = slots_[p].controller == MeleeSlot::Controller::AI ? (slots_[p].difficulty > 0 ? slots_[p].difficulty : settings_.ai_difficulty()) : 0;
+        c.won = wk != -1 && w.alliance_key(std::int32_t(p)) == wk;
+        last_players_.push_back(c);
+    }
+}
+
+const char* FrontEnd::lobby_format_name(LobbyFormat f) {
+    switch (f) {
+        case LobbyFormat::OneVsOne: return "1v1";
+        case LobbyFormat::TwoVsTwo: return "2v2";
+        case LobbyFormat::ThreeVsThree: return "3v3";
+        case LobbyFormat::FourVsFour: return "4v4";
+        case LobbyFormat::FreeForAll: return "FFA";
+    }
+    return "1v1";
+}
+
+int FrontEnd::lobby_format_players(LobbyFormat f, int starts) {
+    switch (f) {
+        case LobbyFormat::OneVsOne: return 2;
+        case LobbyFormat::TwoVsTwo: return 4;
+        case LobbyFormat::ThreeVsThree: return 6;
+        case LobbyFormat::FourVsFour: return 8;
+        case LobbyFormat::FreeForAll: return std::max(2, std::min(8, starts));
+    }
+    return 2;
+}
+
+std::vector<FrontEnd::LobbySlot> FrontEnd::lobby_preset(LobbyFormat f, int rows, LobbyRace you, LobbyRace ai, int tier) {
+    const int players = lobby_format_players(f, rows);
+    std::vector<LobbySlot> out(std::size_t(std::max(rows, players)));
+    for (int i = 0; i < int(out.size()); ++i) {
+        LobbySlot& s = out[std::size_t(i)];
+        if (i >= players) {
+            s.controller = MeleeSlot::Controller::Closed;
+            s.pick = ai;
+            continue;
+        }
+        s.controller = i == 0 ? MeleeSlot::Controller::Human : MeleeSlot::Controller::AI;
+        s.pick = i == 0 ? you : ai;
+        s.difficulty = i == 0 ? 0 : tier;
+        s.team = (f == LobbyFormat::OneVsOne || f == LobbyFormat::FreeForAll) ? -1 : (i < players / 2 ? 0 : 1);
+    }
+    return out;
+}
+
+bool FrontEnd::set_lobby_format(LobbyFormat f) {
+    const int starts = map_start_count(sel_map_);
+    if (lobby_format_players(f, starts) > starts) return false;
+    lobby_format_ = f;
+    lobby_slots_ = lobby_preset(f, starts, settings_.profile_race(), settings_.opponent_race(), settings_.ai_difficulty());
+    match_error_.clear();
+    return true;
+}
+
+int FrontEnd::map_start_count(int index) {
+    if (index < 0 || index >= int(maps_.size())) return 2;
+    const platform::MapEntry& e = maps_[std::size_t(index)];
+    if (e.path.empty()) return 4;
+    auto it = map_starts_cache_.find(e.path);
+    if (it != map_starts_cache_.end()) return it->second;
+    int n = 0;
+    try {
+        std::vector<std::uint8_t> bytes;
+        if (e.casc) bytes = store_.read_by_name(e.path);
+        else {
+            std::ifstream in(e.path, std::ios::binary);
+            bytes.assign(std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>());
+        }
+        formats::Mpq arc = formats::Mpq::open(std::move(bytes));
+        if (arc.contains("Objects")) n = int(formats::parse_placed_objects(arc.read_file("Objects")).start_locations.size());
+    } catch (const std::exception&) {
+    }
+    n = n < 2 ? 2 : std::min(n, 8);
+    map_starts_cache_[e.path] = n;
+    return n;
+}
+
 std::string FrontEnd::save_game() {
     if (!skirmish_ || skirmish_->replay_active() || saves_dir_.empty()) return std::string();
     std::error_code ec;
@@ -1814,7 +1946,7 @@ std::string FrontEnd::save_game() {
     std::strftime(stamp, sizeof stamp, "%Y%m%d-%H%M%S", &tmv);
     std::string path = saves_dir_ + "/" + stamp + ".sc2orders";
     for (int n = 1; std::filesystem::exists(path, ec) && n < 100; ++n) path = saves_dir_ + "/" + stamp + "-" + std::to_string(n) + ".sc2orders";
-    skirmish_->set_replay_meta(match_map_path_, {std::int32_t(p0_race_), std::int32_t(p1_race_)});
+    stamp_replay_meta(*skirmish_, match_map_path_, slots_, match_any_pair_);
     return skirmish_->write_replay(path) ? path : std::string();
 }
 
@@ -1841,14 +1973,15 @@ bool FrontEnd::load_save(const std::string& path) {
     sel_map_ = 0;
     for (std::size_t i = 0; i < maps_.size(); ++i)
         if (!replay_log_pending_.map_id.empty() && maps_[i].path == replay_log_pending_.map_id) sel_map_ = int(i);
-    if (replay_log_pending_.player_races.size() >= 2) {
-        p0_race_ = Race(std::max(0, std::min(2, int(replay_log_pending_.player_races[0]))));
-        p1_race_ = Race(std::max(0, std::min(2, int(replay_log_pending_.player_races[1]))));
-    }
+    slots_from_log(replay_log_pending_);
     match_error_.clear();
     loading_frames_ = 0;
     load_plan_.reset();
-    if (replay_log_pending_.map_id.empty()) start_skirmish();
+    if (replay_log_pending_.map_id.empty() && slots_.size() > 2) {
+        clear_score();
+        sel_map_ = 0;
+        begin_match();
+    } else if (replay_log_pending_.map_id.empty()) start_skirmish();
     else router_.replace(ScreenId::Loading);
     return true;
 }
@@ -1869,7 +2002,7 @@ void FrontEnd::record_match_replay() {
     std::strftime(stamp, sizeof stamp, "%Y%m%d-%H%M%S", &tmv);
     std::string path = replays_dir_ + "/" + stamp + ".sc2orders";
     for (int n = 1; std::filesystem::exists(path, ec) && n < 100; ++n) path = replays_dir_ + "/" + stamp + "-" + std::to_string(n) + ".sc2orders";
-    skirmish_->set_replay_meta(match_map_path_, {std::int32_t(p0_race_), std::int32_t(p1_race_)});
+    stamp_replay_meta(*skirmish_, match_map_path_, slots_, match_any_pair_);
     if (skirmish_->write_replay(path)) last_recorded_replay_ = path;
 }
 
@@ -1880,8 +2013,7 @@ void FrontEnd::start_sandbox() {
 
 void FrontEnd::start_skirmish() {
     clear_score();
-    p0_race_ = Race::Terran;
-    p1_race_ = Race::Terran;
+    set_two_player_races(Race::Terran, Race::Terran);
     p0_pick_ = p1_pick_ = LobbyRace::Terran;
     sel_map_ = 0;
     begin_match();
@@ -1915,9 +2047,8 @@ void FrontEnd::plan_load() {
     }
     add(LoadStep::Kind::Layout, {}, "Loading the interface layout");
     add(LoadStep::Kind::Font, {}, "Loading fonts");
-    const Race rs[2] = {p0_race_, p1_race_};
-    for (int p = 0; p < 2; ++p) {
-        const RaceUnits u = race_units(rs[p]);
+    for (const MeleeSlot& sl : slots_) {
+        const RaceUnits u = race_units(sl.race);
         for (const char* tok : {u.hall, u.worker, u.producer, u.supply, u.army})
             if (tok && *tok) add(LoadStep::Kind::Model, tok, std::string("Loading ") + tok);
     }
@@ -2144,13 +2275,21 @@ bool FrontEnd::begin_match() {
     float playable_x0 = -1.0f, playable_y0 = -1.0f, playable_x1 = -1.0f, playable_y1 = -1.0f;
 
     if (synthetic) {
+        match_any_pair_ = false;
         data::Production prod;
         prod.build(cat_);
-        const Race rs[2] = {p0_race_, p1_race_};
-        for (int p = 0; p < 2; ++p) {
-            const MeleeProtos pr = race_protos(cat_, rs[p]);
-            const TestMap::Base& base = map_.players[p].main;
+        std::vector<const TestMap::Base*> sites;
+        if (!arena_sites(map_, slots_, sites)) {
+            match_error_ = "the built-in arena seats 2 to 4 players (its two mains and two naturals); this setup has " +
+                           std::to_string(slots_.size());
+            router_.replace(ScreenId::Lobby);
+            return false;
+        }
+        for (std::size_t p = 0; p < slots_.size(); ++p) {
+            const MeleeProtos pr = race_protos(cat_, slots_[p].race);
+            const TestMap::Base& base = *sites[p];
             MeleePlayerSetup ps;
+            ps.team = slots_[p].team;
             ps.start = {Fx(base.town.x), Fx(base.town.y)};
             ps.town_hall = pr.hall;
             ps.town_hall_facing = pr.hall_facing;
@@ -2171,7 +2310,7 @@ bool FrontEnd::begin_match() {
             ps.army_unit = pr.army;
             ps.start_minerals = pr.start_minerals;
             ps.food_ceiling = pr.food_ceiling;
-            apply_race_costs(ps, cat_, rs[p], prod);
+            apply_race_costs(ps, cat_, slots_[p].race, prod);
             setup.players.push_back(ps);
         }
         ground = &map_.ground;
@@ -2179,13 +2318,28 @@ bool FrontEnd::begin_match() {
         map_h = map_.height;
         nav = &map_.nav;
     } else {
-        for (int phase = 0; phase < 4; ++phase)
+        for (int phase = 0; phase < 4; ++phase) {
             if (!build_real_map_phase(phase)) {
                 router_.replace(ScreenId::Lobby);
                 return false;
             }
-        setup = melee_setup_for_map(*real_map_, cat_, p0_race_, p1_race_, -1, 8,
-                                    replay_pending_ ? replay_log_pending_.seed : (match_seed_ ? match_seed_ : MeleeGameConfig{}.seed));
+            static const char* const kPhase[] = {"map: phase 0 (archive, terrain)", "map: phase 1", "map: phase 2", "map: phase 3"};
+            render::mem_mark(kPhase[phase]);
+        }
+        const std::uint64_t start_seed = replay_pending_ ? replay_log_pending_.seed : (match_seed_ ? match_seed_ : MeleeGameConfig{}.seed);
+        const bool any_pair = replay_pending_ ? replay_log_pending_.any_start_pair : true;
+        match_any_pair_ = any_pair && slots_.size() == 2 && map_melee_any_pair_rule(*real_map_);
+        if (slots_.size() == 2 && slots_[0].team == -1 && slots_[1].team == -1) {
+            setup = melee_setup_for_map(*real_map_, cat_, slots_[0].race, slots_[1].race, -1, 8, start_seed, any_pair);
+        } else {
+            try {
+                setup = melee_setup_for_map(*real_map_, cat_, slots_, -1, 8, start_seed, any_pair);
+            } catch (const std::exception& e) {
+                match_error_ = std::string("this map cannot seat the setup: ") + e.what();
+                router_.replace(ScreenId::Lobby);
+                return false;
+            }
+        }
         ground = &real_ground_;
         map_w = float(real_map_->width);
         map_h = float(real_map_->height);
@@ -2205,9 +2359,8 @@ bool FrontEnd::begin_match() {
         }
     }
 
-    const Race rs2[2] = {p0_race_, p1_race_};
-    for (int p = 0; p < 2; ++p) {
-        const RaceUnits u = race_units(rs2[p]);
+    for (const MeleeSlot& sl : slots_) {
+        const RaceUnits u = race_units(sl.race);
         for (const char* tok : {u.hall, u.worker, u.producer, u.supply, u.army})
             models_.ensure(store_, tok);
     }
@@ -2215,11 +2368,18 @@ bool FrontEnd::begin_match() {
         if (!n.catalog_id.empty()) models_.ensure(store_, n.catalog_id);
 
     MeleeGameConfig cfg;
-    cfg.human_player = 0;
+    cfg.human_player = melee_human_player(slots_);
     if (replay_pending_) cfg.seed = replay_log_pending_.seed;
     else if (match_seed_) cfg.seed = match_seed_;
     if (!replay_pending_) cfg.ai_difficulty = settings_.ai_difficulty();
+    if (!replay_pending_) {
+        const std::vector<int> rungs = melee_slot_difficulties(slots_);
+        for (int r : rungs)
+            if (r > 0) cfg.slot_difficulty = rungs;
+    }
+    render::mem_mark("match: setup chosen, race models");
     skirmish_ = std::make_unique<MeleeGame>(cfg);
+    render::mem_mark("match: MeleeGame constructed");
     if (!replay_pending_) apply_settings_to_match();
     skirmish_->set_ground_fog(ground_fog_);
     skirmish_->set_reveal_map(reveal_map_);
@@ -2286,6 +2446,7 @@ bool FrontEnd::begin_match() {
     }
     skirmish_->setup(setup, &models_, ground, map_w, map_h, nav, placement, playable_x0,
                      playable_y0, playable_x1, playable_y1);
+    render::mem_mark("match: MeleeGame::setup (world, nav, actors)");
     if (real_map_ && real_map_->scripted_camera.found && !std::getenv("SC2_NO_MAP_CAMERA")) {
         const formats::ScriptedCamera& sc = real_map_->scripted_camera;
         render::CameraControl& cc = skirmish_->camera_control();
@@ -2441,11 +2602,15 @@ bool FrontEnd::begin_match() {
         } catch (const std::exception&) {
         }
     }
-    const std::vector<Race> races = {p0_race_, p1_race_};
+    std::vector<Race> races;
+    for (const MeleeSlot& sl : slots_) races.push_back(sl.race);
+    render::mem_mark("match: doodads, cliffs, research catalog");
     apply_shipping_wiring(*skirmish_, cat_, research_up_.get(), &setup, &races);
-    for (int p = 0; p < 2; ++p) {
-        const RaceUnits u = race_units(rs2[p]);
-        skirmish_->set_spawn_models(p, models_.model_for(u.worker), models_.model_for(u.army),
+    render::mem_mark("match: shipping wiring");
+    if (portrait_full_rate_) skirmish_->set_portrait_hz(0.0f);
+    for (std::size_t p = 0; p < slots_.size(); ++p) {
+        const RaceUnits u = race_units(slots_[p].race);
+        skirmish_->set_spawn_models(int(p), models_.model_for(u.worker), models_.model_for(u.army),
                                     models_.model_for(u.producer));
     }
     skirmish_->set_pause_actions([this] { save_game(); }, [this] { load_pending_path_ = newest_save(); });
@@ -2580,7 +2745,7 @@ bool FrontEnd::step(const render::InputState& in, float dt_ms,
         if (router_.top() == ScreenId::Lobby) {
             if (!shell_v1()) p1_pick_ = settings_.opponent_race();
             p0_pick_ = settings_.profile_race();
-            if (p0_pick_ != LobbyRace::Random) p0_race_ = Race(int(p0_pick_));
+            if (p0_pick_ != LobbyRace::Random) slots_[0].race = Race(int(p0_pick_));
         }
         if (router_.top() != ScreenId::Profile) profile_editing_ = false;
         last_drawn_ = router_.top();
@@ -3020,8 +3185,8 @@ void FrontEnd::build_overlay_body(std::uint32_t view_w, std::uint32_t view_h,
         LoadInfo info;
         info.map_name = sel_map_ >= 0 && sel_map_ < int(maps_.size()) ? maps_[sel_map_].name
                                                                      : std::string("-");
-        info.p0_race = race_name(p0_race_);
-        info.p1_race = race_name(p1_race_);
+        info.p0_race = race_name(race_of(0));
+        info.p1_race = race_name(race_of(1));
         const std::vector<data::TeamColor> tc = data::team_colors(cat_);
         auto to_rgb = [](const float v[4]) {
             auto ch = [](float f) {
@@ -3171,8 +3336,8 @@ void FrontEnd::remember_last_match() {
             m.map = e.name;
             break;
         }
-    m.race[0] = int(p0_race_);
-    m.race[1] = int(p1_race_);
+    m.race[0] = int(race_of(0));
+    m.race[1] = int(race_of(1));
     m.ticks = static_cast<long long>(skirmish_->world().tick());
     m.replay = last_recorded_replay_;
     m.tier = settings_.ai_difficulty();
@@ -3196,9 +3361,15 @@ int ShellCtx::selected_map() const { return fe.sel_map_; }
 
 void ShellCtx::select_map(int index) {
     if (index < 0 || index >= int(fe.maps_.size())) return;
+    const bool changed = fe.sel_map_ != index;
     fe.sel_map_ = index;
     fe.match_error_.clear();
     settings.set_lobby_map(fe.maps_[std::size_t(index)].path);
+    if (changed && fe.lobby_format_ != FrontEnd::LobbyFormat::OneVsOne && !fe.set_lobby_format(fe.lobby_format_)) {
+        fe.lobby_format_ = FrontEnd::LobbyFormat::OneVsOne;
+        fe.lobby_slots_.clear();
+        fx.toast(std::string("This map has ") + std::to_string(fe.map_start_count(index)) + " start locations - back to 1v1", false);
+    }
 }
 
 const IconAtlas::Icon* ShellCtx::map_preview(int index) { return fe.map_preview(index); }
@@ -3317,9 +3488,39 @@ bool ShellCtx::start_selected_match(const char* via) {
     fe.p1_pick_ = settings.opponent_race();
     fe.match_seed_ = new_match_seed();
     const std::uint64_t match_seed = fe.match_seed_ ? fe.match_seed_ : MeleeGameConfig{}.seed;
-    fe.p0_race_ = resolve_lobby_race(fe.p0_pick_, match_seed, 0);
-    fe.p1_race_ = resolve_lobby_race(fe.p1_pick_, match_seed, 1);
     fe.match_error_.clear();
+    if (fe.lobby_format_ == FrontEnd::LobbyFormat::OneVsOne || fe.lobby_slots_.empty()) {
+        fe.set_two_player_races(resolve_lobby_race(fe.p0_pick_, match_seed, 0), resolve_lobby_race(fe.p1_pick_, match_seed, 1));
+    } else {
+        std::vector<MeleeSlot> s;
+        for (std::size_t i = 0; i < fe.lobby_slots_.size(); ++i) {
+            const FrontEnd::LobbySlot& row = fe.lobby_slots_[i];
+            if (row.controller == MeleeSlot::Controller::Closed) continue;
+            MeleeSlot sl;
+            sl.race = resolve_lobby_race(row.pick, match_seed, int(i));
+            sl.controller = row.controller;
+            sl.difficulty = row.controller == MeleeSlot::Controller::AI ? row.difficulty : 0;
+            sl.team = row.team;
+            s.push_back(sl);
+        }
+        bool shared = false, one_side = !s.empty();
+        for (std::size_t a = 0; a < s.size(); ++a)
+            for (std::size_t b = a + 1; b < s.size(); ++b) {
+                if (s[a].team >= 0 && s[a].team == s[b].team) shared = true;
+                if (s[a].team < 0 || s[a].team != s[b].team) one_side = false;
+            }
+        if (!shared)
+            for (MeleeSlot& sl : s) sl.team = -1;
+        if (s.size() < 2) {
+            fe.match_error_ = "a melee needs two players or more - open a row";
+            return false;
+        }
+        if (shared && one_side) {
+            fe.match_error_ = "every player is on one team - nobody to fight";
+            return false;
+        }
+        fe.slots_ = std::move(s);
+    }
     fe.loading_frames_ = 0;
     fe.load_plan_.reset();
     return router.follow(via);
@@ -3337,10 +3538,7 @@ bool ShellCtx::watch_replay(const std::string& path, const char* via) {
     fe.sel_map_ = 0;
     for (std::size_t i = 0; i < fe.maps_.size(); ++i)
         if (!fe.replay_log_pending_.map_id.empty() && fe.maps_[i].path == fe.replay_log_pending_.map_id) fe.sel_map_ = int(i);
-    if (fe.replay_log_pending_.player_races.size() >= 2) {
-        fe.p0_race_ = Race(std::max(0, std::min(2, int(fe.replay_log_pending_.player_races[0]))));
-        fe.p1_race_ = Race(std::max(0, std::min(2, int(fe.replay_log_pending_.player_races[1]))));
-    }
+    fe.slots_from_log(fe.replay_log_pending_);
     fe.match_error_.clear();
     fe.loading_frames_ = 0;
     fe.load_plan_.reset();
@@ -3354,8 +3552,9 @@ ShellCtx::LoadView ShellCtx::loading() const {
     v.map_index = fe.sel_map_;
     if (fe.sel_map_ >= 0 && fe.sel_map_ < int(fe.maps_.size()))
         v.map = fe.maps_[std::size_t(fe.sel_map_)].path.empty() ? std::string("TEST ARENA") : fe.maps_[std::size_t(fe.sel_map_)].name;
-    v.race[0] = fe.p0_race_;
-    v.race[1] = fe.p1_race_;
+    v.race[0] = fe.race_of(0);
+    v.race[1] = fe.race_of(1);
+    v.players = fe.slots_;
     v.replay = fe.replay_pending_;
     v.done = fe.load_plan_.done;
     v.total = fe.load_plan_.steps.size();
@@ -3376,7 +3575,39 @@ ShellCtx::ResultView ShellCtx::result() const {
     v.race[1] = Race(last.race[1]);
     v.tier = last.tier;
     v.score = &fe.last_score_;
+    v.players = &fe.last_players_;
     return v;
+}
+
+int ShellCtx::lobby_format() const { return int(fe.lobby_format_); }
+bool ShellCtx::set_lobby_format(int format) { return fe.set_lobby_format(FrontEnd::LobbyFormat(std::max(0, std::min(4, format)))); }
+int ShellCtx::lobby_rows() const { return int(fe.lobby_slots_.size()); }
+int ShellCtx::map_start_count(int index) { return fe.map_start_count(index); }
+void ShellCtx::lobby_row(int i, int& controller, int& race, int& difficulty, int& team) const {
+    controller = 2, race = 0, difficulty = 0, team = -1;
+    if (i < 0 || i >= int(fe.lobby_slots_.size())) return;
+    const FrontEnd::LobbySlot& s = fe.lobby_slots_[std::size_t(i)];
+    controller = int(s.controller);
+    race = int(s.pick);
+    difficulty = s.difficulty;
+    team = s.team;
+}
+void ShellCtx::set_lobby_row(int i, int controller, int race, int difficulty, int team) {
+    if (i < 0 || i >= int(fe.lobby_slots_.size())) return;
+    FrontEnd::LobbySlot& s = fe.lobby_slots_[std::size_t(i)];
+    const MeleeSlot::Controller c = MeleeSlot::Controller(std::max(0, std::min(2, controller)));
+    if (c == MeleeSlot::Controller::Human && s.controller != MeleeSlot::Controller::Human)
+        for (FrontEnd::LobbySlot& o : fe.lobby_slots_)
+            if (o.controller == MeleeSlot::Controller::Human) {
+                o.controller = MeleeSlot::Controller::AI;
+                if (o.difficulty <= 0) o.difficulty = settings.ai_difficulty();
+            }
+    s.controller = c;
+    s.pick = LobbyRace(std::max(0, std::min(3, race)));
+    s.difficulty = std::max(0, std::min(7, difficulty));
+    if (c == MeleeSlot::Controller::AI && s.difficulty == 0) s.difficulty = settings.ai_difficulty();
+    s.team = std::max(-1, std::min(3, team));
+    fe.match_error_.clear();
 }
 std::string ShellCtx::player_name() const { return settings.profile_name(); }
 
