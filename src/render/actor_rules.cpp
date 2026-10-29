@@ -1,8 +1,8 @@
-#include "sc2/render/actor_rules.hpp"
+#include "omc/render/actor_rules.hpp"
 
-#include "sc2/data/actor_catalog.hpp"
+#include "omc/data/actor_catalog.hpp"
 
-namespace sc2::render {
+namespace omc::render {
 
 namespace {
 

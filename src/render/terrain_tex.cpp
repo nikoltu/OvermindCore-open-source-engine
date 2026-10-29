@@ -3,18 +3,19 @@
 #include <cstdio>
 #include <cstring>
 #include <algorithm>
-#include "sc2/render/terrain_tex.hpp"
+#include "omc/render/terrain_tex.hpp"
 
-#include "sc2/render/creep_layer.hpp"
+#include "omc/render/creep_layer.hpp"
 
 #include <cmath>
 #include <exception>
 
-#include "sc2/casc/storage.hpp"
-#include "sc2/core/xml.hpp"
-#include "sc2/formats/dds.hpp"
+#include "omc/casc/storage.hpp"
+#include "omc/core/xml.hpp"
+#include "omc/formats/dds.hpp"
+#include "omc/formats/map_archive.hpp"
 
-namespace sc2::render {
+namespace omc::render {
 
 namespace {
 
@@ -213,7 +214,7 @@ std::vector<ResolvedLayer> resolve_map_layers(const casc::Storage& store,
                 break;
             }
         }
-        if (const char* ov = std::getenv("SC2_TERRAIN_TEX_OVERRIDE"); ov && !layer.diffuse.empty()) {
+        if (const char* ov = std::getenv("OMC_TERRAIN_TEX_OVERRIDE"); ov && !layer.diffuse.empty()) {
             const std::string rel = normalise_asset_path(ov);
             if (diffuse_decodes(store, rel)) layer.diffuse = rel;
         }
@@ -321,7 +322,7 @@ bool set_terrain_splat_gpu(formats::Model& m, const casc::Storage& store,
     for (size_t i = 0; i < nrm.size(); ++i)
         if (!layers[i].normal.empty() && decode_asset(store, layers[i].normal, nrm[i].w, nrm[i].h, nrm[i].rgba))
             dxt5nm_to_rgb(nrm[i].rgba);
-    const char* nflip = std::getenv("SC2_TERRAIN_NFLIP");
+    const char* nflip = std::getenv("OMC_TERRAIN_NFLIP");
     if (const char* fl = nflip ? nflip : "y") {
         const bool fx = std::strchr(fl, 'x') != nullptr, fy = std::strchr(fl, 'y') != nullptr, sw = std::strchr(fl, 's') != nullptr;
         for (auto& im : nrm)
@@ -332,7 +333,7 @@ bool set_terrain_splat_gpu(formats::Model& m, const casc::Storage& store,
             }
     }
     m.splat_height.assign(nrm.size(), {1.0f, 0.0f, 0.0f});
-    static const bool kHeightBlend = std::getenv("SC2_HEIGHT_BLEND") != nullptr && std::getenv("SC2_NO_HEIGHT_BLEND") == nullptr;
+    static const bool kHeightBlend = std::getenv("OMC_HEIGHT_BLEND") != nullptr && std::getenv("OMC_NO_HEIGHT_BLEND") == nullptr;
     for (size_t i = 0; i < nrm.size(); ++i) {
         if (layers[i].heightmap.empty() || nrm[i].rgba.empty() || !kHeightBlend) continue;
         auto lower = [](std::string s) { for (char& ch : s) ch = char(std::tolower(static_cast<unsigned char>(ch))); return s; };
@@ -356,7 +357,7 @@ bool set_terrain_splat_gpu(formats::Model& m, const casc::Storage& store,
             for (uint32_t x = 0; x < mask.mask_w; ++x)
                 dst[size_t(y) * mask.mask_w + x] = mask.layer_weight(L, x, y);
     }
-    if (const char* only = std::getenv("SC2_SPLAT_ONLY")) {
+    if (const char* only = std::getenv("OMC_SPLAT_ONLY")) {
         const uint32_t keep = uint32_t(std::atoi(only));
         for (uint32_t L = 0; L < 8; ++L)
             std::memset(planes.data() + size_t(L) * mask.mask_w * mask.mask_h, L == keep ? 255 : 0, size_t(mask.mask_w) * mask.mask_h);
@@ -380,13 +381,13 @@ bool set_terrain_splat_gpu(formats::Model& m, const casc::Storage& store,
                 }
         }
     }
-    if (std::getenv("SC2_TINT_TRACE")) {
+    if (std::getenv("OMC_TINT_TRACE")) {
         std::size_t dark = 0;
         const uint8_t* t8 = planes.data() + size_t(8) * mask.mask_w * mask.mask_h;
         for (size_t i = 0; i < size_t(mask.mask_w) * mask.mask_h; ++i) dark += t8[i] < 250;
         std::fprintf(stderr, "terrain tint: %zu patches, %zu of %zu texels shaded\n", tint ? tint->patches.size() : 0, dark, size_t(mask.mask_w) * mask.mask_h);
     }
-    if (const char* fg = std::getenv("SC2_TERRAIN_FLAT_GREY")) {
+    if (const char* fg = std::getenv("OMC_TERRAIN_FLAT_GREY")) {
         int r = 0, gch = 0, b = 0;
         if (std::sscanf(fg, "%d,%d,%d", &r, &gch, &b) != 3) r = gch = b = std::atoi(fg);
         const uint8_t v[3] = {uint8_t(std::clamp(r, 0, 255)), uint8_t(std::clamp(gch, 0, 255)), uint8_t(std::clamp(b, 0, 255))};
@@ -441,7 +442,7 @@ void apply_grid_uvs(formats::Model& m, float uv_tiles_u, float uv_tiles_v) {
     }
     float dx = maxx - minx, dy = maxy - miny;
     m.uvs.assign(size_t(m.vertex_count) * 2, 0.0f);
-    const char* fl = std::getenv("SC2_TERRAIN_UV_FLIP");
+    const char* fl = std::getenv("OMC_TERRAIN_UV_FLIP");
     if (!fl) fl = "v";
     const bool flip_u = std::strchr(fl, 'u') != nullptr, flip_v = std::strchr(fl, 'v') != nullptr;
     for (uint32_t i = 0; i < m.vertex_count; ++i) {
@@ -543,6 +544,35 @@ std::vector<uint8_t> make_checker_rgba(uint32_t w, uint32_t h, uint32_t cells) {
             out[i + 3] = 255;
         }
     return out;
+}
+
+void texture_map_ground(formats::Model& ground, const casc::Storage& store, const formats::LoadedMap& lm) {
+    const std::vector<std::string>& palette = lm.has_splat ? lm.texture_info.layer_names : lm.tileset_textures;
+    const float uv_tiles = lm.uv_tiling.found ? lm.uv_tiling.u : float(lm.width) / 8.0f;
+    const float uv_tiles_v = lm.uv_tiling.found ? lm.uv_tiling.v : uv_tiles;
+    if (lm.has_splat || lm.has_retail_splat) {
+        const bool splat_vertices = std::getenv("OMC_SPLAT_EXTENT_VERTICES") != nullptr;
+        const float splat_w = splat_vertices ? float(lm.width) : float(lm.cell_width());
+        const float splat_h = splat_vertices ? float(lm.height) : float(lm.cell_height());
+        if (set_terrain_splat_gpu(ground, store, palette, lm.texture_mask, splat_w, splat_h, &lm.vertex_tint)) {
+            apply_grid_uvs(ground, uv_tiles, uv_tiles_v);
+            return;
+        }
+        std::vector<ResolvedLayer> layers = resolve_map_layers(store, palette);
+        GroundImage g = composite_map_ground(store, lm.has_splat ? lm.texture_info : formats::TextureInfo{}, lm.texture_mask, layers,
+                                             std::max(1u, uint32_t(uv_tiles)));
+        if (!g.empty()) {
+            apply_grid_uvs(ground, 1.0f);
+            set_terrain_diffuse_rgba(ground, g.w, g.h, std::move(g.rgba));
+            return;
+        }
+    }
+    std::string diff = resolve_map_tileset_diffuse(store, lm.tileset, lm.tileset_textures);
+    if (diff.empty()) diff = resolve_tileset_diffuse(store);
+    if (!diff.empty()) {
+        apply_grid_uvs(ground, uv_tiles, uv_tiles_v);
+        set_terrain_diffuse(ground, diff);
+    }
 }
 
 }

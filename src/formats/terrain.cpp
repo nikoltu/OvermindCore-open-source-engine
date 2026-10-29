@@ -1,4 +1,4 @@
-#include "sc2/formats/terrain.hpp"
+#include "omc/formats/terrain.hpp"
 
 #include <algorithm>
 #include <cmath>
@@ -6,10 +6,10 @@
 #include <cstdlib>
 #include <stdexcept>
 
-#include "sc2/core/byte_reader.hpp"
-#include "sc2/core/xml.hpp"
+#include "omc/core/byte_reader.hpp"
+#include "omc/core/xml.hpp"
 
-namespace sc2::formats {
+namespace omc::formats {
 
 using core::ByteReader;
 

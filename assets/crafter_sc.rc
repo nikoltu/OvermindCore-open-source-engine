@@ -1,5 +1,0 @@
-// Windows resource script for crafter-sc: binds the application/window icon.
-// IDI_APPICON (1) is the first icon, so Explorer and the taskbar use it for the exe.
-// The .ico itself is a LOCAL, gitignored asset (see assets/.gitignore) — the clean-room
-// source tree carries no image, and CMake only compiles this in when the .ico is present.
-1 ICON "app_icon.ico"

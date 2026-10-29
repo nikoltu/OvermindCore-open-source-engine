@@ -1,4 +1,4 @@
-#include "sc2/audio/vorbis.hpp"
+#include "omc/audio/vorbis.hpp"
 
 #include <array>
 #include <cmath>
@@ -6,9 +6,9 @@
 #include <map>
 #include <string>
 
-#include "sc2/audio/ogg.hpp"
+#include "omc/audio/ogg.hpp"
 
-namespace sc2::audio {
+namespace omc::audio {
 
 namespace {
 

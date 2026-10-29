@@ -52,6 +52,8 @@ vec3 point_lights(vec3 p, vec3 n) {
     for (int i = 0; i < 64; ++i) {
         if (i >= cnt) break;
         vec3 d = g.lightPos[i].xyz - p;
+        const float reach = max(max(g.lightPos[i].w, g.lightCol[i].w + 1e-3), 1e-3) * 1.0001;
+        if (dot(d, d) > reach * reach) continue;
         float dist = length(d);
         float att = 1.0 - smoothstep(g.lightCol[i].w, max(g.lightPos[i].w, g.lightCol[i].w + 1e-3), dist);
         if (g.lightMeta.y > 0.5) { float q = clamp(1.0 - dist / max(g.lightPos[i].w, 1e-3), 0.0, 1.0); att = g.lightMeta.y > 1.5 ? q * q : q; }
@@ -76,8 +78,10 @@ vec3 point_spec(vec3 p, vec3 n, vec3 v, float gloss) {
     for (int i = 0; i < 64; ++i) {
         if (i >= cnt) break;
         vec3 d = g.lightPos[i].xyz - p;
-        const float dist = length(d);
         const float far = max(g.lightPos[i].w, 1e-3);
+        const float reach = far * 1.0001;
+        if (dot(d, d) > reach * reach) continue;
+        const float dist = length(d);
         const float q = clamp((1.0 - dist / far) * far / max(far - g.lightCol[i].w, 1e-3), 0.0, 1.0);
         float att = q * q;
         d /= max(dist, 1e-4);
@@ -114,7 +118,7 @@ vec3 rig_shade(vec3 n, float shF, float ao) {
 }
 layout(set = 2, binding = 1) uniform sampler2DShadow shadowMap;
 layout(set = 2, binding = 2) uniform sampler2D fogMap;
-struct FxRec { vec4 head; vec4 p0; vec4 p1; vec4 uv; vec4 teamEmissive; vec4 maskX; vec4 mask2X; vec4 mask2Lv; vec4 fresD; vec4 fresM; vec4 fresM2; vec4 fresS; vec4 fresE; vec4 fresEM; vec4 maskO; vec4 emis2; vec4 emis2T; vec4 emisUV; };
+struct FxRec { vec4 head; vec4 p0; vec4 p1; vec4 uv; vec4 teamEmissive; vec4 maskX; vec4 mask2X; vec4 mask2Lv; vec4 fresD; vec4 fresM; vec4 fresM2; vec4 fresS; vec4 fresE; vec4 fresEM; vec4 maskO; vec4 emis2; vec4 emis2T; vec4 emisUV; vec4 cloak; vec4 fresE2; };
 layout(std430, set = 2, binding = 3) readonly buffer InstFx { FxRec fx[]; };
 layout(set = 2, binding = 4) uniform sampler2D sceneCopy;
 layout(set = 2, binding = 5) uniform sampler2D creepMap;
@@ -173,8 +177,8 @@ float shadow_factor() {
         }
     return lit / 9.0;
 }
-vec3 height_fog(vec3 rgb) {
-    if (g.heightFog.w < 0.5) return rgb;
+float height_fog_f() {
+    if (g.heightFog.w < 0.5) return 0.0;
     if (g.heightFog.w > 1.5) {
         const vec3 vv = vWorldPos - g.eyePos.xyz;
         const float dist = length(vv);
@@ -183,11 +187,15 @@ vec3 height_fog(vec3 rgb) {
             const float fT = clamp(g.heightFog.y * vv.z, -80.0, 80.0);
             fi = fT == 0.0 ? 0.0 : fi * (1.0 - exp(-fT)) / fT;
         }
-        return mix(rgb, g.heightFogColor.rgb, clamp(fi, 0.0, 1.0));
+        return clamp(fi, 0.0, 1.0);
     }
     float depth = max(g.heightFog.z + g.heightFog.y - vWorldPos.z, 0.0);
-    float f = 1.0 - exp(-g.heightFog.x * depth);
-    return mix(rgb, g.heightFogColor.rgb, clamp(f, 0.0, 1.0));
+    return clamp(1.0 - exp(-g.heightFog.x * depth), 0.0, 1.0);
+}
+
+vec3 height_fog(vec3 rgb) {
+    if (g.heightFog.w < 0.5) return rgb;
+    return mix(rgb, g.heightFogColor.rgb, height_fog_f());
 }
 
 float layer_fresnel(vec4 fr, vec3 nrm) {
@@ -431,7 +439,7 @@ void main() {
         const int cs = int(sel2 + 0.5);
         vec4 c2 = cs == 1 ? vec4(s2.a) : cs == 2 ? vec4(s2.r) : cs == 3 ? vec4(s2.g) : cs == 4 ? vec4(s2.b) : cs == 5 ? s2 : vec4(s2.rgb, 1.0);
         c2 = c2 * F.emis2.x + F.emis2.y;
-        vec3 k2 = vec3(F.emis2.z) * pc.tint.rgb;
+        vec3 k2 = vec3(F.emis2.z) * pc.tint.rgb * layer_fresnel(F.fresE2, n);
         if (gammaModel) k2 *= g.rigParams.w;
         if (op2 == 2) emis += max(c2.rgb * c2.a, vec3(0.0)) * k2;
         else if (op2 == 6) emis += max(c2.rgb, vec3(0.0)) * k2;
@@ -459,7 +467,7 @@ void main() {
             const float dim = g.keySpec.w > 1.5 ? 1.0 : clamp(-0.000004444 * pw * pw + 0.004333 * pw + 0.0020834, 0.0, 1.0);
             const vec3 specIn = F.p0.w > 2.5 ? vec3(dot(specColor, vec3(0.3, 0.59, 0.11))) : F.p0.w > 1.5 ? to_gamma(specColor) : specColor;
             const float specASel = specAlphaOnly ? specS.a : 1.0;
-            const bool specLevels = fxKind == 0 && F.p0.w > 0.5;
+            const bool specLevels = (fxKind == 0 || (fxKind == FX_CLOAK && F.cloak.w > 0.5)) && F.p0.w > 0.5;
             const float specA = ((int(fract(g.lightDir.w) * 8.0 + 0.5) & 1) == 0 || F.p0.w > 2.5) ? 1.0 : specLevels ? clamp(specASel * F.p0.x + F.p0.y, 0.0, 1.0) : specASel;
             const vec3 specL = (specLevels ? clamp(specIn * F.p0.x + F.p0.y, 0.0, 1.0) * F.p0.z : specColor * (1.0 + F.head.w)) * specA;
             const float specCut = ((floor(g.lightDir.w) > 1.5 || gDblLambert) && (int(fract(g.lightDir.w) * 8.0 + 0.5) & 2) == 0) ? 0.5 : 0.0;
@@ -548,7 +556,7 @@ void main() {
         outColor = vec4(texture(sceneCopy, clamp(suv + off, vec2(0.0), vec2(1.0))).rgb, 1.0);
         return;
     }
-    if (fxKind == FX_CLOAK) {
+    if (fxKind == FX_CLOAK && F.cloak.w < 0.5) {
         const vec2 suv = gl_FragCoord.xy / max(g.screen.xy, vec2(1.0));
         const vec2 wob = vec2(sin(F.head.y * 2.1 + vWorldPos.y * 3.0), cos(F.head.y * 1.7 + vWorldPos.x * 3.0));
         const vec2 off = (n.xy + 0.35 * wob) * F.p0.y;
@@ -582,7 +590,19 @@ void main() {
     }
     if (int(pc.mat.z + 0.5) == 7 && abs(pc.mat.y - 1.0) < 0.5) env /= max(cover, 0.02);
     const vec3 outRGB = (lit + spec + emis + env) * vVColor;
-    outColor = vec4(fog_veil((uvBits & 2048) != 0 ? outRGB : height_fog(outRGB)), cover);
+    const bool additiveOut = abs(pc.mat.y - 2.0) < 0.5 || abs(pc.mat.y - 3.0) < 0.5;
+    const vec3 fogged = (additiveOut && g.heightFogColor.w > 0.5) ? outRGB * (1.0 - height_fog_f()) : height_fog(outRGB);
+    if (fxKind == FX_CLOAK) {
+        const vec2 suv = gl_FragCoord.xy / max(g.screen.xy, vec2(1.0));
+        const vec2 wob = vec2(sin(F.head.y * 2.1 + vWorldPos.y * 3.0), cos(F.head.y * 1.7 + vWorldPos.x * 3.0));
+        const vec2 off = (n.xy + 0.35 * wob) * F.cloak.y;
+        const vec3 behind = texture(sceneCopy, clamp(suv + off, vec2(0.0), vec2(1.0))).rgb;
+        const vec3 v = normalize(g.eyePos.xyz - vWorldPos);
+        const float rim = pow(1.0 - clamp(abs(dot(n, v)), 0.0, 1.0), 3.0);
+        outColor = vec4(mix(behind, fog_veil((uvBits & 2048) != 0 ? outRGB : fogged), clamp(F.cloak.x + rim * 0.25, 0.0, 1.0) * cover), 1.0);
+        return;
+    }
+    outColor = vec4(fog_veil((uvBits & 2048) != 0 ? outRGB : fogged), cover);
     if (g.screen.z > 4.5 && g.screen.z < 5.5 && pc.mat.y > 0.5) {
         outColor = vec4(cover > 0.8 ? vec3(1, 0, 0) : cover > 0.6 ? vec3(0, 1, 0) : cover > 0.4 ? vec3(0, 0, 1) : vec3(0.0), 1.0);
         return;

@@ -2,8 +2,9 @@
 #include <set>
 #include <tuple>
 #include <unordered_map>
-#include "sc2/render/frame_prof.hpp"
-#include "sc2/render/scene_renderer.hpp"
+#include "omc/render/frame_prof.hpp"
+#include "omc/render/quality.hpp"
+#include "omc/render/scene_renderer.hpp"
 
 #include <algorithm>
 #include <cctype>
@@ -12,13 +13,13 @@
 #include <map>
 #include <stdexcept>
 
-#include "sc2/casc/storage.hpp"
-#include "sc2/data/environment.hpp"
-#include "sc2/render/shadow_fit.hpp"
-#include "sc2/formats/dds.hpp"
-#include "sc2/render/anim.hpp"
-#include "sc2/render/terrain_tex.hpp"
-#include "sc2/render/texture_decode.hpp"
+#include "omc/casc/storage.hpp"
+#include "omc/data/environment.hpp"
+#include "omc/render/shadow_fit.hpp"
+#include "omc/formats/dds.hpp"
+#include "omc/render/anim.hpp"
+#include "omc/render/terrain_tex.hpp"
+#include "omc/render/texture_decode.hpp"
 
 static const uint32_t kSceneVertSpv[] =
 #include "scene.vert.spv.h"
@@ -53,8 +54,14 @@ static const uint32_t kBloomFragSpv[] =
 static const uint32_t kTerrainSplatFragSpv[] =
 #include "terrain_splat.frag.spv.h"
     ;
+static const uint32_t kTerrainSplatQ1FragSpv[] =
+#include "terrain_splat_q1.frag.spv.h"
+    ;
+static const uint32_t kTerrainSplatQ2FragSpv[] =
+#include "terrain_splat_q2.frag.spv.h"
+    ;
 
-namespace sc2::render {
+namespace omc::render {
 
 namespace {
 struct PoseKey {
@@ -97,7 +104,7 @@ struct TonemapPC {
     float fog_from_ndc[16];
 };
 static bool material_hidden(const formats::Model& m, int mi) {
-    static const char* kHide = std::getenv("SC2_HIDE_MATERIAL");
+    static const char* kHide = std::getenv("OMC_HIDE_MATERIAL");
     if (!kHide || mi < 0 || std::size_t(mi) >= m.materials.size()) return false;
     const std::string& nm = m.materials[std::size_t(mi)].name;
     const std::string list = std::string(",") + kHide + ",";
@@ -105,14 +112,14 @@ static bool material_hidden(const formats::Model& m, int mi) {
 }
 
 static bool material_unshadowed(const formats::Model& m, int mi) {
-    static const char* kList = std::getenv("SC2_NO_SHADOW_MATERIAL");
+    static const char* kList = std::getenv("OMC_NO_SHADOW_MATERIAL");
     if (!kList || mi < 0 || std::size_t(mi) >= m.materials.size()) return false;
     const std::string list = std::string(",") + kList + ",";
     return list.find("," + m.materials[std::size_t(mi)].name + ",") != std::string::npos;
 }
 
 static bool fog_in_scene() {
-    static const bool on = std::getenv("SC2_FOG_IN_SCENE") != nullptr;
+    static const bool on = std::getenv("OMC_FOG_IN_SCENE") != nullptr;
     return on;
 }
 static bool invert4(const float* m, float* out) {
@@ -214,7 +221,7 @@ std::vector<Mat4> reach_bone_deltas(const SceneInstance& inst, const std::vector
         return R;
     };
     const Mat4 R = turn(normalize(dl));
-    static const float kArch = std::getenv("SC2_TENTACLE_ARCH") ? float(std::atof(std::getenv("SC2_TENTACLE_ARCH"))) : 0.0f;
+    static const float kArch = std::getenv("OMC_TENTACLE_ARCH") ? float(std::atof(std::getenv("OMC_TENTACLE_ARCH"))) : 0.0f;
     std::vector<Mat4> delta(n, Mat4::identity());
     std::vector<char> moved(n, 0);
     for (int b : chain) {
@@ -231,7 +238,7 @@ std::vector<Mat4> reach_bone_deltas(const SceneInstance& inst, const std::vector
         delta[size_t(b)] = translation(np.x, np.y, np.z) * Rk * translation(-pk.x, -pk.y, -pk.z);
         moved[size_t(b)] = 1;
     }
-    static const bool kRibbonRootStays = std::getenv("SC2_REACH_RIBBON_ROOT_STAYS") != nullptr;
+    static const bool kRibbonRootStays = std::getenv("OMC_REACH_RIBBON_ROOT_STAYS") != nullptr;
     if (!kRibbonRootStays && chain.size() >= 2) {
         for (const formats::M3Ribbon& rb : m.ribbons)
             if (rb.bone < n && m.bones[rb.bone].parent == inst.reach_root_bone && !moved[rb.bone]) {
@@ -254,7 +261,7 @@ std::vector<Mat4> reach_bone_deltas(const SceneInstance& inst, const std::vector
 
 std::vector<Mat4> instance_bones_world(const SceneInstance& inst, const std::vector<Mat4>& bw) {
     std::vector<Mat4> out(bw.size());
-    static const bool kReachRibbons = std::getenv("SC2_NO_REACH_RIBBONS") == nullptr;
+    static const bool kReachRibbons = std::getenv("OMC_NO_REACH_RIBBONS") == nullptr;
     const std::vector<Mat4> rd = kReachRibbons && inst.reach_tip_bone >= 0 ? reach_bone_deltas(inst, bw) : std::vector<Mat4>{};
     for (size_t i = 0; i < bw.size(); ++i) out[i] = i < rd.size() ? inst.world * rd[i] * bw[i] : inst.world * bw[i];
     const formats::Model& m = *inst.model;
@@ -319,30 +326,30 @@ void particle_rng(uint32_t emitter, int particle, float& u1, float& u2, float& u
 
 void SceneRenderer::apply_environment(Tunables& tun, const data::EnvLight& env) {
     if (env.has_key_dir) {
-        const float fx = std::getenv("SC2_KEY_FLIPXY") ? -1.0f : 1.0f;
+        const float fx = std::getenv("OMC_KEY_FLIPXY") ? -1.0f : 1.0f;
         const Vec3 d{fx * float(env.key_dir[0]), fx * float(env.key_dir[1]), float(env.key_dir[2])};
         if (d.x * d.x + d.y * d.y + d.z * d.z > 1e-9f) tun.light_dir = normalize(d);
     }
-    tun.gamma_space = env.has_key_dir && !std::getenv("SC2_LINEAR_PIPELINE");
+    tun.gamma_space = env.has_key_dir && !std::getenv("OMC_LINEAR_PIPELINE");
     if (env.has_hdr && env.hdr_exposure > 0.0) tun.exposure = tun.gamma_space ? float(env.hdr_exposure) : 1.0f;
-    if (const char* ex = std::getenv("SC2_EXPOSURE")) tun.exposure = float(std::atof(ex));
-    static const bool kUnauthoredLinear = std::getenv("SC2_HDR_UNAUTHORED_LINEAR") != nullptr;
+    if (const char* ex = std::getenv("OMC_EXPOSURE")) tun.exposure = float(std::atof(ex));
+    static const bool kUnauthoredLinear = std::getenv("OMC_HDR_UNAUTHORED_LINEAR") != nullptr;
     tun.hdr_operator = (tun.gamma_space && kUnauthoredLinear) ? 3 : 0;
-    if (tun.gamma_space && !kUnauthoredLinear && !std::getenv("SC2_HDR_UNAUTHORED_REINHARD")) tun.hdr_operator = 1;
+    if (tun.gamma_space && !kUnauthoredLinear && !std::getenv("OMC_HDR_UNAUTHORED_REINHARD")) tun.hdr_operator = 1;
     const bool operator_authored = env.params.find("OperatorHDR") != env.params.end();
     if (auto it = env.params.find("OperatorHDR"); it != env.params.end()) tun.hdr_operator = int32_t(it->second + 0.5);
-    if (const char* op = std::getenv("SC2_HDR_OPERATOR")) tun.hdr_operator = std::atoi(op);
+    if (const char* op = std::getenv("OMC_HDR_OPERATOR")) tun.hdr_operator = std::atoi(op);
     const bool exposure_as_authored = env.params.count("ExposureAsAuthored") != 0;
-    if (env.params.count("NoShadows") != 0 && !std::getenv("SC2_CONSOLE_SHADOWS")) tun.shadow_strength = 0.0f;
-    tun.spec_no_energy_dim = env.params.count("SpecNoEnergyDim") != 0 && !std::getenv("SC2_CONSOLE_SPEC_DIM");
-    static const double kUnauthoredDiv = std::getenv("SC2_HDR_UNAUTHORED_DIV") ? std::atof(std::getenv("SC2_HDR_UNAUTHORED_DIV")) : 1.06;
-    static const double kFilmicDiv = std::getenv("SC2_HDR_FILMIC_DIV") ? std::atof(std::getenv("SC2_HDR_FILMIC_DIV")) : 1.0;
-    static const double kExponentialDiv = std::getenv("SC2_HDR_EXPONENTIAL_DIV") ? std::atof(std::getenv("SC2_HDR_EXPONENTIAL_DIV")) : 1.0;
+    if (env.params.count("NoShadows") != 0 && !std::getenv("OMC_CONSOLE_SHADOWS")) tun.shadow_strength = 0.0f;
+    tun.spec_no_energy_dim = env.params.count("SpecNoEnergyDim") != 0 && !std::getenv("OMC_CONSOLE_SPEC_DIM");
+    static const double kUnauthoredDiv = std::getenv("OMC_HDR_UNAUTHORED_DIV") ? std::atof(std::getenv("OMC_HDR_UNAUTHORED_DIV")) : 1.06;
+    static const double kFilmicDiv = std::getenv("OMC_HDR_FILMIC_DIV") ? std::atof(std::getenv("OMC_HDR_FILMIC_DIV")) : 1.0;
+    static const double kExponentialDiv = std::getenv("OMC_HDR_EXPONENTIAL_DIV") ? std::atof(std::getenv("OMC_HDR_EXPONENTIAL_DIV")) : 1.0;
     const bool unauthored_reinhard = !operator_authored && !kUnauthoredLinear && tun.hdr_operator == 0;
-    if (tun.gamma_space && env.has_hdr && env.hdr_exposure > 0.0 && (tun.hdr_operator != 0 || unauthored_reinhard) && !std::getenv("SC2_EXPOSURE"))
+    if (tun.gamma_space && env.has_hdr && env.hdr_exposure > 0.0 && (tun.hdr_operator != 0 || unauthored_reinhard) && !std::getenv("OMC_EXPOSURE"))
         tun.exposure = float(exposure_as_authored ? env.hdr_exposure : env.hdr_exposure / (unauthored_reinhard ? kUnauthoredDiv : tun.hdr_operator == 4 ? kFilmicDiv : kExponentialDiv));
-    if (const char* es = std::getenv("SC2_EXPOSURE_SCALE")) tun.exposure *= float(std::atof(es));
-    if (std::getenv("SC2_LIGHT_TRACE")) {
+    if (const char* es = std::getenv("OMC_EXPOSURE_SCALE")) tun.exposure *= float(std::atof(es));
+    if (std::getenv("OMC_LIGHT_TRACE")) {
         std::fprintf(stderr, "env HDRExposure=%.3f -> exposure %.3f white_point=%.3f\n", env.hdr_exposure, double(tun.exposure), env.hdr_white_point);
         for (const char* k : {"ColorizationBlend", "ColorizationContrast", "ColorizationHue", "ColorizationSaturation", "ColorizationLightness", "HDRGain", "HDRBloomThreshold", "HDRScale"})
             if (auto it = env.params.find(k); it != env.params.end()) std::fprintf(stderr, "env %s=%.4f\n", k, double(it->second));
@@ -364,13 +371,13 @@ void SceneRenderer::apply_environment(Tunables& tun, const data::EnvLight& env) 
     param("ColorizationInputLow", tun.col_input_low);
     param("ColorizationInputHigh", tun.col_input_high);
     param("ColorizationInputGamma", tun.col_input_gamma);
-    if (const char* v = std::getenv("SC2_COL_BLEND")) tun.col_blend = float(std::atof(v));
-    if (const char* v = std::getenv("SC2_COL_SAT")) tun.col_saturation = float(std::atof(v));
-    if (const char* v = std::getenv("SC2_COL_HUE")) tun.col_hue = float(std::atof(v));
-    if (!exposure_as_authored && tun.gamma_space && !std::getenv("SC2_SHADOW_HARD")) tun.shadow_penumbra = 0.05f;
+    if (const char* v = std::getenv("OMC_COL_BLEND")) tun.col_blend = float(std::atof(v));
+    if (const char* v = std::getenv("OMC_COL_SAT")) tun.col_saturation = float(std::atof(v));
+    if (const char* v = std::getenv("OMC_COL_HUE")) tun.col_hue = float(std::atof(v));
+    if (!exposure_as_authored && tun.gamma_space && !std::getenv("OMC_SHADOW_HARD")) tun.shadow_penumbra = 0.05f;
     param("ShadowPenumbraSize", tun.shadow_penumbra);
     tun.bloom_threshold = 1.5f;
-    if (!exposure_as_authored && tun.gamma_space && !std::getenv("SC2_BLOOM_OLD_DEFAULTS")) {
+    if (!exposure_as_authored && tun.gamma_space && !std::getenv("OMC_BLOOM_OLD_DEFAULTS")) {
         tun.bloom_threshold = 1.0f;
         tun.bloom_gain = 1.0f;
         tun.bloom_scale = 1.0f;
@@ -378,25 +385,25 @@ void SceneRenderer::apply_environment(Tunables& tun, const data::EnvLight& env) 
     param("HDRBloomThreshold", tun.bloom_threshold);
     param("HDRGain", tun.bloom_gain);
     param("HDRScale", tun.bloom_scale);
-    if (const char* v = std::getenv("SC2_BLOOM_GAIN")) tun.bloom_gain = float(std::atof(v));
-    if (const char* v = std::getenv("SC2_BLOOM_SCALE")) tun.bloom_scale = float(std::atof(v));
-    if (const char* v = std::getenv("SC2_BLOOM_THRESHOLD")) tun.bloom_threshold = float(std::atof(v));
+    if (const char* v = std::getenv("OMC_BLOOM_GAIN")) tun.bloom_gain = float(std::atof(v));
+    if (const char* v = std::getenv("OMC_BLOOM_SCALE")) tun.bloom_scale = float(std::atof(v));
+    if (const char* v = std::getenv("OMC_BLOOM_THRESHOLD")) tun.bloom_threshold = float(std::atof(v));
     param("CreepHDRSpecMultiplier", tun.creep_spec_mult);
     param("CreepSpecularExp", tun.creep_spec_exp);
     if (env.has_key_dir) tun.terrain_spec = 1.0f;
-    if (!tun.gamma_space || !std::getenv("SC2_NO_TERRAIN_DIFFUSE")) param("TerrainHDRDiffuse", tun.terrain_diffuse);
-    if (const char* v = std::getenv("SC2_TERRAIN_DIFFUSE")) tun.terrain_diffuse = float(std::atof(v));
+    if (!tun.gamma_space || !std::getenv("OMC_NO_TERRAIN_DIFFUSE")) param("TerrainHDRDiffuse", tun.terrain_diffuse);
+    if (const char* v = std::getenv("OMC_TERRAIN_DIFFUSE")) tun.terrain_diffuse = float(std::atof(v));
     param("TerrainHDRSpecular", tun.terrain_spec);
     param("TerrainSpecularExp", tun.terrain_spec_exp);
     param("HDRAmbientMultiplier", tun.hdr_ambient_mult);
     if (env.has_ambient && tun.gamma_space) {
         const float top = float(std::max(env.ambient_color[0], std::max(env.ambient_color[1], env.ambient_color[2])));
-        if (!std::getenv("SC2_AMBIENT_MULT_AUTHORED") || (tun.hdr_ambient_mult > 1.0f && top * tun.hdr_ambient_mult > 1.0f)) tun.hdr_ambient_mult = 1.0f;
+        if (!std::getenv("OMC_AMBIENT_MULT_AUTHORED") || (tun.hdr_ambient_mult > 1.0f && top * tun.hdr_ambient_mult > 1.0f)) tun.hdr_ambient_mult = 1.0f;
     }
-    if (const char* v = std::getenv("SC2_AMBIENT_MULT")) tun.hdr_ambient_mult = float(std::atof(v));
+    if (const char* v = std::getenv("OMC_AMBIENT_MULT")) tun.hdr_ambient_mult = float(std::atof(v));
     param("HDRDiffuseMultiplier", tun.hdr_diffuse_mult);
-    if (!exposure_as_authored && !std::getenv("SC2_MODEL_HDR_DIFFUSE") && !std::getenv("SC2_HDR_DIFFUSE_ALL")) tun.hdr_diffuse_mult = 1.0f;
-    if (const char* v = std::getenv("SC2_HDR_DIFFUSE_MULT")) tun.hdr_diffuse_mult = float(std::atof(v));
+    if (!exposure_as_authored && !std::getenv("OMC_MODEL_HDR_DIFFUSE") && !std::getenv("OMC_HDR_DIFFUSE_ALL")) tun.hdr_diffuse_mult = 1.0f;
+    if (const char* v = std::getenv("OMC_HDR_DIFFUSE_MULT")) tun.hdr_diffuse_mult = float(std::atof(v));
     param("HDREmisMultiplier", tun.hdr_emis_mult);
     param("AOOcclusionRadius", tun.ao_radius);
     param("AOOcclusionPower", tun.ao_power);
@@ -405,7 +412,7 @@ void SceneRenderer::apply_environment(Tunables& tun, const data::EnvLight& env) 
     param("AODetailOcclusionPower", tun.ao_detail_power);
     param("AODetailNoOcclusion", tun.ao_detail_no_occlusion);
     param("HDRSpecMultiplier", tun.hdr_spec_mult);
-    if (const char* v = std::getenv("SC2_EMIS_MULT")) tun.hdr_emis_mult = float(std::atof(v));
+    if (const char* v = std::getenv("OMC_EMIS_MULT")) tun.hdr_emis_mult = float(std::atof(v));
     {
         float en = 0.0f, rgb[3] = {0, 0, 0};
         param("TerrainFogEnabled", en);
@@ -419,20 +426,20 @@ void SceneRenderer::apply_environment(Tunables& tun, const data::EnvLight& env) 
             float zoff = 0.0f;
             param("EngineZOffset", zoff);
             tun.fog_start -= zoff;
-            const char* v = std::getenv("SC2_FOG_START_ADD");
+            const char* v = std::getenv("OMC_FOG_START_ADD");
             tun.fog_start += v ? float(std::atof(v)) : 0.0f;
-            if (const char* v = std::getenv("SC2_FOG_DENSITY_MULT")) tun.fog_density *= float(std::atof(v));
-            if (const char* v = std::getenv("SC2_FOG_FALLOFF_MULT")) tun.fog_falloff *= float(std::atof(v));
-            if (std::getenv("SC2_LIGHT_TRACE"))
+            if (const char* v = std::getenv("OMC_FOG_DENSITY_MULT")) tun.fog_density *= float(std::atof(v));
+            if (const char* v = std::getenv("OMC_FOG_FALLOFF_MULT")) tun.fog_falloff *= float(std::atof(v));
+            if (std::getenv("OMC_LIGHT_TRACE"))
                 std::fprintf(stderr, "env fog: start %.3f (engine z, offset %.3f) density %.4f falloff %.3f\n", double(tun.fog_start), double(zoff),
                              double(tun.fog_density), double(tun.fog_falloff));
         }
-        tun.height_fog = en > 0.5f && tun.fog_density > 0.0f && !std::getenv("SC2_NO_HEIGHT_FOG");
+        tun.height_fog = en > 0.5f && tun.fog_density > 0.0f && !std::getenv("OMC_NO_HEIGHT_FOG");
         for (int k = 0; k < 3; ++k) {
             const float c = std::max(0.0f, rgb[k]) / 255.0f;
             tun.fog_color[k] = tun.gamma_space ? c : std::pow(c, 2.2f);
         }
-        if (std::getenv("SC2_LIGHT_TRACE"))
+        if (std::getenv("OMC_LIGHT_TRACE"))
         std::fprintf(stderr, "tun colorize blend=%.3f contrast=%.3f hue=%.3f saturation=%.3f lightness=%.3f\n", double(tun.col_blend), double(tun.col_contrast),
                      double(tun.col_hue), double(tun.col_saturation), double(tun.col_lightness));
     frame_prof_count("fog.enabled", tun.height_fog ? 1.0 : 0.0);
@@ -473,7 +480,7 @@ void SceneRenderer::create_targets() {
     hdrColor_ = make_image(pd_, dev_, kHdr,
                            VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT,
                            VK_IMAGE_ASPECT_COLOR_BIT, width_, height_);
-    static const bool kHalfCopy = std::getenv("SC2_SCENE_COPY_HALF") != nullptr;
+    static const bool kHalfCopy = std::getenv("OMC_SCENE_COPY_HALF") != nullptr;
     copy_w_ = kHalfCopy ? (width_ > 1 ? width_ / 2 : 1) : width_;
     copy_h_ = kHalfCopy ? (height_ > 1 ? height_ / 2 : 1) : height_;
     sceneCopy_ = make_image(pd_, dev_, kHdr, VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
@@ -642,6 +649,63 @@ void SceneRenderer::resize(uint32_t w, uint32_t h) {
     width_ = w;
     height_ = h;
     create_targets();
+}
+
+void SceneRenderer::sync_live_quality() {
+    const RenderQuality& q = render_quality();
+    const uint32_t dim = q.shadow_dim >= 2048 ? base_shadow_dim_ : std::max<uint32_t>(256, q.shadow_dim);
+    if (dim != tun_.shadow_dim) set_shadow_dim(dim);
+    const std::uint8_t tq = splatPipelineQ_[0].get() ? std::min<std::uint8_t>(2, std::uint8_t(q.terrain)) : 0;
+    if (tq != terrain_q_) set_terrain_quality(tq);
+}
+
+void SceneRenderer::set_shadow_dim(uint32_t dim) {
+    if (tun_.shared_shadow || !shadowPass_.get()) return;
+    vkQueueWaitIdle(queue_);
+    tun_.shadow_dim = dim;
+    shadowMap_ = make_image(pd_, dev_, kDepthF, VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT, VK_IMAGE_ASPECT_DEPTH_BIT, dim, dim);
+    shadow_ = &shadowMap_;
+    VkImageView view = shadowMap_.view.get();
+    VkFramebufferCreateInfo fbi{};
+    fbi.sType = VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO;
+    fbi.renderPass = shadowPass_.get();
+    fbi.attachmentCount = 1;
+    fbi.pAttachments = &view;
+    fbi.width = dim;
+    fbi.height = dim;
+    fbi.layers = 1;
+    VkFramebuffer rawFb = VK_NULL_HANDLE;
+    check(vkCreateFramebuffer(dev_, &fbi, nullptr, &rawFb), "vkCreateFramebuffer(shadow resize)");
+    VkDevice dev = dev_;
+    shadowFb_ = Unique<VkFramebuffer>(rawFb, [dev](VkFramebuffer f) { vkDestroyFramebuffer(dev, f, nullptr); });
+    VkDescriptorImageInfo ii{shadowSampler_.get(), view, VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL};
+    VkWriteDescriptorSet w = vk_init<VkWriteDescriptorSet>(VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET);
+    w.dstSet = global_set_;
+    w.dstBinding = 1;
+    w.descriptorCount = 1;
+    w.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+    w.pImageInfo = &ii;
+    vkUpdateDescriptorSets(dev_, 1, &w, 0, nullptr);
+}
+
+void SceneRenderer::set_terrain_quality(std::uint8_t q) {
+    vkQueueWaitIdle(queue_);
+    terrain_q_ = q;
+    for (auto& kv : splat_cache_) {
+        const TerrainSplat& ts = kv.second;
+        VkDescriptorImageInfo ii[2] = {{splat_sampler(), ts.diffuse_arr.view.get(), VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL},
+                                       {splat_sampler(), ts.normal_arr.view.get(), VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL}};
+        VkWriteDescriptorSet w[2];
+        for (int s = 0; s < 2; ++s) {
+            w[s] = vk_init<VkWriteDescriptorSet>(VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET);
+            w[s].dstSet = ts.set;
+            w[s].dstBinding = s == 0 ? 0u : 2u;
+            w[s].descriptorCount = 1;
+            w[s].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+            w[s].pImageInfo = &ii[s];
+        }
+        vkUpdateDescriptorSets(dev_, 2, w, 0, nullptr);
+    }
 }
 
 void SceneRenderer::flush_pending_fog(VkCommandBuffer cmd) {
@@ -825,7 +889,7 @@ float SceneRenderer::fog_alpha_at(float x, float y) const {
 }
 
 void SceneRenderer::set_fog(const FogField& fog) {
-    SC2_PROF_SCOPE("set_fog");
+    OMC_PROF_SCOPE("set_fog");
     if (!fog.valid()) {
         if (fog_present_) upload_fog_image(1, 1, {0, 0, 0, 0});
         fog_present_ = false;
@@ -858,7 +922,7 @@ int SceneRenderer::upload_texture(uint32_t w, uint32_t h, const std::vector<uint
                            VK_IMAGE_ASPECT_COLOR_BIT, w, h, mips);
     Buffer stg = make_buffer(pd_, dev_, rgba.size(), VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
                              const_cast<uint8_t*>(rgba.data()));
-    static const bool kUnbatched = std::getenv("SC2_UPLOAD_UNBATCHED") != nullptr;
+    static const bool kUnbatched = std::getenv("OMC_UPLOAD_UNBATCHED") != nullptr;
     const bool batched = upload_batch_ > 0 && !kUnbatched;
     auto submit = [&](const std::function<void(VkCommandBuffer)>& rec) {
         if (!batched) { one_time(rec); return; }
@@ -945,7 +1009,7 @@ void SceneRenderer::flush_upload_batch() {
     si.commandBufferCount = 1;
     si.pCommandBuffers = &batch_cb_;
     {
-        SC2_PROF_SCOPE("sr.upload_wait");
+        OMC_PROF_SCOPE("sr.upload_wait");
         check(vkQueueSubmit(queue_, 1, &si, VK_NULL_HANDLE), "vkQueueSubmit(upload batch)");
         check(vkQueueWaitIdle(queue_), "vkQueueWaitIdle(upload batch)");
     }
@@ -990,9 +1054,9 @@ std::size_t SceneRenderer::gpu_bytes_estimate() const {
 
 static bool layer_triplanar(const formats::Model& m, int material, const char* usage) {
     const std::string u = usage ? usage : "";
-    static const bool kTriNormal = std::getenv("SC2_TRIPLANAR_NORMAL") != nullptr;
-    static const bool kTriDiffuseOnly = std::getenv("SC2_TRIPLANAR_DIFFUSE_ONLY") != nullptr;
-    static const bool kNoTri = std::getenv("SC2_NO_TRIPLANAR") != nullptr;
+    static const bool kTriNormal = std::getenv("OMC_TRIPLANAR_NORMAL") != nullptr;
+    static const bool kTriDiffuseOnly = std::getenv("OMC_TRIPLANAR_DIFFUSE_ONLY") != nullptr;
+    static const bool kNoTri = std::getenv("OMC_NO_TRIPLANAR") != nullptr;
     if ((u == "Diffuse" || ((u == "Normal" || u == "Specular") && kTriNormal && !kTriDiffuseOnly)) && !kNoTri)
         if (const formats::M3Layer* tl = layer_ptr_of(m, material, usage))
             return !tl->raw_record.empty() && tl->word40 >= 16 && tl->word40 <= 18;
@@ -1060,7 +1124,7 @@ bool request_model_textures(const formats::Model& m, const casc::Storage* storag
 int SceneRenderer::resolve_texture(const formats::Model& m, int material, const char* usage,
                                    int def) {
     const std::string u = usage ? usage : "";
-    static const bool kSpecSrgb = std::getenv("SC2_SPEC_SRGB") != nullptr;
+    static const bool kSpecSrgb = std::getenv("OMC_SPEC_SRGB") != nullptr;
     const bool srgb = u == "Diffuse" || u == "Emissive" || u == "Decal" || u == "LightMap" || (kSpecSrgb && u == "Specular");
     if (const formats::M3Layer* layer = layer_ptr_of(m, material, usage)) {
         if (!layer->inline_rgba.empty() && layer->inline_w && layer->inline_h &&
@@ -1076,9 +1140,9 @@ int SceneRenderer::resolve_texture(const formats::Model& m, int material, const 
     std::string path = layer_of(m, material, usage);
     if (path.empty() || !storage_) return def;
     bool triplanar = false;
-    static const bool kTriNormal = std::getenv("SC2_TRIPLANAR_NORMAL") != nullptr;
-    static const bool kTriDiffuseOnly = std::getenv("SC2_TRIPLANAR_DIFFUSE_ONLY") != nullptr;
-    static const bool kNoTri = std::getenv("SC2_NO_TRIPLANAR") != nullptr;
+    static const bool kTriNormal = std::getenv("OMC_TRIPLANAR_NORMAL") != nullptr;
+    static const bool kTriDiffuseOnly = std::getenv("OMC_TRIPLANAR_DIFFUSE_ONLY") != nullptr;
+    static const bool kNoTri = std::getenv("OMC_NO_TRIPLANAR") != nullptr;
     if ((u == "Diffuse" || ((u == "Normal" || u == "Specular") && kTriNormal && !kTriDiffuseOnly)) && !kNoTri)
         if (const formats::M3Layer* tl = layer_ptr_of(m, material, usage))
             triplanar = !tl->raw_record.empty() && tl->word40 >= 16 && tl->word40 <= 18;
@@ -1086,24 +1150,25 @@ int SceneRenderer::resolve_texture(const formats::Model& m, int material, const 
     auto it = tex_index_.find(cache_key);
     if (it != tex_index_.end()) return it->second;
     int idx = def;
-    static const bool kDecodeOld = std::getenv("SC2_TEX_DECODE_OLD") != nullptr;
+    static const bool kDecodeOld = std::getenv("OMC_TEX_DECODE_OLD") != nullptr;
     if (!kDecodeOld) {
         const bool normal = u == "Normal";
-        const std::string pool_key = texture_key_2d(path, normal, triplanar, tun_.max_texture_dim);
+        const std::string pool_key = texture_key_2d(path, normal, triplanar, tun_.max_texture_dim) + (tun_.halve_textures ? "#half" : "");
         std::shared_ptr<DecodedTexture> taken = take_decoded(pool_key);
         if (!taken) {
-            SC2_PROF_SCOPE("sr.sync_decode");
+            OMC_PROF_SCOPE("sr.sync_decode");
             frame_prof_count("sr.sync_decodes", 1.0);
-            if (std::getenv("SC2_TEX_TRACE")) std::fprintf(stderr, "texsync %s %s\n", usage ? usage : "", pool_key.c_str());
+            if (std::getenv("OMC_TEX_TRACE")) std::fprintf(stderr, "texsync %s %s\n", usage ? usage : "", pool_key.c_str());
             taken = std::make_shared<DecodedTexture>(decode_texture_2d(*storage_, texture_root_, path, normal, triplanar, tun_.max_texture_dim));
+            if (tun_.halve_textures) halve_decoded(*taken);
             keep_decoded(pool_key, taken);
         }
         const DecodedTexture& d = *taken;
         if (d.ok) {
-            SC2_PROF_SCOPE("sr.tex_upload");
+            OMC_PROF_SCOPE("sr.tex_upload");
             try { idx = upload_texture(d.w, d.h, d.rgba, srgb); } catch (const std::exception&) {}
         }
-        if (idx == def && std::getenv("SC2_TEX_TRACE")) std::fprintf(stderr, "texmiss %s %s\n", usage ? usage : "", path.c_str());
+        if (idx == def && std::getenv("OMC_TEX_TRACE")) std::fprintf(stderr, "texmiss %s %s\n", usage ? usage : "", path.c_str());
         tex_index_[cache_key] = idx;
         return idx;
     }
@@ -1158,7 +1223,7 @@ int SceneRenderer::resolve_texture(const formats::Model& m, int material, const 
             }
         } catch (const std::exception&) {   }
     }
-    if (idx == def && std::getenv("SC2_TEX_TRACE")) std::fprintf(stderr, "texmiss %s %s\n", usage ? usage : "", path.c_str());
+    if (idx == def && std::getenv("OMC_TEX_TRACE")) std::fprintf(stderr, "texmiss %s %s\n", usage ? usage : "", path.c_str());
     tex_index_[cache_key] = idx;
     return idx;
 }
@@ -1169,26 +1234,26 @@ int SceneRenderer::resolve_env_texture(const formats::Model& m, int material) {
     const std::string key = path + "#envll";
     if (auto it = tex_index_.find(key); it != tex_index_.end()) return it->second;
     int idx = kDefaultEmissive;
-    static const bool kDecodeOld = std::getenv("SC2_TEX_DECODE_OLD") != nullptr;
+    static const bool kDecodeOld = std::getenv("OMC_TEX_DECODE_OLD") != nullptr;
     if (!kDecodeOld) {
         const std::string pool_key = texture_key_env(path);
         std::shared_ptr<DecodedTexture> taken = take_decoded(pool_key);
         if (!taken) {
-            SC2_PROF_SCOPE("sr.sync_decode");
+            OMC_PROF_SCOPE("sr.sync_decode");
             frame_prof_count("sr.sync_decodes", 1.0);
-            if (std::getenv("SC2_TEX_TRACE")) std::fprintf(stderr, "texsync env %s\n", pool_key.c_str());
+            if (std::getenv("OMC_TEX_TRACE")) std::fprintf(stderr, "texsync env %s\n", pool_key.c_str());
             taken = std::make_shared<DecodedTexture>(decode_texture_env(*storage_, texture_root_, path));
             keep_decoded(pool_key, taken);
         }
         const DecodedTexture& d = *taken;
         if (d.ok) {
-            SC2_PROF_SCOPE("sr.tex_upload");
+            OMC_PROF_SCOPE("sr.tex_upload");
             try {
                 idx = upload_texture(d.w, d.h, d.rgba, true);
                 if (d.sphere) env_sphere_tex_.insert(idx);
             } catch (const std::exception&) {}
         }
-        if (idx == kDefaultEmissive && std::getenv("SC2_TEX_TRACE")) std::fprintf(stderr, "envmiss %s\n", path.c_str());
+        if (idx == kDefaultEmissive && std::getenv("OMC_TEX_TRACE")) std::fprintf(stderr, "envmiss %s\n", path.c_str());
         tex_index_[key] = idx;
         return idx;
     }
@@ -1204,7 +1269,7 @@ int SceneRenderer::resolve_env_texture(const formats::Model& m, int material) {
             const bool dx10 = bytes[84] == 'D' && bytes[85] == 'X' && bytes[86] == '1' && bytes[87] == '0';
             if (dx10) break;
             if (!(caps2 & 0x200u)) {
-                if (std::getenv("SC2_NO_SPHERE_ENVIO")) break;
+                if (std::getenv("OMC_NO_SPHERE_ENVIO")) break;
                 formats::DdsInfo info;
                 const std::vector<uint8_t> rgba = formats::dds_decode_rgba(bytes, info);
                 if (!rgba.empty() && info.width && info.height) {
@@ -1252,13 +1317,13 @@ int SceneRenderer::resolve_env_texture(const formats::Model& m, int material) {
             break;
         } catch (const std::exception&) {   }
     }
-    if (idx == kDefaultEmissive && std::getenv("SC2_TEX_TRACE")) std::fprintf(stderr, "envmiss %s\n", path.c_str());
+    if (idx == kDefaultEmissive && std::getenv("OMC_TEX_TRACE")) std::fprintf(stderr, "envmiss %s\n", path.c_str());
     tex_index_[key] = idx;
     return idx;
 }
 
 static float diffuse_layer_packed(const formats::Model& m, int mi, float mult) {
-    static const bool kOff = std::getenv("SC2_DIFFUSE_ADD_OFF") != nullptr;
+    static const bool kOff = std::getenv("OMC_DIFFUSE_ADD_OFF") != nullptr;
     mult = std::min(std::max(mult, 0.0f), 999.0f);
     if (kOff || mi < 0 || std::size_t(mi) >= m.materials.size()) return mult;
     for (const formats::M3Layer& L : m.materials[std::size_t(mi)].layers)
@@ -1272,18 +1337,18 @@ static float diffuse_layer_packed(const formats::Model& m, int mi, float mult) {
 }
 
 static const ClipLayers* glayers(const SceneInstance& inst) {
-    static const bool kOff = std::getenv("SC2_NO_GLOBAL_LAYER_EXTRAS") != nullptr;
+    static const bool kOff = std::getenv("OMC_NO_GLOBAL_LAYER_EXTRAS") != nullptr;
     return kOff || inst.global_layers.empty() ? nullptr : &inst.global_layers;
 }
 
 static void material_anim(const formats::Model& m, int mi, int seq, float time_ms, float out[4], const ClipLayers* gl = nullptr) {
     out[0] = 0.0f; out[1] = 0.0f; out[2] = 1.0f; out[3] = 1.0f;
     if (mi < 0 || std::size_t(mi) >= m.materials.size()) return;
-    static const bool kNoEmisSelect = std::getenv("SC2_NO_EMIS_SELECT") != nullptr;
-    static const bool kNoEmisAdd = std::getenv("SC2_NO_EMIS_ADD") != nullptr;
-    static const bool kNoBrightMult = std::getenv("SC2_NO_BRIGHTMULT") != nullptr;
-    static const std::string kBrightTraceValue = std::getenv("SC2_BRIGHT_TRACE") ? std::getenv("SC2_BRIGHT_TRACE") : "";
-    static const char* const kBrightTrace = std::getenv("SC2_BRIGHT_TRACE") ? kBrightTraceValue.c_str() : nullptr;
+    static const bool kNoEmisSelect = std::getenv("OMC_NO_EMIS_SELECT") != nullptr;
+    static const bool kNoEmisAdd = std::getenv("OMC_NO_EMIS_ADD") != nullptr;
+    static const bool kNoBrightMult = std::getenv("OMC_NO_BRIGHTMULT") != nullptr;
+    static const std::string kBrightTraceValue = std::getenv("OMC_BRIGHT_TRACE") ? std::getenv("OMC_BRIGHT_TRACE") : "";
+    static const char* const kBrightTrace = std::getenv("OMC_BRIGHT_TRACE") ? kBrightTraceValue.c_str() : nullptr;
     const formats::M3Material& mat = m.materials[std::size_t(mi)];
     const uint32_t s = seq >= 0 ? uint32_t(seq) : UINT32_MAX;
     for (const formats::M3Layer& L : mat.layers) {
@@ -1301,10 +1366,10 @@ static void material_anim(const formats::Model& m, int mi, int seq, float time_m
             else
                 out[2] = a.bright_mult;
             if (!L.raw_record.empty() && L.word44 == 0) out[2] *= std::max(out[2] + a.midtone_offset, 0.0f);
-            static const bool kTeamClampOld = std::getenv("SC2_EMIS_TEAM_CLAMP_AFTER_MULT") != nullptr;
+            static const bool kTeamClampOld = std::getenv("OMC_EMIS_TEAM_CLAMP_AFTER_MULT") != nullptr;
             if (kTeamClampOld || mat.emis_op != 4 || kNoEmisSelect)
                 out[2] *= mat.emis_mult;
-            static const bool kBrightStatic = std::getenv("SC2_EMIS_BRIGHTNESS_STATIC") != nullptr;
+            static const bool kBrightStatic = std::getenv("OMC_EMIS_BRIGHTNESS_STATIC") != nullptr;
             if (!L.raw_record.empty()) {
                 float br = a.brightness;
                 if (!kBrightStatic && seq >= 0 && a.brightness_flags) animated_layer_field(m, s, a.brightness_interp, a.brightness_flags, a.brightness_id, time_ms, 1, &a.brightness, &br, gl);
@@ -1314,7 +1379,7 @@ static void material_anim(const formats::Model& m, int mi, int seq, float time_m
                 }
                 out[2] *= br;
             }
-            static const bool kPosAdd = std::getenv("SC2_NO_EMIS_ADD_POS") == nullptr;
+            static const bool kPosAdd = std::getenv("OMC_NO_EMIS_ADD_POS") == nullptr;
             if (!L.raw_record.empty() && L.word44 == 0 && a.bright_mult > 0.0f && out[2] < 999.0f && !kNoEmisAdd &&
                 (a.midtone_offset < 0.0f || (kPosAdd && a.midtone_offset > 0.0f))) {
                 const float k = std::floor(std::max(-400.0f, std::min(100.0f, -a.midtone_offset / a.bright_mult * 100.0f)) + 0.5f);
@@ -1415,10 +1480,10 @@ bool SceneRenderer::preload_model_textures(const formats::Model& m, std::size_t 
             [&] { resolve_texture(m, mat, "AlphaMask", kDefaultWhite); },
             [&] { resolve_env_texture(m, mat); },
             [&] { resolve_texture(m, mat, "EnvironmentVIOMask", kDefaultWhite); },
-            [&] { if (!std::getenv("SC2_NO_DECAL_LAYER")) resolve_texture(m, mat, "Decal", kDefaultClear); },
-            [&] { if (std::getenv("SC2_AO_LAYER")) resolve_texture(m, mat, "AmbientOcclusion", kDefaultWhite); },
+            [&] { if (!std::getenv("OMC_NO_DECAL_LAYER")) resolve_texture(m, mat, "Decal", kDefaultClear); },
+            [&] { if (std::getenv("OMC_AO_LAYER")) resolve_texture(m, mat, "AmbientOcclusion", kDefaultWhite); },
             [&] { resolve_texture(m, mat, "AlphaMask2", kDefaultWhite); },
-            [&] { if (!std::getenv("SC2_NO_EMISSIVE2")) resolve_texture(m, mat, "Emissive2", kDefaultEmissive); },
+            [&] { if (!std::getenv("OMC_NO_EMISSIVE2")) resolve_texture(m, mat, "Emissive2", kDefaultEmissive); },
         };
         for (const auto& s : steps) {
             if (over()) { done = false; break; }
@@ -1442,7 +1507,7 @@ SceneRenderer::Mesh& SceneRenderer::ensure_mesh(const formats::Model& m, std::ui
     std::vector<uint32_t> tri;
     std::vector<Vertex> verts;
     {
-        SC2_PROF_SCOPE("sr.mesh_build");
+        OMC_PROF_SCOPE("sr.mesh_build");
         tri = resolve_indices(m, mesh.draws);
         verts = build_vertices(m, tri);
     }
@@ -1481,13 +1546,13 @@ SceneRenderer::Mesh& SceneRenderer::ensure_mesh(const formats::Model& m, std::ui
                             resolve_texture(m, mat, "AlphaMask", kDefaultWhite),
                             resolve_env_texture(m, mat),
                             resolve_texture(m, mat, "EnvironmentVIOMask", kDefaultWhite),
-                            std::getenv("SC2_NO_DECAL_LAYER") ? kDefaultClear : resolve_texture(m, mat, "Decal", kDefaultClear),
-                            std::getenv("SC2_AO_LAYER") ? resolve_texture(m, mat, "AmbientOcclusion", kDefaultWhite) : kDefaultWhite,
+                            std::getenv("OMC_NO_DECAL_LAYER") ? kDefaultClear : resolve_texture(m, mat, "Decal", kDefaultClear),
+                            std::getenv("OMC_AO_LAYER") ? resolve_texture(m, mat, "AmbientOcclusion", kDefaultWhite) : kDefaultWhite,
                             resolve_texture(m, mat, "AlphaMask2", kDefaultWhite),
-                            std::getenv("SC2_NO_EMISSIVE2") ? kDefaultEmissive : resolve_texture(m, mat, "Emissive2", kDefaultEmissive)};
+                            std::getenv("OMC_NO_EMISSIVE2") ? kDefaultEmissive : resolve_texture(m, mat, "Emissive2", kDefaultEmissive)};
     }
     mesh.draw_maskx.assign(mesh.draws.size(), {1.0f, 1.0f, 0.0f, 0.0f, 1.0f, 1.0f, 0.0f, 0.0f, 1.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f});
-    if (!std::getenv("SC2_NO_MASK2"))
+    if (!std::getenv("OMC_NO_MASK2"))
         for (size_t i = 0; i < mesh.draws.size(); ++i) {
             const int mat = mesh.draws[i].material;
             if (mat < 0 || std::size_t(mat) >= m.materials.size()) continue;
@@ -1496,11 +1561,11 @@ SceneRenderer::Mesh& SceneRenderer::ensure_mesh(const formats::Model& m, std::ui
                 if (L.raw_record.empty()) continue;
                 const formats::M3Layer::AnimRefs& a = L.anim;
                 const bool moved = a.uv_tiling[0] != 1.0f || a.uv_tiling[1] != 1.0f || a.uv_angle[2] != 0.0f;
-                static const bool kMaskScreen = std::getenv("SC2_NO_MASK_SCREEN_UV") == nullptr;
+                static const bool kMaskScreen = std::getenv("OMC_NO_MASK_SCREEN_UV") == nullptr;
                 const bool screen = kMaskScreen && L.usage == "AlphaMask" && L.word40 == 15;
-                static const bool kMaskClamp = std::getenv("SC2_MASK_ALWAYS_TILED") == nullptr;
+                static const bool kMaskClamp = std::getenv("OMC_MASK_ALWAYS_TILED") == nullptr;
                 const bool untiled = kMaskClamp && L.usage == "AlphaMask" && !screen && (L.word36 & 0xcu) == 0 && !L.image_path.empty();
-                static const bool kMaskOffset = std::getenv("SC2_MASK_NO_OFFSET") == nullptr;
+                static const bool kMaskOffset = std::getenv("OMC_MASK_NO_OFFSET") == nullptr;
                 const bool one_axis = kMaskOffset && L.usage == "AlphaMask" && !screen && !untiled && !L.image_path.empty() && (L.word36 & 0xcu) != 0xcu;
                 const bool offset = kMaskOffset && L.usage == "AlphaMask" && !screen && (a.uv_offset[0] != 0.0f || a.uv_offset[1] != 0.0f);
                 if (L.usage == "AlphaMask" && (moved || screen || untiled || one_axis || offset) && a.uv_tiling[0] != 0.0f && a.uv_tiling[1] != 0.0f) {
@@ -1522,7 +1587,7 @@ SceneRenderer::Mesh& SceneRenderer::ensure_mesh(const formats::Model& m, std::ui
                     mx[9] = a.midtone_offset;
                     mesh.any_maskx = true;
                 }
-                static const bool kEmisSrc = std::getenv("SC2_NO_EMIS_UV_SOURCE") == nullptr;
+                static const bool kEmisSrc = std::getenv("OMC_NO_EMIS_UV_SOURCE") == nullptr;
                 if (kEmisSrc && L.usage == "Emissive" && a.uv_tiling[0] > 0.0f && a.uv_tiling[1] > 0.0f && a.uv_tiling[0] < 100.0f) {
                     const float plane = L.word40 == 13 ? 1.0f : L.word40 == 14 ? 2.0f : L.word40 == 5 ? 3.0f : 0.0f;
                     const float k = plane > 0.0f ? 0.09375f : 1.0f;
@@ -1534,9 +1599,9 @@ SceneRenderer::Mesh& SceneRenderer::ensure_mesh(const formats::Model& m, std::ui
                 }
             }
         }
-    static const bool kFresSE = std::getenv("SC2_NO_LAYER_FRESNEL_SE") == nullptr;
+    static const bool kFresSE = std::getenv("OMC_NO_LAYER_FRESNEL_SE") == nullptr;
     mesh.draw_fres.assign(mesh.draws.size(), std::array<float, 24>{});
-    if (!std::getenv("SC2_NO_LAYER_FRESNEL_DM"))
+    if (!std::getenv("OMC_NO_LAYER_FRESNEL_DM"))
         for (size_t i = 0; i < mesh.draws.size(); ++i) {
             const int mat = mesh.draws[i].material;
             if (mat < 0 || std::size_t(mat) >= m.materials.size()) continue;
@@ -1556,7 +1621,7 @@ SceneRenderer::Mesh& SceneRenderer::ensure_mesh(const formats::Model& m, std::ui
             }
         }
     {
-        SC2_PROF_SCOPE("sr.mesh_upload");
+        OMC_PROF_SCOPE("sr.mesh_upload");
         mesh.vbuf = make_buffer(pd_, dev_, sizeof(Vertex) * verts.size(),
                                 VK_BUFFER_USAGE_VERTEX_BUFFER_BIT, verts.data());
         mesh.ibuf = make_buffer(pd_, dev_, sizeof(uint32_t) * tri.size(),
@@ -1580,7 +1645,7 @@ SceneRenderer::Mesh& SceneRenderer::ensure_mesh(const formats::Model& m, std::ui
         const int mat = mesh.draws[i].material;
         if (mat < 0 || std::size_t(mat) >= m.materials.size()) continue;
         const formats::M3Layer* L = formats::material_alpha_mask(m.materials[std::size_t(mat)]);
-        static const bool kMaskAnim = std::getenv("SC2_SHIELD_FLARE_OLD") == nullptr;
+        static const bool kMaskAnim = std::getenv("OMC_SHIELD_FLARE_OLD") == nullptr;
         if (kMaskAnim && L && L->usage == "AlphaMask" && !L->raw_record.empty() && (L->anim.bright_mult_flags != 0 || L->anim.midtone_flags != 0)) {
             mesh.draw_masklv_anim[i] = 1;
             mesh.any_masklv = true;
@@ -1589,12 +1654,12 @@ SceneRenderer::Mesh& SceneRenderer::ensure_mesh(const formats::Model& m, std::ui
         if (L && !L->raw_record.empty()) {
             float mul = L->anim.bright_mult;
             float add = L->anim.midtone_offset;
-            static const bool kMaskInvert = std::getenv("SC2_ALPHA_MASK_NO_INVERT") == nullptr;
+            static const bool kMaskInvert = std::getenv("OMC_ALPHA_MASK_NO_INVERT") == nullptr;
             if (kMaskInvert && L->usage == "AlphaMask" && (L->word36 & 0x10u) != 0) {
                 add = mul + add;
                 mul = -mul;
             }
-            if (const char* k = std::getenv("SC2_PREPASS_MASK_ADD"); k && (m.materials[std::size_t(mat)].flags & 0x100u)) add *= float(std::atof(k));
+            if (const char* k = std::getenv("OMC_PREPASS_MASK_ADD"); k && (m.materials[std::size_t(mat)].flags & 0x100u)) add *= float(std::atof(k));
             if (mul != 1.0f || add != 0.0f) {
                 mesh.draw_masklv[i] = {mul - 1.0f, add};
                 mesh.any_masklv = true;
@@ -1606,7 +1671,7 @@ SceneRenderer::Mesh& SceneRenderer::ensure_mesh(const formats::Model& m, std::ui
         const int mat = mesh.draws[i].material;
         if (mat < 0 || std::size_t(mat) >= m.materials.size()) continue;
         if (mesh.draw_tex[i][5] == kDefaultEmissive) {
-            if (std::getenv("SC2_TEX_TRACE") && !layer_of(m, mat, "EnvironmentVIO").empty())
+            if (std::getenv("OMC_TEX_TRACE") && !layer_of(m, mat, "EnvironmentVIO").empty())
                 std::fprintf(stderr, "envnone %s material '%s' (image not bound)\n", layer_of(m, mat, "EnvironmentVIO").c_str(), m.materials[std::size_t(mat)].name.c_str());
             continue;
         }
@@ -1629,16 +1694,16 @@ SceneRenderer::Mesh& SceneRenderer::ensure_mesh(const formats::Model& m, std::ui
         const float mode = env->word40 == 3 ? 1.0f : env->word40 == 8 ? 2.0f : env->word40 == 7 ? 3.0f : 0.0f;
         const bool sphere_img = env_sphere_tex_.count(mesh.draw_tex[i][5]) != 0;
         if (sphere_img && !(mode == 1.0f || mode == 2.0f)) {
-            if (std::getenv("SC2_TEX_TRACE")) std::fprintf(stderr, "envskip %s source %u image 2D\n", env->image_path.c_str(), unsigned(env->word40));
+            if (std::getenv("OMC_TEX_TRACE")) std::fprintf(stderr, "envskip %s source %u image 2D\n", env->image_path.c_str(), unsigned(env->word40));
             continue;
         }
-        if (sphere_img && std::getenv("SC2_TEX_TRACE"))
+        if (sphere_img && std::getenv("OMC_TEX_TRACE"))
             std::fprintf(stderr, "[envll] sphere %s source %u strength %.3f (mult %.3f brightness %.3f add %.3f) w36 %x w44 %u mask %s code %.0f x%.2f +%.2f material '%s' blend %u flags %08x\n",
                          env->image_path.c_str(), unsigned(env->word40), double(strength), double(env->anim.bright_mult), double(env->anim.brightness), double(env->anim.midtone_offset),
                          unsigned(env->word36), unsigned(env->word44), mask ? mask->image_path.c_str() : "-", double(code), double(mul), double(add),
                          m.materials[std::size_t(mat)].name.c_str(), unsigned(m.materials[std::size_t(mat)].blend_mode), unsigned(m.materials[std::size_t(mat)].flags));
         code += 16.0f * (sphere_img ? mode : (mode == 3.0f ? 3.0f : 0.0f));
-        if (mask && !std::getenv("SC2_ENV_MASK_NO_BITS")) {
+        if (mask && !std::getenv("OMC_ENV_MASK_NO_BITS")) {
             if (mask->word36 & 0x10u) code += 64.0f;
             if (mask->word36 & 0x20u) code += 128.0f;
         }
@@ -1651,7 +1716,7 @@ SceneRenderer::Mesh& SceneRenderer::ensure_mesh(const formats::Model& m, std::ui
     mesh.draw_specl.assign(mesh.draws.size(), std::array<float, 3>{0.0f, 0.0f, 0.0f});
     mesh.draw_specluma.assign(mesh.draws.size(), 0);
     mesh.draw_uvsrc.assign(mesh.draws.size(), 0);
-    if (!std::getenv("SC2_NO_UV_SOURCE"))
+    if (!std::getenv("OMC_NO_UV_SOURCE"))
         for (size_t i = 0; i < mesh.draws.size(); ++i) {
             const int mat = mesh.draws[i].material;
             if (mat < 0 || std::size_t(mat) >= m.materials.size()) continue;
@@ -1659,48 +1724,48 @@ SceneRenderer::Mesh& SceneRenderer::ensure_mesh(const formats::Model& m, std::ui
                 if (L.raw_record.empty()) continue;
                 if (L.usage == "AlphaMask" && L.word40 == 1) mesh.draw_uvsrc[i] |= 1;
                 if (L.usage == "Diffuse" && L.word40 == 5) mesh.draw_uvsrc[i] |= 2;
-                if (L.usage == "Diffuse" && L.word40 >= 16 && L.word40 <= 18 && L.raw_record.size() >= 396 && !std::getenv("SC2_NO_TRIPLANAR")) {
+                if (L.usage == "Diffuse" && L.word40 >= 16 && L.word40 <= 18 && L.raw_record.size() >= 396 && !std::getenv("OMC_NO_TRIPLANAR")) {
                     float sc = 0.0f, oz = 0.0f;
                     std::memcpy(&sc, &L.raw_record[384], 4);
                     std::memcpy(&oz, &L.raw_record[356], 4);
                     if (std::isfinite(sc) && sc > 1e-5f && sc < 100.0f && std::isfinite(oz)) {
                         if (mesh.draw_tri.size() != mesh.draws.size()) mesh.draw_tri.assign(mesh.draws.size(), {0.0f, 0.0f, 0.0f});
                         bool tri_normal = false;
-                        if (std::getenv("SC2_TRIPLANAR_NORMAL") && !std::getenv("SC2_TRIPLANAR_DIFFUSE_ONLY"))
+                        if (std::getenv("OMC_TRIPLANAR_NORMAL") && !std::getenv("OMC_TRIPLANAR_DIFFUSE_ONLY"))
                             for (const formats::M3Layer& NL : m.materials[std::size_t(mat)].layers)
                                 if (NL.usage == "Normal" && !NL.raw_record.empty() && NL.word40 >= 16 && NL.word40 <= 18 && !NL.image_path.empty()) tri_normal = true;
-                        if (!std::getenv("SC2_TRIPLANAR_OFFSET_ADD")) oz = -oz;
-                        mesh.draw_tri[i] = {sc, oz, float(L.word40) + (tri_normal ? 0.5f : 0.0f) + (std::getenv("SC2_TRIPLANAR_VFLIP") ? 0.25f : 0.0f)};
+                        if (!std::getenv("OMC_TRIPLANAR_OFFSET_ADD")) oz = -oz;
+                        mesh.draw_tri[i] = {sc, oz, float(L.word40) + (tri_normal ? 0.5f : 0.0f) + (std::getenv("OMC_TRIPLANAR_VFLIP") ? 0.25f : 0.0f)};
                         mesh.draw_uvsrc[i] |= 2;
                     }
                 }
-                static const bool kSpecSel = std::getenv("SC2_NO_SPEC_SELECT") == nullptr;
+                static const bool kSpecSel = std::getenv("OMC_NO_SPEC_SELECT") == nullptr;
                 if (kSpecSel && L.usage == "Specular" && L.word44 == 2) mesh.draw_uvsrc[i] |= 8;
-                static const bool kEmisSel = std::getenv("SC2_NO_EMIS_SELECT") == nullptr;
+                static const bool kEmisSel = std::getenv("OMC_NO_EMIS_SELECT") == nullptr;
                 if (kEmisSel && L.usage == "Emissive") {
                     if (L.word40 == 1) mesh.draw_uvsrc[i] |= 32;
                     if (L.word44 >= 2 && L.word44 <= 5) mesh.draw_uvsrc[i] |= std::uint16_t((L.word44 - 1) << 7);
                     if ((L.word36 & 0xcu) == 0) mesh.draw_uvsrc[i] |= 1024;
                 }
             }
-            static const bool kMatDbl = std::getenv("SC2_NO_MAT_DBL_LAMBERT") == nullptr;
+            static const bool kMatDbl = std::getenv("OMC_NO_MAT_DBL_LAMBERT") == nullptr;
             if (kMatDbl && (m.materials[std::size_t(mat)].flags & 0x80000u) != 0) mesh.draw_uvsrc[i] |= 4;
-            static const bool kCliffDbl = std::getenv("SC2_NO_CLIFF_DBL_LAMBERT") == nullptr;
+            static const bool kCliffDbl = std::getenv("OMC_NO_CLIFF_DBL_LAMBERT") == nullptr;
             if (kCliffDbl && m.vertex_alpha_coverage) mesh.draw_uvsrc[i] |= 4;
-            static const bool kNoLocal = std::getenv("SC2_BLENDED_LOCAL_LIGHTS") == nullptr;
+            static const bool kNoLocal = std::getenv("OMC_BLENDED_LOCAL_LIGHTS") == nullptr;
             if (kNoLocal && !m.material_refs.empty() && m.materials[std::size_t(mat)].blend_mode != formats::kBlendOpaque &&
                 (m.materials[std::size_t(mat)].flags & 0x20000u) == 0)
                 mesh.draw_uvsrc[i] |= 16;
-            static const bool kLayerFresnel = std::getenv("SC2_NO_LAYER_FRESNEL") == nullptr;
+            static const bool kLayerFresnel = std::getenv("OMC_NO_LAYER_FRESNEL") == nullptr;
             if (kLayerFresnel)
                 for (const formats::M3Layer& L : m.materials[std::size_t(mat)].layers) {
                     std::uint32_t fm = 0;
                     float fe = 0.0f, fb = 0.0f, fs = 0.0f;
                     if (L.usage == "Emissive" && formats::layer_fresnel(L, fm, fe, fb, fs)) mesh.draw_uvsrc[i] |= 2048;
                 }
-            static const bool kEmisTeam = std::getenv("SC2_NO_EMIS_SELECT") == nullptr;
+            static const bool kEmisTeam = std::getenv("OMC_NO_EMIS_SELECT") == nullptr;
             if (kEmisTeam && m.materials[std::size_t(mat)].emis_op == 4) mesh.draw_uvsrc[i] |= 64;
-            static const bool kMatUnfogged = std::getenv("SC2_MAT_UNFOGGED") != nullptr;
+            static const bool kMatUnfogged = std::getenv("OMC_MAT_UNFOGGED") != nullptr;
             if (kMatUnfogged && !m.material_refs.empty() && (m.materials[std::size_t(mat)].flags & 0x4u) != 0) mesh.draw_uvsrc[i] |= 4096;
             if (mesh.draw_uvsrc[i]) mesh.any_uvsrc = true;
         }
@@ -1710,15 +1775,15 @@ SceneRenderer::Mesh& SceneRenderer::ensure_mesh(const formats::Model& m, std::ui
         float spec_add = 0.0f;
         float spec_layer = 1.0f;
         float spec_alpha = 1.0f;
-        static const bool kSpecAlphaOne = std::getenv("SC2_SPEC_RGB_ALPHA_MULT") == nullptr;
-        if (!std::getenv("SC2_NO_SPEC_LAYER_BRIGHT"))
+        static const bool kSpecAlphaOne = std::getenv("OMC_SPEC_RGB_ALPHA_MULT") == nullptr;
+        if (!std::getenv("OMC_NO_SPEC_LAYER_BRIGHT"))
             for (const formats::M3Layer& L : m.materials[std::size_t(mat)].layers)
                 if (L.usage == "Specular" && !L.raw_record.empty()) {
                     spec_layer = L.anim.bright_mult;
                     spec_add = L.anim.midtone_offset;
                     if (!kSpecAlphaOne && L.word44 == 0 && !L.image_path.empty())
                         spec_alpha = (L.word36 & 0x20u) ? 1.0f : std::max(L.anim.bright_mult + L.anim.midtone_offset, 0.0f);
-                    if (spec_alpha != 1.0f && std::getenv("SC2_SPEC_ALPHA_TRACE")) {
+                    if (spec_alpha != 1.0f && std::getenv("OMC_SPEC_ALPHA_TRACE")) {
                         static std::set<std::string> told;
                         const formats::M3Material& tm = m.materials[std::size_t(mat)];
                         if (told.insert(tm.name).second)
@@ -1731,7 +1796,7 @@ SceneRenderer::Mesh& SceneRenderer::ensure_mesh(const formats::Model& m, std::ui
             mesh.draw_specm[i] = m.materials[std::size_t(mat)].spec_mult * spec_layer * spec_alpha - 1.0f;
             mesh.any_specm = true;
         }
-        if (spec_add != 0.0f && !std::getenv("SC2_NO_SPEC_LAYER_ADD")) {
+        if (spec_add != 0.0f && !std::getenv("OMC_NO_SPEC_LAYER_ADD")) {
             mesh.draw_specl[i] = {spec_layer, spec_add, m.materials[std::size_t(mat)].spec_mult * spec_alpha};
             if (mesh.draw_specm[i] == 0.0f) mesh.draw_specm[i] = 1e-6f;
             mesh.any_specm = true;
@@ -1746,16 +1811,16 @@ SceneRenderer::Mesh& SceneRenderer::ensure_mesh(const formats::Model& m, std::ui
             bool on = false;
             std::uint32_t mask = 0, value = 0;
             UndimRule() {
-                if (const char* e = std::getenv("SC2_SPEC_UNDIM")) {
+                if (const char* e = std::getenv("OMC_SPEC_UNDIM")) {
                     unsigned mk = 0, vl = 0;
                     if (std::sscanf(e, "%x:%x", &mk, &vl) == 2) { on = true; mask = mk; value = vl; }
                 }
             }
         } undim;
-        static const bool kDimAll = std::getenv("SC2_SPEC_DIM_ALL") != nullptr;
-        static const bool kDimFoliage = std::getenv("SC2_SPEC_DIM_FOLIAGE") != nullptr;
-        static const bool kUndim800000 = std::getenv("SC2_SPEC_DIM_800000") == nullptr;
-        static const bool kDim800000Any = std::getenv("SC2_SPEC_DIM_800000_ANY") != nullptr;
+        static const bool kDimAll = std::getenv("OMC_SPEC_DIM_ALL") != nullptr;
+        static const bool kDimFoliage = std::getenv("OMC_SPEC_DIM_FOLIAGE") != nullptr;
+        static const bool kUndim800000 = std::getenv("OMC_SPEC_DIM_800000") == nullptr;
+        static const bool kDim800000Any = std::getenv("OMC_SPEC_DIM_800000_ANY") != nullptr;
         const std::uint32_t mflags = m.materials[std::size_t(mat)].flags;
         const bool dim800000 = (mflags & 0x800000u) != 0 && (kDim800000Any || (mflags & 0x4u) != 0);
         const bool undim_rule = undim.on ? (mflags & undim.mask) == undim.value
@@ -1767,16 +1832,16 @@ SceneRenderer::Mesh& SceneRenderer::ensure_mesh(const formats::Model& m, std::ui
             if (dim > 0.001f) {
                 mesh.draw_specm[i] = m.materials[std::size_t(mat)].spec_mult * spec_layer * spec_alpha / dim - 1.0f;
                 mesh.any_specm = true;
-                static const bool kLevelledDimmed = std::getenv("SC2_SPEC_LEVELLED_DIMMED") != nullptr;
+                static const bool kLevelledDimmed = std::getenv("OMC_SPEC_LEVELLED_DIMMED") != nullptr;
                 if (!kLevelledDimmed && i < mesh.draw_specl.size() && mesh.draw_specl[i][1] != 0.0f)
                     mesh.draw_specl[i][2] = m.materials[std::size_t(mat)].spec_mult * spec_alpha / dim;
             }
         }
-        if (const char* k = std::getenv("SC2_PREPASS_SPEC_SCALE"); k && (m.materials[std::size_t(mat)].flags & 0x100u)) {
+        if (const char* k = std::getenv("OMC_PREPASS_SPEC_SCALE"); k && (m.materials[std::size_t(mat)].flags & 0x100u)) {
             mesh.draw_specm[i] = m.materials[std::size_t(mat)].spec_mult * spec_layer * float(std::atof(k)) - 1.0f;
             mesh.any_specm = true;
         }
-        if (const char* e = std::getenv("SC2_SPEC_SCALE_MATERIAL")) {
+        if (const char* e = std::getenv("OMC_SPEC_SCALE_MATERIAL")) {
             const std::string spec(e);
             const std::size_t colon = spec.rfind(':');
             const formats::M3Material& mm = m.materials[std::size_t(mat)];
@@ -1925,10 +1990,18 @@ SceneRenderer::TerrainSplat* SceneRenderer::ensure_splat(const formats::Model& m
         return img;
     };
     ts.diffuse_arr = upload_array(kTexColorSrgb, tw, th, 4, diff.data(), diff.size(), 0, true);
-    ts.weight_arr = upload_array(VK_FORMAT_R8_UNORM, m.splat_w, m.splat_h, 1,
-                                 m.splat_weights.data(),
-                                 m.splat_weights.size(),
-                                 uint32_t(m.splat_weights.size() / (size_t(m.splat_w) * m.splat_h)));
+    {
+        const size_t plane = size_t(m.splat_w) * m.splat_h;
+        const size_t planes = m.splat_weights.size() / plane;
+        std::vector<uint8_t> packed(plane * 4 * 3);
+        for (size_t q = 0; q < 3; ++q)
+            for (size_t c = 0; c < 4; ++c) {
+                const uint8_t* src = m.splat_weights.data() + std::min(q * 4 + c, planes - 1) * plane;
+                uint8_t* dst = packed.data() + q * plane * 4 + c;
+                for (size_t t = 0; t < plane; ++t) dst[t * 4] = src[t];
+            }
+        ts.weight_arr = upload_array(VK_FORMAT_R8G8B8A8_UNORM, m.splat_w, m.splat_h, 4, packed.data(), packed.size(), 3);
+    }
     {
         std::vector<uint8_t> nrm(size_t(tw) * th * 4 * kLayers);
         for (uint32_t L = 0; L < kLayers; ++L) {
@@ -1958,9 +2031,9 @@ SceneRenderer::TerrainSplat* SceneRenderer::ensure_splat(const formats::Model& m
     dsa.pSetLayouts = &sl;
     check(vkAllocateDescriptorSets(dev_, &dsa, &ts.set), "vkAllocateDescriptorSets(splat)");
     VkDescriptorImageInfo dii[3] = {
-        {sampler_.get(), ts.diffuse_arr.view.get(), VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL},
+        {splat_sampler(), ts.diffuse_arr.view.get(), VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL},
         {sampler_.get(), ts.weight_arr.view.get(), VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL},
-        {sampler_.get(), ts.normal_arr.view.get(), VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL}};
+        {splat_sampler(), ts.normal_arr.view.get(), VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL}};
     VkWriteDescriptorSet w[3];
     for (int s = 0; s < 3; ++s) {
         w[s] = vk_init<VkWriteDescriptorSet>(VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET);
@@ -1982,10 +2055,12 @@ SceneRenderer::SceneRenderer(VkPhysicalDevice pd, VkDevice dev, VkQueue queue,
       height_(height), ldr_format_(ldr_format), storage_(storage),
       texture_root_(std::move(texture_root)), tun_(tun) {
     tun_.light_dir = normalize(tun_.light_dir);
-    if (const char* sd = std::getenv("SC2_SHADOW_DIM")) {
+    if (const char* sd = std::getenv("OMC_SHADOW_DIM")) {
         const int v = std::atoi(sd);
         if (v >= 1024 && v <= 8192) tun_.shadow_dim = uint32_t(v);
     }
+    base_shadow_dim_ = tun_.shadow_dim;
+    if (tun_.gpu_timing) gpu_.init(pd_, dev_, gfx_family_, tun_.gpu_timing == 1 ? "gpu.frame" : "gpu.portrait", tun_.gpu_timing == 1);
 
     VkCommandPoolCreateInfo cpi{};
     cpi.sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO;
@@ -2018,7 +2093,7 @@ SceneRenderer::SceneRenderer(VkPhysicalDevice pd, VkDevice dev, VkQueue queue,
         VkFormatProperties sfp{};
         vkGetPhysicalDeviceFormatProperties(pd_, kDepthF, &sfp);
         const bool linear_ok = (sfp.optimalTilingFeatures & VK_FORMAT_FEATURE_SAMPLED_IMAGE_FILTER_LINEAR_BIT) != 0;
-        ssmi.magFilter = ssmi.minFilter = (linear_ok && !std::getenv("SC2_SHADOW_NEAREST")) ? VK_FILTER_LINEAR : VK_FILTER_NEAREST;
+        ssmi.magFilter = ssmi.minFilter = (linear_ok && !std::getenv("OMC_SHADOW_NEAREST")) ? VK_FILTER_LINEAR : VK_FILTER_NEAREST;
     }
     ssmi.compareEnable = VK_TRUE;
     ssmi.compareOp = VK_COMPARE_OP_LESS_OR_EQUAL;
@@ -2484,6 +2559,25 @@ SceneRenderer::SceneRenderer(VkPhysicalDevice pd, VkDevice dev, VkQueue queue,
         VkPipeline rawPipeline = VK_NULL_HANDLE;
         check(vkCreateGraphicsPipelines(dev_, VK_NULL_HANDLE, 1, &gpi, nullptr, &rawPipeline), "vkCreateGraphicsPipelines(splat)");
         splatPipeline_ = Unique<VkPipeline>(rawPipeline, [dev](VkPipeline p) { vkDestroyPipeline(dev, p, nullptr); });
+        if (tun_.live_quality) {
+            const uint32_t* q_code[2] = {kTerrainSplatQ1FragSpv, kTerrainSplatQ2FragSpv};
+            const std::size_t q_size[2] = {sizeof(kTerrainSplatQ1FragSpv), sizeof(kTerrainSplatQ2FragSpv)};
+            const float q_aniso[2] = {4.0f, 1.0f};
+            for (int q = 0; q < 2; ++q) {
+                splatfsQ_[q] = make_shader(dev_, q_code[q], q_size[q]);
+                stages[1].module = splatfsQ_[q].get();
+                VkPipeline rawQ = VK_NULL_HANDLE;
+                check(vkCreateGraphicsPipelines(dev_, VK_NULL_HANDLE, 1, &gpi, nullptr, &rawQ), "vkCreateGraphicsPipelines(splat quality)");
+                splatPipelineQ_[q] = Unique<VkPipeline>(rawQ, [dev](VkPipeline p) { vkDestroyPipeline(dev, p, nullptr); });
+                VkSamplerCreateInfo qsi = smi;
+                qsi.anisotropyEnable = (smi.anisotropyEnable && q_aniso[q] > 1.0f) ? VK_TRUE : VK_FALSE;
+                qsi.maxAnisotropy = qsi.anisotropyEnable ? std::min(smi.maxAnisotropy, q_aniso[q]) : 1.0f;
+                VkSampler rawS = VK_NULL_HANDLE;
+                check(vkCreateSampler(dev_, &qsi, nullptr, &rawS), "vkCreateSampler(splat quality)");
+                splatSamplerQ_[q] = Unique<VkSampler>(rawS, [dev](VkSampler s) { vkDestroySampler(dev, s, nullptr); });
+            }
+            stages[1].module = splatfs_.get();
+        }
 
         VkDescriptorPoolSize sp{VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 12};
         VkDescriptorPoolCreateInfo spci{};
@@ -2566,7 +2660,7 @@ SceneRenderer::SceneRenderer(VkPhysicalDevice pd, VkDevice dev, VkQueue queue,
         srs.depthBiasEnable = VK_TRUE;
         srs.depthBiasConstantFactor = tun_.raster_const;
         srs.depthBiasSlopeFactor = tun_.raster_slope;
-        if (const char* sr = std::getenv("SC2_SHADOW_RASTER")) {
+        if (const char* sr = std::getenv("OMC_SHADOW_RASTER")) {
             float rc = tun_.raster_const, rs = tun_.raster_slope;
             if (std::sscanf(sr, "%f:%f", &rc, &rs) >= 1) {
                 srs.depthBiasConstantFactor = rc;
@@ -2588,6 +2682,7 @@ SceneRenderer::SceneRenderer(VkPhysicalDevice pd, VkDevice dev, VkQueue queue,
         sgpi.pVertexInputState = &vin;
         sgpi.pInputAssemblyState = &ia;
         sgpi.pViewportState = &svps;
+        sgpi.pDynamicState = &dyn;
         sgpi.pRasterizationState = &srs;
         sgpi.pMultisampleState = &ms;
         sgpi.pDepthStencilState = &sds;
@@ -2909,8 +3004,8 @@ void SceneRenderer::prepare(const std::vector<const SceneInstance*>& live, const
             break;
         }
     frame_lights_.clear();
-    const bool env_light_trace = std::getenv("SC2_LIGHT_TRACE") != nullptr;
-    const bool env_light_no_scale = std::getenv("SC2_LIGHT_NO_SCALE") != nullptr;
+    const bool env_light_trace = std::getenv("OMC_LIGHT_TRACE") != nullptr;
+    const bool env_light_no_scale = std::getenv("OMC_LIGHT_NO_SCALE") != nullptr;
     std::vector<const SceneInstance*> lit(live.begin(), live.end());
     if (light_only) lit.insert(lit.end(), light_only->begin(), light_only->end());
     for (const SceneInstance* instp : lit) {
@@ -2951,7 +3046,7 @@ void SceneRenderer::prepare(const std::vector<const SceneInstance*>& live, const
             const Mat4 mb = (L.bone >= 0 && size_t(L.bone) < bw.size()) ? bw[size_t(L.bone)] : inst.world;
             FrameLight f;
             f.pos = {mb.m[12], mb.m[13], mb.m[14]};
-            static const float kLightGain = std::getenv("SC2_LIGHT_GAIN") ? float(std::atof(std::getenv("SC2_LIGHT_GAIN"))) : 1.0f;
+            static const float kLightGain = std::getenv("OMC_LIGHT_GAIN") ? float(std::atof(std::getenv("OMC_LIGHT_GAIN"))) : 1.0f;
             intensity *= kLightGain;
             f.col = {L.color[0] * intensity, L.color[1] * intensity, L.color[2] * intensity};
             float lscale = 1.0f;
@@ -2969,7 +3064,7 @@ void SceneRenderer::prepare(const std::vector<const SceneInstance*>& live, const
                 const float zl = std::sqrt(z.x * z.x + z.y * z.y + z.z * z.z);
                 if (zl > 1e-6f) {
                     f.spot_dir = {z.x / zl, z.y / zl, z.z / zl};
-                    static const float kCone = std::getenv("SC2_SPOT_CONE_FACTOR") ? float(std::atof(std::getenv("SC2_SPOT_CONE_FACTOR"))) : 0.5f;
+                    static const float kCone = std::getenv("OMC_SPOT_CONE_FACTOR") ? float(std::atof(std::getenv("OMC_SPOT_CONE_FACTOR"))) : 0.5f;
                     f.cos_outer = std::cos(std::min(kCone * L.falloff, 1.5607f));
                     const float ci = std::cos(std::min(kCone * std::min(L.hotspot, L.falloff), 1.5607f));
                     f.cone_scale = 1.0f / std::max(ci - f.cos_outer, 1e-3f);
@@ -3039,7 +3134,7 @@ void SceneRenderer::prepare(const std::vector<const SceneInstance*>& live, const
 
 static float cutout_threshold(const formats::M3Material& mm) {
     const float t = float(mm.cutout_thresh) / 255.0f;
-    static const bool kRaw = std::getenv("SC2_CUTOUT_RAW_ALPHA") != nullptr;
+    static const bool kRaw = std::getenv("OMC_CUTOUT_RAW_ALPHA") != nullptr;
     if (kRaw) return t;
     const formats::M3Layer* diff = nullptr;
     const formats::M3Layer* mask = nullptr;
@@ -3047,7 +3142,7 @@ static float cutout_threshold(const formats::M3Material& mm) {
         if (ly.usage == "Diffuse") diff = &ly;
         else if (ly.usage == "AlphaMask") mask = &ly;
     }
-    static const bool kOwnOnly = std::getenv("SC2_CUTOUT_DIFFUSE_ALPHA") != nullptr;
+    static const bool kOwnOnly = std::getenv("OMC_CUTOUT_DIFFUSE_ALPHA") != nullptr;
     if (!diff || !mask || mask->raw_record.empty() || mask->word44 < 2 || mask->word44 > 5 || mask->image_path.empty()) return t;
     if (kOwnOnly) {
         if (mask->word44 != 2 || mask->image_path.size() != diff->image_path.size()) return t;
@@ -3060,7 +3155,7 @@ static float cutout_threshold(const formats::M3Material& mm) {
 }
 
 static int cutout_mask_channel(const formats::M3Material& mm) {
-    static const bool kOld = std::getenv("SC2_CUTOUT_DIFFUSE_ALPHA") != nullptr;
+    static const bool kOld = std::getenv("OMC_CUTOUT_DIFFUSE_ALPHA") != nullptr;
     if (kOld || mm.blend_mode != formats::kBlendOpaque || mm.cutout_thresh == 0) return 0;
     const formats::M3Layer* diff = nullptr;
     const formats::M3Layer* mask = nullptr;
@@ -3072,7 +3167,7 @@ static int cutout_mask_channel(const formats::M3Material& mm) {
     bool same = diff && mask->word44 == 2 && mask->image_path.size() == diff->image_path.size();
     for (std::size_t i = 0; same && i < mask->image_path.size(); ++i)
         same = std::tolower(static_cast<unsigned char>(mask->image_path[i])) == std::tolower(static_cast<unsigned char>(diff->image_path[i]));
-    static const bool kTrace = std::getenv("SC2_CUTOUT_TRACE") != nullptr;
+    static const bool kTrace = std::getenv("OMC_CUTOUT_TRACE") != nullptr;
     if (kTrace && !same) std::fprintf(stderr, "[cutmask] '%s' channel %d thresh %u mask '%s'\n", mm.name.c_str(), int(mask->word44) - 1, unsigned(mm.cutout_thresh), mask->image_path.c_str());
     return same ? 0 : int(mask->word44) - 1;
 }
@@ -3080,24 +3175,27 @@ static int cutout_mask_channel(const formats::M3Material& mm) {
 void SceneRenderer::record(VkCommandBuffer cmd, const std::vector<const SceneInstance*>& live,
                            const Camera& cam, const std::vector<ParticleVertex>& pverts,
                            const std::vector<ParticleGroup>& pgroups) {
-    SC2_PROF_SCOPE("SceneRenderer::record");
-    const bool env_alpha_mask_no_invert = std::getenv("SC2_ALPHA_MASK_NO_INVERT") != nullptr;
-    const char* const env_specm_trace = std::getenv("SC2_SPECM_TRACE");
-    const bool env_no_envio = std::getenv("SC2_NO_ENVIO") != nullptr;
-    const char* const env_draw_trace = std::getenv("SC2_DRAW_TRACE");
-    const bool env_ground_casts = std::getenv("SC2_GROUND_CASTS") != nullptr;
-    const bool env_no_ground_doodad_shadow = std::getenv("SC2_NO_GROUND_DOODAD_SHADOW") != nullptr;
-    const char* const env_ao_uv = std::getenv("SC2_AO_UV");
-    const bool env_no_blended = std::getenv("SC2_NO_BLENDED") != nullptr;
-    const bool env_no_unshaded = std::getenv("SC2_NO_UNSHADED") != nullptr;
-    const bool env_no_depth_prepass = std::getenv("SC2_NO_DEPTH_PREPASS") != nullptr;
+    OMC_PROF_SCOPE("SceneRenderer::record");
+    if (tun_.live_quality) sync_live_quality();
+    const bool env_alpha_mask_no_invert = std::getenv("OMC_ALPHA_MASK_NO_INVERT") != nullptr;
+    const char* const env_specm_trace = std::getenv("OMC_SPECM_TRACE");
+    const bool env_no_envio = std::getenv("OMC_NO_ENVIO") != nullptr;
+    const char* const env_draw_trace = std::getenv("OMC_DRAW_TRACE");
+    const bool env_ground_casts = std::getenv("OMC_GROUND_CASTS") != nullptr;
+    const bool env_no_ground_doodad_shadow = std::getenv("OMC_NO_GROUND_DOODAD_SHADOW") != nullptr;
+    const char* const env_ao_uv = std::getenv("OMC_AO_UV");
+    const bool env_no_blended = std::getenv("OMC_NO_BLENDED") != nullptr;
+    const bool env_no_unshaded = std::getenv("OMC_NO_UNSHADED") != nullptr;
+    const bool env_no_depth_prepass = std::getenv("OMC_NO_DEPTH_PREPASS") != nullptr;
+    gpu_.begin(cmd);
     flush_pending_fog(cmd);
+    gpu_.mark(cmd, "gpu.upload");
     Mat4 view_proj = cam.view_proj(float(width_) / float(height_));
-    static const bool kSsaoEnv = std::getenv("SC2_SSAO") != nullptr;
+    static const bool kSsaoEnv = std::getenv("OMC_SSAO") != nullptr;
     const bool ssao_on = kSsaoEnv && tun_.ao_radius > 0.0f && !cam.transparent_clear && !cam.orthographic && tun_.gamma_space && tun_.rig.present;
 
     Vec3 shadow_dir = tun_.light_dir;
-    const bool rig_swap = std::getenv("SC2_RIG_SWAP") && tun_.rig.present && tun_.rig.fill.present;
+    const bool rig_swap = std::getenv("OMC_RIG_SWAP") && tun_.rig.present && tun_.rig.fill.present;
     if (rig_swap) {
         const float sgn = dot(tun_.light_dir, tun_.rig.key.dir) < 0.0f ? -1.0f : 1.0f;
         shadow_dir = normalize(Vec3{sgn * tun_.rig.fill.dir.x, sgn * tun_.rig.fill.dir.y, sgn * tun_.rig.fill.dir.z});
@@ -3105,7 +3203,7 @@ void SceneRenderer::record(VkCommandBuffer cmd, const std::vector<const SceneIns
     const ShadowBox sbox =
         fit_shadow_ortho(aabb_min_, aabb_max_, cam, float(width_) / float(height_), shadow_dir,
                          tun_.fit_pad, tun_.shadow_dim, tun_.shadow_clip, tun_.camera_fit_shadow);
-    if (std::getenv("SC2_LIGHT_TRACE"))
+    if (std::getenv("OMC_LIGHT_TRACE"))
         std::fprintf(stderr, "shadow fit: aabb (%.1f,%.1f,%.1f)-(%.1f,%.1f,%.1f) box x[%.1f,%.1f] y[%.1f,%.1f] z[%.1f,%.1f] texel %.3f clip %.1f camfit %d\n",
                      aabb_min_.x, aabb_min_.y, aabb_min_.z, aabb_max_.x, aabb_max_.y, aabb_max_.z, sbox.xmn, sbox.xmx, sbox.ymn, sbox.ymx,
                      sbox.znear, sbox.zfar, double(sbox.texel(tun_.shadow_dim)), double(tun_.shadow_clip), int(tun_.camera_fit_shadow));
@@ -3118,32 +3216,33 @@ void SceneRenderer::record(VkCommandBuffer cmd, const std::vector<const SceneIns
     std::memcpy(globals.lightVP, lightVP.m.data(), 64);
     globals.shadowParams[0] = 1.0f / float(tun_.shadow_dim);
     globals.shadowParams[1] = tun_.depth_bias;
-    if (const char* sb = std::getenv("SC2_SHADOW_BIAS")) globals.shadowParams[1] = float(std::atof(sb));
+    if (const char* sb = std::getenv("OMC_SHADOW_BIAS")) globals.shadowParams[1] = float(std::atof(sb));
     {
-        const char* sw = std::getenv("SC2_SHADOW_BIAS_WORLD");
+        const char* sw = std::getenv("OMC_SHADOW_BIAS_WORLD");
         const float world_bias = sw ? float(std::atof(sw)) : (tun_.camera_fit_shadow ? 0.04f : 0.0f);
-        if (world_bias > 0.0f && sbox.zfar > sbox.znear && !std::getenv("SC2_SHADOW_BIAS")) globals.shadowParams[1] = world_bias / (sbox.zfar - sbox.znear);
+        if (world_bias > 0.0f && sbox.zfar > sbox.znear && !std::getenv("OMC_SHADOW_BIAS")) globals.shadowParams[1] = world_bias / (sbox.zfar - sbox.znear);
     }
-    globals.shadowParams[2] = std::getenv("SC2_NO_SHADOW") ? 0.0f : tun_.shadow_strength;
+    const ShadowQuality shadow_q = tun_.live_quality ? render_quality().shadows : ShadowQuality::Full;
+    globals.shadowParams[2] = (std::getenv("OMC_NO_SHADOW") || shadow_q == ShadowQuality::Off) ? 0.0f : tun_.shadow_strength;
     globals.shadowParams[3] = tun_.gloss;
     globals.eyePos[0] = cam.eye.x;
     globals.eyePos[1] = cam.eye.y;
     globals.eyePos[2] = cam.eye.z;
-    globals.eyePos[3] = std::getenv("SC2_NO_SPEC") ? 0.0f : tun_.spec_strength;
+    globals.eyePos[3] = std::getenv("OMC_NO_SPEC") ? 0.0f : tun_.spec_strength;
     globals.lightDir[0] = shadow_dir.x;
     globals.lightDir[1] = shadow_dir.y;
     globals.lightDir[2] = shadow_dir.z;
     globals.lightDir[3] = 0.0f;
     globals.lightDir[3] = tun_.gamma_space ? 1.0f : 0.0f;
-    if (const char* dl = std::getenv("SC2_DBL_LAMBERT")) globals.lightDir[3] = std::string(dl) == "all" ? 2.0f : std::string(dl) == "off" ? 0.0f : 1.0f;
-    if (std::getenv("SC2_SPEC_GATE_NL0")) globals.lightDir[3] += 0.25f;
-    if (std::getenv("SC2_PROJ_MODEL_LIGHT")) globals.lightDir[3] += 0.5f;
-    if (std::getenv("SC2_SPEC_LAYER_ALPHA")) globals.lightDir[3] += 0.125f;
+    if (const char* dl = std::getenv("OMC_DBL_LAMBERT")) globals.lightDir[3] = std::string(dl) == "all" ? 2.0f : std::string(dl) == "off" ? 0.0f : 1.0f;
+    if (std::getenv("OMC_SPEC_GATE_NL0")) globals.lightDir[3] += 0.25f;
+    if (std::getenv("OMC_PROJ_MODEL_LIGHT")) globals.lightDir[3] += 0.5f;
+    if (std::getenv("OMC_SPEC_LAYER_ALPHA")) globals.lightDir[3] += 0.125f;
     globals.rigAmbient[0] = tun_.rig.ambient[0];
     globals.rigAmbient[1] = tun_.rig.ambient[1];
     globals.rigAmbient[2] = tun_.rig.ambient[2];
     globals.rigAmbient[3] = tun_.rig.present ? 1.0f : 0.0f;
-    if (std::getenv("SC2_LIGHT_TRACE"))
+    if (std::getenv("OMC_LIGHT_TRACE"))
         std::fprintf(stderr, "rig ambient=(%.3f,%.3f,%.3f) HDRAmbientMultiplier %.3f bloom threshold %.3f gain %.3f scale %.3f\n", double(tun_.rig.ambient[0]),
                      double(tun_.rig.ambient[1]), double(tun_.rig.ambient[2]), double(tun_.hdr_ambient_mult), double(tun_.bloom_threshold), double(tun_.bloom_gain), double(tun_.bloom_scale));
     {
@@ -3153,9 +3252,9 @@ void SceneRenderer::record(VkCommandBuffer cmd, const std::vector<const SceneIns
             globals.rigDir[i][0] = ls[i]->dir.x;
             globals.rigDir[i][1] = ls[i]->dir.y;
             globals.rigDir[i][2] = ls[i]->dir.z;
-            globals.rigDir[i][3] = (ls[i]->present && !(i > 0 && std::getenv("SC2_NO_FILLBACK"))) ? 1.0f : 0.0f;
+            globals.rigDir[i][3] = (ls[i]->present && !(i > 0 && std::getenv("OMC_NO_FILLBACK"))) ? 1.0f : 0.0f;
             for (int c = 0; c < 3; ++c) globals.rigColor[i][c] = ls[i]->color[c];
-            if (const char* fb = i > 0 ? std::getenv("SC2_FILLBACK") : nullptr) {
+            if (const char* fb = i > 0 ? std::getenv("OMC_FILLBACK") : nullptr) {
                 const std::string mode(fb);
                 if (mode == "neg" || mode == "negxy") { globals.rigDir[i][0] = -ls[i]->dir.x; globals.rigDir[i][1] = -ls[i]->dir.y; }
                 if (mode == "neg" || mode == "negz") globals.rigDir[i][2] = -ls[i]->dir.z;
@@ -3163,11 +3262,11 @@ void SceneRenderer::record(VkCommandBuffer cmd, const std::vector<const SceneIns
                     for (int c = 0; c < 3; ++c) globals.rigColor[i][c] *= float(std::atof(fb));
             }
             globals.rigColor[i][3] = 0.0f;
-            if (std::getenv("SC2_LIGHT_TRACE"))
+            if (std::getenv("OMC_LIGHT_TRACE"))
                 std::fprintf(stderr, "rig[%d] present=%d travel=(%.3f,%.3f,%.3f) colour=(%.3f,%.3f,%.3f)\n", i, int(ls[i]->present), ls[i]->dir.x, ls[i]->dir.y,
                              ls[i]->dir.z, ls[i]->color[0], ls[i]->color[1], ls[i]->color[2]);
         }
-        globals.rigParams[0] = std::getenv("SC2_SHADOW_FLOOR") ? float(std::atof(std::getenv("SC2_SHADOW_FLOOR"))) : tun_.rig_shadow_floor;
+        globals.rigParams[0] = std::getenv("OMC_SHADOW_FLOOR") ? float(std::atof(std::getenv("OMC_SHADOW_FLOOR"))) : tun_.rig_shadow_floor;
         globals.rigParams[1] = tun_.hdr_ambient_mult;
         globals.rigParams[2] = tun_.hdr_diffuse_mult;
         globals.rigParams[3] = tun_.hdr_emis_mult;
@@ -3176,10 +3275,10 @@ void SceneRenderer::record(VkCommandBuffer cmd, const std::vector<const SceneIns
         for (int i = 0; i < 3; ++i) {
             for (int c = 0; c < 3; ++c) globals.rigSpec[i][c] = ls[i]->spec[c] * (tun_.gamma_space ? tun_.hdr_spec_mult : 1.0f);
             globals.rigSpec[i][3] = 0.0f;
-            if (std::getenv("SC2_LIGHT_TRACE"))
+            if (std::getenv("OMC_LIGHT_TRACE"))
                 std::fprintf(stderr, "rig[%d] spec=(%.3f,%.3f,%.3f)\n", i, globals.rigSpec[i][0], globals.rigSpec[i][1], globals.rigSpec[i][2]);
         }
-        static const bool spec_all_lights = std::getenv("SC2_SPEC_ALL_LIGHTS") != nullptr;
+        static const bool spec_all_lights = std::getenv("OMC_SPEC_ALL_LIGHTS") != nullptr;
         globals.rigSpec[0][3] = spec_all_lights ? 1.0f : 0.0f;
     }
     for (const SceneInstance* p : live)
@@ -3199,7 +3298,7 @@ void SceneRenderer::record(VkCommandBuffer cmd, const std::vector<const SceneIns
     globals.fogExtent[0] = fog_world_w_;
     globals.fogExtent[1] = fog_world_h_;
     globals.fogExtent[2] = fog_present_ && fog_in_scene() ? 1.0f : 0.0f;
-    static const float kTeamPow = std::getenv("SC2_TEAM_COLOR_POW") ? float(std::atof(std::getenv("SC2_TEAM_COLOR_POW"))) : 0.0f;
+    static const float kTeamPow = std::getenv("OMC_TEAM_COLOR_POW") ? float(std::atof(std::getenv("OMC_TEAM_COLOR_POW"))) : 0.0f;
     globals.fogExtent[3] = kTeamPow;
     {
         std::vector<FrameLight> fl = frame_lights_;
@@ -3209,7 +3308,7 @@ void SceneRenderer::record(VkCommandBuffer cmd, const std::vector<const SceneIns
             return std::sqrt(da) - a.att_far < std::sqrt(db) - b.att_far;
         });
         const size_t n = std::min<size_t>(fl.size(), kMaxFrameLights);
-        if (std::getenv("SC2_LIGHT_TRACE")) {
+        if (std::getenv("OMC_LIGHT_TRACE")) {
             const auto reach = [&](const FrameLight& a) {
                 return std::sqrt((a.pos.x - cam.center.x) * (a.pos.x - cam.center.x) + (a.pos.y - cam.center.y) * (a.pos.y - cam.center.y)) - a.att_far;
             };
@@ -3222,51 +3321,53 @@ void SceneRenderer::record(VkCommandBuffer cmd, const std::vector<const SceneIns
             globals.lightSpot[i][0] = fl[i].spot_dir.x; globals.lightSpot[i][1] = fl[i].spot_dir.y; globals.lightSpot[i][2] = fl[i].spot_dir.z;
             globals.lightSpot[i][3] = fl[i].cos_outer;
             globals.lightCone[i][0] = fl[i].cone_scale;
-            globals.lightCone[i][1] = fl[i].cone_scale > 0.0f && !std::getenv("SC2_NO_SPOT_CONE") ? 1.0f : 0.0f;
+            globals.lightCone[i][1] = fl[i].cone_scale > 0.0f && !std::getenv("OMC_NO_SPOT_CONE") ? 1.0f : 0.0f;
             globals.lightCone[i][2] = globals.lightCone[i][3] = 0.0f;
         }
-        globals.lightMeta[0] = std::getenv("SC2_NO_POINTLIGHTS") ? 0.0f : float(n);
-        globals.lightMeta[1] = std::getenv("SC2_LIGHT_FALLOFF") ? float(std::atoi(std::getenv("SC2_LIGHT_FALLOFF"))) : 0.0f;
-        globals.lightMeta[2] = std::getenv("SC2_EMIS_LINEAR") ? 0.0f : 1.0f;
-        globals.lightMeta[3] = std::getenv("SC2_POINT_SPEC") ? float(std::atof(std::getenv("SC2_POINT_SPEC"))) : 0.0f;
+        globals.lightMeta[0] = std::getenv("OMC_NO_POINTLIGHTS") ? 0.0f : float(n);
+        globals.lightMeta[1] = std::getenv("OMC_LIGHT_FALLOFF") ? float(std::atoi(std::getenv("OMC_LIGHT_FALLOFF"))) : 0.0f;
+        globals.lightMeta[2] = std::getenv("OMC_EMIS_LINEAR") ? 0.0f : 1.0f;
+        globals.lightMeta[3] = std::getenv("OMC_POINT_SPEC") ? float(std::atof(std::getenv("OMC_POINT_SPEC"))) : 0.0f;
         lights_drawn_ = n;
         lights_seen_ = frame_lights_.size();
     }
     globals.screen[0] = float(width_);
     globals.screen[1] = float(height_);
-    globals.screen[2] = (!cam.transparent_clear && !std::getenv("SC2_NO_GLOW_MASK") && std::getenv("SC2_EMISSIVE_SHARE")) ? 1.0f : 0.0f;
-    if (const char* nv = std::getenv("SC2_SHOW_NV")) globals.screen[2] = std::atoi(nv) == 2 ? 8.0f : 7.0f;
-    if (std::getenv("SC2_SHOW_COVER")) globals.screen[2] = 5.0f;
+    globals.screen[2] = (!cam.transparent_clear && !std::getenv("OMC_NO_GLOW_MASK") && std::getenv("OMC_EMISSIVE_SHARE")) ? 1.0f : 0.0f;
+    if (const char* nv = std::getenv("OMC_SHOW_NV")) globals.screen[2] = std::atoi(nv) == 2 ? 8.0f : 7.0f;
+    if (std::getenv("OMC_SHOW_COVER")) globals.screen[2] = 5.0f;
     globals.screen[3] = ssao_on ? 1.0f : 0.0f;
-    globals.creepParams[2] = std::getenv("SC2_WATER_NO_DEPTH_TINT") ? 0.0f : cam.znear;
+    globals.creepParams[2] = std::getenv("OMC_WATER_NO_DEPTH_TINT") ? 0.0f : cam.znear;
     globals.creepParams[3] = cam.zfar;
     {
         const float world_per_texel = (sbox.xmx - sbox.xmn) / float(tun_.shadow_dim);
-        static const float kPenScale = std::getenv("SC2_SHADOW_PENUMBRA_SCALE") ? float(std::atof(std::getenv("SC2_SHADOW_PENUMBRA_SCALE"))) : 1.0f;
+        static const float kPenScale = std::getenv("OMC_SHADOW_PENUMBRA_SCALE") ? float(std::atof(std::getenv("OMC_SHADOW_PENUMBRA_SCALE"))) : 1.0f;
         float r = (tun_.shadow_penumbra > 0.0f && world_per_texel > 1e-6f) ? kPenScale * tun_.shadow_penumbra / world_per_texel : 0.0f;
         if (r > 0.0f) r = std::min(32.0f, std::max(1.0f, r));
-        if (const char* sp = std::getenv("SC2_SHADOW_PCF")) r = float(std::atof(sp));
-        if (const char* sw = std::getenv("SC2_SHADOW_PENUMBRA_WORLD"); sw && world_per_texel > 1e-6f) r = float(std::atof(sw)) / world_per_texel;
-        if (std::getenv("SC2_LIGHT_TRACE")) {
+        if (const char* sp = std::getenv("OMC_SHADOW_PCF")) r = float(std::atof(sp));
+        if (const char* sw = std::getenv("OMC_SHADOW_PENUMBRA_WORLD"); sw && world_per_texel > 1e-6f) r = float(std::atof(sw)) / world_per_texel;
+        if (std::getenv("OMC_LIGHT_TRACE")) {
             static int told = 0;
             if (told++ < 2)
                 std::fprintf(stderr, "shadow kernel: authored penumbra %.4f, world per texel %.5f (box %.2f over %u), radius %.2f texels = %.3f world\n",
                              double(tun_.shadow_penumbra), double(world_per_texel), double(sbox.xmx - sbox.xmn), unsigned(tun_.shadow_dim), double(r), double(r * world_per_texel));
         }
         globals.shadowExtra[0] = r;
-        globals.shadowExtra[1] = std::getenv("SC2_SHADOW_NO_SLOPE_BIAS") ? 0.0f : 1.0f;
-        globals.shadowExtra[2] = std::getenv("SC2_TEAM_EMIS_POW") ? float(std::atof(std::getenv("SC2_TEAM_EMIS_POW"))) : 0.0f;
+        globals.shadowExtra[1] = std::getenv("OMC_SHADOW_NO_SLOPE_BIAS") ? 0.0f : 1.0f;
+        globals.shadowExtra[2] = std::getenv("OMC_TEAM_EMIS_POW") ? float(std::atof(std::getenv("OMC_TEAM_EMIS_POW"))) : 0.0f;
         globals.heightFog[0] = tun_.fog_density;
         globals.heightFog[1] = tun_.fog_falloff;
         globals.heightFog[2] = tun_.fog_start;
         globals.heightFog[3] = tun_.height_fog ? (tun_.gamma_space ? 2.0f : 1.0f) : 0.0f;
         for (int k = 0; k < 3; ++k) globals.heightFogColor[k] = tun_.fog_color[k];
+        static const bool kAddFogOld = std::getenv("OMC_ADD_FOG_OLD") != nullptr;
+        globals.heightFogColor[3] = kAddFogOld ? 0.0f : 1.0f;
         globals.creepParams[0] = tun_.creep_spec_mult;
         globals.creepParams[1] = tun_.creep_spec_exp;
-        globals.terrainColorize[0] = tun_.terrain_diffuse * (std::getenv("SC2_HDR_DIFFUSE_ALL") ? tun_.hdr_diffuse_mult : 1.0f);
-        globals.terrainColorize[1] = std::getenv("SC2_NO_SPEC") ? 0.0f : tun_.terrain_spec;
-        if (const char* tg = std::getenv("SC2_TERRAIN_SPEC_GAIN")) globals.terrainColorize[1] *= float(std::atof(tg));
-    if (const char* ts = std::getenv("SC2_TERRAIN_SPEC")) {
+        globals.terrainColorize[0] = tun_.terrain_diffuse * (std::getenv("OMC_HDR_DIFFUSE_ALL") ? tun_.hdr_diffuse_mult : 1.0f);
+        globals.terrainColorize[1] = std::getenv("OMC_NO_SPEC") ? 0.0f : tun_.terrain_spec;
+        if (const char* tg = std::getenv("OMC_TERRAIN_SPEC_GAIN")) globals.terrainColorize[1] *= float(std::atof(tg));
+    if (const char* ts = std::getenv("OMC_TERRAIN_SPEC")) {
         const std::string mode(ts);
         if (mode == "off") {
             globals.terrainColorize[1] = 0.0f;
@@ -3275,30 +3376,38 @@ void SceneRenderer::record(VkCommandBuffer cmd, const std::vector<const SceneIns
         }
     }
     if (tun_.gamma_space && tun_.hdr_spec_mult > 0.0f && globals.terrainColorize[1] != 0.0f &&
-        !(std::getenv("SC2_TERRAIN_SPEC") && (std::string(std::getenv("SC2_TERRAIN_SPEC")) == "hdr" || std::string(std::getenv("SC2_TERRAIN_SPEC")) == "nohdr")))
+        !(std::getenv("OMC_TERRAIN_SPEC") && (std::string(std::getenv("OMC_TERRAIN_SPEC")) == "hdr" || std::string(std::getenv("OMC_TERRAIN_SPEC")) == "nohdr")))
         globals.terrainColorize[1] /= tun_.hdr_spec_mult;
-    const bool terrain_spec_undimmed = !(std::getenv("SC2_TERRAIN_SPEC") && std::string(std::getenv("SC2_TERRAIN_SPEC")) == "dimmed");
-    if (std::getenv("SC2_LIGHT_TRACE")) {
+    const bool terrain_spec_undimmed = !(std::getenv("OMC_TERRAIN_SPEC") && std::string(std::getenv("OMC_TERRAIN_SPEC")) == "dimmed");
+    if (std::getenv("OMC_LIGHT_TRACE")) {
         std::fprintf(stderr, "terrain: HDRDiffuse %.3f HDRSpecular %.3f SpecularExp %.2f | light HDRSpecMultiplier %.3f HDRDiffuseMultiplier %.3f\n", tun_.terrain_diffuse,
                      tun_.terrain_spec, tun_.terrain_spec_exp, tun_.hdr_spec_mult, tun_.hdr_diffuse_mult);
     }
         globals.terrainColorize[2] = tun_.terrain_spec_exp;
-        if (const char* te = std::getenv("SC2_TERRAIN_SPEC_EXP_GAIN")) globals.terrainColorize[2] *= float(std::atof(te));
+        if (const char* te = std::getenv("OMC_TERRAIN_SPEC_EXP_GAIN")) globals.terrainColorize[2] *= float(std::atof(te));
         globals.terrainColorize[3] = terrain_spec_undimmed ? 1.0f : 0.0f;
         globals.terrainColorize2[0] = tun_.col_contrast;
         globals.terrainColorize2[1] = tun_.col_blend > 0.0f ? 1.0f : 0.0f;
-        globals.terrainColorize2[2] = std::getenv("SC2_TERRAIN_BUMP") ? float(std::atof(std::getenv("SC2_TERRAIN_BUMP"))) : kTerrainBumpGain;
-        globals.terrainColorize2[3] = std::getenv("SC2_TERRAIN_NORMAL_LOD") ? float(std::atof(std::getenv("SC2_TERRAIN_NORMAL_LOD"))) : 0.0f;
+        globals.terrainColorize2[2] = std::getenv("OMC_TERRAIN_BUMP") ? float(std::atof(std::getenv("OMC_TERRAIN_BUMP"))) : kTerrainBumpGain;
+        globals.terrainColorize2[3] = std::getenv("OMC_TERRAIN_NORMAL_LOD") ? float(std::atof(std::getenv("OMC_TERRAIN_NORMAL_LOD"))) : 0.0f;
     }
     std::vector<FxRecord> fxrecs(1, FxRecord{});
     std::vector<uint32_t> fx_index(live.size(), 0u);
     bool need_copy = false;
     bool water_depth = false;
-    static const bool kWaterDepthTint = std::getenv("SC2_WATER_NO_DEPTH_TINT") == nullptr;
+    static const bool kWaterDepthTint = std::getenv("OMC_WATER_NO_DEPTH_TINT") == nullptr;
+    static const bool kCloakLightOld = std::getenv("OMC_CLOAK_LIGHT_OLD") != nullptr;
+    auto cloak_row = [](InstanceFX& f) {
+        if (kCloakLightOld || f.kind != FxKind::Cloak) return;
+        for (int k = 0; k < 3; ++k) f.cloak[k] = f.p0[k];
+        f.cloak[3] = 1.0f;
+        for (float& v : f.p0) v = 0.0f;
+    };
     for (size_t i = 0; i < live.size(); ++i) {
-        const InstanceFX& f = live[i]->fx;
+        InstanceFX f = live[i]->fx;
         if (!need_copy && live[i]->model && live[i]->model->vertex_count && ensure_mesh(*live[i]->model, live[i]->mesh_version).any_displace) need_copy = true;
         if (f.is_default()) continue;
+        cloak_row(f);
         fx_index[i] = uint32_t(fxrecs.size());
         fxrecs.push_back(fx_record_of(f));
         if (f.kind == FxKind::Cloak || f.kind == FxKind::Water) need_copy = true;
@@ -3364,6 +3473,7 @@ void SceneRenderer::record(VkCommandBuffer cmd, const std::vector<const SceneIns
             }
             const bool has_fb = fb_code < 0.0f;
             float e2[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+            float e2f[4] = {0.0f, 0.0f, 0.0f, 0.0f};
             bool has_e2 = false;
             if (d < mesh.draw_tex.size() && mesh.draw_tex[d][10] != kDefaultEmissive) {
                 const int emi = mesh.draws[d].material;
@@ -3385,6 +3495,15 @@ void SceneRenderer::record(VkCommandBuffer cmd, const std::vector<const SceneIns
                         e2[2] = br * em.emis_mult;
                         e2[3] = float(em.emis2_op + 16u * sel + (L.word40 == 1 ? 256u : 0u));
                         has_e2 = true;
+                        static const bool kE2FresOld = std::getenv("OMC_EMIS2_FRESNEL_OLD") != nullptr;
+                        std::uint32_t fm = 0;
+                        float fe = 0.0f, fb = 0.0f, fs = 0.0f;
+                        if (!kE2FresOld && formats::layer_fresnel(L, fm, fe, fb, fs)) {
+                            e2f[0] = fe;
+                            e2f[1] = fb;
+                            e2f[2] = fs;
+                            e2f[3] = float(fm);
+                        }
                         if (const char* dt = env_draw_trace; dt && em.name.find(dt) != std::string::npos) {
                             static int ne2 = 0;
                             if (ne2++ < 6)
@@ -3397,7 +3516,7 @@ void SceneRenderer::record(VkCommandBuffer cmd, const std::vector<const SceneIns
             }
             float euvo[2] = {0.0f, 0.0f};
             bool has_eu = false;
-            static const bool kEmisUvAnim = std::getenv("SC2_NO_EMIS_UV_ANIM") == nullptr;
+            static const bool kEmisUvAnim = std::getenv("OMC_NO_EMIS_UV_ANIM") == nullptr;
             if (kEmisUvAnim && inst.seq >= 0) {
                 const int emi = mesh.draws[d].material;
                 if (emi >= 0 && std::size_t(emi) < inst.model->materials.size())
@@ -3412,6 +3531,7 @@ void SceneRenderer::record(VkCommandBuffer cmd, const std::vector<const SceneIns
             if (!has_uvx && !has_lv && !has_sm && !has_env && !uvsrc && !has_mx && !has_fr && !has_fb && !has_e2 && !has_eu) continue;
             if (draw_fx[i].empty()) draw_fx[i].assign(mesh.draws.size(), fx_index[i]);
             InstanceFX f = inst.fx;
+            cloak_row(f);
             if (has_uvx) {
                 f.uv_tiling[0] = uvx[0];
                 f.uv_tiling[1] = uvx[1];
@@ -3447,7 +3567,7 @@ void SceneRenderer::record(VkCommandBuffer cmd, const std::vector<const SceneIns
                 f.ext[0] = lv[0];
                 f.ext[1] = lv[1];
             }
-            static const bool kTeamClampOld = std::getenv("SC2_EMIS_TEAM_CLAMP_AFTER_MULT") != nullptr;
+            static const bool kTeamClampOld = std::getenv("OMC_EMIS_TEAM_CLAMP_AFTER_MULT") != nullptr;
             if ((uvsrc & 64) != 0 && ext_free && (inst.team_emissive[3] >= 0.0f || !kTeamClampOld)) {
                 const int tmi = mesh.draws[d].material;
                 const float em = (!kTeamClampOld && tmi >= 0 && std::size_t(tmi) < inst.model->materials.size())
@@ -3459,6 +3579,7 @@ void SceneRenderer::record(VkCommandBuffer cmd, const std::vector<const SceneIns
             }
             if (has_e2) {
                 for (int k = 0; k < 4; ++k) f.emis2[k] = e2[k];
+                for (int k = 0; k < 4; ++k) f.fres_e2[k] = e2f[k];
                 const bool role = inst.team_emissive[3] >= 0.0f;
                 const bool body = inst.team[3] > 0.0f && inst.team[3] < 1.5f;
                 for (int k = 0; k < 3; ++k) f.emis2_t[k] = role ? inst.team_emissive[k] : body ? inst.team[k] : 0.0f;
@@ -3475,20 +3596,20 @@ void SceneRenderer::record(VkCommandBuffer cmd, const std::vector<const SceneIns
                         f.team_emissive[1] = fb;
                         f.team_emissive[2] = fs;
                         f.team_emissive[3] = fm == 2 ? 4.0f : 3.0f;
-                        static const bool kOnce = std::getenv("SC2_EMIS_FRESNEL_ONCE") != nullptr;
+                        static const bool kOnce = std::getenv("OMC_EMIS_FRESNEL_ONCE") != nullptr;
                         if (!kOnce && inst.model->materials[std::size_t(fmi)].emis_op == 2) f.team_emissive[3] += 2.0f;
                     }
             }
             if (uvsrc) {
                 f.uv_src = (((uvsrc & 4) ? 1.0f : 0.0f) + ((uvsrc & 1) ? 2.0f : 0.0f) + ((uvsrc & 2) ? 4.0f : 0.0f) + ((uvsrc & 8) ? 8.0f : 0.0f) +
                             ((uvsrc & 16) ? 16.0f : 0.0f) + float(uvsrc & 0x7e0u) + ((uvsrc & 4096) ? 2048.0f : 0.0f)) / 4096.0f;
-                static const bool kUvSrcTrace = std::getenv("SC2_UVSRC_TRACE") != nullptr;
+                static const bool kUvSrcTrace = std::getenv("OMC_UVSRC_TRACE") != nullptr;
                 if (kUvSrcTrace)
                     std::fprintf(stderr, "uvsrc inst %zu draw %zu bits %u kind %u tiling %.3f %.3f\n", i, d, unsigned(uvsrc), unsigned(f.kind),
                                  double(f.uv_tiling[0]), double(f.uv_tiling[1]));
                 if (uvsrc & 2) {
-                    static const float kPlanar = std::getenv("SC2_PLANAR_UV_SCALE") ? float(std::atof(std::getenv("SC2_PLANAR_UV_SCALE"))) : 0.09375f;
-                    static const bool kPlanarFlip = std::getenv("SC2_PLANAR_V_FLIPPED") != nullptr;
+                    static const float kPlanar = std::getenv("OMC_PLANAR_UV_SCALE") ? float(std::atof(std::getenv("OMC_PLANAR_UV_SCALE"))) : 0.09375f;
+                    static const bool kPlanarFlip = std::getenv("OMC_PLANAR_V_FLIPPED") != nullptr;
                     f.uv_tiling[0] *= kPlanar;
                     f.uv_tiling[1] *= kPlanarFlip ? -kPlanar : kPlanar;
                 }
@@ -3499,11 +3620,11 @@ void SceneRenderer::record(VkCommandBuffer cmd, const std::vector<const SceneIns
                 f.uv_angle = mesh.draw_tri[d][2];
             }
             if (has_sm) f.aux = mesh.draw_specm[d];
-            if (has_sm && inst.fx.kind == FxKind::None && d < mesh.draw_specl.size() && mesh.draw_specl[d][1] != 0.0f) {
+            if (has_sm && (inst.fx.kind == FxKind::None || (!kCloakLightOld && inst.fx.kind == FxKind::Cloak)) && d < mesh.draw_specl.size() && mesh.draw_specl[d][1] != 0.0f) {
                 f.p0[0] = mesh.draw_specl[d][0];
                 f.p0[1] = mesh.draw_specl[d][1];
                 f.p0[2] = mesh.draw_specl[d][2];
-                static const bool kSpecAddByte = std::getenv("SC2_SPEC_LAYER_ADD_BYTE") != nullptr;
+                static const bool kSpecAddByte = std::getenv("OMC_SPEC_LAYER_ADD_BYTE") != nullptr;
                 f.p0[3] = kSpecAddByte ? 2.0f : 1.0f;
                 if (d < mesh.draw_specluma.size() && mesh.draw_specluma[d]) {
                     f.p0[0] = 1.0f;
@@ -3585,9 +3706,9 @@ void SceneRenderer::record(VkCommandBuffer cmd, const std::vector<const SceneIns
         if (!(inst.seq >= 0 && !inst.model->bones.empty())) { bone_set[i] = shared_static; continue; }
         ++posed;
         const bool blending = inst.blend_weight > 0.0f && inst.blend_seq >= 0 && inst.blend_seq != inst.seq;
-        static const bool kBillboards = std::getenv("SC2_NO_BILLBOARDS") == nullptr;
+        static const bool kBillboards = std::getenv("OMC_NO_BILLBOARDS") == nullptr;
         const bool billboarded = kBillboards && !inst.model->billboards.empty();
-        static const bool kGlBones = std::getenv("SC2_NO_GLOBAL_LAYER_BONES") == nullptr;
+        static const bool kGlBones = std::getenv("OMC_NO_GLOBAL_LAYER_BONES") == nullptr;
         const ClipLayers* glb = kGlBones && !inst.global_layers.empty() ? &inst.global_layers : nullptr;
         const bool cacheable_inst = inst.beam_bone < 0 && inst.reach_tip_bone < 0 && !blending && !billboarded && !glb;
         PoseKey pkey{};
@@ -3724,7 +3845,7 @@ void SceneRenderer::record(VkCommandBuffer cmd, const std::vector<const SceneIns
             vkUpdateDescriptorSets(dev_, 5, w, 0, nullptr);
         }
     }
-    static const bool kSoftParticles = std::getenv("SC2_NO_SOFT_PARTICLES") == nullptr;
+    static const bool kSoftParticles = std::getenv("OMC_NO_SOFT_PARTICLES") == nullptr;
     bool need_depth = water_depth;
     if (draw_particles && kSoftParticles)
         for (const ParticleGroup& pg : pgroups) need_depth = need_depth || pg.depth_blend > 0.0f;
@@ -3739,13 +3860,29 @@ void SceneRenderer::record(VkCommandBuffer cmd, const std::vector<const SceneIns
     srbi.clearValueCount = 1;
     srbi.pClearValues = &sclear;
     {
-        SC2_PROF_SCOPE("rec.shadow_pass");
+        OMC_PROF_SCOPE("rec.shadow_pass");
     vkCmdBeginRenderPass(cmd, &srbi, VK_SUBPASS_CONTENTS_INLINE);
+    {
+        const VkViewport svp{0, 0, float(tun_.shadow_dim), float(tun_.shadow_dim), 0, 1};
+        const VkRect2D ssc{{0, 0}, {tun_.shadow_dim, tun_.shadow_dim}};
+        vkCmdSetViewport(cmd, 0, 1, &svp);
+        vkCmdSetScissor(cmd, 0, 1, &ssc);
+    }
     vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, shadowPipeline_.get());
     vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, layout_.get(), 2, 1, &global_set_, 0, nullptr);
     VkPipeline bound_shadow = shadowPipeline_.get();
-    for (size_t i = 0; i < live.size(); ++i) {
+    const bool gpu_shadow_groups = gpu_.on();
+    int gpu_shadow_group = -1;
+    for (size_t i = 0; i < live.size() && shadow_q != ShadowQuality::Off; ++i) {
         const SceneInstance& inst = *live[i];
+        if (gpu_shadow_groups && int(inst.pass_group) != gpu_shadow_group) {
+            if (gpu_shadow_group >= 0) gpu_.mark(cmd, shadow_group_label(std::uint8_t(gpu_shadow_group)));
+            gpu_shadow_group = int(inst.pass_group);
+        }
+        if (shadow_q == ShadowQuality::Units &&
+            (inst.pass_group == std::uint8_t(PassGroup::Terrain) || inst.pass_group == std::uint8_t(PassGroup::Doodads) ||
+             inst.pass_group == std::uint8_t(PassGroup::Foliage)))
+            continue;
         if (inst.model->vertex_count == 0 && !inst.model->has_splat_payload()) continue;
         if (inst.team[3] >= 1.5f || inst.fx.kind == FxKind::Cloak || inst.fx.kind == FxKind::Water || inst.fx.kind == FxKind::Creep) continue;
         std::size_t caster_first = 0, caster_end = std::size_t(-1);
@@ -3799,7 +3936,7 @@ void SceneRenderer::record(VkCommandBuffer cmd, const std::vector<const SceneIns
                 bool has_mask = false;
                 for (const formats::M3Layer& ly : sm.layers) has_mask = has_mask || ly.usage == "AlphaMask";
                 bool diffuse_rgb = false;
-                static const bool kRgbCutout = std::getenv("SC2_RGB_CUTOUT") != nullptr;
+                static const bool kRgbCutout = std::getenv("OMC_RGB_CUTOUT") != nullptr;
                 if (!kRgbCutout)
                     for (const formats::M3Layer& ly : sm.layers)
                         if (ly.usage == "Diffuse" && !ly.raw_record.empty() && ly.word44 == 0) diffuse_rgb = true;
@@ -3821,16 +3958,18 @@ void SceneRenderer::record(VkCommandBuffer cmd, const std::vector<const SceneIns
                 continue;
             if (!region_visible(*inst.model, inst.seq, inst.time_ms, d, glayers(inst))) continue;
             if (material_unshadowed(*inst.model, mi)) continue;
-            static const bool kDisplaceCasts = std::getenv("SC2_DISPLACE_CASTS") != nullptr;
+            static const bool kDisplaceCasts = std::getenv("OMC_DISPLACE_CASTS") != nullptr;
             if (!kDisplaceCasts && mi >= 0 && std::size_t(mi) < inst.model->materials.size() && inst.model->materials[std::size_t(mi)].displace > 0.0f) continue;
-            static const bool kNoCast = std::getenv("SC2_SHADOW_IGNORE_NOCAST") == nullptr;
+            static const bool kNoCast = std::getenv("OMC_SHADOW_IGNORE_NOCAST") == nullptr;
             if (kNoCast && !inst.model->vertex_alpha_coverage && !inst.model->cliff_skin_opaque && mi >= 0 && std::size_t(mi) < inst.model->materials.size() && (inst.model->materials[mi].flags & 0x20u) != 0)
                 continue;
             vkCmdDrawIndexed(cmd, mesh.draws[d].index_count, 1, mesh.draws[d].first_index, 0, 0);
         }
     }
+    if (gpu_shadow_group >= 0) gpu_.mark(cmd, shadow_group_label(std::uint8_t(gpu_shadow_group)));
     vkCmdEndRenderPass(cmd);
     }
+    gpu_.mark(cmd, "gpu.shadow.end");
 
     VkClearValue clears[2];
     clears[0].color = {{tun_.clear_color[0], tun_.clear_color[1], tun_.clear_color[2], cam.transparent_clear ? 0.0f : 1.0f}};
@@ -3856,6 +3995,8 @@ void SceneRenderer::record(VkCommandBuffer cmd, const std::vector<const SceneIns
         size_t inst;
         size_t draw;
         float dist2;
+        bool lit_body = false;
+        float body_mpc[4] = {0.0f, 0.0f, 0.0f, 0.0f};
     };
     std::vector<BlendedDraw> blended;
     auto outside_frustum = [&](size_t li) -> bool {
@@ -3881,8 +4022,14 @@ void SceneRenderer::record(VkCommandBuffer cmd, const std::vector<const SceneIns
         return false;
     };
     lit_drawn_ = lit_culled_ = 0;
+    const bool gpu_groups = gpu_.on();
+    int gpu_group = -1;
     for (size_t i = 0; i < live.size(); ++i) {
         const SceneInstance& inst = *live[i];
+        if (gpu_groups && int(inst.pass_group) != gpu_group) {
+            if (gpu_group >= 0) gpu_.mark(cmd, pass_group_label(std::uint8_t(gpu_group)));
+            gpu_group = int(inst.pass_group);
+        }
         if (outside_frustum(i)) { ++lit_culled_; continue; }
         ++lit_drawn_;
         if (inst.model->vertex_count == 0 && !inst.model->has_splat_payload()) continue;
@@ -3929,9 +4076,9 @@ void SceneRenderer::record(VkCommandBuffer cmd, const std::vector<const SceneIns
             float mpc[4] = {0.0f, 0.0f, 0.0f, 0.0f};
             if (mi >= 0 && std::size_t(mi) < inst.model->materials.size()) {
                 mpc[0] = inst.model->materials[mi].specularity;
-                static const bool kTwoSidedO = std::getenv("SC2_NO_TWO_SIDED") == nullptr;
+                static const bool kTwoSidedO = std::getenv("OMC_NO_TWO_SIDED") == nullptr;
                 if (kTwoSidedO && (inst.model->materials[mi].flags & 0x8u) != 0 && !inst.model->vertex_alpha_coverage) mpc[0] += 100000.0f;
-                static const bool kOpaqueCull = std::getenv("SC2_OPAQUE_ALL_FACES") == nullptr;
+                static const bool kOpaqueCull = std::getenv("OMC_OPAQUE_ALL_FACES") == nullptr;
                 if (kOpaqueCull && (inst.model->materials[mi].flags & 0x8u) == 0 && inst.model->materials[mi].blend_mode == formats::kBlendOpaque &&
                     !inst.model->vertex_alpha_coverage)
                     mpc[0] += 300000.0f;
@@ -3951,14 +4098,14 @@ void SceneRenderer::record(VkCommandBuffer cmd, const std::vector<const SceneIns
                         else if (ly.usage == "AlphaMask") mask = true;
                     }
                     bool diffuse_rgb = false;
-                    static const bool kRgbCutout = std::getenv("SC2_RGB_CUTOUT") != nullptr;
+                    static const bool kRgbCutout = std::getenv("OMC_RGB_CUTOUT") != nullptr;
                     if (!kRgbCutout)
                         for (const formats::M3Layer& ly : mm.layers)
                             if (ly.usage == "Diffuse" && !ly.raw_record.empty() && ly.word44 == 0) diffuse_rgb = true;
                     if (mm.cutout_thresh > 0 && !(diffuse_rgb && !mask)) mpc[1] = cutout_threshold(mm) * 0.5f;
                     else if (!mask) mpc[1] = -1.0f;
                     if (mpc[1] > 0.0f) mpc[2] += float(cutout_mask_channel(mm));
-                    static const bool kTeamAlways = std::getenv("SC2_TEAM_ALPHA_ALWAYS") != nullptr;
+                    static const bool kTeamAlways = std::getenv("OMC_TEAM_ALPHA_ALWAYS") != nullptr;
                     if (!kTeamAlways)
                         for (const formats::M3Layer& ly : mm.layers)
                             if (ly.usage == "Diffuse") {
@@ -3968,13 +4115,13 @@ void SceneRenderer::record(VkCommandBuffer cmd, const std::vector<const SceneIns
                 }
             }
             const bool refractive = inst.fx.kind == FxKind::Cloak || inst.fx.kind == FxKind::Water || inst.fx.kind == FxKind::Creep;
-            static const bool kShellBlend = std::getenv("SC2_NO_SHELL_BLEND") == nullptr;
+            static const bool kShellBlend = std::getenv("OMC_NO_SHELL_BLEND") == nullptr;
             bool shell = false;
             if (kShellBlend && mi >= 0 && std::size_t(mi) < inst.model->materials.size() && !inst.model->cliff_skin_opaque &&
                 inst.model->materials[mi].blend_mode == formats::kBlendAlphaBlend && !formats::material_is_alpha_blended(inst.model->materials[mi]))
                 for (const formats::M3Material& om : inst.model->materials)
                     if (formats::material_is_alpha_blended(om) && formats::material_alpha_mask(om)) { shell = true; break; }
-            static const bool kUnmaskedDiffuse = !(std::getenv("SC2_UNMASKED_BLEND") && std::string(std::getenv("SC2_UNMASKED_BLEND")) == "opaque");
+            static const bool kUnmaskedDiffuse = !(std::getenv("OMC_UNMASKED_BLEND") && std::string(std::getenv("OMC_UNMASKED_BLEND")) == "opaque");
             if (kUnmaskedDiffuse && mi >= 0 && std::size_t(mi) < inst.model->materials.size() && !inst.model->cliff_skin_opaque &&
                 !inst.model->vertex_alpha_coverage && inst.team[3] != -1.0f && inst.model->materials[mi].blend_mode == formats::kBlendAlphaBlend &&
                 !formats::material_is_alpha_blended(inst.model->materials[mi]))
@@ -3985,7 +4132,14 @@ void SceneRenderer::record(VkCommandBuffer cmd, const std::vector<const SceneIns
                   (formats::material_is_alpha_blended(inst.model->materials[mi]) && !inst.model->cliff_skin_opaque)))) {
                 const float dx = inst.world.m[12] - cam.eye.x, dy = inst.world.m[13] - cam.eye.y,
                             dz = inst.world.m[14] - cam.eye.z;
-                blended.push_back(BlendedDraw{i, d, dx * dx + dy * dy + dz * dz});
+                BlendedDraw bd{i, d, dx * dx + dy * dy + dz * dz};
+                if (!kCloakLightOld && inst.fx.kind == FxKind::Cloak && !shell && mi >= 0 && std::size_t(mi) < inst.model->materials.size() &&
+                    !formats::material_is_additive(inst.model->materials[mi]) && !formats::material_is_alpha_blended(inst.model->materials[mi])) {
+                    bd.lit_body = true;
+                    std::memcpy(bd.body_mpc, mpc, sizeof(mpc));
+                    if (inst.opacity < 1.0f) bd.body_mpc[3] = inst.opacity;
+                }
+                blended.push_back(bd);
                 continue;
             }
             vkCmdPushConstants(cmd, layout_.get(),
@@ -4002,11 +4156,12 @@ void SceneRenderer::record(VkCommandBuffer cmd, const std::vector<const SceneIns
             vkCmdDrawIndexed(cmd, mesh.draws[d].index_count, 1, mesh.draws[d].first_index, 0, 0);
         }
     }
+    if (gpu_group >= 0) gpu_.mark(cmd, pass_group_label(std::uint8_t(gpu_group)));
     for (size_t i : splat_draws) {
         const SceneInstance& inst = *live[i];
         TerrainSplat* ts = ensure_splat(*inst.model);
         Mesh& mesh = ensure_mesh(*inst.model, inst.mesh_version);
-        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, splatPipeline_.get());
+        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, splat_pipeline());
         vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, splatPipeLayout_.get(), 0, 1, &ts->set, 0, nullptr);
         vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, splatPipeLayout_.get(), 1, 1, &bone_set[i], 0, nullptr);
         vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, splatPipeLayout_.get(), 2, 1, &global_set_, 0, nullptr);
@@ -4019,7 +4174,7 @@ void SceneRenderer::record(VkCommandBuffer cmd, const std::vector<const SceneIns
         VkBuffer vb = mesh.vbuf.buf.get();
         vkCmdBindVertexBuffers(cmd, 0, 1, &vb, &off);
         vkCmdBindIndexBuffer(cmd, mesh.ibuf.buf.get(), 0, VK_INDEX_TYPE_UINT32);
-        static const bool kDoodadDbl = std::getenv("SC2_DOODAD_DBL_LAMBERT") != nullptr;
+        static const bool kDoodadDbl = std::getenv("OMC_DOODAD_DBL_LAMBERT") != nullptr;
         const std::size_t df = inst.model->caster_region_first, de = inst.model->caster_region_end;
         float flag_now = -1.0f;
         for (size_t d = 0; d < mesh.draws.size(); ++d) {
@@ -4032,6 +4187,7 @@ void SceneRenderer::record(VkCommandBuffer cmd, const std::vector<const SceneIns
             vkCmdDrawIndexed(cmd, mesh.draws[d].index_count, 1, mesh.draws[d].first_index, 0, 0);
         }
     }
+    gpu_.mark(cmd, "gpu.terrain.ground");
     if (need_copy || ssao_on || need_depth) {
         vkCmdEndRenderPass(cmd);
         if (need_depth) {
@@ -4097,11 +4253,11 @@ void SceneRenderer::record(VkCommandBuffer cmd, const std::vector<const SceneIns
             vkCmdSetViewport(cmd, 0, 1, &avp);
             vkCmdSetScissor(cmd, 0, 1, &asc);
             const float th = std::tan(cam.fovy * 0.5f);
-            static const float kAoSamples = std::getenv("SC2_SSAO_SAMPLES") ? float(std::atof(std::getenv("SC2_SSAO_SAMPLES"))) : 16.0f;
-            static const float kAoRadiusScale = std::getenv("SC2_SSAO_RADIUS") ? float(std::atof(std::getenv("SC2_SSAO_RADIUS"))) : 1.0f;
-            static const float kAoUnit = std::getenv("SC2_SSAO_UNIT") ? float(std::atof(std::getenv("SC2_SSAO_UNIT"))) : 1.0f;
-            static const float kAoLimiter = std::getenv("SC2_SSAO_LIMITER") ? float(std::atof(std::getenv("SC2_SSAO_LIMITER"))) : 0.0f;
-            static const bool kAoDetail = std::getenv("SC2_SSAO_NO_DETAIL") == nullptr;
+            static const float kAoSamples = std::getenv("OMC_SSAO_SAMPLES") ? float(std::atof(std::getenv("OMC_SSAO_SAMPLES"))) : 16.0f;
+            static const float kAoRadiusScale = std::getenv("OMC_SSAO_RADIUS") ? float(std::atof(std::getenv("OMC_SSAO_RADIUS"))) : 1.0f;
+            static const float kAoUnit = std::getenv("OMC_SSAO_UNIT") ? float(std::atof(std::getenv("OMC_SSAO_UNIT"))) : 1.0f;
+            static const float kAoLimiter = std::getenv("OMC_SSAO_LIMITER") ? float(std::atof(std::getenv("OMC_SSAO_LIMITER"))) : 0.0f;
+            static const bool kAoDetail = std::getenv("OMC_SSAO_NO_DETAIL") == nullptr;
             float apc[16] = {th * float(width_) / float(height_), th, cam.znear, cam.zfar,
                              tun_.ao_radius * 0.15f * kAoRadiusScale * kAoUnit, tun_.ao_power, tun_.ao_no_occlusion * kAoUnit, 0.0f,
                              0.0f, kAoSamples, 0.01f * kAoUnit, kAoLimiter,
@@ -4167,6 +4323,7 @@ void SceneRenderer::record(VkCommandBuffer cmd, const std::vector<const SceneIns
         vkCmdSetViewport(cmd, 0, 1, &dvp);
         vkCmdSetScissor(cmd, 0, 1, &dsc);
     }
+    gpu_.mark(cmd, "gpu.copy_ao");
     if (!blended.empty()) {
         auto displaces = [&](const BlendedDraw& d) {
             const SceneInstance& si = *live[d.inst];
@@ -4192,7 +4349,7 @@ void SceneRenderer::record(VkCommandBuffer cmd, const std::vector<const SceneIns
                                                  ? inst.model->materials[std::size_t(mi)] : kNoMaterial;
             const bool refractive = inst.fx.kind == FxKind::Cloak || inst.fx.kind == FxKind::Water || inst.fx.kind == FxKind::Creep;
             const bool inst_alpha = (inst.opacity < 1.0f || refractive) && !formats::material_is_additive(mat);
-            static const bool kMeshGlowMask = std::getenv("SC2_NO_GLOW_MASK") == nullptr;
+            static const bool kMeshGlowMask = std::getenv("OMC_NO_GLOW_MASK") == nullptr;
             const bool mesh_glow = kMeshGlowMask && !cam.transparent_clear && (mat.flags & 0x10u) != 0;
             const bool overlay = mesh.draws[bd.draw].overlay && mat.blend_mode == formats::kBlendAlphaBlend && !inst_alpha;
             const VkPipeline want = mat.displace > 0.0f                           ? alphaBlendPipeline_.get()
@@ -4210,8 +4367,8 @@ void SceneRenderer::record(VkCommandBuffer cmd, const std::vector<const SceneIns
             std::memcpy(pc, inst.world.m.data(), 64);
             pc[16] = inst.team[0]; pc[17] = inst.team[1];
             pc[18] = inst.team[2]; pc[19] = inst.team[3];
-            static const bool kBlendedTeam = std::getenv("SC2_BLENDED_NO_TEAM_MIX") == nullptr;
-            if (kBlendedTeam && inst.team[3] > 0.0f && inst.team[3] < 1.5f && mi >= 0 && std::size_t(mi) < inst.model->materials.size())
+            static const bool kBlendedTeam = std::getenv("OMC_BLENDED_NO_TEAM_MIX") == nullptr;
+            if (kBlendedTeam && !bd.lit_body && inst.team[3] > 0.0f && inst.team[3] < 1.5f && mi >= 0 && std::size_t(mi) < inst.model->materials.size())
                 for (const formats::M3Layer& ly : inst.model->materials[std::size_t(mi)].layers)
                     if (ly.usage == "Diffuse") {
                         if (!ly.raw_record.empty() && ly.word44 == 1) pc[19] = 1.25f;
@@ -4219,29 +4376,29 @@ void SceneRenderer::record(VkCommandBuffer cmd, const std::vector<const SceneIns
                     }
             vkCmdPushConstants(cmd, layout_.get(), VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0, 80, pc);
             const bool unshaded = (mat.flags & 0x10u) != 0 && !env_no_unshaded;
-            static const bool kAddAlpha = std::getenv("SC2_ADD_DIFFUSE_NO_ALPHA") == nullptr;
+            static const bool kAddAlpha = std::getenv("OMC_ADD_DIFFUSE_NO_ALPHA") == nullptr;
             float add_alpha = (kAddAlpha && mat.blend_mode == formats::kBlendAdd && mi >= 0) ? 0.25f : 0.0f;
-            static const bool kMaskCover = std::getenv("SC2_MASK_DIFFUSE_TEST") == nullptr;
+            static const bool kMaskCover = std::getenv("OMC_MASK_DIFFUSE_TEST") == nullptr;
             if (kMaskCover && mat.blend_mode == formats::kBlendAlphaBlend && formats::material_alpha_mask_channel(mat) == 1) {
                 const formats::M3Layer* ml = formats::material_alpha_mask(mat);
                 for (const formats::M3Layer& dl : mat.layers)
                     if (dl.usage == "Diffuse" && ml && !ml->image_path.empty() && dl.image_path == ml->image_path) add_alpha = 0.25f;
             }
-            static const bool kUvSrcCover = std::getenv("SC2_UVSRC_DIFFUSE_TEST") == nullptr && std::getenv("SC2_NO_UV_SOURCE") == nullptr;
+            static const bool kUvSrcCover = std::getenv("OMC_UVSRC_DIFFUSE_TEST") == nullptr && std::getenv("OMC_NO_UV_SOURCE") == nullptr;
             if (kUvSrcCover && mat.blend_mode == formats::kBlendAlphaBlend && formats::material_alpha_mask_channel(mat) != 0) {
                 bool apart = false;
                 for (const formats::M3Layer& L : mat.layers)
                     if (!L.raw_record.empty() && ((L.usage == "AlphaMask" && L.word40 == 1) || (L.usage == "Diffuse" && L.word40 == 5))) apart = true;
                 if (apart) add_alpha = 0.25f;
             }
-            static const bool kConstMaskCover = std::getenv("SC2_CONST_MASK_DIFFUSE_TEST") == nullptr;
+            static const bool kConstMaskCover = std::getenv("OMC_CONST_MASK_DIFFUSE_TEST") == nullptr;
             if (kConstMaskCover && mat.blend_mode == formats::kBlendAlphaBlend && formats::material_alpha_mask_channel(mat) != 0) {
                 const formats::M3Layer* cml = formats::material_alpha_mask(mat);
                 if (cml && cml->const_colour) add_alpha = 0.25f;
             }
-            static const bool kAlphaAddMasks = std::getenv("SC2_ALPHAADD_DIFFUSE_ALPHA") == nullptr;
+            static const bool kAlphaAddMasks = std::getenv("OMC_ALPHAADD_DIFFUSE_ALPHA") == nullptr;
             if (kAlphaAddMasks && mat.blend_mode == formats::kBlendAlphaAdd) add_alpha = 0.25f;
-            static const bool kMaskedCover = std::getenv("SC2_MASKED_DIFFUSE_TEST") == nullptr;
+            static const bool kMaskedCover = std::getenv("OMC_MASKED_DIFFUSE_TEST") == nullptr;
             if (kMaskedCover && mat.blend_mode == formats::kBlendAlphaBlend && formats::material_alpha_mask_channel(mat) != 0) add_alpha = 0.25f;
             if (overlay && formats::material_alpha_mask_channel(mat) != 0) add_alpha = 0.25f;
             if (mat.blend_mode == formats::kBlendAlphaBlend && formats::material_alpha_mask_channel(mat) == 0 && !inst_alpha) add_alpha = 0.25f;
@@ -4253,16 +4410,16 @@ void SceneRenderer::record(VkCommandBuffer cmd, const std::vector<const SceneIns
                 ao_uv1 = m == "uv1" ? 0.25f : m == "uv1v" ? 0.5f : m == "uv0v" ? 0.75f : 0.0f;
             }
             int mask_code = formats::material_alpha_mask_channel(mat);
-            static const bool kUnmaskedDiffuseB = !(std::getenv("SC2_UNMASKED_BLEND") && std::string(std::getenv("SC2_UNMASKED_BLEND")) == "opaque");
+            static const bool kUnmaskedDiffuseB = !(std::getenv("OMC_UNMASKED_BLEND") && std::string(std::getenv("OMC_UNMASKED_BLEND")) == "opaque");
             if (kUnmaskedDiffuseB && mask_code == 0 && mat.blend_mode == formats::kBlendAlphaBlend && !inst_alpha) mask_code = 6;
-            static const bool kConstMaskAlone = std::getenv("SC2_CONST_MASK_X_DIFFUSE_ALPHA") == nullptr;
+            static const bool kConstMaskAlone = std::getenv("OMC_CONST_MASK_X_DIFFUSE_ALPHA") == nullptr;
             if (!kConstMaskAlone && mask_code == 1 && mat.blend_mode == formats::kBlendAlphaBlend) {
                 const formats::M3Layer* cml7 = formats::material_alpha_mask(mat);
                 if (cml7 && cml7->const_colour) mask_code = 7;
             }
-            static const bool kTwoSidedB = std::getenv("SC2_NO_TWO_SIDED") == nullptr;
+            static const bool kTwoSidedB = std::getenv("OMC_NO_TWO_SIDED") == nullptr;
             float two_sided = (kTwoSidedB && mi >= 0 && (mat.flags & 0x8u) != 0 && !inst.model->vertex_alpha_coverage) ? 100000.0f : 0.0f;
-            static const bool kBlendCull = std::getenv("SC2_BLEND_ALL_FACES") == nullptr;
+            static const bool kBlendCull = std::getenv("OMC_BLEND_ALL_FACES") == nullptr;
             if (kBlendCull && mi >= 0 && !unshaded && (mat.flags & 0x8u) == 0 && mat.blend_mode != formats::kBlendOpaque && !inst.model->vertex_alpha_coverage) two_sided = 200000.0f;
             float mpc[4] = {unshaded ? -1.0f : mat.specularity + two_sided, float(mat.blend_mode) + add_alpha, float(mask_code) + ao_uv1,
                             inst.opacity < 1.0f ? inst.opacity : 0.0f};
@@ -4270,11 +4427,12 @@ void SceneRenderer::record(VkCommandBuffer cmd, const std::vector<const SceneIns
                 float s = mat.displace;
                 if (inst.seq >= 0)
                     animated_layer_field(*inst.model, std::uint32_t(inst.seq), mat.displace_interp, mat.displace_flags, mat.displace_id, inst.time_ms, 1, &mat.displace, &s, &inst.global_layers);
-                static const float kDisplaceScale = std::getenv("SC2_DISPLACE_SCALE") ? float(std::atof(std::getenv("SC2_DISPLACE_SCALE"))) : 0.05f;
+                static const float kDisplaceScale = std::getenv("OMC_DISPLACE_SCALE") ? float(std::atof(std::getenv("OMC_DISPLACE_SCALE"))) : 0.05f;
                 mpc[1] = 100.0f + std::clamp(s, 0.0f, 50.0f);
                 mpc[2] = kDisplaceScale;
                 mpc[3] = (!mat.layers.empty() && mat.layers[0].word40 == 1) ? 1.0f : 0.0f;
             }
+            if (bd.lit_body) std::memcpy(mpc, bd.body_mpc, sizeof(mpc));
             if (const char* dt = env_draw_trace; dt && mat.name.find(dt) != std::string::npos) {
                 static int printed = 0;
                 if (printed++ < 4)
@@ -4306,6 +4464,7 @@ void SceneRenderer::record(VkCommandBuffer cmd, const std::vector<const SceneIns
             vkCmdDrawIndexed(cmd, mesh.draws[bd.draw].index_count, 1, mesh.draws[bd.draw].first_index, 0, 0);
         }
     }
+    gpu_.mark(cmd, "gpu.blended");
     if (draw_particles) {
         float pmvp[32] = {};
         pmvp[25] = cam.znear;
@@ -4318,7 +4477,7 @@ void SceneRenderer::record(VkCommandBuffer cmd, const std::vector<const SceneIns
         vkCmdBindVertexBuffers(cmd, 0, 1, &pvb, &poff);
         uint32_t bound_blend = UINT32_MAX;
         for (size_t g = 0; g < pgroups.size(); ++g) {
-            static const bool kGlowMask = std::getenv("SC2_NO_GLOW_MASK") == nullptr;
+            static const bool kGlowMask = std::getenv("OMC_NO_GLOW_MASK") == nullptr;
             const bool glow = kGlowMask && pgroups[g].glow && !cam.transparent_clear;
             const uint32_t want_blend = pgroups[g].blend | (glow ? 0x100u : 0u);
             if (want_blend != bound_blend) {
@@ -4337,12 +4496,12 @@ void SceneRenderer::record(VkCommandBuffer cmd, const std::vector<const SceneIns
             pmvp[20] = pgroups[g].mask2_tex >= 0 ? pgroups[g].mask2_code : 0.0f;
             pmvp[21] = pgroups[g].mask2_mul;
             pmvp[22] = pgroups[g].mask2_add;
-            pmvp[23] = std::getenv("SC2_PARTICLE_DIFFUSE_ALPHA") ? -1.0f : float(pgroups[g].blend);
-            static const bool kLitProduct = std::getenv("SC2_PARTICLE_MASK_ALONE") == nullptr;
+            pmvp[23] = std::getenv("OMC_PARTICLE_DIFFUSE_ALPHA") ? -1.0f : float(pgroups[g].blend);
+            static const bool kLitProduct = std::getenv("OMC_PARTICLE_MASK_ALONE") == nullptr;
             if (kLitProduct && !pgroups[g].mask_alone && pgroups[g].blend <= formats::kBlendAlphaBlend) pmvp[23] = -1.0f;
-            if (pgroups[g].blend == formats::kBlendAdd && std::getenv("SC2_PARTICLE_ADD_ALPHA")) pmvp[23] = 2.25f;
+            if (pgroups[g].blend == formats::kBlendAdd && std::getenv("OMC_PARTICLE_ADD_ALPHA")) pmvp[23] = 2.25f;
             pmvp[24] = need_depth ? pgroups[g].depth_blend : 0.0f;
-            static const bool kBlendSaturates = std::getenv("SC2_PARTICLE_HDR_BLEND") == nullptr;
+            static const bool kBlendSaturates = std::getenv("OMC_PARTICLE_HDR_BLEND") == nullptr;
             pmvp[27] = (kBlendSaturates && !pgroups[g].glow && pgroups[g].blend <= formats::kBlendAlphaBlend) ? 1.0f : 0.0f;
             for (int k = 0; k < 4; ++k) pmvp[28 + k] = pgroups[g].emis[k];
             vkCmdPushConstants(cmd, partPipeLayout_.get(), VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0, 128, pmvp);
@@ -4351,23 +4510,24 @@ void SceneRenderer::record(VkCommandBuffer cmd, const std::vector<const SceneIns
         }
     }
     vkCmdEndRenderPass(cmd);
+    gpu_.mark(cmd, "gpu.particles");
 
     float col_packed_levels = 1000.0f * 2048.0f + 1000.0f, col_packed_light = 0.0f;
     {
-        const bool off = !tun_.col_levels || std::getenv("SC2_COL_LEVELS_OFF") != nullptr;
+        const bool off = !tun_.col_levels || std::getenv("OMC_COL_LEVELS_OFF") != nullptr;
         const float low = off ? 0.0f : std::clamp(tun_.col_input_low, 0.0f, 0.9f);
         const float high = off ? 1.0f : std::clamp(tun_.col_input_high, low + 0.05f, 1.0f);
-        static const bool kFilmicSquared = std::getenv("SC2_COL_CONTRAST_SQUARED") != nullptr;
+        static const bool kFilmicSquared = std::getenv("OMC_COL_CONTRAST_SQUARED") != nullptr;
         const float cexp = (tun_.hdr_operator == 4 && !kFilmicSquared) ? tun_.col_contrast : tun_.col_contrast * tun_.col_contrast;
         const float p = off ? 1.0f : std::clamp(cexp * std::pow(std::max(tun_.col_input_gamma, 0.05f), -0.2f), 0.25f, 7.9f);
         const float gain = off ? 1.0f : std::clamp(tun_.col_brightness * std::pow((1.0f - low) / (high - low), p), 0.0f, 2.047f);
         col_packed_levels = float(std::lround(p * 1000.0f) * 2048 + std::lround(gain * 1000.0f));
-        static const bool kLightTowardWhite = std::getenv("SC2_COL_LIGHTNESS_TOWARD_WHITE") != nullptr;
+        static const bool kLightTowardWhite = std::getenv("OMC_COL_LIGHTNESS_TOWARD_WHITE") != nullptr;
         col_packed_light = float(std::lround((std::clamp(tun_.col_lightness, -1.0f, 1.0f) + 1.0f) * 1000.0f) + (kLightTowardWhite ? 2048 : 0) + 4096 * std::lround(low * 1000.0f));
     }
-    static const float kColFlags = (std::getenv("SC2_COL_LEVELS_SCALE") ? 64.0f : 0.0f) + (std::getenv("SC2_COL_LUT_NO_CAP") ? 128.0f : 0.0f) +
-                                   (std::getenv("SC2_WHITE_SHIFT") ? 0.0f : 256.0f);
-    TonemapPC tm{tun_.exposure, std::getenv("SC2_TONEMAP_CURVE") ? std::atoi(std::getenv("SC2_TONEMAP_CURVE")) : tun_.curve, cam.transparent_clear ? 1 : 0, tun_.white_point,
+    static const float kColFlags = (std::getenv("OMC_COL_LEVELS_SCALE") ? 64.0f : 0.0f) + (std::getenv("OMC_COL_LUT_NO_CAP") ? 128.0f : 0.0f) +
+                                   (std::getenv("OMC_WHITE_SHIFT") ? 0.0f : 256.0f);
+    TonemapPC tm{tun_.exposure, std::getenv("OMC_TONEMAP_CURVE") ? std::atoi(std::getenv("OMC_TONEMAP_CURVE")) : tun_.curve, cam.transparent_clear ? 1 : 0, tun_.white_point,
                  tun_.col_blend, col_packed_levels, std::clamp(tun_.col_hue, -31.0f, 31.0f) + kColFlags, tun_.col_saturation, col_packed_light,
                  tun_.bloom_threshold, tun_.bloom_gain, tun_.bloom_scale, (tun_.gamma_space && tun_.rig.present) ? tun_.hdr_operator : -1, 0, {0, 0}, {}};
     {
@@ -4379,7 +4539,7 @@ void SceneRenderer::record(VkCommandBuffer cmd, const std::vector<const SceneIns
                 inv[c * 4 + 1] /= fog_world_h_;
             }
             std::memcpy(tm.fog_from_ndc, inv, sizeof(inv));
-            tm.fog_on = std::getenv("SC2_FOW_VEILS_VOID") ? 2 : 1;
+            tm.fog_on = std::getenv("OMC_FOW_VEILS_VOID") ? 2 : 1;
             tm.pad_[1] = int32_t(std::lround(cam.center.z * 256.0f)) + 1048576;
         }
         if (!tm.fog_on && cam.dof_amount > 0.0f && cam.dof_end > cam.dof_start && cam.dof_radius_px > 0.0f && !cam.orthographic) {
@@ -4403,12 +4563,12 @@ void SceneRenderer::record(VkCommandBuffer cmd, const std::vector<const SceneIns
         db.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
         vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, 0, 0, nullptr, 0, nullptr, 1, &db);
     }
-    static const bool kBloomRings = std::getenv("SC2_BLOOM_RINGS") != nullptr;
+    static const bool kBloomRings = std::getenv("OMC_BLOOM_RINGS") != nullptr;
     if (tun_.bloom_gain > 0.0f && tun_.gamma_space && tun_.rig.present && !cam.transparent_clear && !kBloomRings) {
-        static const float kSigma = std::getenv("SC2_BLOOM_SIGMA") ? float(std::atof(std::getenv("SC2_BLOOM_SIGMA"))) : 4.0f;
+        static const float kSigma = std::getenv("OMC_BLOOM_SIGMA") ? float(std::atof(std::getenv("OMC_BLOOM_SIGMA"))) : 4.0f;
         const float sigma = std::max(0.5f, kSigma * std::max(tun_.bloom_scale, 0.25f));
         const float radius = std::min(32.0f, std::ceil(sigma * 3.0f));
-        static const float kPrescale = std::getenv("SC2_BLOOM_PRESCALE") ? float(std::atof(std::getenv("SC2_BLOOM_PRESCALE"))) : 1.0f;
+        static const float kPrescale = std::getenv("OMC_BLOOM_PRESCALE") ? float(std::atof(std::getenv("OMC_BLOOM_PRESCALE"))) : 1.0f;
         struct BloomStep {
             VkFramebuffer fb;
             VkDescriptorSet src;
@@ -4438,6 +4598,7 @@ void SceneRenderer::record(VkCommandBuffer cmd, const std::vector<const SceneIns
         }
         tm.pad_[0] = 1;
     }
+    gpu_.mark(cmd, "gpu.bloom");
     VkRenderPassBeginInfo tmrbi{};
     tmrbi.sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO;
     tmrbi.renderPass = tmPass_.get();
@@ -4457,6 +4618,7 @@ void SceneRenderer::record(VkCommandBuffer cmd, const std::vector<const SceneIns
     vkCmdPushConstants(cmd, tmPipeLayout_.get(), VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(TonemapPC), &tm);
     vkCmdDraw(cmd, 3, 1, 0, 0);
     vkCmdEndRenderPass(cmd);
+    gpu_.mark(cmd, "gpu.post_fog");
 }
 
 void SceneRenderer::trail_note(std::uint64_t key, float now_s, const Vec3& current) {
@@ -4492,18 +4654,18 @@ void build_particles(SceneRenderer& sr, const std::vector<const SceneInstance*>&
                      const Camera& cam,
                      std::vector<SceneRenderer::ParticleVertex>& pverts,
                      std::vector<SceneRenderer::ParticleGroup>& pgroups) {
-    if (std::getenv("SC2_NO_PARTICLES")) return;
-    const char* const env_par_trace_verts = std::getenv("SC2_PAR_TRACE_VERTS");
-    const char* const env_par_trace_near = std::getenv("SC2_PAR_TRACE_NEAR");
-    const char* const env_par_trace_active = std::getenv("SC2_PAR_TRACE_ACTIVE");
-    const bool env_no_particle_emissive = std::getenv("SC2_NO_PARTICLE_EMISSIVE") != nullptr;
-    const bool env_glow_alphablend = std::getenv("SC2_GLOW_ALPHABLEND") != nullptr;
-    const bool env_par_cover_trace = std::getenv("SC2_PAR_COVER_TRACE") != nullptr;
-    const bool env_particle_unlit = std::getenv("SC2_PARTICLE_UNLIT") != nullptr;
-    const bool env_no_particle_fog = std::getenv("SC2_NO_PARTICLE_FOG") != nullptr;
-    const bool env_no_particle_mask = std::getenv("SC2_NO_PARTICLE_MASK") != nullptr;
-    const bool env_particle_no_mask2 = std::getenv("SC2_PARTICLE_NO_MASK2") != nullptr;
-    const bool env_shot_trace = std::getenv("SC2_SHOT_TRACE") != nullptr;
+    if (std::getenv("OMC_NO_PARTICLES")) return;
+    const char* const env_par_trace_verts = std::getenv("OMC_PAR_TRACE_VERTS");
+    const char* const env_par_trace_near = std::getenv("OMC_PAR_TRACE_NEAR");
+    const char* const env_par_trace_active = std::getenv("OMC_PAR_TRACE_ACTIVE");
+    const bool env_no_particle_emissive = std::getenv("OMC_NO_PARTICLE_EMISSIVE") != nullptr;
+    const bool env_glow_alphablend = std::getenv("OMC_GLOW_ALPHABLEND") != nullptr;
+    const bool env_par_cover_trace = std::getenv("OMC_PAR_COVER_TRACE") != nullptr;
+    const bool env_particle_unlit = std::getenv("OMC_PARTICLE_UNLIT") != nullptr;
+    const bool env_no_particle_fog = std::getenv("OMC_NO_PARTICLE_FOG") != nullptr;
+    const bool env_no_particle_mask = std::getenv("OMC_NO_PARTICLE_MASK") != nullptr;
+    const bool env_particle_no_mask2 = std::getenv("OMC_PARTICLE_NO_MASK2") != nullptr;
+    const bool env_shot_trace = std::getenv("OMC_SHOT_TRACE") != nullptr;
     struct ParCount {
         double instances = 0, poses_now = 0, poses_birth = 0;
         ~ParCount() {
@@ -4576,6 +4738,7 @@ void build_particles(SceneRenderer& sr, const std::vector<const SceneInstance*>&
             ++emitter_uid;
             if (pe.lifetime <= 0.0f) continue;
             if (material_hidden(m, formats::particle_material(m, pe))) continue;
+            if (!formats::fx_material_drawable(m, pe.material_ref_index)) continue;
             int ptex = sr.default_white();
             float pbright = 1.0f;
             uint32_t pblend = formats::kBlendAlphaAdd;
@@ -4590,18 +4753,18 @@ void build_particles(SceneRenderer& sr, const std::vector<const SceneInstance*>&
             bool plit = false;
             if (const int pm = formats::particle_material(m, pe); pm >= 0) {
                 const char* used = "Diffuse";
-                static const bool kEmisMult = std::getenv("SC2_PARTICLE_NO_EMIS_MULT") == nullptr;
+                static const bool kEmisMult = std::getenv("OMC_PARTICLE_NO_EMIS_MULT") == nullptr;
                 ptex = sr.resolve_texture(m, pm, "Diffuse", -1);
                 if (ptex < 0) { ptex = sr.resolve_texture(m, pm, "Emissive", -1); used = "Emissive"; }
                 if (ptex < 0) { ptex = sr.resolve_texture(m, pm, "Emissive2", sr.default_white()); used = "Emissive2"; }
                 for (const formats::M3Layer& L : m.materials[size_t(pm)].layers)
                     if (L.usage == used) { pbright = L.anim.bright_mult; break; }
-                static const bool kFlipAnySource = std::getenv("SC2_PARTICLE_FLIPBOOK_ANY_SOURCE") != nullptr;
+                static const bool kFlipAnySource = std::getenv("OMC_PARTICLE_FLIPBOOK_ANY_SOURCE") != nullptr;
                 if (!kFlipAnySource)
                     for (const formats::M3Layer& L : m.materials[size_t(pm)].layers)
                         if (L.usage == used && !L.raw_record.empty()) { pflip_uv = L.word40 == 6; break; }
-                static const bool kConstEmis = std::getenv("SC2_NO_PARTICLE_CONST_EMISSIVE") == nullptr;
-                static const bool kEmisTwice = std::getenv("SC2_PARTICLE_CONST_EMISSIVE_TWICE") != nullptr;
+                static const bool kConstEmis = std::getenv("OMC_NO_PARTICLE_CONST_EMISSIVE") == nullptr;
+                static const bool kEmisTwice = std::getenv("OMC_PARTICLE_CONST_EMISSIVE_TWICE") != nullptr;
                 if (kConstEmis && (kEmisTwice || std::string(used) == "Diffuse"))
                     for (const formats::M3Layer& L : m.materials[size_t(pm)].layers)
                         if (L.usage == "Emissive" && L.const_colour && L.inline_rgba.size() >= 4) {
@@ -4611,11 +4774,11 @@ void build_particles(SceneRenderer& sr, const std::vector<const SceneInstance*>&
                             pemis = int(pemis_table.size()) - 1;
                             break;
                         }
-                static const bool kParSel = std::getenv("SC2_PARTICLE_NO_CHANNEL_SELECT") == nullptr;
+                static const bool kParSel = std::getenv("OMC_PARTICLE_NO_CHANNEL_SELECT") == nullptr;
                 if (kParSel)
                     for (const formats::M3Layer& L : m.materials[size_t(pm)].layers)
                         if (L.usage == used && !L.raw_record.empty() && L.word44 == 2) {
-                            static const bool kOff = std::getenv("SC2_PARTICLE_TEAM_EMIS_OP_OFF") != nullptr;
+                            static const bool kOff = std::getenv("OMC_PARTICLE_TEAM_EMIS_OP_OFF") != nullptr;
                             const bool team_op = !kOff && std::string(used) == "Emissive" && m.materials[size_t(pm)].emis_op == 4;
                             std::array<float, 4> te{0.0f, 0.0f, 0.0f, team_op ? 9.0f : 1.0f};
                             if (team_op)
@@ -4630,7 +4793,7 @@ void build_particles(SceneRenderer& sr, const std::vector<const SceneInstance*>&
                             }
                             break;
                         }
-                static const bool kEmisImage = std::getenv("SC2_NO_PARTICLE_EMISSIVE_IMAGE") == nullptr;
+                static const bool kEmisImage = std::getenv("OMC_NO_PARTICLE_EMISSIVE_IMAGE") == nullptr;
                 if (kEmisImage && std::string(used) == "Diffuse") {
                     const formats::M3Layer* dl = nullptr;
                     const formats::M3Layer* el = nullptr;
@@ -4675,7 +4838,7 @@ void build_particles(SceneRenderer& sr, const std::vector<const SceneInstance*>&
                     }
                     pglow = std::string(used) != "Diffuse" || (dl && el && !el->image_path.empty() && dl->image_path == el->image_path) ||
                             (m.materials[size_t(pm)].flags & 0x10u) != 0;
-                    static const bool kPlumeProduct = std::getenv("SC2_PLUME_COVER_PRODUCT") != nullptr;
+                    static const bool kPlumeProduct = std::getenv("OMC_PLUME_COVER_PRODUCT") != nullptr;
                     pmask_alone = dl && el && !el->image_path.empty() && dl->image_path == el->image_path && !kPlumeProduct;
                     if (pblend != formats::kBlendAdd && pblend != formats::kBlendAlphaAdd && !env_glow_alphablend) pglow = false;
                     if (pglow) pmask_alone = true;
@@ -4724,10 +4887,10 @@ void build_particles(SceneRenderer& sr, const std::vector<const SceneInstance*>&
             Vec3 t2 = cross(axis, t1);
             const Mat4 mb_now = mb;
             const Vec3 axis_now = axis, t1_now = t1, t2_now = t2;
-            static const bool kParScale = std::getenv("SC2_NO_PARTICLE_SCALE") == nullptr;
+            static const bool kParScale = std::getenv("OMC_NO_PARTICLE_SCALE") == nullptr;
             float iscale = kParScale ? std::sqrt(inst.world.m[0] * inst.world.m[0] + inst.world.m[1] * inst.world.m[1] + inst.world.m[2] * inst.world.m[2]) : 1.0f;
-            static const bool kParBoneScale = std::getenv("SC2_PARTICLE_INSTANCE_SCALE") == nullptr;
-            static const bool kParStaticBoneScale = std::getenv("SC2_PARTICLE_STATIC_BONE_SCALE") != nullptr;
+            static const bool kParBoneScale = std::getenv("OMC_PARTICLE_INSTANCE_SCALE") == nullptr;
+            static const bool kParStaticBoneScale = std::getenv("OMC_PARTICLE_STATIC_BONE_SCALE") != nullptr;
             if (kParScale && kParBoneScale && pe.bone < bw.size() && pe.bone < m.bones.size() && (kParStaticBoneScale || m.bones[pe.bone].scale.anim_flags != 0)) {
                 const float sx = std::sqrt(mb.m[0] * mb.m[0] + mb.m[1] * mb.m[1] + mb.m[2] * mb.m[2]);
                 const float sy = std::sqrt(mb.m[4] * mb.m[4] + mb.m[5] * mb.m[5] + mb.m[6] * mb.m[6]);
@@ -4742,7 +4905,7 @@ void build_particles(SceneRenderer& sr, const std::vector<const SceneInstance*>&
             const float live_rate =
                 animated_scalar(m, pseq, rate_ref, inst.time_ms, pe.emission_rate, glayers(inst));
             int n = formats::particle_count_at_rate(pe, live_rate);
-            static const bool kBurstCount = std::getenv("SC2_PAR_BURST_COUNT") != nullptr;
+            static const bool kBurstCount = std::getenv("OMC_PAR_BURST_COUNT") != nullptr;
             if (kBurstCount && pe.rate_anim_flags && inst.seq >= 0 && std::size_t(inst.seq) < m.sequences.size() &&
                 (m.sequences[std::size_t(inst.seq)].flags & 0x1u) != 0 && pe.lifetime > 0.0f) {
                 const float t1 = inst.time_ms, t0 = std::max(0.0f, inst.time_ms - pe.lifetime * 1000.0f);
@@ -4787,10 +4950,10 @@ void build_particles(SceneRenderer& sr, const std::vector<const SceneInstance*>&
                                  double(std::sqrt(mb.m[8] * mb.m[8] + mb.m[9] * mb.m[9] + mb.m[10] * mb.m[10])));
                 }
             }
-            static const bool kParRange = std::getenv("SC2_PARTICLE_NO_RANGE") == nullptr;
+            static const bool kParRange = std::getenv("OMC_PARTICLE_NO_RANGE") == nullptr;
             if (kParRange && pe.rand_life2 && pe.lifetime2 > 0.0f && pe.lifetime > 0.0f)
                 n = int(float(n) * 0.5f * (pe.lifetime + pe.lifetime2) / pe.lifetime + 0.5f);
-            static const bool kParSteady = std::getenv("SC2_PAR_STEADY") != nullptr;
+            static const bool kParSteady = std::getenv("OMC_PAR_STEADY") != nullptr;
             const bool one_shot = inst.seq >= 0 && std::size_t(inst.seq) < m.sequences.size() && (m.sequences[std::size_t(inst.seq)].flags & 0x1u) != 0;
             const float clip_len_ms = (inst.seq >= 0 && std::size_t(inst.seq) < m.sequences.size()) ? float(m.sequences[std::size_t(inst.seq)].length_ms()) : 0.0f;
             const float life_max = std::max(pe.lifetime, (pe.rand_life2 && pe.lifetime2 > 0.0f) ? pe.lifetime2 : 0.0f);
@@ -4835,7 +4998,7 @@ void build_particles(SceneRenderer& sr, const std::vector<const SceneInstance*>&
             }
             plap.lap("par.material");
             if (n <= 0) continue;
-            static const bool kTrailQuads = std::getenv("SC2_PAR_TRAIL_AS_QUADS") != nullptr;
+            static const bool kTrailQuads = std::getenv("OMC_PAR_TRAIL_AS_QUADS") != nullptr;
             struct TrailPt { float age; Vec3 c; float size; float rgb[3]; float fade; };
             std::vector<TrailPt> trail_pts;
             const bool as_trail = !kTrailQuads && pe.ptype == 6;
@@ -4869,12 +5032,12 @@ void build_particles(SceneRenderer& sr, const std::vector<const SceneInstance*>&
                     }
                     birth_at = birth_ms;
                 }
-                static const bool kBirthPose = std::getenv("SC2_PAR_POSE_NOW") == nullptr;
+                static const bool kBirthPose = std::getenv("OMC_PAR_POSE_NOW") == nullptr;
                 if (kBirthPose && birth_at >= 0.0f && pe.bone < bw.size()) {
                     const int q = int(birth_at / 33.333f);
                     auto bp = birth_pose.find(q);
                     if (bp == birth_pose.end()) {
-                        static const bool kBirthUncached = std::getenv("SC2_PAR_BIRTH_POSE_UNCACHED") != nullptr;
+                        static const bool kBirthUncached = std::getenv("OMC_PAR_BIRTH_POSE_UNCACHED") != nullptr;
                         const float tq = (float(q) + 0.5f) * 33.333f;
                         if (kBirthUncached) {
                             bp = birth_pose.emplace(q, instance_bones_world(inst, pose_world(m, pseq, tq))).first;
@@ -4948,19 +5111,19 @@ void build_particles(SceneRenderer& sr, const std::vector<const SceneInstance*>&
                     }
                     Vec3 off{0, 0, 0};
                     const float az = u4 * 6.2831853f;
-                    static const char* kPlaneFrame = std::getenv("SC2_PARTICLE_PLANE_FRAME");
+                    static const char* kPlaneFrame = std::getenv("OMC_PARTICLE_PLANE_FRAME");
                     static float plane_sx = 0.0f, plane_sy = 0.0f;
                     static const bool plane_frame = kPlaneFrame && std::sscanf(kPlaneFrame, "%f,%f", &plane_sx, &plane_sy) == 2;
                     Vec3 e1 = t1, e2 = t2;
                     switch (pe.shape) {
                         case 1: {
-                            static const float kPlane = std::getenv("SC2_PARTICLE_PLANE_SCALE") ? float(std::atof(std::getenv("SC2_PARTICLE_PLANE_SCALE"))) : 0.5f;
+                            static const float kPlane = std::getenv("OMC_PARTICLE_PLANE_SCALE") ? float(std::atof(std::getenv("OMC_PARTICLE_PLANE_SCALE"))) : 0.5f;
                             off = {pe.area_size[0] * kPlane * (2.0f * u5 - 1.0f), pe.area_size[1] * kPlane * (2.0f * u6 - 1.0f), 0.0f};
                             if (plane_frame) {
                                 off.x += pe.area_size[0] * 2.0f * kPlane * plane_sx;
                                 off.y += pe.area_size[1] * 2.0f * kPlane * plane_sy;
                             }
-                            static const bool kCameraFrame = std::getenv("SC2_PARTICLE_PLANE_CAMERA_FRAME") != nullptr;
+                            static const bool kCameraFrame = std::getenv("OMC_PARTICLE_PLANE_CAMERA_FRAME") != nullptr;
                             if (!kCameraFrame) {
                                 const Vec3 bx{mb.m[0], mb.m[1], mb.m[2]}, by{mb.m[4], mb.m[5], mb.m[6]};
                                 if (dot(bx, bx) > 1e-8f && dot(by, by) > 1e-8f) {
@@ -4989,7 +5152,16 @@ void build_particles(SceneRenderer& sr, const std::vector<const SceneInstance*>&
                         }
                         default: break;
                     }
-                    off = {off.x * iscale, off.y * iscale, off.z * iscale};
+                    static const bool kShapeScaleOld = std::getenv("OMC_PAR_SHAPE_SCALE_OLD") != nullptr;
+                    if (kShapeScaleOld || !kParScale) {
+                        off = {off.x * iscale, off.y * iscale, off.z * iscale};
+                    } else {
+                        const float sx = std::sqrt(mb.m[0] * mb.m[0] + mb.m[1] * mb.m[1] + mb.m[2] * mb.m[2]);
+                        const float sy = std::sqrt(mb.m[4] * mb.m[4] + mb.m[5] * mb.m[5] + mb.m[6] * mb.m[6]);
+                        const float sz = std::sqrt(mb.m[8] * mb.m[8] + mb.m[9] * mb.m[9] + mb.m[10] * mb.m[10]);
+                        const float sxy = 0.5f * (sx + sy);
+                        off = {off.x * sxy, off.y * sxy, off.z * sz};
+                    }
                     Vec3 o2{origin.x + e1.x * off.x + e2.x * off.y + axis.x * off.z,
                             origin.y + e1.y * off.x + e2.y * off.y + axis.y * off.z,
                             origin.z + e1.z * off.x + e2.z * off.y + axis.z * off.z};
@@ -5001,7 +5173,7 @@ void build_particles(SceneRenderer& sr, const std::vector<const SceneInstance*>&
                     const float k = pe.slowdown;
                     const float travel = k > 1e-4f ? p_speed * (1.0f - std::exp(-k * age)) / k
                                                    : p_speed * age;
-                    static const bool kFallWorld = std::getenv("SC2_PARTICLE_FALL_SCALED") == nullptr;
+                    static const bool kFallWorld = std::getenv("OMC_PARTICLE_FALL_SCALED") == nullptr;
                     const float fall = 0.5f * pe.z_accel * age * age * (kFallWorld ? 1.0f : iscale);
                     c = {o2.x + dir.x * travel * iscale, o2.y + dir.y * travel * iscale, o2.z + dir.z * travel * iscale + fall};
                 } else {
@@ -5026,10 +5198,10 @@ void build_particles(SceneRenderer& sr, const std::vector<const SceneInstance*>&
                     size += (key3(pe.size2[0], pe.size2[1], pe.size2[2], pe.size_mid_at) - size) * ur;
                 size *= iscale;
                 if (size <= 0.0f) continue;
-                static const bool kBeyondField = std::getenv("SC2_PARTICLE_BEYOND_FIELD") != nullptr;
+                static const bool kBeyondField = std::getenv("OMC_PARTICLE_BEYOND_FIELD") != nullptr;
                 if (!kBeyondField && !sr.fog_field_contains(c.x, c.y)) continue;
                 {
-                    static const char* kFloor = std::getenv("SC2_PARTICLE_FLOOR_Z");
+                    static const char* kFloor = std::getenv("OMC_PARTICLE_FLOOR_Z");
                     static const float kFloorZ = kFloor ? float(std::atof(kFloor)) : 0.0f;
                     if (kFloor && c.z < kFloorZ) continue;
                 }
@@ -5062,7 +5234,7 @@ void build_particles(SceneRenderer& sr, const std::vector<const SceneInstance*>&
                                      double(lit_shade[1]), double(lit_shade[2]), double(pgain), double(rgb[0]), double(rgb[1]), double(rgb[2]), double(fade), double(life01), int(pglow), pfog,
                                      double(sr.tunables().exposure));
                     static int traced_pos = 0;
-                    static const bool kPlaceAll = std::getenv("SC2_PAR_PLACE_ALL") != nullptr;
+                    static const bool kPlaceAll = std::getenv("OMC_PAR_PLACE_ALL") != nullptr;
                     if (kPlaceAll || (i < 8 && traced_pos++ < 96))
                         std::fprintf(stderr, "[par]   place %d spawn %.2f %.2f %.2f now %.2f %.2f %.2f age %.2f size %.3f\n", i, double(spawn.x), double(spawn.y), double(spawn.z), double(c.x), double(c.y),
                                      double(c.z), double(age), double(size));
@@ -5096,7 +5268,7 @@ void build_particles(SceneRenderer& sr, const std::vector<const SceneInstance*>&
                 for (int k = 0; k < 4; ++k) {
                     const float cxr = corner[k][0] * spin_c - corner[k][1] * spin_s;
                     const float cyr = corner[k][0] * spin_s + corner[k][1] * spin_c;
-                    static const float kSizeScale = std::getenv("SC2_PARTICLE_SIZE_SCALE") ? float(std::atof(std::getenv("SC2_PARTICLE_SIZE_SCALE"))) : 0.5f;
+                    static const float kSizeScale = std::getenv("OMC_PARTICLE_SIZE_SCALE") ? float(std::atof(std::getenv("OMC_PARTICLE_SIZE_SCALE"))) : 0.5f;
                     float ox = cxr * size * kSizeScale, oy = cyr * size * kSizeScale;
                     q[k].pos[0] = c.x + right.x * ox + upc.x * oy;
                     q[k].pos[1] = c.y + right.y * ox + upc.y * oy;
@@ -5112,20 +5284,20 @@ void build_particles(SceneRenderer& sr, const std::vector<const SceneInstance*>&
                     q[k].color[2] = rgb[2];
                     q[k].color[3] = fade;
                 }
-                static const bool kType1Square = std::getenv("SC2_PAR_TYPE1_SQUARE") != nullptr;
-                static const char* kFlatMat = std::getenv("SC2_PAR_FLAT_MAT");
+                static const bool kType1Square = std::getenv("OMC_PAR_TYPE1_SQUARE") != nullptr;
+                static const char* kFlatMat = std::getenv("OMC_PAR_FLAT_MAT");
                 if (kFlatMat && pe.ptype == 0) {
                     const int mi = formats::particle_material(m, pe);
                     if (mi >= 0 && m.materials[std::size_t(mi)].name == kFlatMat) {
                         Vec3 h{axis.x, axis.y, 0.0f};
                         if (dot(h, h) < 1e-6f) h = Vec3{1, 0, 0};
                         h = normalize(h);
-                        static const bool kFlatTurn = std::getenv("SC2_PAR_FLAT_TURN") != nullptr;
+                        static const bool kFlatTurn = std::getenv("OMC_PAR_FLAT_TURN") != nullptr;
                         if (kFlatTurn) h = Vec3{-h.y, h.x, 0.0f};
-                        static const bool kFlatFlip = std::getenv("SC2_PAR_FLAT_FLIP") != nullptr;
-                        static const bool kFlatAnchor = std::getenv("SC2_PAR_FLAT_ANCHOR") != nullptr;
+                        static const bool kFlatFlip = std::getenv("OMC_PAR_FLAT_FLIP") != nullptr;
+                        static const bool kFlatAnchor = std::getenv("OMC_PAR_FLAT_ANCHOR") != nullptr;
                         const Vec3 s2 = kFlatFlip ? Vec3{h.y, -h.x, 0.0f} : Vec3{-h.y, h.x, 0.0f};
-                        static const float kFlatScale = std::getenv("SC2_PAR_FLAT_SCALE") ? float(std::atof(std::getenv("SC2_PAR_FLAT_SCALE"))) : 1.0f;
+                        static const float kFlatScale = std::getenv("OMC_PAR_FLAT_SCALE") ? float(std::atof(std::getenv("OMC_PAR_FLAT_SCALE"))) : 1.0f;
                         const float fs = size * kFlatScale;
                         const float sh = kFlatAnchor ? fs : 0.0f;
                         for (int k = 0; k < 4; ++k) {
@@ -5226,12 +5398,12 @@ void build_particles(SceneRenderer& sr, const std::vector<const SceneInstance*>&
         const SceneInstance& inst = *instp;
         const formats::Model& m = *inst.model;
         if (m.ribbons.empty()) continue;
-        static const bool kNoRibbons = std::getenv("SC2_NO_RIBBONS") != nullptr;
+        static const bool kNoRibbons = std::getenv("OMC_NO_RIBBONS") != nullptr;
         if (kNoRibbons) continue;
         const uint32_t rseq = inst.seq >= 0 ? uint32_t(inst.seq) : UINT32_MAX;
         const std::vector<Mat4> bw = instance_bones_world(inst, pose_world(m, rseq, inst.seq >= 0 ? inst.time_ms : 0.0f, -1, 0.0f, glayers(inst)));
         for (const formats::M3Ribbon& rb : m.ribbons) {
-            static const bool kFreeHang = std::getenv("SC2_NO_FREE_RIBBON_HANG") == nullptr;
+            static const bool kFreeHang = std::getenv("OMC_NO_FREE_RIBBON_HANG") == nullptr;
             float hang_len = 0.0f;
             if (kFreeHang && rb.end_bone < 0 && rb.version == 6 && rb.raw.size() >= 424) {
                 float g = 0.0f, life = 0.0f;
@@ -5241,24 +5413,38 @@ void build_particles(SceneRenderer& sr, const std::vector<const SceneInstance*>&
             }
             const bool hang = hang_len > 0.0f;
             if (!rb.has_fields || (rb.end_bone < 0 && !hang)) continue;
+            if (!formats::fx_material_drawable(m, rb.material_ref_index)) continue;
             if (rb.bone >= bw.size() || (!hang && size_t(rb.end_bone) >= bw.size())) continue;
-            static const bool kRibHidden = std::getenv("SC2_RIBBON_ON_HIDDEN_BONE") != nullptr;
+            static const bool kRibHidden = std::getenv("OMC_RIBBON_ON_HIDDEN_BONE") != nullptr;
             if (!kRibHidden) {
                 auto collapsed = [](const Mat4& q) { return q.m[0] * q.m[0] + q.m[1] * q.m[1] + q.m[2] * q.m[2] < 1e-10f; };
-                if (collapsed(bw[rb.bone]) || (!hang && collapsed(bw[size_t(rb.end_bone)]))) continue;
+                static const bool kEndScaleOld = std::getenv("OMC_RIBBON_END_SCALE_OLD") != nullptr;
+                const bool end_hides = kEndScaleOld || inst.beam_bone < 0;
+                if (collapsed(bw[rb.bone]) || (!hang && end_hides && collapsed(bw[size_t(rb.end_bone)]))) continue;
             }
             int rtex = sr.default_white();
             uint32_t rblend = formats::kBlendAlphaAdd;
             float manim[4] = {0.0f, 0.0f, 1.0f, 1.0f};
             float ruvx[3] = {1.0f, 1.0f, 0.0f};
+            float rbright = 1.0f;
             if (const int rm = formats::ribbon_material(m, rb); rm >= 0) {
-                rtex = sr.resolve_texture(m, rm, "Diffuse", sr.default_white());
+                if (formats::fx_material_old()) {
+                    rtex = sr.resolve_texture(m, rm, "Diffuse", sr.default_white());
+                } else {
+                    const char* used = "Diffuse";
+                    rtex = sr.resolve_texture(m, rm, "Diffuse", -1);
+                    if (rtex < 0) { rtex = sr.resolve_texture(m, rm, "Emissive", -1); used = "Emissive"; }
+                    if (rtex < 0) { rtex = sr.resolve_texture(m, rm, "Emissive2", sr.default_white()); used = "Emissive2"; }
+                    if (std::string(used) != "Diffuse")
+                        for (const formats::M3Layer& L : m.materials[size_t(rm)].layers)
+                            if (L.usage == used) { rbright = L.anim.bright_mult * m.materials[size_t(rm)].emis_mult; break; }
+                }
                 rblend = m.materials[size_t(rm)].blend_mode;
                 if (rblend > formats::kBlendAlphaAdd) rblend = formats::kBlendAlphaBlend;
                 material_anim(m, rm, inst.seq, inst.time_ms, manim, &inst.global_layers);
                 material_uv_xform(m, rm, inst.seq, inst.time_ms, ruvx, &inst.global_layers);
             }
-            static const bool kRibTeam = std::getenv("SC2_NO_RIBBON_TEAM_COLOR") == nullptr;
+            static const bool kRibTeam = std::getenv("OMC_NO_RIBBON_TEAM_COLOR") == nullptr;
             int remis = 0;
             if (kRibTeam && inst.team[3] > 0.0f && inst.team[3] < 1.5f)
                 if (const int rm = formats::ribbon_material(m, rb); rm >= 0)
@@ -5273,8 +5459,9 @@ void build_particles(SceneRenderer& sr, const std::vector<const SceneInstance*>&
             float w3[3] = {rb.width[0], rb.width[1], rb.width[2]};
             if (rb.width_flags && inst.seq >= 0)
                 animated_layer_field(m, rseq, rb.width_interp, rb.width_flags, rb.width_id, inst.time_ms, 3, rb.width, w3, glayers(inst));
-            static const bool kTubeHalf = std::getenv("SC2_RIBBON_TUBE_HALF_WIDTH") != nullptr;
-            if (!kTubeHalf && rb.version == 8 && rb.sides > 1)
+            static const bool kTubeHalf = std::getenv("OMC_RIBBON_TUBE_HALF_WIDTH") != nullptr;
+            static const bool kV6WidthOld = std::getenv("OMC_RIBBON_V6_WIDTH_OLD") != nullptr;
+            if (!kTubeHalf && rb.sides > 1 && (rb.version == 8 || (rb.version == 6 && !kV6WidthOld)))
                 for (float& w : w3) w *= 0.25f;
             const Vec3 A{bw[rb.bone].m[12], bw[rb.bone].m[13], bw[rb.bone].m[14]};
             const Mat4& eb = hang ? bw[rb.bone] : bw[size_t(rb.end_bone)];
@@ -5292,13 +5479,13 @@ void build_particles(SceneRenderer& sr, const std::vector<const SceneInstance*>&
             auto key = [](float a, float b, float c, float t) {
                 return t < 0.5f ? a + (b - a) * (t * 2.0f) : b + (c - b) * ((t - 0.5f) * 2.0f);
             };
-            static const bool kStraight = std::getenv("SC2_RIBBON_STRAIGHT") != nullptr;
+            static const bool kStraight = std::getenv("OMC_RIBBON_STRAIGHT") != nullptr;
             const bool spline = !kStraight && rb.version == 8 && rb.sides > 1;
             Vec3 T0 = ab, T1 = ab;
             if (spline) {
-                static const float kTanScale = std::getenv("SC2_RIBBON_TANGENT_SCALE") ? float(std::atof(std::getenv("SC2_RIBBON_TANGENT_SCALE"))) : 1.5f;
+                static const float kTanScale = std::getenv("OMC_RIBBON_TANGENT_SCALE") ? float(std::atof(std::getenv("OMC_RIBBON_TANGENT_SCALE"))) : 1.5f;
                 float chord = std::sqrt(dot(ab, ab));
-                static const bool kReachChord = std::getenv("SC2_RIBBON_REACH_TANGENT_CHORD") != nullptr;
+                static const bool kReachChord = std::getenv("OMC_RIBBON_REACH_TANGENT_CHORD") != nullptr;
                 if (!kReachChord && inst.reach_tip_bone >= 0) {
                     const std::vector<Mat4> raw = pose_world(m, rseq, inst.seq >= 0 ? inst.time_ms : 0.0f, -1, 0.0f, glayers(inst));
                     if (rb.bone < raw.size() && size_t(rb.end_bone) < raw.size()) {
@@ -5337,7 +5524,7 @@ void build_particles(SceneRenderer& sr, const std::vector<const SceneInstance*>&
                     const float sl = std::sqrt(dot(hang_side, hang_side));
                     hw *= 0.25f * sl;
                 }
-                static const bool kFlatStrip = std::getenv("SC2_RIBBON_FLAT_STRIP") != nullptr;
+                static const bool kFlatStrip = std::getenv("OMC_RIBBON_FLAT_STRIP") != nullptr;
                 if (spline && !kFlatStrip) {
                     const int cols = std::max(2, int(rb.sides) / 2);
                     const Vec3 tocam = normalize(cross(side, along));
@@ -5366,7 +5553,7 @@ void build_particles(SceneRenderer& sr, const std::vector<const SceneInstance*>&
                         rv.uv[0] = bu * ruv_c - bv * ruv_s + manim[0];
                         rv.uv[1] = bu * ruv_s + bv * ruv_c + manim[1];
                         for (int ch = 0; ch < 3; ++ch)
-                            rv.color[ch] = key(rb.color[0][ch], rb.color[1][ch], rb.color[2][ch], t) * manim[3] * shade[ch];
+                            rv.color[ch] = key(rb.color[0][ch], rb.color[1][ch], rb.color[2][ch], t) * manim[3] * shade[ch] * rbright;
                         rv.color[3] = key(rb.color[0][3], rb.color[1][3], rb.color[2][3], t);
                     }
                     if (k > 0)
@@ -5389,7 +5576,7 @@ void build_particles(SceneRenderer& sr, const std::vector<const SceneInstance*>&
                     v[e].uv[0] = bu * ruv_c - bv * ruv_s + manim[0];
                     v[e].uv[1] = bu * ruv_s + bv * ruv_c + manim[1];
                     for (int ch = 0; ch < 3; ++ch)
-                        v[e].color[ch] = remis > 0 ? inst.team[size_t(ch)] : key(rb.color[0][ch], rb.color[1][ch], rb.color[2][ch], t) * manim[3];
+                        v[e].color[ch] = remis > 0 ? inst.team[size_t(ch)] : key(rb.color[0][ch], rb.color[1][ch], rb.color[2][ch], t) * manim[3] * rbright;
                     v[e].color[3] = key(rb.color[0][3], rb.color[1][3], rb.color[2][3], t);
                 }
                 if (k > 0) {

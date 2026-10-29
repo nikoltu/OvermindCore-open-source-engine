@@ -1,4 +1,7 @@
 #version 450
+#ifndef TQ
+#define TQ 0
+#endif
 layout(push_constant) uniform PC { mat4 world; vec4 team; } pc;
 layout(set = 0, binding = 0) uniform sampler2DArray layerDiffuse;
 layout(set = 0, binding = 1) uniform sampler2DArray layerWeight;
@@ -43,6 +46,8 @@ vec3 point_lights(vec3 p, vec3 n) {
     for (int i = 0; i < 64; ++i) {
         if (i >= cnt) break;
         vec3 d = g.lightPos[i].xyz - p;
+        const float reach = max(max(g.lightPos[i].w, g.lightCol[i].w + 1e-3), 1e-3) * 1.0001;
+        if (dot(d, d) > reach * reach) continue;
         float dist = length(d);
         float att = 1.0 - smoothstep(g.lightCol[i].w, max(g.lightPos[i].w, g.lightCol[i].w + 1e-3), dist);
         if (g.lightMeta.y > 0.5) { float q = clamp(1.0 - dist / max(g.lightPos[i].w, 1e-3), 0.0, 1.0); att = g.lightMeta.y > 1.5 ? q * q : q; }
@@ -154,31 +159,69 @@ void main() {
     vec3 nacc = vec3(0.0);
     float wsum = 0.0;
     float sacc = 0.0;
+#if TQ == 0
     const float kLodBias = -0.75;
+#else
+    const float kLodBias = 0.0;
+#endif
     float lw[8];
     float lwMax = 0.0;
+#if TQ == 2
+    const bool heightBlend = false;
+#else
     const bool heightBlend = g.terrainHeight[0].w > 0.5;
+#endif
+    const vec4 wLo = texture(layerWeight, vec3(maskUV, 0.0));
+    const vec4 wHi = texture(layerWeight, vec3(maskUV, 1.0));
+    lw[0] = wLo.r; lw[1] = wLo.g; lw[2] = wLo.b; lw[3] = wLo.a;
+    lw[4] = wHi.r; lw[5] = wHi.g; lw[6] = wHi.b; lw[7] = wHi.a;
     for (int L = 0; L < 8; ++L) {
-        lw[L] = texture(layerWeight, vec3(maskUV, float(L))).r;
         if (heightBlend && lw[L] > 0.0 && g.terrainHeight[L].z > 0.5)
             lw[L] *= max(texture(layerNormal, vec3(vUV, float(L)), kLodBias).a * g.terrainHeight[L].x + g.terrainHeight[L].y, 0.0);
         lwMax = max(lwMax, lw[L]);
     }
     if (heightBlend)
         for (int L = 0; L < 8; ++L) lw[L] *= 1.0 - clamp(lwMax - lw[L], 0.0, 1.0);
+#if TQ != 0
+    {
+        const int kKeep = TQ == 1 ? 3 : 2;
+        float keep[8];
+        float top = 0.0;
+        for (int L = 0; L < 8; ++L) {
+            keep[L] = 0.0;
+            top = max(top, lw[L]);
+        }
+        for (int k = 0; k < kKeep; ++k) {
+            int best = -1;
+            float bw = TQ == 1 ? top * 0.08 : 0.0;
+            for (int L = 0; L < 8; ++L)
+                if (keep[L] == 0.0 && lw[L] > bw) {
+                    bw = lw[L];
+                    best = L;
+                }
+            if (best < 0) break;
+            keep[best] = 1.0;
+        }
+        for (int L = 0; L < 8; ++L) lw[L] *= keep[L];
+    }
+#endif
     for (int L = 0; L < 8; ++L) {
         const float w = lw[L];
         if (w <= 0.0) continue;
         const vec4 ld = texture(layerDiffuse, vec3(vUV, float(L)), kLodBias + g.terrainColorize2.w);
         acc += w * (g.keySpec.w > 0.5 ? to_gamma(ld.rgb) : ld.rgb);
         sacc += w * ld.a;
+#if TQ != 2
         nacc += w * (texture(layerNormal, vec3(vUV, float(L)), kLodBias + g.terrainColorize2.w).xyz * 2.0 - 1.0);
+#endif
         wsum += w;
     }
-    vec3 base0 = texture(layerDiffuse, vec3(vUV, 0.0)).rgb;
-    if (g.keySpec.w > 0.5) base0 = to_gamma(base0);
-    vec3 diff = wsum > 0.0 ? acc / wsum : base0;
-    diff *= texture(layerWeight, vec3(maskUV, 8.0)).r;
+    vec3 diff = acc / max(wsum, 1e-30);
+    if (!(wsum > 0.0)) {
+        diff = texture(layerDiffuse, vec3(vUV, 0.0)).rgb;
+        if (g.keySpec.w > 0.5) diff = to_gamma(diff);
+    }
+    diff *= texture(layerWeight, vec3(maskUV, 2.0)).r;
     vec3 N = normalize(vNormal);
     vec3 n = N;
     if (wsum > 0.0 && dot(nacc, nacc) > 1e-6) {

@@ -1,10 +1,10 @@
-#include "sc2/app/shell_widgets.hpp"
+#include "omc/app/shell_widgets.hpp"
 
 #include <algorithm>
 #include <cmath>
 #include <cstdlib>
 
-namespace sc2::app::shell {
+namespace omc::app::shell {
 
 namespace v2 = theme::v2;
 using theme::Rgb;
@@ -53,7 +53,7 @@ void UiState::reset_screen() {
 Ui::Ui(Pass pass, std::uint32_t view_w, std::uint32_t view_h, const render::InputState* in, std::vector<std::uint8_t>* out,
        ShellFx& fx, UiState& st, Faces faces, float dt_ms, double double_click_ms)
     : pass_(pass), w_(view_w), h_(view_h), in_(in), out_(out), fx_(fx), st_(st), faces_(faces), double_click_ms_(double_click_ms) {
-    static const bool scale_to_width = std::getenv("SC2_SHELL_SCALE_TO_WIDTH") != nullptr;
+    static const bool scale_to_width = std::getenv("OMC_SHELL_SCALE_TO_WIDTH") != nullptr;
     const float min_w = scale_to_width ? layout::kCanvasW : kFluidMinW;
     const float s0 = h_ > 0 ? float(h_) / layout::kCanvasH : 1.0f;
     const float virt_w = s0 > 0.0f ? float(w_) / s0 : layout::kCanvasW;

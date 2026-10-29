@@ -1,12 +1,12 @@
-#include "sc2/app/shell_screens.hpp"
+#include "omc/app/shell_screens.hpp"
 
 #include <algorithm>
 #include <cstdio>
 #include <filesystem>
 
-#include "sc2/app/front_end.hpp"
+#include "omc/app/front_end.hpp"
 
-namespace sc2::app::shell {
+namespace omc::app::shell {
 
 namespace v2 = theme::v2;
 namespace L = layout::s50_result;

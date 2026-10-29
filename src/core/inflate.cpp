@@ -1,8 +1,8 @@
-#include "sc2/core/inflate.hpp"
+#include "omc/core/inflate.hpp"
 
 #include <stdexcept>
 
-namespace sc2::core {
+namespace omc::core {
 namespace {
 
 class BitReader {

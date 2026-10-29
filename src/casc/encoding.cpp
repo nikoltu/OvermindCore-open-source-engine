@@ -1,10 +1,10 @@
-#include "sc2/casc/encoding.hpp"
+#include "omc/casc/encoding.hpp"
 
 #include <algorithm>
 #include <stdexcept>
 #include <string>
 
-namespace sc2::casc {
+namespace omc::casc {
 
 static uint32_t rd_u32be(const uint8_t* p) {
     return uint32_t(p[0]) << 24 | uint32_t(p[1]) << 16 | uint32_t(p[2]) << 8 |

@@ -1,14 +1,14 @@
-#include "sc2/app/glue_screen.hpp"
+#include "omc/app/glue_screen.hpp"
 
 #include <exception>
 
-#include "sc2/app/ui_layout_source.hpp"
-#include "sc2/casc/storage.hpp"
-#include "sc2/data/melee_mods.hpp"
-#include "sc2/data/strings.hpp"
-#include "sc2/ui/interact.hpp"
+#include "omc/app/ui_layout_source.hpp"
+#include "omc/casc/storage.hpp"
+#include "omc/data/melee_mods.hpp"
+#include "omc/data/strings.hpp"
+#include "omc/ui/interact.hpp"
 
-namespace sc2::app {
+namespace omc::app {
 
 std::optional<GlueScreen> GlueScreen::harvest(casc::Storage& store,
                                               const std::vector<std::string>& layout_paths,

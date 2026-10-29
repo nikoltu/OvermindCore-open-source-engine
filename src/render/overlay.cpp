@@ -1,11 +1,11 @@
-#include "sc2/render/overlay.hpp"
+#include "omc/render/overlay.hpp"
 
 #include <algorithm>
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
 
-namespace sc2::render {
+namespace omc::render {
 
 namespace {
 

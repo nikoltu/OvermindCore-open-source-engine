@@ -1,12 +1,12 @@
-#include "sc2/app/portrait_catalog.hpp"
+#include "omc/app/portrait_catalog.hpp"
 
 #include <algorithm>
 #include <map>
 
-#include "sc2/casc/storage.hpp"
-#include "sc2/data/catalog.hpp"
+#include "omc/casc/storage.hpp"
+#include "omc/data/catalog.hpp"
 
-namespace sc2::app {
+namespace omc::app {
 
 namespace {
 
@@ -49,44 +49,58 @@ std::string model_file(const data::Catalog& cat, const std::string& model_id) {
 }
 
 struct Hero {
-    const char* name;
+    const char* text_key;
     char race;
     const char* stills[3];
 };
 const Hero kHeroes[] = {
-    {"Portrait", 'T', {"raynorcommanderportrait_static", "raynormarineportrait_static", nullptr}},
-    {"Portrait", 'T', {"tychusportrait_static", nullptr, nullptr}},
-    {"Portrait", 'T', {"novaportrait_static", "smx3_nova_portrait_static", nullptr}},
-    {"Portrait", 'T', {"swannportrait_static", nullptr, nullptr}},
-    {"Portrait", 'T', {"hornerportrait_static", nullptr, nullptr}},
-    {"Portrait", 'T', {"smx1_hanportrait_static", "hanportrait_static", nullptr}},
-    {"Portrait", 'T', {"stetmannportrait_static", "stetmann_portrait_static", nullptr}},
-    {"Portrait", 'T', {"toshportrait_static", nullptr, nullptr}},
-    {"Portrait", 'T', {"hansonportrait_static", nullptr, nullptr}},
-    {"Portrait", 'T', {"arcturusportrait_static", nullptr, nullptr}},
-    {"Portrait", 'T', {"valerianportrait_static", "sm_valeriant1portrait_static", nullptr}},
-    {"Portrait", 'T', {"warfieldportrait_static", nullptr, nullptr}},
-    {"Portrait", 'T', {"kerriganghostportrait_static", nullptr, nullptr}},
-    {"Portrait", 'Z', {"kerriganportrait_static", "smx1_kerriganinfestedportrait_static", nullptr}},
-    {"Portrait", 'Z', {"smx1_zagaraportrait_static", "zagaraportrait_static", nullptr}},
-    {"Portrait", 'Z', {"dehakaportrait_static", nullptr, nullptr}},
-    {"Portrait", 'Z', {"smx1_evolutionmasterportrait_static", "smx1_evolutionmaster_static", "evolutionmasterportrait_static"}},
-    {"Portrait", 'Z', {"smx1_infestedstukovportrait_static", nullptr, nullptr}},
-    {"Portrait", 'Z', {"overmindportrait_static", nullptr, nullptr}},
-    {"Portrait", 'P', {"zeratulportrait_static", nullptr, nullptr}},
-    {"Portrait", 'P', {"artanisportrait_static", "artanisex2portrait_static", nullptr}},
-    {"Portrait", 'P', {"karaxportrait_static", "karaxex2portrait_static", nullptr}},
-    {"Portrait", 'P', {"fenixportrait_static", nullptr, nullptr}},
-    {"Portrait", 'P', {"vorazunportrait_static", "vorazunex2portrait_static", nullptr}},
-    {"Portrait", 'P', {"alarakportrait_static", nullptr, nullptr}},
-    {"Portrait", 'P', {"tassadarportrait_static", nullptr, nullptr}},
-    {"Portrait", 'P', {"selendisportrait_static", nullptr, nullptr}},
-    {"Portrait", 'P', {"urunportrait_static", nullptr, nullptr}},
-    {"Portrait", 'P', {"mohandarportrait_static", nullptr, nullptr}},
-    {"Portrait", 'N', {"amonportrait_static", nullptr, nullptr}},
-    {"Portrait", 'N', {"ourosportrait_static", nullptr, nullptr}},
-    {"Portrait", 'N', {"narudportrait_static", "narudex1portrait_static", nullptr}},
+    {"Character/Name/Raynor", 'T', {"raynorcommanderportrait_static", "raynormarineportrait_static", nullptr}},
+    {"Unit/Name/SMMarine01", 'T', {"tychusportrait_static", nullptr, nullptr}},
+    {"Character/Name/Nova", 'T', {"novaportrait_static", "smx3_nova_portrait_static", nullptr}},
+    {"Character/Name/Swann", 'T', {"swannportrait_static", nullptr, nullptr}},
+    {"Character/Name/Horner", 'T', {"hornerportrait_static", nullptr, nullptr}},
+    {"Character/Name/MiraHan", 'T', {"smx1_hanportrait_static", "hanportrait_static", nullptr}},
+    {"Character/Name/BelshirScientist", 'T', {"stetmannportrait_static", "stetmann_portrait_static", nullptr}},
+    {"Unit/Name/Tosh", 'T', {"toshportrait_static", nullptr, nullptr}},
+    {"Unit/Name/SMCivilian", 'T', {"hansonportrait_static", nullptr, nullptr}},
+    {"Unit/Name/SMArcturusMengsk", 'T', {"arcturusportrait_static", nullptr, nullptr}},
+    {"Character/Name/Valerian", 'T', {"valerianportrait_static", "sm_valeriant1portrait_static", nullptr}},
+    {"Character/Name/GeneralWarfield", 'T', {"warfieldportrait_static", nullptr, nullptr}},
+    {"Reward/Name/Kerrigan_70_Portrait_Ghost_Kerrigan", 'T', {"kerriganghostportrait_static", nullptr, nullptr}},
+    {"Character/Name/Kerrigan", 'Z', {"kerriganportrait_static", "smx1_kerriganinfestedportrait_static", nullptr}},
+    {"Character/Name/Zagara", 'Z', {"smx1_zagaraportrait_static", "zagaraportrait_static", nullptr}},
+    {"Unit/Name/Dehaka", 'Z', {"dehakaportrait_static", nullptr, nullptr}},
+    {"Character/Name/Abathur", 'Z', {"smx1_evolutionmasterportrait_static", "smx1_evolutionmaster_static", "evolutionmasterportrait_static"}},
+    {"Character/Name/Stukov", 'Z', {"smx1_infestedstukovportrait_static", nullptr, nullptr}},
+    {"Unit/Name/Overmind", 'Z', {"overmindportrait_static", nullptr, nullptr}},
+    {"Character/Name/Zeratul", 'P', {"zeratulportrait_static", nullptr, nullptr}},
+    {"Character/Name/Artanis", 'P', {"artanisportrait_static", "artanisex2portrait_static", nullptr}},
+    {"Character/Name/Karax", 'P', {"karaxportrait_static", "karaxex2portrait_static", nullptr}},
+    {"Character/Name/ProtossAI", 'P', {"fenixportrait_static", nullptr, nullptr}},
+    {"Character/Name/Vorazun", 'P', {"vorazunportrait_static", "vorazunex2portrait_static", nullptr}},
+    {"Character/Name/Alarak", 'P', {"alarakportrait_static", nullptr, nullptr}},
+    {"Character/Name/TassadarAnnouncer", 'P', {"tassadarportrait_static", nullptr, nullptr}},
+    {"Character/Name/Selendis", 'P', {"selendisportrait_static", nullptr, nullptr}},
+    {"Unit/Name/Urun", 'P', {"urunportrait_static", nullptr, nullptr}},
+    {"Unit/Name/Mohandar", 'P', {"mohandarportrait_static", nullptr, nullptr}},
+    {"Unit/Name/AmonEpilogue03Unit", 'N', {"amonportrait_static", nullptr, nullptr}},
+    {"Reward/Name/VoidBrutal20_Portrait", 'N', {"ourosportrait_static", nullptr, nullptr}},
+    {"Character/Name/Narud", 'N', {"narudportrait_static", "narudex1portrait_static", nullptr}},
 };
+const char* const kHeroTextFiles[] = {
+    "campaigns/liberty.sc2campaign/enus.sc2data/LocalizedData/GameStrings.txt",
+    "campaigns/swarm.sc2campaign/enus.sc2data/LocalizedData/GameStrings.txt",
+    "campaigns/void.sc2campaign/enus.sc2data/LocalizedData/GameStrings.txt",
+    "campaigns/libertystory.sc2campaign/enus.sc2data/LocalizedData/GameStrings.txt",
+    "campaigns/swarmstory.sc2campaign/enus.sc2data/LocalizedData/GameStrings.txt",
+    "campaigns/voidstory.sc2campaign/enus.sc2data/LocalizedData/GameStrings.txt",
+};
+std::string trimmed(const std::string& s) {
+    std::size_t b = 0, e = s.size();
+    while (b < e && (s[b] == ' ' || s[b] == '\t')) ++b;
+    while (e > b && (s[e - 1] == ' ' || s[e - 1] == '\t' || s[e - 1] == '\r')) --e;
+    return s.substr(b, e - b);
+}
 const char* const kHeroRoots[] = {
     "campaigns/liberty.sc2campaign/base.sc2assets/Assets/Textures/", "campaigns/swarm.sc2campaign/base.sc2assets/Assets/Textures/",
     "campaigns/void.sc2campaign/base.sc2assets/Assets/Textures/",    "mods/liberty.sc2mod/base.sc2assets/Assets/Textures/",
@@ -209,10 +223,14 @@ void PortraitCatalog::plan(const data::Catalog& cat) {
         todo_.push_back(std::move(t));
     }
     std::sort(todo_.begin(), todo_.end(), [](const Todo& a, const Todo& b) { return a.name < b.name; });
+    int hero_no = 0;
     for (const Hero& h : kHeroes) {
         Todo t;
         t.hero = true;
-        t.name = h.name;
+        ++hero_no;
+        const std::string* text = hero_text_.find(h.text_key);
+        if (!text || trimmed(*text).empty()) text = cat.strings().find(h.text_key);
+        t.name = text && !trimmed(*text).empty() ? trimmed(*text) : "Portrait " + std::to_string(hero_no);
         t.race = h.race;
         for (const char* s : h.stills) {
             if (!s) break;
@@ -225,7 +243,15 @@ void PortraitCatalog::plan(const data::Catalog& cat) {
 
 bool PortraitCatalog::scan(const data::Catalog& cat, casc::Storage& store, int budget) {
     if (scan_done_) return true;
-    if (!planned_) plan(cat);
+    if (!planned_) {
+        for (const char* f : kHeroTextFiles) {
+            try {
+                hero_text_.load(store.read_by_name(f));
+            } catch (const std::exception&) {
+            }
+        }
+        plan(cat);
+    }
     for (; cursor_ < todo_.size() && budget > 0; ++cursor_, --budget) {
         const Todo& t = todo_[cursor_];
         if (!t.hero) {

@@ -1,10 +1,10 @@
-#include "sc2/data/actor_model.hpp"
+#include "omc/data/actor_model.hpp"
 
 #include <cstdlib>
 #include <map>
 #include <utility>
 
-namespace sc2::data {
+namespace omc::data {
 
 namespace {
 
@@ -59,7 +59,7 @@ std::optional<std::string> model_asset(const Catalog& cat, const std::string& mo
 std::string unit_actor_id(const Catalog& cat, const std::string& token) {
     static const std::string kFly = "Flying";
     if (cat.find("CActorUnit", token)) return token;
-    if (!std::getenv("SC2_NO_BIRTH_ACTOR") && !token.empty()) {
+    if (!std::getenv("OMC_NO_BIRTH_ACTOR") && !token.empty()) {
         static std::map<std::pair<const Catalog*, std::string>, std::string> cache;
         const auto key = std::make_pair(&cat, token);
         if (auto it = cache.find(key); it != cache.end()) {
@@ -79,7 +79,7 @@ std::string unit_actor_id(const Catalog& cat, const std::string& token) {
             if (!found.empty()) return found;
         }
     }
-    if (token.size() <= kFly.size() || std::getenv("SC2_NO_FLYER_ACTOR")) return token;
+    if (token.size() <= kFly.size() || std::getenv("OMC_NO_FLYER_ACTOR")) return token;
     if (token.compare(token.size() - kFly.size(), kFly.size(), kFly) != 0) return token;
     const std::string base = token.substr(0, token.size() - kFly.size());
     if (!cat.find("CActorUnit", base)) return token;

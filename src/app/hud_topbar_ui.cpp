@@ -1,6 +1,6 @@
-#include "sc2/app/melee_game.hpp"
+#include "omc/app/melee_game.hpp"
 
-namespace sc2::app {
+namespace omc::app {
 
 bool MeleeGame::hud_topbar_on_button(const HudPress& p) {
     if (p.id != HudButtonId::Alliance || !p.left) return false;

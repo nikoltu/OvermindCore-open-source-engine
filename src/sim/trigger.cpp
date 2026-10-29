@@ -1,6 +1,6 @@
-#include "sc2/sim/trigger.hpp"
+#include "omc/sim/trigger.hpp"
 
-namespace sc2::sim {
+namespace omc::sim {
 
 bool eval_unit_count(const World& w, int32_t player, Cmp op, int32_t n) {
     int c = w.alive_count(player);

@@ -1,10 +1,10 @@
-#include "sc2/api/ws.hpp"
+#include "omc/api/ws.hpp"
 
 #include <algorithm>
 #include <cctype>
 #include <cstring>
 
-namespace sc2::api::ws {
+namespace omc::api::ws {
 
 namespace {
 

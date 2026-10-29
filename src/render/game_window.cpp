@@ -1,7 +1,8 @@
-#include "sc2/render/frame_prof.hpp"
-#include "sc2/render/game_window.hpp"
+#include "omc/render/frame_prof.hpp"
+#include "omc/render/quality.hpp"
+#include "omc/render/game_window.hpp"
 
-#include "sc2/core/version.hpp"
+#include "omc/core/version.hpp"
 
 #ifndef NOMINMAX
 #define NOMINMAX
@@ -32,14 +33,15 @@
 #include <unordered_map>
 #include <vector>
 
-#include "sc2/casc/storage.hpp"
-#include "sc2/render/device.hpp"
-#include "sc2/render/scene.hpp"
-#include "sc2/render/scene_renderer.hpp"
-#include "sc2/render/texture_decode.hpp"
-#include "sc2/render/vk_helpers.hpp"
-#include "sc2/render/vk_raii.hpp"
-#include "sc2/render/wsi_device.hpp"
+#include "omc/casc/storage.hpp"
+#include "omc/render/device.hpp"
+#include "omc/render/overlay_pass.hpp"
+#include "omc/render/scene.hpp"
+#include "omc/render/scene_renderer.hpp"
+#include "omc/render/texture_decode.hpp"
+#include "omc/render/vk_helpers.hpp"
+#include "omc/render/vk_raii.hpp"
+#include "omc/render/wsi_device.hpp"
 
 static const uint32_t kOverlayVertSpv[] =
 #include "overlay.vert.spv.h"
@@ -48,7 +50,7 @@ static const uint32_t kOverlayFragSpv[] =
 #include "overlay.frag.spv.h"
     ;
 
-namespace sc2::render {
+namespace omc::render {
 
 namespace {
 
@@ -208,7 +210,7 @@ LRESULT CALLBACK game_wndproc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
 }
 
 const wchar_t* game_window_class(HINSTANCE hinst) {
-    static const wchar_t* kName = L"sc2_game_window";
+    static const wchar_t* kName = L"overmindcore_game_window";
     static bool registered = false;
     if (!registered) {
         WNDCLASSEXW wc{};
@@ -241,8 +243,8 @@ WindowResult run_game_window(const GameFrameFn& frame, const casc::Storage* stor
     const wchar_t* cls = game_window_class(hinst);
     RECT rc{0, 0, LONG(width), LONG(height)};
     AdjustWindowRect(&rc, WS_OVERLAPPEDWINDOW, FALSE);
-    std::wstring wtitle(L"sc2 game ");
-    for (const char* p = sc2::kVersion; *p; ++p) wtitle.push_back(wchar_t(*p));
+    std::wstring wtitle(L"OvermindCore ");
+    for (const char* p = omc::kVersion; *p; ++p) wtitle.push_back(wchar_t(*p));
     HWND rawWin = CreateWindowExW(0, cls, wtitle.c_str(), WS_OVERLAPPEDWINDOW, CW_USEDEFAULT,
                                   CW_USEDEFAULT, rc.right - rc.left, rc.bottom - rc.top,
                                   nullptr, nullptr, hinst, nullptr);
@@ -302,9 +304,11 @@ WindowResult run_game_window(const GameFrameFn& frame, const casc::Storage* stor
     tun.camera_fit_shadow = true;
     tun.shadow_clip = shadow_clip;
     tun.clear_color[0] = tun.clear_color[1] = tun.clear_color[2] = 0.0f;
+    tun.gpu_timing = gpu_prof_switch() ? 1 : 0;
+    tun.live_quality = true;
     mem_mark("window: device + swapchain");
-    SceneRenderer scene_renderer(pd, dev, queue, gfx, width, height, fmt.format, storage,
-                                 texture_root, tun);
+    SceneRenderer scene_renderer(pd, dev, queue, gfx, scaled_extent(width, render_quality().scale_pct),
+                                 scaled_extent(height, render_quality().scale_pct), fmt.format, storage, texture_root, tun);
     mem_mark("window: scene renderer");
     bool first_present_marked = false;
 
@@ -457,6 +461,8 @@ WindowResult run_game_window(const GameFrameFn& frame, const casc::Storage* stor
                               VK_IMAGE_ASPECT_COLOR_BIT, width, height);
     Buffer ovlStaging = make_buffer(pd, dev, VkDeviceSize(width) * height * 4,
                                     VK_BUFFER_USAGE_TRANSFER_SRC_BIT, nullptr);
+    uint32_t ovl_w = width, ovl_h = height;
+    std::vector<uint8_t> ovl_shown;
     VkDescriptorPoolSize ovlPsz{VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1};
     VkDescriptorPoolCreateInfo ovlDpi{};
     ovlDpi.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
@@ -595,11 +601,14 @@ WindowResult run_game_window(const GameFrameFn& frame, const casc::Storage* stor
         }
         sc_w = extent.width;
         sc_h = extent.height;
-        if (sc_w != scene_renderer.width() || sc_h != scene_renderer.height()) {
-            scene_renderer.resize(sc_w, sc_h);
+        scene_renderer.resize(scaled_extent(sc_w, render_quality().scale_pct), scaled_extent(sc_h, render_quality().scale_pct));
+        if (sc_w != ovl_w || sc_h != ovl_h) {
+            ovl_w = sc_w;
+            ovl_h = sc_h;
             ovlTex = make_image(pd, dev, kTexColor, VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
                                 VK_IMAGE_ASPECT_COLOR_BIT, sc_w, sc_h);
             ovlStaging = make_buffer(pd, dev, VkDeviceSize(sc_w) * sc_h * 4, VK_BUFFER_USAGE_TRANSFER_SRC_BIT, nullptr);
+            ovl_shown.clear();
             VkDescriptorImageInfo odii{rawSampler, ovlTex.view.get(), VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL};
             VkWriteDescriptorSet ow{};
             ow.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
@@ -632,7 +641,7 @@ WindowResult run_game_window(const GameFrameFn& frame, const casc::Storage* stor
     bool running = true;
 
     while (running) {
-        SC2_PROF_SCOPE("loop_iter");
+        OMC_PROF_SCOPE("loop_iter");
         MSG m;
         while (PeekMessageW(&m, nullptr, 0, 0, PM_REMOVE)) {
             TranslateMessage(&m);
@@ -718,7 +727,7 @@ WindowResult run_game_window(const GameFrameFn& frame, const casc::Storage* stor
         overlay.clear();
         double cb_ms = 0.0;
         bool cont;
-        { SC2_PROF_SCOPE("frame_cb"); cont = frame(in, dt_ms, scene, cam, overlay); }
+        { OMC_PROF_SCOPE("frame_cb"); cont = frame(in, dt_ms, scene, cam, overlay); }
         if (result.frames_presented == 0) mem_mark("first frame: step + overlay (callback)");
         (void)cb_ms;
         if (!cont || accum.quit) running = false;
@@ -727,9 +736,10 @@ WindowResult run_game_window(const GameFrameFn& frame, const casc::Storage* stor
         if (env_provider) scene_renderer.set_environment(env_provider());
 
         VkFence raw_fence = fence.get();
-        { SC2_PROF_SCOPE("fence_wait");
+        { OMC_PROF_SCOPE("fence_wait");
           vkWaitForFences(dev, 1, &raw_fence, VK_TRUE, UINT64_MAX); }
-        SC2_PROF_SCOPE("submit_half");
+        OMC_PROF_SCOPE("submit_half");
+        scene_renderer.resize(scaled_extent(sc_w, render_quality().scale_pct), scaled_extent(sc_h, render_quality().scale_pct));
         if (fog_provider) {
             const FogField* f = fog_provider();
             scene_renderer.set_fog(f ? *f : FogField{});
@@ -760,7 +770,7 @@ WindowResult run_game_window(const GameFrameFn& frame, const casc::Storage* stor
         std::vector<const SceneInstance*> light_only;
         for (const SceneInstance& s : scene)
             if (s.model && !(s.model->vertex_count && !s.model->indices.empty()) && !s.model->lights.empty()) light_only.push_back(&s);
-        { SC2_PROF_SCOPE("prepare"); scene_renderer.prepare(live, &light_only); }
+        { OMC_PROF_SCOPE("prepare"); scene_renderer.prepare(live, &light_only); }
         if (result.frames_presented == 0) mem_mark("first frame: world meshes + textures (prepare)");
 
         std::vector<SceneRenderer::ParticleVertex> pverts;
@@ -770,7 +780,7 @@ WindowResult run_game_window(const GameFrameFn& frame, const casc::Storage* stor
             if (s.model && !(s.model->vertex_count && !s.model->indices.empty()) &&
                 (!s.model->particles.empty() || !s.model->ribbons.empty()) && ready_to_draw(s.model))
                 emitting.push_back(&s);
-        { SC2_PROF_SCOPE("particles"); build_particles(scene_renderer, emitting, cam, pverts, pgroups); }
+        { OMC_PROF_SCOPE("particles"); build_particles(scene_renderer, emitting, cam, pverts, pgroups); }
         frame_prof_count("instances", double(scene.size()));
 
         VkSwapchainKHR cur_swap = swapchain.get();
@@ -820,39 +830,17 @@ WindowResult run_game_window(const GameFrameFn& frame, const casc::Storage* stor
         VkImageBlit bl{};
         bl.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
         bl.srcOffsets[0] = {0, 0, 0};
-        bl.srcOffsets[1] = {int32_t(sc_w), int32_t(sc_h), 1};
+        bl.srcOffsets[1] = {int32_t(scene_renderer.width()), int32_t(scene_renderer.height()), 1};
         bl.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
         bl.dstOffsets[0] = {0, 0, 0};
         bl.dstOffsets[1] = {int32_t(sc_w), int32_t(sc_h), 1};
         vkCmdBlitImage(cmd, scene_renderer.ldr_image(), VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
                        swap_images[idx], VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &bl, VK_FILTER_LINEAR);
+        scene_renderer.gpu_timer().mark(cmd, "gpu.blit");
 
         if (has_overlay) {
-            void* p = nullptr;
-            check(vkMapMemory(dev, ovlStaging.mem.get(), 0, overlay.size(), 0, &p), "vkMapMemory(overlay)");
-            std::memcpy(p, overlay.data(), overlay.size());
-            vkUnmapMemory(dev, ovlStaging.mem.get());
-            VkImageMemoryBarrier b{};
-            b.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
-            b.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
-            b.newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
-            b.image = ovlTex.img.get();
-            b.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
-            b.srcAccessMask = 0;
-            b.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
-            vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
-                                 0, 0, nullptr, 0, nullptr, 1, &b);
-            VkBufferImageCopy rgn{};
-            rgn.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
-            rgn.imageExtent = {sc_w, sc_h, 1};
-            vkCmdCopyBufferToImage(cmd, ovlStaging.buf.get(), ovlTex.img.get(),
-                                   VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &rgn);
-            b.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
-            b.newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
-            b.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
-            b.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
-            vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
-                                 0, 0, nullptr, 0, nullptr, 1, &b);
+            record_overlay_upload(dev, cmd, ovlStaging.mem.get(), ovlStaging.buf.get(), ovlTex.img.get(), ovl_shown, overlay, sc_w, sc_h,
+                                  VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
 
             VkRenderPassBeginInfo rbi{};
 
@@ -884,6 +872,7 @@ WindowResult run_game_window(const GameFrameFn& frame, const casc::Storage* stor
             vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,
                                  0, 0, nullptr, 0, nullptr, 1, &pb);
         }
+        scene_renderer.gpu_timer().mark(cmd, "gpu.hud");
         check(vkEndCommandBuffer(cmd), "vkEndCommandBuffer");
 
         VkPipelineStageFlags wait_stage = VK_PIPELINE_STAGE_TRANSFER_BIT;
@@ -908,7 +897,7 @@ WindowResult run_game_window(const GameFrameFn& frame, const casc::Storage* stor
         ppi.pSwapchains = &cur_swap;
         ppi.pImageIndices = &idx;
         VkResult pr = VK_SUCCESS;
-        { SC2_PROF_SCOPE("present"); pr = vkQueuePresentKHR(queue, &ppi); }
+        { OMC_PROF_SCOPE("present"); pr = vkQueuePresentKHR(queue, &ppi); }
         if (pr == VK_SUCCESS || pr == VK_SUBOPTIMAL_KHR) ++result.frames_presented;
         if (result.frames_presented == 1 && !first_present_marked) {
             first_present_marked = true;

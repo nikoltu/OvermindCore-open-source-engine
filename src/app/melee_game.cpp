@@ -1,9 +1,10 @@
-#include "sc2/render/frame_prof.hpp"
-#include "sc2/app/melee_game.hpp"
-#include "sc2/app/ui_hotkeys.hpp"
-#include "sc2/data/environment.hpp"
+#include "omc/render/frame_prof.hpp"
+#include "omc/app/melee_game.hpp"
+#include "omc/app/ui_hotkeys.hpp"
+#include "omc/data/environment.hpp"
 
-#include "sc2/formats/placed_objects.hpp"
+#include "omc/formats/placed_objects.hpp"
+#include "omc/formats/dds.hpp"
 
 #include <algorithm>
 #include <array>
@@ -17,55 +18,60 @@
 #include <string>
 #include <unordered_map>
 
-#include "sc2/app/caster_composition.hpp"
-#include "sc2/app/splat_place.hpp"
-#include "sc2/app/command_bind.hpp"
-#include "sc2/app/control.hpp"
-#include "sc2/app/doodad_place.hpp"
-#include "sc2/app/hud.hpp"
-#include "sc2/app/hud_render.hpp"
-#include "sc2/app/melee_commands.hpp"
-#include "sc2/app/overlay_draw.hpp"
-#include "sc2/app/ui_theme.hpp"
-#include "sc2/casc/storage.hpp"
-#include "sc2/app/ability.hpp"
-#include "sc2/app/spawn.hpp"
-#include "sc2/app/tooltip.hpp"
-#include "sc2/app/kill_rank.hpp"
-#include "sc2/app/shield_flare.hpp"
-#include "sc2/data/abil_charge.hpp"
-#include "sc2/data/economy.hpp"
-#include "sc2/audio/mixer.hpp"
-#include "sc2/audio/vorbis.hpp"
-#include "sc2/audio/wasapi.hpp"
-#include "sc2/data/actor_model.hpp"
-#include "sc2/data/actor_catalog.hpp"
-#include "sc2/render/anim.hpp"
-#include "sc2/data/audio.hpp"
-#include "sc2/data/catalog.hpp"
-#include "sc2/formats/m3.hpp"
-#include "sc2/render/mat4.hpp"
-#include "sc2/sim/weapon.hpp"
-#include "sc2/render/creep_layer.hpp"
-#include "sc2/app/water_material.hpp"
-#include "sc2/sim/transport.hpp"
-#include "sc2/render/prim.hpp"
-#include "sc2/ui/font.hpp"
+#include "omc/app/caster_composition.hpp"
+#include "omc/app/splat_place.hpp"
+#include "omc/app/command_bind.hpp"
+#include "omc/app/control.hpp"
+#include "omc/app/doodad_place.hpp"
+#include "omc/app/hud.hpp"
+#include "omc/app/hud_render.hpp"
+#include "omc/app/map_doodads.hpp"
+#include "omc/app/melee_commands.hpp"
+#include "omc/app/order_cues.hpp"
+#include "omc/app/overlay_draw.hpp"
+#include "omc/app/ui_theme.hpp"
+#include "omc/casc/storage.hpp"
+#include "omc/app/ability.hpp"
+#include "omc/app/morph_plan.hpp"
+#include "omc/app/spawn.hpp"
+#include "omc/app/tooltip.hpp"
+#include "omc/app/kill_rank.hpp"
+#include "omc/app/shield_flare.hpp"
+#include "omc/data/abil_charge.hpp"
+#include "omc/data/economy.hpp"
+#include "omc/audio/mixer.hpp"
+#include "omc/audio/vorbis.hpp"
+#include "omc/audio/wasapi.hpp"
+#include "omc/data/actor_model.hpp"
+#include "omc/data/actor_catalog.hpp"
+#include "omc/render/anim.hpp"
+#include "omc/data/audio.hpp"
+#include "omc/data/catalog.hpp"
+#include "omc/formats/m3.hpp"
+#include "omc/render/mat4.hpp"
+#include "omc/sim/weapon.hpp"
+#include "omc/render/creep_layer.hpp"
+#include "omc/app/water_material.hpp"
+#include "omc/data/upgrades.hpp"
+#include "omc/sim/transport.hpp"
+#include "omc/render/prim.hpp"
+#include "omc/render/quality.hpp"
+#include "omc/ui/font.hpp"
 
-namespace sc2::app {
+namespace omc::app {
 
 static int fog_ground_state(int state, bool type_hidden) {
-    static const bool black = std::getenv("SC2_FOG_BLACK_MASK") != nullptr;
+    static const bool black = std::getenv("OMC_FOG_BLACK_MASK") != nullptr;
     return !black && !type_hidden && state == int(sim::Visibility::Hidden) ? int(sim::Visibility::Explored) : state;
 }
 static int fog_body_state(int player, int state, bool type_hidden) {
-    static const bool explored = std::getenv("SC2_FOG_EXPLORED") != nullptr;
+    static const bool explored = std::getenv("OMC_FOG_EXPLORED") != nullptr;
     if (player < 0) return fog_ground_state(state, type_hidden);
     return explored && state == int(sim::Visibility::Hidden) ? int(sim::Visibility::Explored) : state;
 }
 
 static float selection_ring_radius(const data::Catalog* cat, const std::string& id, float body_radius) {
-    static const bool kBodyRadius = std::getenv("SC2_SELECTION_BODY_RADIUS") != nullptr;
+    static const bool kBodyRadius = std::getenv("OMC_SELECTION_BODY_RADIUS") != nullptr;
     if (!cat || kBodyRadius) return body_radius;
     static std::unordered_map<std::string, float> authored;
     auto it = authored.find(id);
@@ -75,7 +81,7 @@ static float selection_ring_radius(const data::Catalog* cat, const std::string& 
 
 static std::array<float, 3> unit_draw_scale(const data::Catalog* cat, const std::string& id) {
     if (!cat) return {1.0f, 1.0f, 1.0f};
-    static const bool off = std::getenv("SC2_NO_MODEL_SCALE") != nullptr;
+    static const bool off = std::getenv("OMC_NO_MODEL_SCALE") != nullptr;
     static const data::Catalog* cached_for = nullptr;
     static std::unordered_map<std::string, std::array<float, 3>> cache;
     if (cached_for != cat) { cache.clear(); cached_for = cat; }
@@ -93,6 +99,22 @@ static std::array<float, 3> unit_draw_scale(const data::Catalog* cat, const std:
 using sim::Unit;
 
 namespace {
+
+bool same_placement(const formats::PlacedDoodad& a, const formats::PlacedDoodad& b) {
+    return a.x == b.x && a.y == b.y && a.z == b.z && a.rotation == b.rotation && a.pitch == b.pitch && a.roll == b.roll &&
+           a.sx == b.sx && a.sy == b.sy && a.sz == b.sz && a.variation == b.variation && a.type == b.type;
+}
+
+std::uint64_t doodad_seed(const formats::PlacedDoodad& d) {
+    std::uint64_t dseed = 1469598103934665603ull;
+    for (char ch : d.type) dseed = (dseed ^ std::uint64_t(std::uint8_t(ch))) * 1099511628211ull;
+    for (float f : {d.x, d.y}) {
+        std::uint32_t bits = 0;
+        std::memcpy(&bits, &f, sizeof(bits));
+        dseed = (dseed ^ std::uint64_t(bits)) * 1099511628211ull;
+    }
+    return dseed;
+}
 
 bool ends_with_ci(const std::string& s, const char* suf) {
     const std::size_t n = std::string(suf).size();
@@ -579,23 +601,87 @@ std::size_t MeleeAudio::voice_count() const {
 
 namespace {
 
-void alpha_over(std::vector<uint8_t>& base, const std::vector<uint8_t>& top) {
-    size_t n = std::min(base.size(), top.size());
-    for (size_t i = 0; i + 3 < n; i += 4) {
-        const uint8_t ta = top[i + 3];
-        if (ta == 0) continue;
-        if (ta == 255) {
-            base[i] = top[i];
-            base[i + 1] = top[i + 1];
-            base[i + 2] = top[i + 2];
-            base[i + 3] = 255;
+template <int R>
+void fog_box_pass(std::uint8_t* fa, std::uint8_t* ta, int W, int H) {
+    constexpr int D = 2 * R + 1;
+    const int i0 = std::min(R, W), i1 = std::max(i0, W - R);
+    for (int y = 0; y < H; ++y) {
+        const std::uint8_t* src = fa + std::size_t(y) * std::size_t(W);
+        std::uint8_t* dst = ta + std::size_t(y) * std::size_t(W);
+        auto edge = [&](int x) {
+            const int lo = x - R < 0 ? 0 : x - R, hi = x + R >= W ? W - 1 : x + R;
+            int sum = 0;
+            for (int k = lo; k <= hi; ++k) sum += src[k];
+            dst[x] = std::uint8_t(sum / (hi - lo + 1));
+        };
+        for (int x = 0; x < i0; ++x) edge(x);
+        for (int x = i0; x < i1; ++x) {
+            int sum = 0;
+            for (int k = -R; k <= R; ++k) sum += src[x + k];
+            dst[x] = std::uint8_t(sum / D);
+        }
+        for (int x = i1; x < W; ++x) edge(x);
+    }
+    const int j0 = std::min(R, H), j1 = std::max(j0, H - R);
+    auto edge_row = [&](int y) {
+        const int lo = y - R < 0 ? 0 : y - R, hi = y + R >= H ? H - 1 : y + R;
+        const int n = hi - lo + 1;
+        std::uint8_t* dst = fa + std::size_t(y) * std::size_t(W);
+        for (int x = 0; x < W; ++x) {
+            int sum = 0;
+            for (int k = lo; k <= hi; ++k) sum += ta[std::size_t(k) * std::size_t(W) + std::size_t(x)];
+            dst[x] = std::uint8_t(sum / n);
+        }
+    };
+    for (int y = 0; y < j0; ++y) edge_row(y);
+    for (int y = j0; y < j1; ++y) {
+        const std::uint8_t* rows[D];
+        for (int k = 0; k < D; ++k) rows[k] = ta + std::size_t(y - R + k) * std::size_t(W);
+        std::uint8_t* dst = fa + std::size_t(y) * std::size_t(W);
+        for (int x = 0; x < W; ++x) {
+            int sum = 0;
+            for (int k = 0; k < D; ++k) sum += rows[k][x];
+            dst[x] = std::uint8_t(sum / D);
+        }
+    }
+    for (int y = j1; y < H; ++y) edge_row(y);
+}
+
+inline void alpha_over_px(uint8_t* b, const uint8_t* t) {
+    const uint8_t ta = t[3];
+    if (ta == 0) return;
+    if (ta == 255) {
+        b[0] = t[0];
+        b[1] = t[1];
+        b[2] = t[2];
+        b[3] = 255;
+        return;
+    }
+    float a = ta / 255.0f;
+    for (int c = 0; c < 3; ++c)
+        b[c] = uint8_t(float(t[c]) * a + float(b[c]) * (1.0f - a) + 0.5f);
+    b[3] = uint8_t(std::min(255.0f, float(ta) + float(b[3]) * (1.0f - a) + 0.5f));
+}
+
+void alpha_over(std::vector<uint8_t>& base, const std::vector<uint8_t>& top, size_t begin = 0, size_t end = SIZE_MAX) {
+    const size_t n = std::min(std::min(base.size(), top.size()), end);
+    uint8_t* const b = base.data();
+    const uint8_t* const t = top.data();
+    size_t i = begin;
+    while (i + 15 < n) {
+        const uint8_t a0 = t[i + 3], a1 = t[i + 7], a2 = t[i + 11], a3 = t[i + 15];
+        if ((a0 | a1 | a2 | a3) == 0) {
+            i += 16;
             continue;
         }
-        float a = ta / 255.0f;
-        for (int c = 0; c < 3; ++c)
-            base[i + c] = uint8_t(float(top[i + c]) * a + float(base[i + c]) * (1.0f - a) + 0.5f);
-        base[i + 3] = uint8_t(std::min(255.0f, float(ta) + float(base[i + 3]) * (1.0f - a) + 0.5f));
+        if ((a0 & a1 & a2 & a3) == 255) {
+            std::memcpy(b + i, t + i, 16);
+            i += 16;
+            continue;
+        }
+        for (int k = 0; k < 4; ++k, i += 4) alpha_over_px(b + i, t + i);
     }
+    for (; i + 3 < n; i += 4) alpha_over_px(b + i, t + i);
 }
 
 std::array<float, 4> team_colour(int player, bool selected) {
@@ -644,10 +730,8 @@ int race_index(const data::Catalog* cat, const std::string& catalog_id, const st
     return race_of(token);
 }
 
-struct WireMask { int w = 0, h = 0; std::vector<std::uint8_t> cov; };
-
-const WireMask& wire_mask(const formats::Model* m, int W, int H) {
-    static std::unordered_map<const formats::Model*, WireMask> cache;
+const WireMask& wire_mask(std::unordered_map<const formats::Model*, WireMask>& cache, const formats::Model* m,
+                          int W, int H) {
     auto it = cache.find(m);
     if (it != cache.end() && it->second.w == W && it->second.h == H) return it->second;
     WireMask wm; wm.w = W; wm.h = H; wm.cov.assign(std::size_t(W) * H, 0);
@@ -693,7 +777,9 @@ const WireMask& wire_mask(const formats::Model* m, int W, int H) {
                        m->indices[k + 2] + r.first_vertex);
         }
     }
-    return cache.emplace(m, std::move(wm)).first->second;
+    WireMask& slot = cache[m];
+    slot = std::move(wm);
+    return slot;
 }
 
 float model_diameter(const formats::Model& m) {
@@ -708,13 +794,8 @@ float model_diameter(const formats::Model& m) {
     return mx - mn;
 }
 
-std::unordered_map<const formats::Model*, float>& diam_cache() {
-    static std::unordered_map<const formats::Model*, float> c;
-    return c;
-}
-float cached_diameter(const formats::Model* m) {
+float cached_diameter(std::unordered_map<const formats::Model*, float>& c, const formats::Model* m) {
     if (!m) return 0.0f;
-    auto& c = diam_cache();
     auto it = c.find(m);
     if (it != c.end()) return it->second;
     float d = model_diameter(*m);
@@ -761,7 +842,7 @@ LabelLook resolve_label_style(const ui::StyleSet* styles, const std::string& aut
     if (st.has_color) { out.r = st.r; out.g = st.g; out.b = st.b; }
     out.font = st.font;
     out.height = st.height;
-    if (std::getenv("SC2_LABEL_FACE_TRACE")) {
+    if (std::getenv("OMC_LABEL_FACE_TRACE")) {
         static std::set<std::string> seen;
         if (seen.insert(bare).second)
             std::fprintf(stderr, "[labelface] style %s font %s height %d vjustify %s hjustify %s\n", bare.c_str(), st.font.c_str(), st.height,
@@ -790,7 +871,7 @@ void draw_box_rgba(std::vector<std::uint8_t>& buf, std::uint32_t w, std::uint32_
 static std::array<int, 16> g_map_team_slot = {-1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1};
 void set_map_team_slots(const std::array<int, 16>& slots) {
     g_map_team_slot = slots;
-    if (std::getenv("SC2_NO_MAP_TEAM_COLOR")) g_map_team_slot.fill(-1);
+    if (std::getenv("OMC_NO_MAP_TEAM_COLOR")) g_map_team_slot.fill(-1);
 }
 static int team_slot_of(int player) {
     if (player < 0) return 0;
@@ -799,7 +880,7 @@ static int team_slot_of(int player) {
 }
 
 std::array<float, 4> team_colour_for(const data::Catalog* cat, int player, bool selected) {
-    static const bool neutral_slot = std::getenv("SC2_NO_NEUTRAL_TEAM") == nullptr;
+    static const bool neutral_slot = std::getenv("OMC_NO_NEUTRAL_TEAM") == nullptr;
     if (player < 0 && !(cat && neutral_slot)) return {0, 0, 0, -1.0f};
     if (player < 0) selected = false;
     if (cat) {
@@ -819,7 +900,8 @@ std::array<float, 4> team_colour_for(const data::Catalog* cat, int player, bool 
 }
 
 std::array<float, 4> team_emissive_for(const data::Catalog* cat, int player) {
-    if (!cat || std::getenv("SC2_NO_TEAM_EMISSIVE")) return {0, 0, 0, -1.0f};
+    static const bool kNoTeamEmissive = std::getenv("OMC_NO_TEAM_EMISSIVE") != nullptr;
+    if (!cat || kNoTeamEmissive) return {0, 0, 0, -1.0f};
     static const data::Catalog* cached_for = nullptr;
     static std::vector<data::TeamColor> palette;
     if (cached_for != cat) {
@@ -830,6 +912,25 @@ std::array<float, 4> team_emissive_for(const data::Catalog* cat, int player) {
     for (const data::TeamColor& tc : palette)
         if (tc.slot == slot && tc.emissive[3] >= 0.0f) return {tc.emissive[0], tc.emissive[1], tc.emissive[2], 1.0f};
     return {0, 0, 0, -1.0f};
+}
+
+std::array<std::uint8_t, 3> minimap_attacked_rgb(const data::Catalog* cat, int player) {
+    std::array<std::uint8_t, 3> out = {255, 0, 0};
+    if (!cat) return out;
+    static const data::Catalog* cached_for = nullptr;
+    static std::vector<data::TeamColor> palette;
+    if (cached_for != cat) {
+        palette = data::team_colors(*cat);
+        cached_for = cat;
+    }
+    static const bool kOldSlot = std::getenv("OMC_MINIMAP_FLASH_SLOT_OLD") != nullptr;
+    const int slot = kOldSlot ? player + 1 : team_slot_of(player);
+    for (const data::TeamColor& tc : palette)
+        if (tc.slot == slot) {
+            for (int k = 0; k < 3; ++k) out[std::size_t(k)] = std::uint8_t(tc.attacked[k] * 255.0f + 0.5f);
+            break;
+        }
+    return out;
 }
 
 MeleeGame::MeleeGame(MeleeGameConfig cfg) : cfg_(cfg), world_(cfg.seed) {
@@ -871,7 +972,7 @@ MeleeCommandContext MeleeGame::command_context() {
             world_.unit(id).player == cfg_.human_player) {
             const sim::Unit& u = world_.unit(id);
             if (u.commandable) ctx.commandable_selected = true;
-            static const bool kLiftedOld = std::getenv("SC2_UNIV_FALLBACK_OLD") != nullptr;
+            static const bool kLiftedOld = std::getenv("OMC_UNIV_FALLBACK_OLD") != nullptr;
             if (!kLiftedOld && u.flying && u.speed_air.raw() > 0) {
                 ctx.commandable_selected = true;
                 ctx.mobile_selected = true;
@@ -887,8 +988,8 @@ MeleeCommandContext MeleeGame::command_context() {
                 ctx.town_hall_selected = true;
             }
         }
-    static const bool kUnivOld = std::getenv("SC2_UNIV_FALLBACK_OLD") != nullptr;
-    static const bool kOpenerKeysOld = std::getenv("SC2_OPENER_KEYS_OLD") != nullptr;
+    static const bool kUnivOld = std::getenv("OMC_UNIV_FALLBACK_OLD") != nullptr;
+    static const bool kOpenerKeysOld = std::getenv("OMC_OPENER_KEYS_OLD") != nullptr;
     ctx.opener_keys_old = kOpenerKeysOld;
     if (cat_ && !selection_.empty()) {
         const std::uint32_t lead = selection_.front();
@@ -918,14 +1019,24 @@ MeleeCommandContext MeleeGame::command_context() {
             const std::string unload_ab = cat_->transport_ability(lead_id);
             const std::string merge_ab = cat_->merge_ability(lead_id);
             bool attack_acquire = false;
+            static const bool kStopArrayOld = std::getenv("OMC_CARD_ABILARRAY_OLD") != nullptr;
+            const std::vector<std::string> carried =
+                kStopArrayOld ? std::vector<std::string>{} : cat_->array_links("CUnit", lead_id, "AbilArray");
+            auto carries = [&](const std::string& ab) {
+                return carried.empty() || std::find(carried.begin(), carried.end(), ab) != carried.end();
+            };
             for (const data::Catalog::CommandCardLayout& c : cat_->unit_command_cards(lead_id)) {
                 if (c.index != 0) continue;
                 for (const data::Catalog::CommandCardSlot& sl : c.slots) {
                     if (sl.type != "AbilCmd") continue;
                     if (sl.face == "Move") take(sl, ctx.univ_move);
-                    else if (sl.face == "Stop") take(sl, ctx.univ_stop);
+                    else if (sl.face == "Stop") {
+                        if (carries(sl.ability)) take(sl, ctx.univ_stop);
+                    }
                     else if (sl.face == "MoveHoldPosition") take(sl, ctx.univ_hold);
-                    else if (sl.face == "Attack" || sl.face == "AttackWorker") take(sl, ctx.univ_attack);
+                    else if (sl.face == "Attack" || sl.face == "AttackWorker" ||
+                             (sl.face == "AttackBuilding" && !std::getenv("OMC_ATTACK_UNIT_CLICK_OLD")))
+                        take(sl, ctx.univ_attack);
                     else if (sl.face == "AcquireMove" && ctx.univ_attack.slot < 0 && !kUnivOld) {
                         take(sl, ctx.univ_attack);
                         attack_acquire = true;
@@ -946,6 +1057,9 @@ MeleeCommandContext MeleeGame::command_context() {
                                    (!lu.burrowed || lu.can_burrow_move);
                 if (!moves) ctx.univ_move.slot = ctx.univ_patrol.slot = ctx.univ_hold.slot = -1;
                 if (!moves && attack_acquire) ctx.univ_attack.slot = -1;
+                static const bool kImmobileAttackOld = std::getenv("OMC_IMMOBILE_ATTACK_OLD") != nullptr;
+                if (!kImmobileAttackOld && !moves && cat_->array_links("CUnit", lead_id, "WeaponArray").empty())
+                    ctx.univ_attack.slot = -1;
                 if (lu.burrowed && !lu.can_burrow_attack && !lu.can_burrow_move) ctx.univ_attack.slot = -1;
             }
         }
@@ -979,7 +1093,7 @@ MeleeCommandContext MeleeGame::command_context() {
     }
     if (cat_) ctx.can_afford_factory = bank >= data::unit_cost(*cat_, "Factory").minerals;
     if (cat_) ctx.can_afford_engbay = bank >= data::unit_cost(*cat_, "EngineeringBay").minerals;
-    static const bool kLiberatorOpenerOld = std::getenv("SC2_LIBERATOR_OPENER_OLD") != nullptr;
+    static const bool kLiberatorOpenerOld = std::getenv("OMC_LIBERATOR_OPENER_OLD") != nullptr;
     if (cat_ && kLiberatorOpenerOld) {
         if (selected_liberator() != sim::kNoTarget) ctx.liberator_selected = true;
         if (selected_liberator_ag() != sim::kNoTarget) ctx.liberator_ag_selected = true;
@@ -1001,8 +1115,34 @@ MeleeCommandContext MeleeGame::command_context() {
         if (selected_liftoff_structure(true) != sim::kNoTarget) ctx.land_selected = true;
     }
     if (cat_) {
-        if (selected_depot(false) != sim::kNoTarget) ctx.depot_lower_selected = true;
-        if (selected_depot(true) != sim::kNoTarget) ctx.depot_raise_selected = true;
+        static const bool kDepotDupOld = std::getenv("OMC_DEPOT_LOWER_DUP_OLD") != nullptr;
+        auto authored_cell = [&](const std::string& unit_id, const char* face) {
+            const std::string ab = cat_->morph_button_ability(unit_id, face);
+            if (ab.empty()) return -1;
+            for (const data::Catalog::CommandCardLayout& c : cat_->unit_command_cards(unit_id))
+                for (const data::Catalog::CommandCardSlot& sl : c.slots)
+                    if (c.index == 0 && sl.type == "AbilCmd" && sl.ability == ab && sl.row >= 0 && sl.col >= 0)
+                        return sl.row * CommandCard::kCols + sl.col;
+            return -1;
+        };
+        auto lowered_form = [&](const sim::Unit& du) {
+            const auto ms = cat_->morph_spec(cat_->depot_lower_ability(du.catalog_id));
+            return ms && !ms->target.empty() ? ms->target : du.catalog_id;
+        };
+        if (const std::uint32_t d = selected_depot(false); d != sim::kNoTarget) {
+            ctx.depot_lower_selected = true;
+            if (!kDepotDupOld) {
+                ctx.depot_lower_slot = authored_cell(card_unit_id(world_.unit(d)), "Lower");
+                if (auto ic = cat_->button_icon("Lower"); ic && ctx.depot_lower_slot >= 0) ctx.depot_lower_icon = *ic;
+            }
+        }
+        if (const std::uint32_t d = selected_depot(true); d != sim::kNoTarget) {
+            ctx.depot_raise_selected = true;
+            if (!kDepotDupOld) {
+                ctx.depot_raise_slot = authored_cell(lowered_form(world_.unit(d)), "Raise");
+                if (auto ic = cat_->button_icon("Raise"); ic && ctx.depot_raise_slot >= 0) ctx.depot_raise_icon = *ic;
+            }
+        }
     }
     if (selected_loaded_transport() != sim::kNoTarget) ctx.transport_unload_selected = true;
     return ctx;
@@ -1067,7 +1207,7 @@ std::vector<std::uint32_t> MeleeGame::selected_merge_templar() const {
 }
 
 bool MeleeGame::liftoff_busy(std::uint32_t id) const {
-    if (!cat_ || std::getenv("SC2_LIFTOFF_WHILE_TRAINING") || id >= world_.units().size()) return false;
+    if (!cat_ || std::getenv("OMC_LIFTOFF_WHILE_TRAINING") || id >= world_.units().size()) return false;
     sim::Fixed frac;
     if (!world_.pending_progress(id, frac)) return false;
     return cat_->ability_disables_class(cat_->liftoff_ability(world_.units()[id].catalog_id), "CAbilQueue");
@@ -1091,10 +1231,26 @@ std::uint32_t MeleeGame::selected_depot(bool lowered) const {
         if (id >= world_.units().size()) continue;
         const sim::Unit& u = world_.units()[id];
         if (!u.alive || u.player != cfg_.human_player || u.constructing) continue;
-        if (u.lowered != lowered) continue;
+        if (u.lowered != lowered || world_.is_depot_morphing(id)) continue;
         if (!cat_->depot_lower_ability(u.catalog_id).empty()) return id;
     }
     return sim::kNoTarget;
+}
+
+std::string MeleeGame::zone_marker_of(const std::string& unit_id) const {
+    static std::unordered_map<std::string, std::string> cache;
+    if (!cat_ || unit_id.empty()) return {};
+    auto it = cache.find(unit_id);
+    if (it != cache.end()) return it->second;
+    std::string found;
+    for (const std::string& ab : cat_->array_links("CUnit", unit_id, "AbilArray")) {
+        if (ab.empty()) continue;
+        const data::Catalog::Entry* e = cat_->find("CAbil", ab);
+        if (!e || e->tag != "CAbilEffectTarget") continue;
+        found = cat_->ability_point_marker(ab);
+        if (!found.empty()) break;
+    }
+    return cache.emplace(unit_id, found).first->second;
 }
 
 const MeleeGame::MorphShow* MeleeGame::morph_show(const sim::Unit& u) {
@@ -1116,17 +1272,44 @@ const MeleeGame::MorphShow* MeleeGame::morph_show(const sim::Unit& u) {
                     s.len_ms = float(m->sequences[std::size_t(sq)].length_ms());
                     if (!abil.empty()) s.delay_s = cat_->morph_actor_section(abil).first;
                 }
-                if (std::getenv("SC2_MORPH_TRACE"))
+                if (std::getenv("OMC_MORPH_TRACE"))
                     std::fprintf(stderr, "[morph] transition %s: actor %s model %s clip %d (%.0f ms) delay %.2f s\n", key.c_str(), t->actor.c_str(),
                                  t->model.c_str(), sq, double(s.len_ms), s.delay_s);
             }
+        if (!s.model && morph_cocoon_models_ && abil.empty() && !cat_->merge_ability(u.catalog_id).empty())
+            if (const formats::Model* m = models_->ensure(*ui_store_, to)) {
+                const int birth = render::select_sequence(*m, {"Birth"}, 0);
+                if (birth >= 0 && std::size_t(birth) < m->sequences.size()) {
+                    s.model = m;
+                    s.seq = birth;
+                    s.len_ms = float(m->sequences[std::size_t(birth)].length_ms());
+                }
+                if (std::getenv("OMC_MORPH_TRACE"))
+                    std::fprintf(stderr, "[morph] merge %s: %s birth %d (%.0f ms)\n", key.c_str(), to.c_str(), birth, double(s.len_ms));
+            }
+        if (!s.model && morph_cocoon_models_ && !abil.empty())
+            if (const auto ms = cat_->morph_spec(abil); ms && ms->chain.size() >= 2 && ms->chain.front() != ms->target)
+                if (const formats::Model* m = models_->ensure(*ui_store_, ms->chain.front())) {
+                    const int birth = render::select_sequence(*m, {"Birth"}, 0);
+                    const int stand = render::select_sequence(*m, {"Stand"}, 0);
+                    s.model = m;
+                    s.seq = birth >= 0 ? birth : stand;
+                    s.len_ms = s.seq >= 0 && std::size_t(s.seq) < m->sequences.size() ? float(m->sequences[std::size_t(s.seq)].length_ms()) : 0.0f;
+                    if (birth >= 0 && stand >= 0 && std::size_t(stand) < m->sequences.size()) {
+                        s.stand_seq = stand;
+                        s.stand_ms = float(m->sequences[std::size_t(stand)].length_ms());
+                    }
+                    if (std::getenv("OMC_MORPH_TRACE"))
+                        std::fprintf(stderr, "[morph] cocoon %s: %s birth %d (%.0f ms) stand %d\n", key.c_str(), ms->chain.front().c_str(), birth,
+                                     double(s.len_ms), stand);
+                }
         it = morph_show_.emplace(key, s).first;
     }
     return it->second.model ? &it->second : nullptr;
 }
 
 bool MeleeGame::geyser_covered(const sim::Unit& u) const {
-    static const bool kOld = std::getenv("SC2_GEYSER_DRAWN_UNDER") != nullptr;
+    static const bool kOld = std::getenv("OMC_GEYSER_DRAWN_UNDER") != nullptr;
     if (kOld || !u.alive || !u.resource_raw || !u.is_gas) return false;
     const sim::Fixed tol = sim::Fixed::from_ratio(1, 2);
     for (const sim::Unit& s : world_.units()) {
@@ -1172,6 +1355,7 @@ std::vector<std::uint32_t> MeleeGame::selected_burrowers(bool burrowed) const {
         const sim::Unit& u = world_.units()[id];
         if (!u.alive || u.player != cfg_.human_player || u.constructing) continue;
         if (u.burrowed != burrowed) continue;
+        if (world_.is_burrowing(id)) continue;
         if (!cat_->burrow_ability(u.catalog_id).empty()) out.push_back(id);
     }
     return out;
@@ -1264,6 +1448,7 @@ void MeleeGame::setup(const MeleeSetup& setup, MeleeModels* models,
     world_.enable_target_priority(true);
 
     models_ = models;
+    clear_model_caches();
     driver_.default_model = models ? models->model_for("Marine") : nullptr;
     for (uint32_t id = 0; id < layout_.unit_type.size(); ++id) {
         const formats::Model* m = nullptr;
@@ -1385,7 +1570,7 @@ ReplayTrace MeleeGame::run_replay_to_end() {
     while (world_.tick() < replay_total_) {
         inject_replay_orders(world_.tick());
         world_.step();
-        if (research_) research_->apply_completed();
+        if (research_) research_->apply_completed(upgrade_fold_new_);
         trace.hashes.push_back(world_.state_hash());
     }
     return trace;
@@ -1429,9 +1614,9 @@ void MeleeGame::bind_actor_rules(const data::Catalog& cat) {
         auto it = cache.find(id);
         if (it == cache.end()) {
             std::vector<render::ActorEventRule> rules = convert(cat.actor_rules(id));
-            if (rules.empty() && !std::getenv("SC2_NO_BIRTH_ACTOR_RULES"))
+            if (rules.empty() && !std::getenv("OMC_NO_BIRTH_ACTOR_RULES"))
                 if (const std::string aid = data::unit_actor_id(cat, id); !aid.empty() && aid != id) rules = convert(cat.actor_rules(aid));
-            if (!std::getenv("SC2_NO_PROGRESS_ACTORS")) {
+            if (!std::getenv("OMC_NO_PROGRESS_ACTORS")) {
                 std::vector<render::ActorEventRule> extra;
                 for (render::ActorEventRule& r : rules) {
                     if (r.verb != "Create" || r.args.size() != 1 || !cat.find("CActorProgress", r.args[0])) continue;
@@ -1457,9 +1642,9 @@ void MeleeGame::bind_actor_rules(const data::Catalog& cat) {
         }
         return it->second;
     };
-    if (!std::getenv("SC2_MORPH_START_AT_FINISH"))
+    if (!std::getenv("OMC_MORPH_START_AT_FINISH"))
         driver_.morph_target = [this](std::uint32_t id) { return world_.morph_target_id(id); };
-    if (!std::getenv("SC2_NO_VALIDATE_PLAYER"))
+    if (!std::getenv("OMC_NO_VALIDATE_PLAYER"))
         driver_.validate_player = [this, &cat](int player, const std::string& vid) -> int {
             const data::Catalog::Entry* e = cat.find("CValidator", vid);
             if (!e || player < 0 || e->tag != "CValidatorPlayerRequirement") return -1;
@@ -1605,7 +1790,7 @@ void MeleeGame::maybe_ai_research(int player) {
     pp.minerals -= info.minerals;
     pp.gas -= info.gas;
     research_->begin(player, next, sim::Fixed::from_double(info.time),
-                     std::getenv("SC2_RESEARCH_OUTLIVES_HOST") ? sim::kNoTarget : tech_body, info.minerals, info.gas);
+                     std::getenv("OMC_RESEARCH_OUTLIVES_HOST") ? sim::kNoTarget : tech_body, info.minerals, info.gas);
 }
 
 const std::vector<std::string>& MeleeGame::researched(int player) const {
@@ -1734,6 +1919,33 @@ int MeleeGame::enable_ai_casting_from_roster(const data::Catalog& cat) {
     return registered;
 }
 
+void MeleeGame::run_ai_inject(int player) {
+    if (!cast_policy_ || !cat_) return;
+    const std::size_t U = world_.units().size();
+    for (std::uint32_t q = 0; q < U; ++q) {
+        const sim::Unit& qu = world_.units()[q];
+        if (!qu.alive || qu.player != player || qu.constructing || qu.loaded) continue;
+        if (!qu.orders.empty() && qu.orders.front().type != sim::OrderType::Move) continue;
+        auto it = inject_abil_.find(qu.catalog_id);
+        if (it == inject_abil_.end()) {
+            const data::Catalog::InjectInfo ii = cat_->inject_ability(qu.catalog_id);
+            it = inject_abil_.emplace(qu.catalog_id, ii.found ? ii.ability : std::string()).first;
+        }
+        if (it->second.empty()) continue;
+        std::uint32_t best = sim::kNoTarget;
+        sim::Fixed bd;
+        for (const sim::Unit& h : world_.units()) {
+            if (!h.alive || h.player != player || h.spawner_proto < 0 || h.constructing || h.speed.raw() != 0) continue;
+            if (world_.inject_pending(h.id)) continue;
+            const sim::Fixed dx = h.x - qu.x, dy = h.y - qu.y, d2 = dx * dx + dy * dy;
+            if (d2 > sim::Fixed::from_int(12 * 12)) continue;
+            if (best == sim::kNoTarget || d2 < bd) { best = h.id; bd = d2; }
+        }
+        if (best == sim::kNoTarget) continue;
+        if (cast_policy_->cast_now(world_, q, it->second, best)) ++ai_injects_;
+    }
+}
+
 std::uint32_t MeleeGame::human_lead_caster() const {
     {
         const std::uint32_t lead = sel_groups_.active_lead();
@@ -1765,10 +1977,94 @@ bool MeleeGame::human_cast(const std::string& abil_id, std::uint32_t target_id) 
     const std::uint32_t caster = human_lead_caster();
     if (caster == sim::kNoTarget) return false;
     if (!cast_policy_->cast_now(world_, caster, abil_id, target_id)) return false;
-    static const bool kSprayUnitOld = std::getenv("SC2_SPRAY_UNIT_OLD") != nullptr;
+    static const bool kSprayUnitOld = std::getenv("OMC_SPRAY_UNIT_OLD") != nullptr;
     if (!kSprayUnitOld && target_id < world_.units().size())
         spawn_effect_doodads(abil_id, world_.units()[target_id].x, world_.units()[target_id].y,
                              world_.units()[caster].player);
+    return true;
+}
+
+int MeleeGame::human_cast_instant(const std::string& abil_id) {
+    const std::uint32_t lead = human_lead_caster();
+    if (lead == sim::kNoTarget) return 0;
+    bool best_unit = false;
+    if (cat_)
+        for (const core::XmlNode& n : cat_->resolved("CAbil", abil_id))
+            if ((n.name == "Flags" || n.name == "FlagArray") && n.attr_or("index", "") == "BestUnit")
+                best_unit = n.attr_or("value", "") == "1";
+    if (group_self_cast_ && cat_ && cast_policy_ && group_cast_cell_) {
+        std::vector<std::pair<std::uint32_t, std::string>> cell = group_cell_casters(abil_id);
+        if (cell.empty()) return human_cast(abil_id, lead) ? 1 : 0;
+        if (best_unit && best_unit_pick_) {
+            std::stable_sort(cell.begin(), cell.end(), [&](const auto& a, const auto& b) {
+                return world_.units()[a.first].energy > world_.units()[b.first].energy;
+            });
+            for (const auto& c : cell)
+                if (human_cast_by(c.second, c.first)) return 1;
+            return 0;
+        }
+        if (best_unit) return human_cast(abil_id, lead) ? 1 : 0;
+        int cast = 0;
+        for (const auto& c : cell)
+            if (human_cast_by(c.second, c.first)) ++cast;
+        return cast;
+    }
+    if (!group_self_cast_ || !cat_ || !cast_policy_ || best_unit) return human_cast(abil_id, lead) ? 1 : 0;
+    std::vector<std::uint32_t> casters{lead};
+    for (std::uint32_t id : selection_) {
+        if (id == lead || id >= world_.units().size()) continue;
+        const sim::Unit& u = world_.units()[id];
+        if (!u.alive || u.player != cfg_.human_player || u.catalog_id.empty()) continue;
+        const std::vector<std::string> abils = cat_->array_links("CUnit", u.catalog_id, "AbilArray");
+        if (std::find(abils.begin(), abils.end(), abil_id) == abils.end()) continue;
+        casters.push_back(id);
+    }
+    int cast = 0;
+    for (std::uint32_t id : casters)
+        if (human_cast_by(abil_id, id)) ++cast;
+    return cast;
+}
+
+std::vector<std::pair<std::uint32_t, std::string>> MeleeGame::group_cell_casters(const std::string& abil_id) const {
+    std::vector<std::pair<std::uint32_t, std::string>> out;
+    const std::uint32_t lead = human_lead_caster();
+    if (lead == sim::kNoTarget || !cat_) return out;
+    const AbilityCardEntry* key = nullptr;
+    const std::vector<AbilityCardEntry> lead_entries = selection_ability_entries();
+    for (const AbilityCardEntry& e : lead_entries)
+        if (e.ability == abil_id && e.card == card_page_ && e.slot >= 0) { key = &e; break; }
+    if (!key) return out;
+    out.push_back({lead, abil_id});
+    std::unordered_map<std::string, std::string> by_type;
+    for (std::uint32_t id : selection_) {
+        if (id == lead || id >= world_.units().size()) continue;
+        const sim::Unit& u = world_.units()[id];
+        if (!u.alive || u.player != cfg_.human_player || u.catalog_id.empty()) continue;
+        const std::string type = card_unit_id(u);
+        if (type.empty()) continue;
+        auto it = by_type.find(type);
+        if (it == by_type.end()) {
+            std::string pick;
+            for (const AbilityCardEntry& e : build_ability_card_entries(*cat_, type, human_tech_state(id))) {
+                if (e.slot != key->slot || e.card != key->card || !e.requirement_met) continue;
+                if (e.face != key->face && (key->hotkey.empty() || e.hotkey != key->hotkey)) continue;
+                if (ability_target_mode(*cat_, e.ability) != AbilTargetMode::Instant) continue;
+                pick = e.ability;
+                break;
+            }
+            it = by_type.emplace(type, pick).first;
+        }
+        if (!it->second.empty()) out.push_back({id, it->second});
+    }
+    return out;
+}
+
+bool MeleeGame::human_cast_by(const std::string& abil_id, std::uint32_t caster) {
+    if (!cast_policy_ || caster >= world_.units().size()) return false;
+    if (!cast_policy_->cast_now(world_, caster, abil_id, caster)) return false;
+    static const bool kSprayUnitOld = std::getenv("OMC_SPRAY_UNIT_OLD") != nullptr;
+    if (!kSprayUnitOld)
+        spawn_effect_doodads(abil_id, world_.units()[caster].x, world_.units()[caster].y, world_.units()[caster].player);
     return true;
 }
 
@@ -1782,13 +2078,13 @@ bool MeleeGame::human_cast_point(const std::string& abil_id, sim::Fixed px, sim:
 }
 
 void MeleeGame::spawn_effect_doodads(const std::string& abil_id, sim::Fixed px, sim::Fixed py, int player) {
-    static const bool off = std::getenv("SC2_NO_EFFECT_DOODAD") != nullptr;
+    static const bool off = std::getenv("OMC_NO_EFFECT_DOODAD") != nullptr;
     if (off || !cat_ || !models_ || !ui_store_) return;
     std::string eff = cat_->scalar("CAbil", abil_id, "Effect").value_or("");
     if (eff.empty()) eff = abil_id;
     std::string actor = eff;
     bool creates = false;
-    if (std::getenv("SC2_NO_EFFECT_ACTORS") == nullptr) {
+    if (std::getenv("OMC_NO_EFFECT_ACTORS") == nullptr) {
         for (const data::Catalog::ActorSubscription& s : cat_->actors_on("Effect", eff, "Start"))
             if (s.family == "CActorDoodad" && s.filters.empty()) {
                 actor = s.actor;
@@ -1797,11 +2093,11 @@ void MeleeGame::spawn_effect_doodads(const std::string& abil_id, sim::Fixed px, 
             }
     }
     const std::vector<data::Catalog::ActorRule> rules = cat_->actor_rules(actor, "CActorDoodad");
-    if (std::getenv("SC2_NO_EFFECT_ACTORS") != nullptr)
+    if (std::getenv("OMC_NO_EFFECT_ACTORS") != nullptr)
         for (const data::Catalog::ActorRule& r : rules)
             if (r.head == "Effect" && r.subject == eff && r.sub == "Start" && r.verb == "Create" && r.args.empty() && r.target.empty())
                 creates = true;
-    static const bool no_sound = std::getenv("SC2_NO_EFFECT_SOUND") != nullptr;
+    static const bool no_sound = std::getenv("OMC_NO_EFFECT_SOUND") != nullptr;
     if (!no_sound)
         for (const data::Catalog::ActorRule& r : rules) {
             if (r.head != "Effect" || r.subject != eff || r.sub != "Start" || r.verb != "Create" || r.args.size() != 1) continue;
@@ -1885,12 +2181,12 @@ void MeleeGame::set_placement_ghost(const std::string& unit_id, sim::Fixed x, si
 }
 
 std::string MeleeGame::card_unit_id(const sim::Unit& u) const {
-    static const bool kOld = std::getenv("SC2_LAND_CARD_OLD") != nullptr;
+    static const bool kOld = std::getenv("OMC_LAND_CARD_OLD") != nullptr;
     if (!kOld && cat_ && u.flying && !u.catalog_id.empty()) {
         const std::string air = cat_->liftoff_target(u.catalog_id);
         if (!air.empty() && cat_->find("CUnit", air)) return air;
     }
-    static const bool kBurrowOld = std::getenv("SC2_BURROW_CARD_OLD") != nullptr;
+    static const bool kBurrowOld = std::getenv("OMC_BURROW_CARD_OLD") != nullptr;
     if (!kBurrowOld && cat_ && u.burrowed && !u.catalog_id.empty()) {
         const std::string var = cat_->burrowed_variant(u.catalog_id);
         if (!var.empty() && var != u.catalog_id && cat_->find("CUnit", var)) return var;
@@ -1916,16 +2212,42 @@ bool MeleeGame::land_site(std::uint32_t id, sim::Fixed& x, sim::Fixed& y) const 
 }
 
 bool MeleeGame::morph_blocks_queue(std::uint32_t id) const {
-    static const bool kOld = std::getenv("SC2_MORPH_QUEUE_OPEN") != nullptr;
+    static const bool kOld = std::getenv("OMC_MORPH_QUEUE_OPEN") != nullptr;
     if (kOld || !cat_ || !world_.is_morphing(id)) return false;
     const auto it = morph_abil_.find(id);
     return it != morph_abil_.end() && cat_->ability_disables_class(it->second, "CAbilQueue");
 }
 
 bool MeleeGame::morph_start_blocked(std::uint32_t id, const std::string& morph_abil) const {
-    if (std::getenv("SC2_MORPH_QUEUE_OPEN") || !cat_ || id >= world_.units().size()) return false;
+    if (std::getenv("OMC_MORPH_QUEUE_OPEN") || !cat_ || id >= world_.units().size()) return false;
     sim::Fixed f;
     return world_.pending_progress(id, f) && cat_->ability_disables_class(morph_abil, "CAbilQueue");
+}
+
+bool MeleeGame::effect_cancel_live(std::uint32_t id) const {
+    if (id >= world_.units().size()) return false;
+    const sim::Unit& u = world_.units()[id];
+    if (!u.alive) return false;
+    if (world_.is_channelling(id) || world_.is_healing(id)) return true;
+    return !u.orders.empty() && u.orders.front().type == sim::OrderType::Cast;
+}
+
+bool MeleeGame::human_cancel_effect(const std::string& abil) {
+    if (!cat_ || cfg_.human_player < 0) return false;
+    const data::Catalog::Entry* ce = cat_->find("CAbil", abil);
+    if (!ce || ce->tag.rfind("CAbilEffect", 0) != 0) return false;
+    bool any = false;
+    for (std::uint32_t id : selection_) {
+        if (id >= world_.units().size()) continue;
+        const sim::Unit& u = world_.units()[id];
+        if (!u.alive || u.player != cfg_.human_player || !effect_cancel_live(id)) continue;
+        world_.cancel_channel(id);
+        world_.stop_heal(id);
+        if (!world_.units()[id].orders.empty() && world_.units()[id].orders.front().type == sim::OrderType::Cast)
+            world_.stop(id);
+        any = true;
+    }
+    return any;
 }
 
 bool MeleeGame::human_cancel_morph(const std::string& morph_abil) {
@@ -1953,7 +2275,7 @@ std::vector<MeleeGame::PaneQueueSlot> MeleeGame::pane_queue(std::uint32_t sel) c
     std::vector<PaneQueueSlot> out;
     if (sel >= world_.units().size()) return out;
     const sim::Unit& u = world_.units()[sel];
-    static const bool kMorphOld = std::getenv("SC2_MORPH_PANE_OLD") != nullptr;
+    static const bool kMorphOld = std::getenv("OMC_MORPH_PANE_OLD") != nullptr;
     if (!kMorphOld && cat_ && world_.is_morphing(sel)) {
         const auto it = morph_abil_.find(sel);
         bool show = false;
@@ -2002,6 +2324,27 @@ const formats::Model* MeleeGame::placement_ghost_model() const {
     return m;
 }
 
+bool MeleeGame::draws_authored_warp_in(const std::string& catalog_id, const formats::Model* drawn) {
+    static const bool kOld = std::getenv("OMC_WARPIN_PRESENT_OLD") != nullptr;
+    if (kOld || !drawn || !models_ || !ui_store_ || catalog_id.empty()) return false;
+    auto it = warp_build_model_.find(catalog_id);
+    if (it == warp_build_model_.end())
+        it = warp_build_model_.emplace(catalog_id, models_->ensure_build(*ui_store_, catalog_id)).first;
+    return it->second != nullptr && it->second == drawn;
+}
+
+const formats::Model* MeleeGame::warp_ghost_model() const {
+    if (!warp_ghost_.active || !pending_warp_ || warp_ghost_.unit_id.empty() || !cat_ || !models_ || !ui_store_) return nullptr;
+    std::string actor = data::unit_actor_id(*cat_, warp_ghost_.unit_id);
+    if (actor.empty()) actor = warp_ghost_.unit_id;
+    std::string pm = cat_->scalar("CActorUnit", actor, "PlacementModel").value_or("");
+    for (std::size_t at; (at = pm.find("##unitName##")) != std::string::npos;)
+        pm.replace(at, 12, cat_->actor_unit_name(actor, "CActorUnit"));
+    const formats::Model* m = pm.empty() ? nullptr : models_->cmodel(*ui_store_, pm);
+    if (!m) m = models_->cmodel(*ui_store_, warp_ghost_.unit_id);
+    return m;
+}
+
 std::vector<AbilityCardEntry> MeleeGame::selection_ability_entries() const {
     if (!cat_) return {};
     const std::uint32_t lead = human_lead_caster();
@@ -2022,7 +2365,7 @@ std::vector<AbilityCardEntry> MeleeGame::selection_ability_entries() const {
             }
             return false;
         };
-        static const bool kSetCellOld = std::getenv("SC2_ABILSET_CELL_OLD") != nullptr;
+        static const bool kSetCellOld = std::getenv("OMC_ABILSET_CELL_OLD") != nullptr;
         auto set_key = [&](const std::string& set, int slot) {
             return kSetCellOld ? set : set + "@" + std::to_string(slot);
         };
@@ -2052,7 +2395,7 @@ std::vector<AbilityCardEntry> MeleeGame::selection_ability_entries() const {
               out.end());
     for (AbilityCardEntry& e : out)
         if (e.command != "Cancel" && morph_start_blocked(lead, e.ability)) e.requirement_met = false;
-    static const bool return_always = [] { const char* e = std::getenv("SC2_RETURN_CARGO_ALWAYS"); return e && e[0] == '1'; }();
+    static const bool return_always = [] { const char* e = std::getenv("OMC_RETURN_CARGO_ALWAYS"); return e && e[0] == '1'; }();
     if (!return_always) {
         bool any_carry = false;
         for (std::uint32_t id : selection_)
@@ -2064,7 +2407,7 @@ std::vector<AbilityCardEntry> MeleeGame::selection_ability_entries() const {
                                      }),
                       out.end());
     }
-    static const bool no_badge = [] { const char* e = std::getenv("SC2_NO_CHARGE_BADGE"); return e && e[0] == '1'; }();
+    static const bool no_badge = [] { const char* e = std::getenv("OMC_NO_CHARGE_BADGE"); return e && e[0] == '1'; }();
     if (!no_badge) {
         auto ticks = [](double s) { return int(s * double(sim::World::kTicksPerSecond) + 0.5); };
         const int32_t owner = lead < world_.units().size() ? world_.units()[lead].player : -1;
@@ -2153,7 +2496,7 @@ MinimapExtent MeleeGame::minimap_extent() const {
 void MeleeGame::surrender(int player) {
     if (player < 0 || surrendered_player_ >= 0 || outcome_ != MatchResult::Outcome::Ongoing) return;
     const int viewer = cfg_.human_player >= 0 ? cfg_.human_player : 0;
-    if (layout_.players.size() > 2 && player != viewer && !std::getenv("SC2_SURRENDER_DECIDES_MATCH")) {
+    if (layout_.players.size() > 2 && player != viewer && !std::getenv("OMC_SURRENDER_DECIDES_MATCH")) {
         if (player >= int(layout_.players.size())) return;
         world_.player(player).defeated = true;
         return;
@@ -2350,11 +2693,11 @@ CommandCard MeleeGame::compose_command_card(std::vector<BuildCardEntry>& builds,
         selected_training_producer() != sim::kNoTarget) {
         if (authored_cancel >= 0) card.slots[authored_cancel].is_cancel = true;
         else card.set_cancel(command_context().cancel_icon);
-    } else if (card_page_ == 0 && !std::getenv("SC2_IDLE_CANCEL_CELL")) {
+    } else if (card_page_ == 0 && !std::getenv("OMC_IDLE_CANCEL_CELL")) {
         bool morphing = false;
         for (std::uint32_t id : selection_)
             if (id < world_.units().size() && world_.is_morphing(id)) morphing = true;
-        static const bool kNoChannelCancel = std::getenv("SC2_NO_CHANNEL_CANCEL") != nullptr;
+        static const bool kNoChannelCancel = std::getenv("OMC_NO_CHANNEL_CANCEL") != nullptr;
         if (!kNoChannelCancel)
             for (std::uint32_t id : selection_)
                 if (id < world_.units().size() && world_.is_channelling(id)) morphing = true;
@@ -2362,7 +2705,7 @@ CommandCard MeleeGame::compose_command_card(std::vector<BuildCardEntry>& builds,
             for (int i = 0; i < CommandCard::kSlots; ++i)
                 if (card.slots[i].is_cancel) card.slots[i] = CommandButton{};
     }
-    if (cat_ && !std::getenv("SC2_DISABLED_CARD_OLD") && !selection_.empty() && selection_[0] < world_.units().size()) {
+    if (cat_ && !std::getenv("OMC_DISABLED_CARD_OLD") && !selection_.empty() && selection_[0] < world_.units().size()) {
         const std::uint32_t lead = selection_[0];
         const sim::Unit& lu = world_.unit(lead);
         bool keep_cancel = false, clear = false;
@@ -2374,11 +2717,22 @@ CommandCard MeleeGame::compose_command_card(std::vector<BuildCardEntry>& builds,
                     if (n.name == "Flags" && n.attr_or("index", "") == "DisableAbils" && n.attr_or("value", "0") != "0")
                         clear = keep_cancel = true;
         }
-        static const bool kCancelOnly = std::getenv("SC2_MORPH_CARD_CANCEL_ONLY") != nullptr;
+        static const bool kCancelOnly = std::getenv("OMC_MORPH_CARD_CANCEL_ONLY") != nullptr;
         if (clear && keep_cancel && !kCancelOnly && lu.salvage_timer.raw() <= 0) {
+            static const bool kMorphBehaviorOnOld = std::getenv("OMC_MORPH_BEHAVIOR_ON_CARD_OLD") != nullptr;
+            std::vector<std::string> link_off;
+            if (const auto mit = morph_abil_.find(lead); !kMorphBehaviorOnOld && mit != morph_abil_.end())
+                for (const core::XmlNode& n : cat_->resolved("CAbil", mit->second)) {
+                    if (n.name != "BehaviorOn") continue;
+                    const std::string beh = n.attr_or("value", "");
+                    if (beh.empty()) continue;
+                    if (const auto bb = cat_->behavior_buff(beh))
+                        link_off.insert(link_off.end(), bb->disabled_abils.begin(), bb->disabled_abils.end());
+                }
             std::vector<int> live;
             for (const AbilityCardEntry& e : abils)
-                if (const data::Catalog::Entry* ce = cat_->find("CAbil", e.ability); ce && ce->tag == "CAbilRally")
+                if (const data::Catalog::Entry* ce = cat_->find("CAbil", e.ability); ce && ce->tag == "CAbilRally" &&
+                    std::find(link_off.begin(), link_off.end(), e.ability) == link_off.end())
                     live.push_back(e.slot);
             auto is_live = [&](int s) { return std::find(live.begin(), live.end(), s) != live.end(); };
             for (int i = 0; i < CommandCard::kSlots; ++i)
@@ -2404,17 +2758,32 @@ CommandCard MeleeGame::compose_command_card(std::vector<BuildCardEntry>& builds,
         }
     }
     if (cat_ && !selection_.empty() && selection_[0] < world_.units().size()) {
-        static const bool kHaltOld = std::getenv("SC2_HALT_IDLE_OLD") != nullptr;
-        static const bool kRallyOld = std::getenv("SC2_RALLY_MOBILE_OLD") != nullptr;
-        static const bool kToggleOld = std::getenv("SC2_TOGGLE_PAIR_OLD") != nullptr;
-        const sim::Unit& lu = world_.unit(selection_[0]);
+        static const bool kHaltOld = std::getenv("OMC_HALT_IDLE_OLD") != nullptr;
+        static const bool kRallyOld = std::getenv("OMC_RALLY_MOBILE_OLD") != nullptr;
+        static const bool kToggleOld = std::getenv("OMC_TOGGLE_PAIR_OLD") != nullptr;
+        static const bool kRedirectOld = std::getenv("OMC_REDIRECT_EMPTY_OLD") != nullptr;
+        static const bool kEffectCancelOld = std::getenv("OMC_EFFECT_CANCEL_IDLE_OLD") != nullptr;
+        static const bool kAbilArrayOld = std::getenv("OMC_CARD_ABILARRAY_OLD") != nullptr;
+        const std::uint32_t lead_id = selection_[0];
+        const sim::Unit& lu = world_.unit(lead_id);
         const bool building = lu.constructing || lu.warp_forming;
         const bool mobile = lu.speed.raw() != 0 || lu.flying;
+        std::vector<std::string> carried;
+        if (!kAbilArrayOld) carried = cat_->array_links("CUnit", card_unit_id(lu), "AbilArray");
         std::vector<int> drop;
         for (const AbilityCardEntry& e : abils) {
             if (e.slot < 0 || e.slot >= CommandCard::kSlots || card.slots[e.slot].is_cancel) continue;
             const data::Catalog::Entry* ce = cat_->find("CAbil", e.ability);
             if (!ce) continue;
+            if (!kAbilArrayOld && !carried.empty() && ce->tag == "CAbilRally" &&
+                std::find(carried.begin(), carried.end(), e.ability) == carried.end())
+                drop.push_back(e.slot);
+            if (!kRedirectOld && (ce->tag == "CAbilRedirectInstant" || ce->tag == "CAbilRedirectTarget") &&
+                world_.cargo_used(lead_id) <= 0)
+                drop.push_back(e.slot);
+            if (!kEffectCancelOld && e.command == "Cancel" && ce->tag.rfind("CAbilEffect", 0) == 0 &&
+                !effect_cancel_live(lead_id))
+                drop.push_back(e.slot);
             if (!kHaltOld && (ce->tag == "CAbilBuildable" || ce->tag == "CAbilBuildInProgress") && !building)
                 drop.push_back(e.slot);
             if (!kRallyOld && ce->tag == "CAbilRally" && mobile && !building) drop.push_back(e.slot);
@@ -2453,7 +2822,7 @@ std::optional<TooltipInfo> MeleeGame::hovered_card_tooltip(std::uint32_t view_w,
                                                            float mx, float my,
                                                            const ConsolePanel* console) {
     if (cfg_.human_player < 0 || !view_w || !view_h) return std::nullopt;
-    static const bool kComposeAlways = std::getenv("SC2_CARD_TOOLTIP_COMPOSE_ALWAYS") != nullptr;
+    static const bool kComposeAlways = std::getenv("OMC_CARD_TOOLTIP_COMPOSE_ALWAYS") != nullptr;
     if (!kComposeAlways) {
         bool over_cell = false;
         for (int i = 0; i < CommandCard::kSlots && !over_cell; ++i) {
@@ -2591,15 +2960,47 @@ void MeleeGame::enable_ai_tech_gate(const data::Catalog& cat) {
         if (!cat_ || player < 0) return true;
         return data::eval_requirement(*cat_, req_id, "Use", tech_state_of(player));
     });
-    world_.set_train_gate([this](std::uint32_t producer, const std::string& unit_id) {
+    world_.set_train_gate([this](std::uint32_t producer, const std::string& unit_id, bool at_site) {
         if (!cat_ || producer >= world_.units().size()) return true;
         const sim::Unit& p = world_.units()[producer];
-        if (p.player == cfg_.human_player || p.catalog_id.empty()) return true;
-        for (const data::Catalog::TrainProduct& tp : cat_->unit_train_products(p.catalog_id))
-            if (tp.unit == unit_id)
-                return production_.can_produce(*cat_, tp.ability, unit_id, tech_state_of(p.player, producer));
-        return true;
+        if (p.catalog_id.empty()) return true;
+        if (!train_gate_strict_) {
+            if (p.player == cfg_.human_player) return true;
+            for (const data::Catalog::TrainProduct& tp : cat_->unit_train_products(p.catalog_id))
+                if (tp.unit == unit_id)
+                    return production_.can_produce(*cat_, tp.ability, unit_id, tech_state_of(p.player, producer));
+            return true;
+        }
+        const std::string ability = train_ability_listed(producer, unit_id, at_site);
+        if (ability.empty()) return false;
+        return production_.can_produce(*cat_, ability, unit_id, tech_state_of(p.player, producer));
     });
+}
+
+std::string MeleeGame::train_ability_listed(std::uint32_t producer, const std::string& unit_id, bool at_site) const {
+    if (!cat_ || producer >= world_.units().size()) return {};
+    const sim::Unit& p = world_.units()[producer];
+    auto in = [&](const std::vector<data::Catalog::TrainProduct>& ps) -> std::string {
+        for (const data::Catalog::TrainProduct& tp : ps)
+            if (tp.unit == unit_id) return tp.ability;
+        return {};
+    };
+    std::string a = in(cat_->unit_train_products(p.catalog_id));
+    if (a.empty()) a = in(cat_->unit_train_products(card_unit_id(p)));
+    if (a.empty()) a = in(cat_->unit_warp_products(p.catalog_id));
+    if (a.empty())
+        if (const auto sb = cat_->unit_spawn_behavior(p.catalog_id))
+            if (!sb->unit.empty()) a = in(cat_->unit_train_products(sb->unit));
+    if (a.empty() && at_site && !hall_needs_builder_) {
+        std::set<std::string> seen;
+        for (const sim::Unit& w : world_.units()) {
+            if (!w.alive || w.player != p.player || !w.is_worker || w.catalog_id.empty()) continue;
+            if (!seen.insert(w.catalog_id).second) continue;
+            for (const data::Catalog::BuildProduct& bp : cat_->unit_build_products(w.catalog_id))
+                if (bp.unit == unit_id) return bp.ability;
+        }
+    }
+    return a;
 }
 
 const std::vector<std::pair<std::string, std::string>>& MeleeGame::upgrade_model_swaps(const std::string& unit_id) const {
@@ -2625,7 +3026,7 @@ static const std::string& option_model_swap(const data::ActorCatalog* ac, const 
     static std::map<std::string, std::string> cache;
     auto it = cache.find(unit_id);
     if (it != cache.end()) return it->second;
-    static const std::string level = std::getenv("SC2_SHADER_OPTION") ? std::getenv("SC2_SHADER_OPTION") : "Extreme";
+    static const std::string level = std::getenv("OMC_SHADER_OPTION") ? std::getenv("OMC_SHADER_OPTION") : "Extreme";
     std::string out;
     if (ac)
         if (const data::CActorUnit* a = ac->actor_for_unit(unit_id))
@@ -2635,10 +3036,10 @@ static const std::string& option_model_swap(const data::ActorCatalog* ac, const 
                     const std::size_t b = f.find_first_not_of(' '), e = f.find_last_not_of(' ');
                     if (b != std::string::npos && f.substr(b, e - b + 1) == "Option Shader " + level) out = r.args[0];
                 }
-                if (std::getenv("SC2_SHADER_OPTION_TRACE"))
+                if (std::getenv("OMC_SHADER_OPTION_TRACE"))
                     std::fprintf(stderr, "[optswap] %s rule %s | %s -> %s\n", unit_id.c_str(), r.terms.c_str(), r.send.c_str(), out.c_str());
             }
-    if (std::getenv("SC2_SHADER_OPTION_TRACE"))
+    if (std::getenv("OMC_SHADER_OPTION_TRACE"))
         std::fprintf(stderr, "[optswap] %s actor %s -> '%s'\n", unit_id.c_str(), (ac && ac->actor_for_unit(unit_id)) ? "found" : "none", out.c_str());
     return cache.emplace(unit_id, std::move(out)).first->second;
 }
@@ -2708,7 +3109,7 @@ std::vector<MeleeGame::TrainCardEntry> MeleeGame::selection_train_entries() cons
         const sim::Unit& u = world_.units()[id];
         if (!u.alive || u.player != cfg_.human_player || u.constructing || u.catalog_id.empty()) continue;
         if (morph_blocks_queue(id)) {
-            if (std::getenv("SC2_MORPH_CARD_CANCEL_ONLY")) break;
+            if (std::getenv("OMC_MORPH_CARD_CANCEL_ONLY")) break;
             queue_closed = true;
         }
         std::vector<data::Catalog::TrainProduct> ps = cat_->unit_train_products(card_unit_id(u));
@@ -2736,7 +3137,7 @@ std::vector<MeleeGame::TrainCardEntry> MeleeGame::selection_train_entries() cons
         if (tp.row >= 0 && tp.col >= 0) e.slot = tp.row * 5 + tp.col;
         e.card = tp.card;
         data::UnitCost c = data::unit_cost(*cat_, tp.unit);
-        if (!std::getenv("SC2_TRAIN_PAIR_SINGLE"))
+        if (!std::getenv("OMC_TRAIN_PAIR_SINGLE"))
             if (const auto row = cat_->ability_info_row(tp.ability, tp.command); row && row->unit_count > 1) {
                 c.minerals *= row->unit_count;
                 c.gas *= row->unit_count;
@@ -2824,7 +3225,7 @@ bool MeleeGame::human_train(std::uint32_t producer, const std::string& unit_id) 
             const double ft = folded_train_time(tp.ability, tp.command, tp.time);
             time = ft > 0 ? sim::Fixed::from_double(ft) : sim::Fixed();
             train_ability = tp.ability;
-            if (!std::getenv("SC2_TRAIN_PAIR_SINGLE"))
+            if (!std::getenv("OMC_TRAIN_PAIR_SINGLE"))
                 if (const auto row = cat_->ability_info_row(tp.ability, tp.command)) train_count = row->unit_count;
             trains_it = true;
             break;
@@ -2928,7 +3329,7 @@ bool MeleeGame::lead_authors_card_page(int page) const {
 
 static int timed_ladder_stage(const formats::Model& model, const std::vector<std::vector<std::string>>& ladder, double p,
                               double total_ms, int fallback) {
-    static const bool kEqualStages = std::getenv("SC2_PROGRESS_EQUAL_STAGES") != nullptr;
+    static const bool kEqualStages = std::getenv("OMC_PROGRESS_EQUAL_STAGES") != nullptr;
     if (kEqualStages || !(total_ms > 0.0) || ladder.empty()) return fallback;
     std::vector<double> len(ladder.size(), -1.0);
     double fixed = 0.0;
@@ -2997,8 +3398,9 @@ bool MeleeGame::human_warp_train(std::uint32_t producer, const std::string& unit
         return false;
     const sim::Unit proto = app::make_unit(*cat_, unit_id, cfg_.human_player);
     const data::UnitCost c = data::unit_cost(*cat_, unit_id);
+    const double rate = cat_->warp_progress_rate(unit_id, world_.power_level_at(tx, ty, cfg_.human_player));
     const sim::Fixed forming =
-        found->time > 0 ? sim::Fixed::from_double(found->time) : sim::Fixed();
+        found->time > 0 ? sim::Fixed::from_double(found->time / (rate > 0 ? rate : 1.0)) : sim::Fixed();
     const sim::Fixed charge =
         found->warp_charge > 0 ? sim::Fixed::from_double(found->warp_charge) : sim::Fixed();
     return world_.warp_train(producer, proto, tx, ty, forming, charge, c.minerals, c.gas);
@@ -3021,7 +3423,7 @@ bool MeleeGame::human_build(std::uint32_t worker, const std::string& structure_u
             break;
         }
     if (!builds_it) return false;
-    static const bool kRemoteOld = std::getenv("SC2_NYDUS_REMOTE_OLD") != nullptr;
+    static const bool kRemoteOld = std::getenv("OMC_NYDUS_REMOTE_OLD") != nullptr;
     const bool remote = !kRemoteOld && !instant && !w.is_worker && w.build_charges < 0 && w.speed.raw() == 0;
     const bool charged = !instant && !w.is_worker && (w.build_charges >= 0 || remote);
     if (!instant && !w.is_worker && !charged) return false;
@@ -3033,8 +3435,8 @@ bool MeleeGame::human_build(std::uint32_t worker, const std::string& structure_u
     if (instant) {
         const std::int32_t kind = addon_kind_of(*cat_, structure_unit_id);
         if (kind == sim::World::kAddonNone) return false;
-        if (w.flying && !std::getenv("SC2_LAND_CARD_OLD")) {
-            if (std::getenv("SC2_FLY_ADDON_REFUSED") || w.lift_lock.raw() > 0) return false;
+        if (w.flying && !std::getenv("OMC_LAND_CARD_OLD")) {
+            if (std::getenv("OMC_FLY_ADDON_REFUSED") || w.lift_lock.raw() > 0) return false;
             const data::UnitCost fc = data::unit_cost(*cat_, structure_unit_id);
             const sim::Player& fp = world_.player(cfg_.human_player);
             if (fp.minerals < fc.minerals || fp.gas < fc.gas) return false;
@@ -3100,23 +3502,95 @@ bool MeleeGame::human_land_addon(std::uint32_t host, sim::Fixed x, sim::Fixed y,
     return world_.order_land_addon(host, x, y, kind, time, c.minerals, c.gas);
 }
 
+std::optional<data::Catalog::MorphSpec> MeleeGame::player_morph_spec(std::int32_t player, const std::string& abil) const {
+    if (!cat_) return std::nullopt;
+    const data::UpgradeCatalog* up = research_ ? research_->upgrades() : nullptr;
+    if (!morph_upgrade_fold_ || !up || player < 0) return cat_->morph_spec(abil);
+    const std::vector<std::string>& done = world_.researched(player);
+    if (done.empty()) return cat_->morph_spec(abil);
+    return cat_->morph_spec(abil, [&](const std::string& field, double base) {
+        return data::fold_upgrade_whole_field(*up, done, "Abil", abil, field, base);
+    });
+}
+
+sim::Unit MeleeGame::research_body(const std::string& unit_id, std::int32_t player) const {
+    const data::UpgradeCatalog* up = research_ ? research_->upgrades() : nullptr;
+    if (!upgrade_fold_new_ || !up || player < 0) return make_unit(*cat_, unit_id, player);
+    const std::vector<std::string>& done = world_.researched(player);
+    sim::Unit u = make_unit_upgraded(*cat_, *up, unit_id, player, done);
+    u.upgrades_folded = std::uint32_t(done.size());
+    return u;
+}
+
+bool MeleeGame::human_burrow(std::uint32_t id, bool down) {
+    if (!cat_ || id >= world_.units().size()) return false;
+    const sim::Unit& u = world_.units()[id];
+    if (!u.alive || u.burrowed == down || world_.is_burrowing(id)) return false;
+    if (!timed_burrow_) {
+        sim::set_burrowed(world_, id, down);
+        return true;
+    }
+    std::string abil = cat_->burrow_ability(u.catalog_id);
+    if (!down) {
+        const std::string variant = cat_->burrowed_variant(u.catalog_id);
+        abil = variant.empty() ? std::string() : cat_->unburrow_ability(variant);
+    }
+    const auto ms = abil.empty() ? std::nullopt : player_morph_spec(u.player, abil);
+    if (!ms || ms->transient) {
+        sim::set_burrowed(world_, id, down);
+        return true;
+    }
+    return world_.begin_burrow(id, down, sim::Fixed::from_double(ms->stats_delay),
+                               sim::Fixed::from_double(ms->order_time));
+}
+
+bool MeleeGame::human_depot(std::uint32_t id, bool down) {
+    if (!cat_ || id >= world_.units().size()) return false;
+    const sim::Unit& u = world_.units()[id];
+    if (!u.alive || u.lowered == down || world_.is_depot_morphing(id)) return false;
+    if (!timed_depot_) return down ? world_.lower(id) : world_.raise(id);
+    const std::string lower = cat_->depot_lower_ability(u.catalog_id);
+    std::string abil = lower;
+    if (!down && !lower.empty())
+        if (const auto ms = cat_->morph_spec(lower)) abil = cat_->morph_button_ability(ms->target, "Raise");
+    const auto ms = abil.empty() ? std::nullopt : player_morph_spec(u.player, abil);
+    if (!ms) return down ? world_.lower(id) : world_.raise(id);
+    return world_.begin_depot_morph(id, down, sim::Fixed::from_double(ms->collide_delay),
+                                    sim::Fixed::from_double(ms->order_time));
+}
+
 bool MeleeGame::human_morph(std::uint32_t caster, const std::string& morph_abil) {
     if (!cat_ || morph_abil.empty() || caster >= world_.units().size()) return false;
     const sim::Unit& u = world_.units()[caster];
-    if (!u.alive || u.player != cfg_.human_player) return false;
-    const auto ms = cat_->morph_spec(morph_abil);
+    const std::int32_t mp = morph_as_player_ >= 0 ? morph_as_player_ : cfg_.human_player;
+    if (!u.alive || u.player != mp) return false;
+    const auto ms = player_morph_spec(mp, morph_abil);
     if (!ms || ms->target.empty()) return false;
     auto delta = morph_charge(*cat_, u.catalog_id, morph_abil);
-    sim::Player& hp = world_.player(cfg_.human_player);
+    sim::Player& hp = world_.player(mp);
     if (hp.minerals < delta.first || hp.gas < delta.second) return false;
     if (morph_start_blocked(caster, morph_abil)) return false;
-    const std::int32_t proto = world_.add_spawn_proto(make_unit(*cat_, ms->target, cfg_.human_player));
+    const std::int32_t proto = world_.add_spawn_proto(research_body(ms->target, mp));
     world_.clear_zone(caster);
-    const sim::Fixed t = ms->morph_time > 0 ? sim::Fixed::from_double(ms->morph_time) : sim::Fixed();
+    const double lock_s = morph_lock_seconds(*ms, morph_lock_order_);
+    const sim::Fixed t = lock_s > 0 ? sim::Fixed::from_double(lock_s) : sim::Fixed();
     const std::string fin = cat_->morph_finish_behavior(morph_abil);
     const std::uint32_t fin_tag =
         (!fin.empty() && cat_->behavior_is_permanent(fin)) ? behavior_id_hash(fin) : 0u;
-    world_.begin_morph(caster, proto, t, fin_tag);
+    std::vector<sim::MorphStep> steps;
+    if (morph_swap_at_data_) {
+        std::string last_unit;
+        std::int32_t last_proto = -1;
+        for (const MorphStepPlan& sp : morph_step_plan(*ms, lock_s)) {
+            if (sp.unit != last_unit) {
+                last_unit = sp.unit;
+                last_proto = sp.unit == ms->target ? proto : world_.add_spawn_proto(research_body(sp.unit, mp));
+            }
+            steps.push_back({sp.at, last_proto, sp.type, sp.vitals});
+        }
+    }
+    world_.begin_morph(caster, proto, t, fin_tag, std::move(steps),
+                       morph_extras(*cat_, *ms, morph_start_delay_, morph_behaviors_sim_));
     if (!world_.is_morphing(caster)) return false;
     morph_abil_[caster] = morph_abil;
     morph_paid_[caster] = delta;
@@ -3161,6 +3635,78 @@ int MeleeGame::human_morph_selection(const std::string& morph_abil) {
         if (human_morph(id, morph_abil)) ++committed;
     }
     return committed;
+}
+
+int MeleeGame::run_morph_autocast() {
+    static const bool kOld = std::getenv("OMC_MORPH_AUTOCAST_OLD") != nullptr;
+    if (kOld || !cat_) return 0;
+    auto key = [](std::uint32_t id, const std::string& a) { return std::to_string(id) + "|" + a; };
+    auto set_off = [&](std::uint32_t id, const std::string& a) {
+        if (cast_policy_) cast_policy_->set_autocast(id, a, false);
+        else morph_autocast_off_[key(id, a)] = true;
+    };
+    auto is_on = [&](std::uint32_t id, const std::string& a) {
+        if (cast_policy_) return cast_policy_->autocast_state(world_, id, a);
+        return !morph_autocast_off_.count(key(id, a)) && cat_->ability_autocast(a).on_by_default;
+    };
+    int started = 0;
+    const std::size_t n = world_.units().size();
+    for (std::uint32_t id = 0; id < n; ++id) {
+        const sim::Unit& u = world_.units()[id];
+        if (!u.alive || u.player < 0 || u.catalog_id.empty()) {
+            morph_autocast_was_morphing_.erase(id);
+            continue;
+        }
+        if (world_.is_morphing(id)) {
+            morph_autocast_was_morphing_[id] = true;
+            continue;
+        }
+        if (const auto w = morph_autocast_was_morphing_.find(id); w != morph_autocast_was_morphing_.end()) {
+            morph_autocast_was_morphing_.erase(w);
+            if (const auto m = morph_abil_.find(id); m != morph_abil_.end())
+                for (const std::string& a : cat_->morph_finish_autocast_off(m->second)) set_off(id, a);
+        }
+        if (u.constructing || u.loaded || !u.orders.empty()) continue;
+        auto it = morph_autocast_cache_.find(u.catalog_id);
+        if (it == morph_autocast_cache_.end()) {
+            std::vector<MorphAutocast> v;
+            for (const std::string& a : cat_->array_links("CUnit", u.catalog_id, "AbilArray")) {
+                const data::Catalog::Entry* e = cat_->find("CAbil", a);
+                if (!e || e->tag != "CAbilMorph" || !cat_->ability_autocast(a).offered) continue;
+                MorphAutocast mc;
+                mc.abil = a;
+                mc.requirement = cat_->button_requirement(a, "Execute");
+                AbilityBuild b;
+                parse_ability_autocast_validators(*cat_, a, b);
+                mc.not_behaviors = b.autocast_not_behaviors;
+                v.push_back(std::move(mc));
+            }
+            it = morph_autocast_cache_.emplace(u.catalog_id, std::move(v)).first;
+        }
+        if (it->second.empty()) continue;
+        sim::Fixed f;
+        if (world_.pending_progress(id, f) || world_.queued_count(id) > 0) continue;
+        for (const MorphAutocast& mc : it->second) {
+            if (!is_on(id, mc.abil)) continue;
+            bool blocked = false;
+            for (std::uint32_t tag : mc.not_behaviors)
+                for (const sim::BehaviorInstance& b : u.behaviors)
+                    if (b.src == tag) blocked = true;
+            if (blocked) continue;
+            if (!mc.requirement.empty() &&
+                !data::eval_requirement(*cat_, mc.requirement, "Use", tech_state_of(u.player, id)))
+                continue;
+            morph_as_player_ = u.player;
+            const bool ok = human_morph(id, mc.abil);
+            morph_as_player_ = -1;
+            if (ok) {
+                morph_autocast_was_morphing_[id] = true;
+                ++started;
+                break;
+            }
+        }
+    }
+    return started;
 }
 
 bool MeleeGame::human_toggle_cloak(const std::string& abil_id, const std::string& command) {
@@ -3305,13 +3851,18 @@ bool MeleeGame::human_research(const std::string& abil_id, const std::string& in
     hp.minerals -= info.minerals;
     hp.gas -= info.gas;
     begin_research(cfg_.human_player, upgrade, sim::Fixed::from_double(info.time),
-                   std::getenv("SC2_RESEARCH_PANE_OLD") ? sim::kNoTarget : producer, info.minerals, info.gas);
+                   std::getenv("OMC_RESEARCH_PANE_OLD") ? sim::kNoTarget : producer, info.minerals, info.gas);
     return true;
 }
 
 bool MeleeGame::human_siege_defender(std::uint32_t caster, sim::Fixed cx, sim::Fixed cy) {
+    const std::string from = caster < world_.units().size() ? world_.units()[caster].catalog_id : std::string();
     if (!human_morph(caster, "LiberatorMorphtoAG")) return false;
     world_.set_zone(caster, cx, cy, sim::Fixed::from_int(5));
+    if (zone_markers_) zone_marker_[caster] = {zone_marker_of(from), world_.tick()};
+    if (std::getenv("OMC_MORPH_TRACE"))
+        std::fprintf(stderr, "[morph] zone of %s at (%.2f, %.2f): marker '%s'\n", from.c_str(), cx.to_double(), cy.to_double(),
+                     zone_markers_ ? zone_marker_[caster].first.c_str() : "(off)");
     return true;
 }
 
@@ -3560,8 +4111,8 @@ void MeleeGame::update_camera(const render::InputState& in, float dt_s) {
     if (o != 0.0f) camctl_.orbit(o * cfg_.orbit_speed * dt_s);
     if (in.middle_down && (in.mouse_dx != 0.0f || in.mouse_dy != 0.0f))
         camctl_.pan(-in.mouse_dx * cfg_.pan_mouse, in.mouse_dy * cfg_.pan_mouse);
-    if (cam_right_ > cam_left_ && !std::getenv("SC2_NO_CAMERA_MARGIN")) {
-        static const float kMargin = std::getenv("SC2_CAMERA_MARGIN") ? float(std::atof(std::getenv("SC2_CAMERA_MARGIN"))) : 12.0f;
+    if (cam_right_ > cam_left_ && !std::getenv("OMC_NO_CAMERA_MARGIN")) {
+        static const float kMargin = std::getenv("OMC_CAMERA_MARGIN") ? float(std::atof(std::getenv("OMC_CAMERA_MARGIN"))) : 12.0f;
         const float lo = cam_left_ + kMargin, hi = cam_right_ - kMargin;
         if (hi > lo) camctl_.focus.x = std::clamp(camctl_.focus.x, lo, hi);
     }
@@ -3578,7 +4129,7 @@ void MeleeGame::update_camera(const render::InputState& in, float dt_s) {
                 }
             camctl_.focus.z = sum / float(n);
         }
-        if (const char* cf = std::getenv("SC2_CAM_FOCUS")) {
+        if (const char* cf = std::getenv("OMC_CAM_FOCUS")) {
             const float gz = ground_z_at(camctl_.focus.x, camctl_.focus.y);
             if (cf[0] == 't') {
                 static float last_x = -1.0f, last_y = -1.0f;
@@ -3642,7 +4193,7 @@ const formats::Model* MeleeGame::splat_quad_for(const sim::Unit& u) {
     const formats::Model* splat = (models_ && ui_store_) ? models_->unit_splat(*ui_store_, u.catalog_id) : nullptr;
     if (!splat || splat->materials.empty()) {
         if (models_ && ui_store_ && cat_ && u.player >= 0 && u.speed.raw() == 0 && (u.attributes & sim::kAttrStructure) != 0 &&
-            !std::getenv("SC2_NO_PLAYER_DECAL")) {
+            !std::getenv("OMC_NO_PLAYER_DECAL")) {
             if (const MeleeModels::GroundDecal* gd = models_->unit_ground_decal(*ui_store_, u.catalog_id)) {
                 const float fl = std::sqrt(gd->forward[0] * gd->forward[0] + gd->forward[1] * gd->forward[1]);
                 if (fl > 1e-6f) {
@@ -3673,7 +4224,7 @@ const formats::Model* MeleeGame::splat_quad_for(const sim::Unit& u) {
         }
         if (any) extent = float(std::max(x1 - x0, y1 - y0) + 1);
     }
-    if (models_->unit_splat_from_actor(u.catalog_id) && !splat->projectors.empty() && !std::getenv("SC2_ACTOR_SPLAT_QUAD")) {
+    if (models_->unit_splat_from_actor(u.catalog_id) && !splat->projectors.empty() && !std::getenv("OMC_ACTOR_SPLAT_QUAD")) {
         const float ux = float(u.x.to_double()), uy = float(u.y.to_double());
         formats::PlacedDoodad d{};
         d.rotation = float(u.facing.to_double());
@@ -3684,18 +4235,18 @@ const formats::Model* MeleeGame::splat_quad_for(const sim::Unit& u) {
         splat_none_.insert(u.id);
         return nullptr;
     }
-    static const bool kPadFootprint = std::getenv("SC2_SPLAT_PAD_FOOTPRINT") != nullptr;
-    const bool burrow_ring = (u.id & 0x80000000u) != 0 && !std::getenv("SC2_BURROW_RING_FOOTPRINT");
+    static const bool kPadFootprint = std::getenv("OMC_SPLAT_PAD_FOOTPRINT") != nullptr;
+    const bool burrow_ring = (u.id & 0x80000000u) != 0 && !std::getenv("OMC_BURROW_RING_FOOTPRINT");
     if (!kPadFootprint && cat_ && u.player >= 0 && ((u.speed.raw() == 0 && (u.attributes & sim::kAttrStructure) != 0) || burrow_ring) && !splat->projectors.empty()) {
         const formats::M3Projector& pj = splat->projectors.front();
         if (pj.x_right - pj.x_left > 0.05f && pj.y_back - pj.y_front > 0.05f) {
             const float ux = float(u.x.to_double()), uy = float(u.y.to_double());
-            static const float kRotAdd = std::getenv("SC2_SPLAT_PAD_ROT_ADD") ? float(std::atof(std::getenv("SC2_SPLAT_PAD_ROT_ADD"))) * 0.01745329252f : 0.0f;
+            static const float kRotAdd = std::getenv("OMC_SPLAT_PAD_ROT_ADD") ? float(std::atof(std::getenv("OMC_SPLAT_PAD_ROT_ADD"))) * 0.01745329252f : 0.0f;
             formats::PlacedDoodad d{};
             d.rotation = float(cat_->unit_facing_radians(u.catalog_id)) + 1.5707963f + kRotAdd;
             d.sx = d.sy = d.sz = models_->unit_splat_scale(u.catalog_id);
             std::vector<ProjectorItem> items{{splat, d}};
-            static const bool kNoDecal = std::getenv("SC2_NO_PLAYER_DECAL") != nullptr;
+            static const bool kNoDecal = std::getenv("OMC_NO_PLAYER_DECAL") != nullptr;
             if (const MeleeModels::GroundDecal* gd = kNoDecal ? nullptr : models_->unit_ground_decal(*ui_store_, u.catalog_id)) {
                 const float fl = std::sqrt(gd->forward[0] * gd->forward[0] + gd->forward[1] * gd->forward[1]);
                 if (fl > 1e-6f) {
@@ -3710,7 +4261,7 @@ const formats::Model* MeleeGame::splat_quad_for(const sim::Unit& u) {
             }
             formats::Model pad = build_projector_items(items, 0.0f,
                                                        [&](float x, float y) { return ground_z_at(ux + x, uy + y); });
-            if (std::getenv("SC2_SPLAT_TRACE"))
+            if (std::getenv("OMC_SPLAT_TRACE"))
                 for (std::size_t ri = 0; ri < pad.regions.size(); ++ri) {
                     const formats::M3Region& rg = pad.regions[ri];
                     float lo[3] = {1e30f, 1e30f, 1e30f}, hi[3] = {-1e30f, -1e30f, -1e30f};
@@ -3737,10 +4288,10 @@ const formats::Model* MeleeGame::splat_quad_for(const sim::Unit& u) {
     if (!splat->projectors.empty()) {
         const formats::M3Projector& pj = splat->projectors.front();
         const float pw = pj.x_right - pj.x_left, pl = pj.y_back - pj.y_front;
-        if (std::getenv("SC2_SPLAT_TRACE"))
+        if (std::getenv("OMC_SPLAT_TRACE"))
             std::fprintf(stderr, "[splat] %s projector type %u x[%.2f,%.2f] y[%.2f,%.2f] z[%.2f,%.2f] footprint extent %.2f\n", u.catalog_id.c_str(), pj.type,
                          double(pj.x_left), double(pj.x_right), double(pj.y_front), double(pj.y_back), double(pj.z_bottom), double(pj.z_top), double(extent));
-        if (pw > 0.05f && pl > 0.05f && (u.player < 0 || std::getenv("SC2_SPLAT_PROJ_BOX")) && !std::getenv("SC2_SPLAT_FOOTPRINT_BOX")) extent = std::max(pw, pl);
+        if (pw > 0.05f && pl > 0.05f && (u.player < 0 || std::getenv("OMC_SPLAT_PROJ_BOX")) && !std::getenv("OMC_SPLAT_FOOTPRINT_BOX")) extent = std::max(pw, pl);
     }
     const std::uint32_t divs = 4;
     const float cx = float(u.x.to_double()), cy = float(u.y.to_double());
@@ -3775,17 +4326,57 @@ const formats::Model* MeleeGame::splat_quad_for(const sim::Unit& u) {
     return &splat_quads_.emplace(u.id, std::move(quad)).first->second;
 }
 
+std::string MeleeGame::power_visual_actor(const std::string& unit_id) const {
+    static const bool kOld = std::getenv("OMC_WARPIN_PRESENT_OLD") != nullptr;
+    if (kOld || !cat_ || unit_id.empty()) return "PowerVisual";
+    if (auto it = power_visual_cache_.find(unit_id); it != power_visual_cache_.end()) return it->second;
+    std::string found;
+    for (const std::string& beh : cat_->array_links("CUnit", unit_id, "BehaviorArray")) {
+        if (beh.empty() || !found.empty()) continue;
+        const data::Catalog::Entry* e = cat_->find("CBehavior", beh);
+        if (!e || e->tag != "CBehaviorPowerSource") continue;
+        const std::string create = "Behavior." + beh + ".Create";
+        for (const std::string& pid : cat_->ids("CActorPower")) {
+            bool hit = false;
+            std::string visual;
+            for (const core::XmlNode& n : cat_->resolved("CActorPower", pid)) {
+                if (n.name == "On") {
+                    const std::string terms = n.attr_or("Terms", "");
+                    if (terms.compare(0, create.size(), create) == 0 &&
+                        (terms.find("Option Model Low") == std::string::npos || terms.find("!Option Model Low") != std::string::npos))
+                        hit = true;
+                } else if (n.name == "VisualArray") {
+                    const std::string v = n.attr_or("value", "");
+                    if (!v.empty()) visual = v;
+                }
+            }
+            if (hit && !visual.empty()) { found = visual; break; }
+        }
+    }
+    if (found.empty()) found = "PowerVisual";
+    power_visual_cache_.emplace(unit_id, found);
+    return found;
+}
+
 const formats::Model* MeleeGame::power_quad_for(const sim::Unit& u) {
-    if (auto it = power_quads_.find(u.id); it != power_quads_.end()) return &it->second;
+    static const bool kOld = std::getenv("OMC_WARPIN_PRESENT_OLD") != nullptr;
+    const std::array<float, 2> at = {float(u.x.to_double()), float(u.y.to_double())};
+    if (auto it = power_quads_.find(u.id); it != power_quads_.end()) {
+        auto pa = power_quad_at_.find(u.id);
+        if (kOld || pa == power_quad_at_.end() || pa->second == at) return &it->second;
+        power_quads_.erase(it);
+    }
     if (power_quad_none_.count(u.id)) return nullptr;
-    const formats::Model* splat = (models_ && ui_store_) ? models_->actor_splat(*ui_store_, "PowerVisual") : nullptr;
+    const std::string visual = power_visual_actor(u.catalog_id);
+    const formats::Model* splat = (models_ && ui_store_) ? models_->actor_splat(*ui_store_, visual) : nullptr;
     if (!splat || splat->materials.empty() || u.power_radius.raw() <= 0) {
         power_quad_none_.insert(u.id);
         return nullptr;
     }
+    power_quad_at_[u.id] = at;
     float scale = 1.0f;
     if (cat_)
-        if (auto sm = cat_->scalar("CModel", "PowerVisual", "ScaleMax"); sm && !sm->empty()) {
+        if (auto sm = cat_->scalar("CModel", cat_->scalar("CActorSplat", visual, "Model").value_or(visual), "ScaleMax"); sm && !sm->empty()) {
             const double v = std::strtod(sm->c_str(), nullptr);
             if (v > 0.0) scale = float(v);
         }
@@ -4121,6 +4712,26 @@ std::string MeleeGame::alert_sound_id(AlertKind kind, const std::string& alert_o
     return {};
 }
 
+bool MeleeGame::advance_corpse(Corpse& c, float dt_ms, bool dead_phase) {
+    c.time_ms += dt_ms;
+    if (c.time_ms < c.length_ms) return true;
+    if (c.dead) {
+        if (c.hold || c.length_ms <= 0.0f) c.time_ms = c.length_ms > 0.0f ? c.length_ms : 0.0f;
+        else c.time_ms = std::fmod(c.time_ms, c.length_ms);
+        return true;
+    }
+    if (!dead_phase || !c.model) return false;
+    const int dead = render::select_sequence(*c.model, {"Dead"}, 0);
+    if (dead < 0 || std::size_t(dead) >= c.model->sequences.size()) return false;
+    const formats::M3Sequence& s = c.model->sequences[std::size_t(dead)];
+    c.dead = true;
+    c.seq = dead;
+    c.time_ms = 0.0f;
+    c.length_ms = float(s.length_ms());
+    c.hold = (s.flags & 0x1u) != 0;
+    return true;
+}
+
 void MeleeGame::spawn_corpse(const sim::Unit& u) {
     const formats::Model* model = nullptr;
     std::vector<std::string> props = {"Death"};
@@ -4128,14 +4739,19 @@ void MeleeGame::spawn_corpse(const sim::Unit& u) {
         if (const data::CActorUnit* actor = actor_cat_->actor_for_unit(u.catalog_id)) {
             const data::ActorDeath* row = nullptr;
             const std::string want = sim::death_name_of(u.death_code);
-            if (u.death_code != 0)
+            static const bool kUnderConstructionOld = std::getenv("OMC_DEATH_UNDER_CONSTRUCTION_OLD") != nullptr;
+            const bool building = u.constructing || (u.id < constructing_seen_.size() && constructing_seen_[u.id] != 0);
+            if (!kUnderConstructionOld && building)
+                for (const data::ActorDeath& d : actor->death_array)
+                    if (d.index == "UnderConstruction") { row = &d; break; }
+            if (!row && u.death_code != 0)
                 for (const data::ActorDeath& d : actor->death_array)
                     if (d.index == want) { row = &d; break; }
             if (!row)
                 for (const data::ActorDeath& d : actor->death_array)
                     if (d.index == "Normal" || d.index.empty()) { row = &d; break; }
             if (!row && !actor->death_array.empty()) row = &actor->death_array.front();
-            static const bool kCustomOld = std::getenv("SC2_DEATH_CUSTOM_OLD") != nullptr;
+            static const bool kCustomOld = std::getenv("OMC_DEATH_CUSTOM_OLD") != nullptr;
             data::ActorDeath empty_row;
             if (!kCustomOld && u.cargo_space > 0 && world_.cargo_used(u.id) == 0)
                 for (const data::ActorDeath& d : actor->death_customs)
@@ -4166,7 +4782,7 @@ void MeleeGame::spawn_corpse(const sim::Unit& u) {
     if (!model && u.id < driver_.actors.size()) model = driver_.actors[u.id].model;
     int seq = model ? render::select_sequence(*model, props, u.id) : -1;
     if (model && seq < 0 && props != std::vector<std::string>{"Death"}) seq = render::select_sequence(*model, {"Death"}, u.id);
-    if (std::getenv("SC2_CORPSE_TRACE"))
+    if (std::getenv("OMC_CORPSE_TRACE"))
         std::fprintf(stderr, "[corpse] tick %d at (%.1f, %.1f) %s death '%s' -> %s model (%u verts, %zu emitters), clip %d '%s'\n", world_.tick(), u.x.to_double(), u.y.to_double(), u.catalog_id.c_str(), sim::death_name_of(u.death_code),
                      model ? (own_model ? "its own" : "the death row's") : "NO", model ? model->vertex_count : 0u, model ? model->particles.size() : std::size_t(0), seq,
                      model && seq >= 0 && std::size_t(seq) < model->sequences.size() ? model->sequences[std::size_t(seq)].name.c_str() : "-");
@@ -4180,12 +4796,12 @@ void MeleeGame::spawn_corpse(const sim::Unit& u) {
     c.x = float(u.x.to_double());
     c.y = float(u.y.to_double());
     c.z = cat_ ? cat_->unit_display_height(u.catalog_id) : 0.0f;
-    static const bool kCorpseAtZero = std::getenv("SC2_CORPSE_AT_ZERO") != nullptr;
+    static const bool kCorpseAtZero = std::getenv("OMC_CORPSE_AT_ZERO") != nullptr;
     if (!kCorpseAtZero) c.z += ground_z_at(c.x, c.y);
     c.scale = unit_draw_scale(cat_, u.catalog_id);
     c.player = u.player;
     c.fog_visibility = u.fog_visibility;
-    static const bool kUnturned = std::getenv("SC2_CORPSE_UNTURNED") != nullptr;
+    static const bool kUnturned = std::getenv("OMC_CORPSE_UNTURNED") != nullptr;
     if (!kUnturned && u.id < driver_.actors.size()) c.orient = driver_.actors[u.id].orient();
     corpses_.push_back(c);
 }
@@ -4276,7 +4892,7 @@ bool MeleeGame::card_smart_click(const std::string& tag, const Control& ctrl, co
 }
 
 bool MeleeGame::human_load_all(const std::string& abil_id) {
-    static const bool kOld = std::getenv("SC2_LOADALL_OLD") != nullptr;
+    static const bool kOld = std::getenv("OMC_LOADALL_OLD") != nullptr;
     if (kOld || !cat_ || cfg_.human_player < 0) return false;
     const data::Catalog::Entry* ce = cat_->find("CAbil", abil_id);
     if (!ce || ce->tag != "CAbilTransport") return false;
@@ -4313,8 +4929,10 @@ bool MeleeGame::human_load_all(const std::string& abil_id) {
     return true;
 }
 
-bool MeleeGame::consume_modal_target(sim::Fixed wx, sim::Fixed wy) {
+bool MeleeGame::consume_modal_target(sim::Fixed wx, sim::Fixed wy, bool queued) {
     if (!(pending_attack_ || pending_patrol_ || pending_move_) || selection_.empty()) return false;
+    static const bool kModalQueueOld = std::getenv("OMC_MODAL_QUEUE_OLD") != nullptr;
+    if (kModalQueueOld) queued = false;
     std::vector<app::FormationTarget> slots;
     if (pending_move_ || pending_attack_)
         slots = app::formation_targets(world_, selection_, wx, wy, formation_diameter_[0], formation_diameter_[1]);
@@ -4339,17 +4957,35 @@ bool MeleeGame::consume_modal_target(sim::Fixed wx, sim::Fixed wy) {
             o.ty = wy;
             o.px = u.x;
             o.py = u.y;
+            if (queued)
+                for (auto it = u.orders.rbegin(); it != u.orders.rend(); ++it)
+                    if (it->tx.raw() != 0 || it->ty.raw() != 0) {
+                        o.px = it->tx;
+                        o.py = it->ty;
+                        break;
+                    }
         }
-        world_.issue(id, o);
+        world_.issue(id, o, queued);
     }
+    cue_confirm_point(float(wx.to_double()), float(wy.to_double()), pending_attack_);
     audio_ui_event(human_lead_caster(), pending_attack_ ? data::UnitEvent::AttackOrder : data::UnitEvent::Confirm,
                    kUiCueTrim);
+    if (queued) {
+        modal_shift_kept_ = true;
+        return true;
+    }
     pending_attack_ = pending_patrol_ = pending_move_ = false;
+    modal_shift_kept_ = false;
     return true;
 }
 
 void MeleeGame::handle_commands(const render::InputState& in, float aspect) {
     clear_placement_ghost();
+    if (cues_) cue_cursor_point(false, 0.0f, 0.0f);
+    if (modal_shift_kept_ && !in.shift) {
+        modal_shift_kept_ = false;
+        pending_attack_ = pending_patrol_ = pending_move_ = false;
+    }
     if (cfg_.human_player < 0 || !in.view_w || !in.view_h) return;
     render::Mat4 mvp = camctl_.view_proj(aspect);
     Control ctrl = make_control(mvp, in.view_w, in.view_h, cfg_.human_player);
@@ -4408,16 +5044,7 @@ void MeleeGame::handle_commands(const render::InputState& in, float aspect) {
     if (pending_build_ || pending_refinery_) {
         sim::Fixed wx, wy;
         if (!over_bar && ctrl.ground_point(world_, ScreenPoint{in.mouse_x, in.mouse_y}, wx, wy)) {
-            if (cat_ && !build_proto_.catalog_id.empty()) {
-                double sfx = 0.5, sfy = 0.5;
-                if (cat_->unit_placement_grid_phase(build_proto_.catalog_id, sfx, sfy)) {
-                    auto snap = [](sim::Fixed v, double phase) {
-                        return sim::Fixed::from_double(std::floor(v.to_double() - phase + 0.5) + phase);
-                    };
-                    wx = snap(wx, sfx);
-                    wy = snap(wy, sfy);
-                }
-            }
+            snap_build_site(wx, wy);
             build_px_ = wx;
             build_py_ = wy;
             bool clear = wx.to_double() >= 0.0 && wy.to_double() >= 0.0 &&
@@ -4436,25 +5063,11 @@ void MeleeGame::handle_commands(const render::InputState& in, float aspect) {
             if (clear && build_proto_.needs_power &&
                 !world_.powered_at(wx, wy, cfg_.human_player))
                 clear = false;
-            if (clear && world_.placement().configured()) {
-                int gcx = 0, gcy = 0;
-                world_.placement().to_cell(wx, wy, gcx, gcy);
-                int gminx = 0, gmaxx = 0, gminy = 0, gmaxy = 0;
-                for (const std::pair<std::int16_t, std::int16_t>& o : build_proto_.footprint_offsets) {
-                    if (o.first < gminx) gminx = o.first;
-                    if (o.first > gmaxx) gmaxx = o.first;
-                    if (o.second < gminy) gminy = o.second;
-                    if (o.second > gmaxy) gmaxy = o.second;
-                }
-                if (!world_.placement().can_place(gcx + gminx, gcy + gminy, gmaxx - gminx + 1,
-                                                  gmaxy - gminy + 1,
-                                                   build_proto_.requires_vespene))
-                    clear = false;
-            }
+            if (clear && !build_site_on_grid(wx, wy)) clear = false;
             build_valid_ = clear &&
                            world_.player(cfg_.human_player).minerals >= build_cost_ &&
                            world_.player(cfg_.human_player).gas >= build_gas_cost_;
-            static const bool kNoGhost = std::getenv("SC2_NO_PLACEMENT_GHOST") != nullptr;
+            static const bool kNoGhost = std::getenv("OMC_NO_PLACEMENT_GHOST") != nullptr;
             if (!kNoGhost) {
                 bool site = world_.player(cfg_.human_player).minerals >= build_cost_ &&
                             world_.player(cfg_.human_player).gas >= build_gas_cost_ &&
@@ -4467,13 +5080,33 @@ void MeleeGame::handle_commands(const render::InputState& in, float aspect) {
             build_valid_ = false;
         }
     }
-    if (pending_land_ && !std::getenv("SC2_LAND_CARD_OLD") && !std::getenv("SC2_NO_PLACEMENT_GHOST") &&
+    {
+        static const bool kWarpPresentOld = std::getenv("OMC_WARPIN_PRESENT_OLD") != nullptr;
+        warp_ghost_.active = false;
+        sim::Fixed wx, wy;
+        if (pending_warp_ && !kWarpPresentOld && cfg_.human_player >= 0 && !over_bar &&
+            ctrl.ground_point(world_, ScreenPoint{in.mouse_x, in.mouse_y}, wx, wy)) {
+            warp_ghost_.active = true;
+            warp_ghost_.unit_id = pending_warp_unit_;
+            warp_ghost_.x = float(wx.to_double());
+            warp_ghost_.y = float(wy.to_double());
+            warp_ghost_.ok = world_.powered_at(wx, wy, cfg_.human_player) && world_.warp_ready(pending_warp_gate_);
+        }
+    }
+    if (pending_land_ && !std::getenv("OMC_LAND_CARD_OLD") && !std::getenv("OMC_NO_PLACEMENT_GHOST") &&
         pending_land_unit_ < world_.units().size()) {
         sim::Fixed wx, wy;
         if (!over_bar && ctrl.ground_point(world_, ScreenPoint{in.mouse_x, in.mouse_y}, wx, wy)) {
             const bool ok = land_site(pending_land_unit_, wx, wy);
             set_placement_ghost(world_.unit(pending_land_unit_).catalog_id, wx, wy, ok);
         }
+    }
+    if (has_pending_ability_cast()) {
+        sim::Fixed cwx, cwy;
+        const bool cpt = !over_bar && !over_minimap && ctrl.ground_point(world_, ScreenPoint{in.mouse_x, in.mouse_y}, cwx, cwy);
+        cue_cursor_point(cpt, float(cwx.to_double()), float(cwy.to_double()));
+    } else if (cues_) {
+        cue_cursor_point(false, 0.0f, 0.0f);
     }
 
     if (minimap_drag_ && (!in.left_down || map_w_ <= 0.0f)) minimap_drag_ = false;
@@ -4513,7 +5146,7 @@ void MeleeGame::handle_commands(const render::InputState& in, float aspect) {
             float wx, wy; minimap_world(wx, wy);
             const bool spent = consume_modal_target(
                 sim::Fixed::from_ratio(int(std::lround(double(wx) * 4096.0)), 4096),
-                sim::Fixed::from_ratio(int(std::lround(double(wy) * 4096.0)), 4096));
+                sim::Fixed::from_ratio(int(std::lround(double(wy) * 4096.0)), 4096), in.shift);
             if (!spent) {
                 camctl_.focus = {wx, wy, ground_z_at(wx, wy)};
                 user_scrolled_ = true;
@@ -4539,6 +5172,7 @@ void MeleeGame::handle_commands(const render::InputState& in, float aspect) {
                 }
                 world_.issue(id, o, in.shift);
             }
+            cue_confirm_point(wx, wy, false);
             audio_ui_event(human_lead_caster(), data::UnitEvent::Confirm, kUiCueTrim);
         }
         return;
@@ -4661,7 +5295,7 @@ void MeleeGame::handle_commands(const render::InputState& in, float aspect) {
                         break;
                     }
                     if (card.slots[i].is_cancel && cancel_building == sim::kNoTarget && cancel_producer == sim::kNoTarget &&
-                        !std::getenv("SC2_NO_CHANNEL_CANCEL")) {
+                        !std::getenv("OMC_NO_CHANNEL_CANCEL")) {
                         bool channel = false;
                         for (std::uint32_t id : selection_)
                             if (id < world_.units().size() && world_.is_channelling(id)) channel = true;
@@ -4699,7 +5333,7 @@ void MeleeGame::handle_commands(const render::InputState& in, float aspect) {
                             if (ab.requirement_met && cat_) {
                                 pending_attack_ = pending_patrol_ = pending_move_ = false;
                                 cancel_ability_cast();
-                                static const bool kLibOld = std::getenv("SC2_LIBERATOR_OPENER_OLD") != nullptr;
+                                static const bool kLibOld = std::getenv("OMC_LIBERATOR_OPENER_OLD") != nullptr;
                                 if (!kLibOld && ab.ability == "LiberatorAGTarget" && selected_liberator() != sim::kNoTarget) {
                                     pending_liberator_ = selected_liberator();
                                     pending_defender_ = true;
@@ -4719,13 +5353,15 @@ void MeleeGame::handle_commands(const render::InputState& in, float aspect) {
                                            cat_->is_harvest_ability(ab.ability)) {
                                     order_return_cargo(*cat_, world_, human_lead_caster());
                                 } else if (ab.command == "Cancel" && human_cancel_morph(ab.ability)) {
+                                } else if (ab.command == "Cancel" && !std::getenv("OMC_EFFECT_CANCEL_IDLE_OLD") &&
+                                           human_cancel_effect(ab.ability)) {
                                 } else if (const auto ms = cat_->morph_spec(ab.ability);
                                            ms && !ms->target.empty()) {
                                     human_morph_selection(ab.ability);
                                 } else {
                                     const AbilTargetMode m = ability_target_mode(*cat_, ab.ability);
                                     if (m == AbilTargetMode::Instant)
-                                        human_cast(ab.ability, human_lead_caster());
+                                        human_cast_instant(ab.ability);
                                     else {
                                         begin_ability_cast(ab.ability, ab.command);
                                         pending_cast_mode_ = m;
@@ -4784,12 +5420,12 @@ void MeleeGame::handle_commands(const render::InputState& in, float aspect) {
                         case kMeleeAbilBurrow:
                             if (cat_)
                                 for (std::uint32_t id : selected_burrowers(false))
-                                    if (burrow_command_allowed(id)) sim::set_burrowed(world_, id, true);
+                                    if (burrow_command_allowed(id)) human_burrow(id, true);
                             break;
                         case kMeleeAbilUnburrow:
                             if (cat_)
                                 for (std::uint32_t id : selected_burrowers(true))
-                                    sim::set_burrowed(world_, id, false);
+                                    human_burrow(id, false);
                             break;
                         case kMeleeAbilLiftOff:
                             if (cat_)
@@ -4804,12 +5440,12 @@ void MeleeGame::handle_commands(const render::InputState& in, float aspect) {
                         case kMeleeAbilLowerDepot:
                             if (cat_)
                                 if (const std::uint32_t id = selected_depot(false); id != sim::kNoTarget)
-                                    world_.lower(id);
+                                    human_depot(id, true);
                             break;
                         case kMeleeAbilRaiseDepot:
                             if (cat_)
                                 if (const std::uint32_t id = selected_depot(true); id != sim::kNoTarget)
-                                    world_.raise(id);
+                                    human_depot(id, false);
                             break;
                         case kMeleeAbilLand:
                             pending_land_unit_ = selected_liftoff_structure(true);
@@ -4820,7 +5456,7 @@ void MeleeGame::handle_commands(const render::InputState& in, float aspect) {
                             break;
                         case kMeleeAbilUnloadAll:
                             pending_unload_unit_ = selected_loaded_transport();
-                            static const bool kUnloadAllTargeted = std::getenv("SC2_UNLOAD_ALL_TARGETED") != nullptr;
+                            static const bool kUnloadAllTargeted = std::getenv("OMC_UNLOAD_ALL_TARGETED") != nullptr;
                             if (pending_unload_unit_ != sim::kNoTarget && cat_ && !kUnloadAllTargeted &&
                                 !cat_->transport_unload_targeted(world_.unit(pending_unload_unit_).catalog_id)) {
                                 const sim::Unit& tu = world_.unit(pending_unload_unit_);
@@ -4887,8 +5523,11 @@ void MeleeGame::handle_commands(const render::InputState& in, float aspect) {
             sim::Fixed wx, wy;
             if (bw != sim::kNoTarget &&
                 ctrl.ground_point(world_, ScreenPoint{in.mouse_x, in.mouse_y}, wx, wy)) {
+                static const bool kBuildClickGridOld = std::getenv("OMC_BUILD_CLICK_GRID_OLD") != nullptr;
+                if (!kBuildClickGridOld) snap_build_site(wx, wy);
                 bool clear = wx.to_double() >= 0.0 && wy.to_double() >= 0.0 &&
                              wx.to_double() <= double(map_w_) && wy.to_double() <= double(map_h_);
+                if (clear && !kBuildClickGridOld && !build_site_on_grid(wx, wy)) clear = false;
                 if (clear)
                     for (const Unit& u : world_.units()) {
                         if (!u.alive) continue;
@@ -4950,8 +5589,10 @@ void MeleeGame::handle_commands(const render::InputState& in, float aspect) {
                         const sim::Fixed gpx = gy.x, gpy = gy.y;
                         if (world_.issue_worker_build(bw, gpx, gpy, proto, cost, 0,
                                                       sim::Fixed::from_int(30),
-                                                      sim::Fixed::from_int(2), build_verb_for(bw)))
+                                                      sim::Fixed::from_int(2), build_verb_for(bw))) {
                             world_.unit(geyser).resource_left = 0;
+                            cue_build_issued(bw, gpx, gpy, gas);
+                        }
                     }
                 }
             }
@@ -4969,7 +5610,7 @@ void MeleeGame::handle_commands(const render::InputState& in, float aspect) {
             if (pending_land_unit_ < world_.units().size() && world_.unit(pending_land_unit_).alive &&
                 world_.unit(pending_land_unit_).flying &&
                 ctrl.ground_point(world_, ScreenPoint{in.mouse_x, in.mouse_y}, wx, wy)) {
-                if (!std::getenv("SC2_LAND_CARD_OLD")) land_site(pending_land_unit_, wx, wy);
+                if (!std::getenv("OMC_LAND_CARD_OLD")) land_site(pending_land_unit_, wx, wy);
                 const bool in_bounds = wx.to_double() >= 0.0 && wy.to_double() >= 0.0 &&
                                        wx.to_double() <= double(map_w_) && wy.to_double() <= double(map_h_);
                 const bool ordered = !pending_land_addon_.empty()
@@ -4999,15 +5640,32 @@ void MeleeGame::handle_commands(const render::InputState& in, float aspect) {
         } else if ((pending_attack_ || pending_patrol_ || pending_move_) && !selection_.empty()) {
             dragging_ = false;
             sim::Fixed wx, wy;
-            if (ctrl.ground_point(world_, ScreenPoint{in.mouse_x, in.mouse_y}, wx, wy)) {
-                consume_modal_target(wx, wy);
+            static const bool kAttackUnitOld = std::getenv("OMC_ATTACK_UNIT_CLICK_OLD") != nullptr;
+            const std::uint32_t foe = pending_attack_ && !kAttackUnitOld
+                                          ? ctrl.pick_target(world_, ScreenPoint{in.mouse_x, in.mouse_y})
+                                          : sim::kNoTarget;
+            if (foe != sim::kNoTarget) {
+                for (std::uint32_t id : selection_) {
+                    if (id >= world_.units().size() || id == foe) continue;
+                    world_.issue(id, sim::Order{sim::OrderType::Attack, sim::Fixed(), sim::Fixed(), foe}, in.shift);
+                }
+                cue_confirm_point(float(world_.unit(foe).x.to_double()), float(world_.unit(foe).y.to_double()), true);
+                audio_ui_event(human_lead_caster(), data::UnitEvent::AttackOrder, kUiCueTrim);
+                if (in.shift) {
+                    modal_shift_kept_ = true;
+                } else {
+                    pending_attack_ = pending_patrol_ = pending_move_ = false;
+                    modal_shift_kept_ = false;
+                }
+            } else if (ctrl.ground_point(world_, ScreenPoint{in.mouse_x, in.mouse_y}, wx, wy)) {
+                consume_modal_target(wx, wy, in.shift);
             } else {
                 audio_ui_event(human_lead_caster(), data::UnitEvent::Confirm, kUiCueTrim);
                 pending_attack_ = pending_patrol_ = pending_move_ = false;
             }
         } else if (has_pending_ability_cast()) {
             dragging_ = false;
-            static const bool kCardSmartOld = std::getenv("SC2_CARD_SMART_OLD") != nullptr;
+            static const bool kCardSmartOld = std::getenv("OMC_CARD_SMART_OLD") != nullptr;
             const data::Catalog::Entry* pce = cat_ ? cat_->find("CAbil", pending_cast_abil_) : nullptr;
             std::string ptag = pce ? pce->tag : std::string();
             if (ptag == "CAbilEffectTarget" && pending_cast_abil_.size() >= 6 &&
@@ -5017,6 +5675,9 @@ void MeleeGame::handle_commands(const render::InputState& in, float aspect) {
                                    ptag == "CAbilTransport")) {
                 if (card_smart_click(ptag, ctrl, ScreenPoint{in.mouse_x, in.mouse_y}, in.shift)) {
                     cancel_ability_cast();
+                    sim::Fixed cwx, cwy;
+                    const bool cpt = ctrl.ground_point(world_, ScreenPoint{in.mouse_x, in.mouse_y}, cwx, cwy);
+                    cue_after_order(cpt, float(cwx.to_double()), float(cwy.to_double()), sim::kNoTarget);
                     audio_ui_event(human_lead_caster(), data::UnitEvent::Confirm, kUiCueTrim);
                 }
             } else if (pending_cast_mode_ == AbilTargetMode::Point) {
@@ -5025,15 +5686,15 @@ void MeleeGame::handle_commands(const render::InputState& in, float aspect) {
                     const std::uint32_t caster = human_lead_caster();
                     if (caster != sim::kNoTarget && is_nova_cast(caster, pending_cast_abil_)) {
                         if (world_.launch_nova(caster, wx, wy)) cancel_ability_cast();
-                    } else {
-                        cast_pending_at_point(wx, wy);
+                    } else if (cast_pending_at_point(wx, wy)) {
+                        cue_confirm_point(float(wx.to_double()), float(wy.to_double()), false);
                     }
                 }
             } else {
                 std::uint32_t tgt = ctrl.pick_target(world_, ScreenPoint{in.mouse_x, in.mouse_y});
                 if (tgt == sim::kNoTarget)
                     tgt = ctrl.pick_own(world_, ScreenPoint{in.mouse_x, in.mouse_y});
-                if (tgt != sim::kNoTarget) cast_pending_at_target(tgt);
+                if (tgt != sim::kNoTarget && cast_pending_at_target(tgt)) cue_confirm_target(tgt);
             }
         } else {
             dragging_ = true;
@@ -5050,7 +5711,7 @@ void MeleeGame::handle_commands(const render::InputState& in, float aspect) {
             y0 = in.mouse_y - 6.0f; y1 = in.mouse_y + 6.0f;
         }
         const std::vector<std::uint32_t> prev_selection = selection_;
-        static const bool click_old = std::getenv("SC2_CLICK_PICK_OLD") != nullptr;
+        static const bool click_old = std::getenv("OMC_CLICK_PICK_OLD") != nullptr;
         if (!marquee && !click_old) {
             const std::uint32_t hit = click_select_at(ctrl, ScreenPoint{in.mouse_x, in.mouse_y});
             set_selection(hit == sim::kNoTarget ? std::vector<std::uint32_t>{} : std::vector<std::uint32_t>{hit});
@@ -5116,7 +5777,7 @@ void MeleeGame::handle_commands(const render::InputState& in, float aspect) {
             if (select_rules_672_ && v.size() > Control::kSelectionCap) v.resize(Control::kSelectionCap);
             return v;
         };
-        static const bool add_all_type_old = std::getenv("SC2_ADD_ALL_TYPE_OLD") != nullptr;
+        static const bool add_all_type_old = std::getenv("OMC_ADD_ALL_TYPE_OLD") != nullptr;
         if (!handled672 && !add_all_type_old && in.shift && in.key_ctrl && !marquee && selection_.size() == 1 &&
             selection_[0] < world_.units().size() && world_.unit(selection_[0]).player == cfg_.human_player) {
             std::vector<std::uint32_t> merged = prev_selection;
@@ -5172,7 +5833,7 @@ void MeleeGame::handle_commands(const render::InputState& in, float aspect) {
                 }
             }
         }
-        static const bool empty_clears_old = std::getenv("SC2_EMPTY_CLICK_CLEARS_OLD") != nullptr;
+        static const bool empty_clears_old = std::getenv("OMC_EMPTY_CLICK_CLEARS_OLD") != nullptr;
         if (!marquee && clicked_nothing && selection_.empty() && !empty_clears_old) set_selection(prev_selection);
     }
 
@@ -5316,7 +5977,7 @@ void MeleeGame::handle_commands(const render::InputState& in, float aspect) {
                 ctrl.issue_command(world_, movers, ScreenPoint{in.mouse_x, in.mouse_y},
                                     false,  in.shift);
         }
-        if (std::getenv("SC2_SMART_TRACE")) {
+        if (std::getenv("OMC_SMART_TRACE")) {
             std::fprintf(stderr, "[smart] tick %d at (%.0f, %.0f) ground %d (%.3f, %.3f) node %u resume %u transport %u producers %zu raw_refused %d\n",
                          world_.tick(), double(in.mouse_x), double(in.mouse_y), int(have_pt), gx.to_double(), gy.to_double(), unsigned(node),
                          unsigned(resume), unsigned(transport), producers.size(), int(raw_refused));
@@ -5333,6 +5994,13 @@ void MeleeGame::handle_commands(const render::InputState& in, float aspect) {
                 else std::fprintf(stderr, "[smart]   %u %s at (%.3f, %.3f): order %d to (%.3f, %.3f) target %u\n", unsigned(id), su.catalog_id.c_str(), su.x.to_double(),
                                   su.y.to_double(), int(su.orders.front().type), su.orders.front().tx.to_double(), su.orders.front().ty.to_double(), unsigned(su.orders.front().target));
             }
+        }
+        if (!raw_refused) {
+            const std::uint32_t cue_tgt = enemy_under ? ctrl.pick_target(world_, ScreenPoint{in.mouse_x, in.mouse_y})
+                                          : node != sim::kNoTarget ? node
+                                          : resume != sim::kNoTarget ? resume
+                                                                     : transport;
+            cue_after_order(have_pt, float(gx.to_double()), float(gy.to_double()), cue_tgt);
         }
         audio_ui_event(human_lead_caster(), data::UnitEvent::Confirm, kUiCueTrim);
     }
@@ -5381,11 +6049,11 @@ bool MeleeGame::debug_create(const std::string& unit_id_in, float x, float y, fl
     proto.x = sim::Fixed::from_double(double(x));
     proto.y = sim::Fixed::from_double(double(y));
     if (founding) proto.speed = sim::Fixed();
-    if (proto.needs_power && !std::getenv("SC2_DEBUG_CREATE_UNMANAGED_POWER")) proto.power_managed = true;
+    if (proto.needs_power && !std::getenv("OMC_DEBUG_CREATE_UNMANAGED_POWER")) proto.power_managed = true;
     const std::uint32_t id = world_.add_unit(proto);
     if (layout_.unit_type.size() <= id) layout_.unit_type.resize(id + 1);
     layout_.unit_type[id] = unit_id;
-    if (facing > -100.0f && !std::getenv("SC2_DEBUG_CREATE_NO_SPAWN_FACING")) driver_.set_spawn_facing(id, facing);
+    if (facing > -100.0f && !std::getenv("OMC_DEBUG_CREATE_NO_SPAWN_FACING")) driver_.set_spawn_facing(id, facing);
     if (founding) {
         double secs = 0.0;
         for (const char* worker : {"Drone", "Probe", "SCV"})
@@ -5399,8 +6067,15 @@ bool MeleeGame::debug_create(const std::string& unit_id_in, float x, float y, fl
     return true;
 }
 
-bool MeleeGame::debug_morph(const std::string& from_unit, const std::string& morph_abil) {
+bool MeleeGame::debug_morph(const std::string& from_unit, const std::string& morph_abil_at) {
     if (!cat_ || cfg_.human_player < 0) return false;
+    std::string morph_abil = morph_abil_at;
+    float tx = 0.0f, ty = 0.0f;
+    bool at = false;
+    if (const std::size_t p = morph_abil_at.find('@'); p != std::string::npos) {
+        morph_abil = morph_abil_at.substr(0, p);
+        at = std::sscanf(morph_abil_at.c_str() + p + 1, "%f,%f", &tx, &ty) == 2;
+    }
     world_.player(cfg_.human_player).minerals += 5000;
     world_.player(cfg_.human_player).gas += 5000;
     if (const auto ms = cat_->morph_spec(morph_abil)) {
@@ -5408,14 +6083,38 @@ bool MeleeGame::debug_morph(const std::string& from_unit, const std::string& mor
         for (const std::string& c : ms->chain) chain += c + " ";
         std::fprintf(stderr, "[morph] spec %s: time %.2f target %s chain %s\n", morph_abil.c_str(), ms->morph_time, ms->target.c_str(), chain.c_str());
     }
-    const bool burrow_down = morph_abil.rfind("Burrow", 0) == 0 && morph_abil.size() > 4 && morph_abil.compare(morph_abil.size() - 4, 4, "Down") == 0;
-    const bool burrow_up = morph_abil.rfind("Burrow", 0) == 0 && morph_abil.size() > 2 && morph_abil.compare(morph_abil.size() - 2, 2, "Up") == 0;
+    const std::string bdown = cat_->burrow_ability(from_unit);
+    const std::string bvar = bdown.empty() ? std::string() : cat_->burrowed_variant(from_unit);
+    const std::string bup = bvar.empty() ? std::string() : cat_->unburrow_ability(bvar);
+    const bool burrow_down = (morph_abil.rfind("Burrow", 0) == 0 && morph_abil.size() > 4 && morph_abil.compare(morph_abil.size() - 4, 4, "Down") == 0) ||
+                             (!bdown.empty() && morph_abil == bdown);
+    const bool burrow_up = (morph_abil.rfind("Burrow", 0) == 0 && morph_abil.size() > 2 && morph_abil.compare(morph_abil.size() - 2, 2, "Up") == 0) ||
+                           (!bup.empty() && morph_abil == bup);
+    if (const auto mg = cat_->merge_spec(morph_abil)) {
+        std::vector<std::uint32_t> two;
+        for (const Unit& u : world_.units())
+            if (u.alive && u.player == cfg_.human_player && u.catalog_id == from_unit && !world_.is_morphing(u.id)) two.push_back(u.id);
+        if (two.size() < 2 || mg->target.empty()) return false;
+        const std::int32_t proto = world_.add_spawn_proto(make_unit(*cat_, mg->target, cfg_.human_player));
+        return world_.merge_units(two[0], two[1], proto, sim::Fixed::from_double(mg->time));
+    }
     for (const Unit& u : world_.units())
-        if (u.alive && u.player == cfg_.human_player && u.catalog_id == from_unit) {
+        if (u.alive && u.player == cfg_.human_player && u.catalog_id == from_unit && !world_.is_morphing(u.id) &&
+            !world_.is_burrowing(u.id)) {
             if (burrow_down || burrow_up) {
-                sim::set_burrowed(world_, u.id, burrow_down);
-                return true;
+                if (u.burrowed == burrow_down) continue;
+                return human_burrow(u.id, burrow_down);
             }
+            if (const std::string dl = cat_->depot_lower_ability(from_unit); !dl.empty()) {
+                const auto dms = cat_->morph_spec(dl);
+                const bool to_down = morph_abil == dl;
+                if (to_down || (dms && morph_abil == cat_->morph_button_ability(dms->target, "Raise"))) {
+                    if (u.lowered == to_down || world_.is_depot_morphing(u.id)) continue;
+                    return human_depot(u.id, to_down);
+                }
+            }
+            if (at && morph_abil == "LiberatorMorphtoAG")
+                return human_siege_defender(u.id, sim::Fixed::from_double(tx), sim::Fixed::from_double(ty));
             return human_morph(u.id, morph_abil);
         }
     return false;
@@ -5455,13 +6154,21 @@ static void emit_beam(std::vector<render::SceneInstance>& scene, const float a[3
     scene.push_back(s);
 }
 
+float MeleeGame::display_height(const std::string& id, bool flying_variant) {
+    std::unordered_map<std::string, float>& cache = flying_variant ? flying_height_cache_ : display_h_cache_;
+    auto hit = cache.find(id);
+    if (hit == cache.end())
+        hit = cache.emplace(id, cat_->unit_display_height(flying_variant ? id + "Flying" : id)).first;
+    return hit->second;
+}
+
 bool MeleeGame::unit_attach_world(const sim::Unit& u, const char* first, const char* second, float out[3]) {
     out[0] = float(u.x.to_double());
     out[1] = float(u.y.to_double());
     out[2] = (u.flying ? air_z_at(out[0], out[1]) : ground_z_at(out[0], out[1]));
     if (cat_) {
-        float h = cat_->unit_display_height(u.catalog_id);
-        if (u.flying && h <= 0.0f) h = cat_->unit_display_height(u.catalog_id + "Flying");
+        float h = display_height(u.catalog_id, false);
+        if (u.flying && h <= 0.0f) h = display_height(u.catalog_id, true);
         if (h > 0.0f) out[2] = air_z_at(out[0], out[1]) + h;
     }
     if (u.id >= driver_.actors.size()) return false;
@@ -5511,16 +6218,22 @@ void MeleeGame::beam_refresh(std::uint32_t attacker, std::uint32_t target, std::
 }
 
 void MeleeGame::emit_scene(std::vector<render::SceneInstance>& scene) {
-    SC2_PROF_SCOPE("emit_scene");
+    OMC_PROF_SCOPE("emit_scene");
     rebuild_subgroups();
     ++pick_frame_;
     const data::Catalog::SelectionLook sel_look = cat_ ? cat_->selection_look()
                                                        : data::Catalog::SelectionLook{};
-    const bool env_sel_line_003 = std::getenv("SC2_SELECTION_LINE_003") != nullptr;
-    const bool env_sel_width_ratio = std::getenv("SC2_SELECTION_WIDTH_RATIO") != nullptr;
-    const bool env_sel_rim_uniform = std::getenv("SC2_SELECTION_RIM_UNIFORM") != nullptr;
-    const bool env_sel_band_flat = std::getenv("SC2_SELECTION_BAND_FLAT") != nullptr;
-    const bool env_sel_band_radial = std::getenv("SC2_SELECTION_BAND_RADIAL") != nullptr;
+    const bool env_sel_line_003 = std::getenv("OMC_SELECTION_LINE_003") != nullptr;
+    const bool env_sel_width_ratio = std::getenv("OMC_SELECTION_WIDTH_RATIO") != nullptr;
+    const bool env_sel_rim_uniform = std::getenv("OMC_SELECTION_RIM_UNIFORM") != nullptr;
+    const bool env_sel_band_flat = std::getenv("OMC_SELECTION_BAND_FLAT") != nullptr;
+    const bool env_sel_band_radial = std::getenv("OMC_SELECTION_BAND_RADIAL") != nullptr;
+    const bool pass_tags = render::gpu_prof_switch() || render::render_quality().shadows == render::ShadowQuality::Units;
+    auto tag_pass = [&scene, pass_tags](std::size_t from, render::PassGroup g) {
+        if (!pass_tags) return scene.size();
+        for (std::size_t i = from; i < scene.size(); ++i) scene[i].pass_group = std::uint8_t(g);
+        return scene.size();
+    };
     scene.clear();
     if (ground_) {
         render::SceneInstance g;
@@ -5581,8 +6294,8 @@ void MeleeGame::emit_scene(std::vector<render::SceneInstance>& scene) {
                 water_fx_model_.region_material.assign(water_fx_model_.regions.size(), 0);
             }
             w.model = &water_fx_model_;
-            static const bool kCaustics = std::getenv("SC2_NO_WATER_CAUSTICS") == nullptr;
-            if (kCaustics && std::getenv("SC2_WATER_CAUSTICS_TRACE")) {
+            static const bool kCaustics = std::getenv("OMC_NO_WATER_CAUSTICS") == nullptr;
+            if (kCaustics && std::getenv("OMC_WATER_CAUSTICS_TRACE")) {
                 static bool once = false;
                 if (!once) {
                     once = true;
@@ -5595,7 +6308,7 @@ void MeleeGame::emit_scene(std::vector<render::SceneInstance>& scene) {
                     for (int k = 1; k <= 32; ++k) {
                         formats::Model fm = water_fx_model_;
                         formats::M3Layer dl;
-                        static const bool caus_srgb = std::getenv("SC2_WATER_CAUSTICS_SRGB") != nullptr;
+                        static const bool caus_srgb = std::getenv("OMC_WATER_CAUSTICS_SRGB") != nullptr;
                         dl.usage = caus_srgb ? "Diffuse" : "AlphaMask";
                         char nm[96];
                         std::snprintf(nm, sizeof nm, "Assets/Textures/DefaultWaterCaustics_%03d.dds", k);
@@ -5609,9 +6322,9 @@ void MeleeGame::emit_scene(std::vector<render::SceneInstance>& scene) {
                 w.model = &water_caustics_models_[frame];
                 w.fx.emis_uv[0] = water_look_.caustics_tiling;
                 w.fx.emis_uv[1] = water_look_.caustics_falloff;
-                w.fx.emis_uv[2] = std::getenv("SC2_WATER_CAUSTICS_SRGB") ? 0.0f : 1.0f;
+                w.fx.emis_uv[2] = std::getenv("OMC_WATER_CAUSTICS_SRGB") ? 0.0f : 1.0f;
             }
-            static const bool shadow_always = std::getenv("SC2_WATER_SHADOW_ALWAYS") != nullptr;
+            static const bool shadow_always = std::getenv("OMC_WATER_SHADOW_ALWAYS") != nullptr;
             w.team = {(water_look_.receive_shadows || shadow_always) ? 1.0f : 0.0f, 0.0f, 0.0f, -1.0f};
             w.fx.kind = render::FxKind::Water;
             w.fx.t = float(clock_ms_ * 0.001);
@@ -5630,16 +6343,29 @@ void MeleeGame::emit_scene(std::vector<render::SceneInstance>& scene) {
         }
         scene.push_back(w);
     }
+    tag_pass(0, render::PassGroup::Terrain);
     const bool splat_fog_ready = cfg_.human_player >= 0 && vision_.width() > 0;
+    static const bool kFogLeakOld = std::getenv("OMC_FOG_LEAK_OLD") != nullptr;
+    static const bool kSnapshotOldEarly = std::getenv("OMC_FOG_SNAPSHOT_OLD") != nullptr;
+    const bool fog_leak_guard = !kFogLeakOld && !kSnapshotOldEarly && !reveal_map_ && ground_fog_ && splat_fog_ready;
+    auto fog_hides_enemy = [&](int player, float x, float y, int fv) {
+        return fog_leak_guard && player >= 0 && player != cfg_.human_player && !world_.are_allied(player, cfg_.human_player) &&
+               FogVisibility(fv) != FogVisibility::Visible &&
+               vision_.state_at(sim::Fixed::from_double(x), sim::Fixed::from_double(y)) != sim::Visibility::Visible;
+    };
+    fog_splat_frame_.clear();
     if (models_ && ui_store_)
         for (const Unit& u : world_.units()) {
-            static const bool kNeutralSplats = std::getenv("SC2_NO_ACTOR_SPLAT") == nullptr;
-            static const bool kBurrowSplat = std::getenv("SC2_NO_BIRTH_SPLAT") == nullptr;
+            static const bool kNeutralSplats = std::getenv("OMC_NO_ACTOR_SPLAT") == nullptr;
+            static const bool kBurrowSplat = std::getenv("OMC_NO_BIRTH_SPLAT") == nullptr;
             const bool dug = kBurrowSplat && u.burrowed && cat_;
             if (!dug) splat_quads_.erase(u.id | 0x80000000u);
             if (!u.alive || (u.player < 0 && !kNeutralSplats) || (u.speed.raw() != 0 && !dug) || u.flying) continue;
             if (splat_fog_ready && u.player != cfg_.human_player &&
                 !hud_fog_body_drawn(fog_body_state(u.player, int(vision_.state_at(u.x, u.y)), fog_hidden_black_), FogVisibility(u.fog_visibility)))
+                continue;
+            if (fog_hides_enemy(u.player, float(u.x.to_double()), float(u.y.to_double()), int(u.fog_visibility)) &&
+                !(u.id < fog_seen_.size() && fog_seen_[u.id]))
                 continue;
             const formats::Model* q = nullptr;
             if (dug) {
@@ -5655,15 +6381,24 @@ void MeleeGame::emit_scene(std::vector<render::SceneInstance>& scene) {
             inst.model = q;
             inst.world = render::translation(float(u.x.to_double()), float(u.y.to_double()), 0.03f);
             inst.team = {0.0f, 0.0f, 0.0f, -1.0f};
-            static const bool kSplatTeam = std::getenv("SC2_SPLAT_NO_TEAM") == nullptr;
+            static const bool kSplatTeam = std::getenv("OMC_SPLAT_NO_TEAM") == nullptr;
             if (kSplatTeam && u.player >= 0 && (u.attributes & sim::kAttrStructure) != 0) inst.team = team_colour_for(cat_, u.player, false);
             inst.seq = -1;
             scene.push_back(inst);
+            if (fog_leak_guard && !dug && u.player >= 0 && u.player != cfg_.human_player && FogVisibility(u.fog_visibility) != FogVisibility::Visible)
+                fog_splat_frame_[u.id] = inst;
         }
+    if (fog_leak_guard)
+        for (const auto& kv : fog_snaps_)
+            if (kv.second.has_splat &&
+                vision_.state_at(sim::Fixed::from_double(kv.second.x), sim::Fixed::from_double(kv.second.y)) != sim::Visibility::Visible)
+                scene.push_back(kv.second.splat);
 
     if (models_ && ui_store_ && cfg_.human_player >= 0) {
         bool show = pending_build_ && cat_ && !build_proto_.catalog_id.empty() &&
                     cat_->unit_race_index(build_proto_.catalog_id) == 1;
+        static const bool kWarpPresentOld = std::getenv("OMC_WARPIN_PRESENT_OLD") != nullptr;
+        if (!show && !kWarpPresentOld && pending_warp_) show = true;
         if (!show)
             for (uint32_t s : selection_)
                 if (s < world_.units().size() && world_.units()[s].power_radius.raw() > 0) { show = true; break; }
@@ -5682,17 +6417,41 @@ void MeleeGame::emit_scene(std::vector<render::SceneInstance>& scene) {
                 scene.push_back(inst);
             }
     }
+    if (const formats::Model* wgm = warp_ghost_model()) {
+        const float gx = warp_ghost_.x, gy = warp_ghost_.y;
+        const std::array<float, 3> gs = data::resolve_unit_model_scale(*cat_, data::unit_actor_id(*cat_, warp_ghost_.unit_id));
+        render::SceneInstance inst;
+        inst.model = wgm;
+        inst.world = render::translation(gx, gy, ground_z_at(gx, gy)) *
+                     render::rotation_z(cat_->unit_facing_radians(warp_ghost_.unit_id) + 1.5707963f) *
+                     render::scaling(gs[0], gs[1], gs[2]);
+        inst.seq = render::select_sequence(*wgm, {"Stand"}, 0);
+        if (inst.seq >= 0 && std::size_t(inst.seq) < wgm->sequences.size()) {
+            const float len = float(wgm->sequences[std::size_t(inst.seq)].length_ms());
+            inst.time_ms = len > 0.0f ? float(std::fmod(clock_ms_, double(len))) : 0.0f;
+        }
+        inst.team = team_colour_for(cat_, cfg_.human_player, false);
+        inst.team_emissive = team_emissive_for(cat_, cfg_.human_player);
+        inst.opacity = 0.5f;
+        inst.tint = warp_ghost_.ok ? std::array<float, 3>{0.6f, 1.0f, 0.6f} : std::array<float, 3>{1.0f, 0.45f, 0.45f};
+        scene.push_back(inst);
+    }
 
     {
-        static const float kCreepDrawLift = std::getenv("SC2_CREEP_LIFT") ? float(std::atof(std::getenv("SC2_CREEP_LIFT"))) : 0.01f;
+        static const float kCreepDrawLift = std::getenv("OMC_CREEP_LIFT") ? float(std::atof(std::getenv("OMC_CREEP_LIFT"))) : 0.01f;
         constexpr float kCreepUvTilesPerCell = 1.0f;
-        const sim::CreepGrid& cg = world_.creep().grid();
-        const std::uint64_t sum = cg.checksum();
+        refresh_creep_seen();
+        const sim::CreepGrid& cg = creep_fogged_ ? creep_seen_ : world_.creep().grid();
+        if (creep_fogged_ && creep_seen_dirty_) {
+            ++creep_seen_gen_;
+            creep_seen_dirty_ = false;
+        }
+        const std::uint64_t sum = creep_fogged_ ? (0x9E3779B97F4A7C15ull ^ creep_seen_gen_) : cg.checksum();
         if (!creep_model_built_ || sum != creep_drawn_checksum_) {
-            static const bool kCreepPerCell = std::getenv("SC2_CREEP_UV_PER_CELL") != nullptr;
-            static const float kCreepUvAngle = (std::getenv("SC2_CREEP_UV_ANGLE") ? float(std::atof(std::getenv("SC2_CREEP_UV_ANGLE"))) : -15.0f) * 0.01745329252f;
-            static const float kCreepUvSpan = std::getenv("SC2_CREEP_UV_SPAN") ? float(std::atof(std::getenv("SC2_CREEP_UV_SPAN"))) : 91.5f;
-            static const bool kCreepCentre = std::getenv("SC2_CREEP_CENTRE_HEIGHTS") != nullptr;
+            static const bool kCreepPerCell = std::getenv("OMC_CREEP_UV_PER_CELL") != nullptr;
+            static const float kCreepUvAngle = (std::getenv("OMC_CREEP_UV_ANGLE") ? float(std::atof(std::getenv("OMC_CREEP_UV_ANGLE"))) : -15.0f) * 0.01745329252f;
+            static const float kCreepUvSpan = std::getenv("OMC_CREEP_UV_SPAN") ? float(std::atof(std::getenv("OMC_CREEP_UV_SPAN"))) : 91.5f;
+            static const bool kCreepCentre = std::getenv("OMC_CREEP_CENTRE_HEIGHTS") != nullptr;
             creep_model_ = render::build_creep_model(
                 cg, [this](float wx, float wy) { return kCreepCentre ? ground_z_at(wx, wy) : vertex_ground_at(wx, wy); }, kCreepDrawLift,
                 kCreepPerCell ? kCreepUvTilesPerCell : 10.0f, creep_diffuse_,  1,
@@ -5721,7 +6480,7 @@ void MeleeGame::emit_scene(std::vector<render::SceneInstance>& scene) {
             for (int cy = 0; cy < cg.height(); ++cy)
                 for (int cx = 0; cx < cg.width(); ++cx)
                     if (cg.is_creep_cell(cx, cy)) creep_coverage_.alpha[std::size_t(cy) * creep_coverage_.w + std::size_t(cx)] = 255;
-            if (std::getenv("SC2_CREEP_TRACE")) {
+            if (std::getenv("OMC_CREEP_TRACE")) {
                 std::string hex;
                 static const char* kHex = "0123456789abcdef";
                 std::uint32_t acc = 0, nb = 0, cells = 0;
@@ -5755,17 +6514,17 @@ void MeleeGame::emit_scene(std::vector<render::SceneInstance>& scene) {
                 c.fx.p0[2] = creep_coverage_.world_w;
                 c.fx.p0[3] = creep_coverage_.world_h;
                 c.fx.p1[0] = 0.45f;
-                static const bool kCreepStatic = std::getenv("SC2_CREEP_STATIC") != nullptr;
-                static const float kCreepHeightStrength = std::getenv("SC2_CREEP_HEIGHT_STRENGTH") ? float(std::atof(std::getenv("SC2_CREEP_HEIGHT_STRENGTH"))) : 15.0f;
-                static const float kCreepNoiseRate = std::getenv("SC2_CREEP_NOISE_RATE") ? float(std::atof(std::getenv("SC2_CREEP_NOISE_RATE"))) : 0.0255f;
-                static const bool kCreepModelLambert = std::getenv("SC2_CREEP_MODEL_LAMBERT") != nullptr;
+                static const bool kCreepStatic = std::getenv("OMC_CREEP_STATIC") != nullptr;
+                static const float kCreepHeightStrength = std::getenv("OMC_CREEP_HEIGHT_STRENGTH") ? float(std::atof(std::getenv("OMC_CREEP_HEIGHT_STRENGTH"))) : 15.0f;
+                static const float kCreepNoiseRate = std::getenv("OMC_CREEP_NOISE_RATE") ? float(std::atof(std::getenv("OMC_CREEP_NOISE_RATE"))) : 0.0255f;
+                static const bool kCreepModelLambert = std::getenv("OMC_CREEP_MODEL_LAMBERT") != nullptr;
                 c.fx.t = float(clock_ms_ * 0.001);
                 c.fx.team_emissive[0] = kCreepNoiseRate;
                 c.fx.team_emissive[1] = kCreepStatic ? 0.0f : kCreepHeightStrength;
                 c.fx.team_emissive[2] = 0.45f;
                 c.fx.team_emissive[3] = kCreepModelLambert ? 0.0f : 0.25f;
-                static const bool kCreepNoiseRim = std::getenv("SC2_CREEP_NOISE_RIM") != nullptr;
-                c.fx.p1[1] = (kCreepNoiseRim || std::getenv("SC2_CREEP_UV_PER_CELL")) ? 0.0f : 1.0f;
+                static const bool kCreepNoiseRim = std::getenv("OMC_CREEP_NOISE_RIM") != nullptr;
+                c.fx.p1[1] = (kCreepNoiseRim || std::getenv("OMC_CREEP_UV_PER_CELL")) ? 0.0f : 1.0f;
                 c.fx.p1[2] = 0.2f;
                 c.fx.p1[3] = 0.0f;
                 c.coverage = &creep_coverage_;
@@ -5777,21 +6536,62 @@ void MeleeGame::emit_scene(std::vector<render::SceneInstance>& scene) {
         (1000.0f / float(sim::World::kTicksPerSecond)) / float(clock_.multiplier(clock_.speed()));
     const float alpha = tick_ms > 0.0f ? std::min(1.0f, accum_ms_ / tick_ms) : 0.0f;
     const bool fog_ready = ground_fog_ && cfg_.human_player >= 0 && vision_.width() > 0;
+    static const bool kFogSnapshotOld = std::getenv("OMC_FOG_SNAPSHOT_OLD") != nullptr;
+    const bool fog_snapshots = fog_ready && !kFogSnapshotOld && !reveal_map_;
+    const std::size_t units_from = scene.size();
+    if (!fog_snapshots) {
+        fog_snaps_.clear();
+        fog_seen_.clear();
+    } else {
+        if (fog_seen_.size() < world_.units().size()) fog_seen_.resize(world_.units().size(), 0);
+        for (auto it = fog_snaps_.begin(); it != fog_snaps_.end();) {
+            const FogSnapshot& s = it->second;
+            if (vision_.state_at(sim::Fixed::from_double(s.x), sim::Fixed::from_double(s.y)) == sim::Visibility::Visible) {
+                if (s.has_splat && (it->first >= world_.units().size() || !world_.units()[it->first].alive)) splat_quads_.erase(it->first);
+                it = fog_snaps_.erase(it);
+                continue;
+            }
+            scene.push_back(s.inst);
+            ++it;
+        }
+    }
+    bind_cloak_look();
+    cloak_tx_.begin_frame();
     for (const Unit& u : world_.units()) {
         if (!u.alive) continue;
-        if (fog_ready && u.player != cfg_.human_player &&
-            !hud_fog_body_drawn(fog_body_state(u.player, int(vision_.state_at(u.x, u.y)), fog_hidden_black_),
-                                FogVisibility(u.fog_visibility)))
+        bool snapshot_capture = false;
+        if (fog_snapshots && u.player >= 0 && u.player != cfg_.human_player && !world_.are_allied(u.player, cfg_.human_player) &&
+            FogVisibility(u.fog_visibility) != FogVisibility::Visible) {
+            if (vision_.state_at(u.x, u.y) == sim::Visibility::Visible) {
+                fog_seen_[u.id] = 1;
+            } else if (fog_seen_[u.id]) {
+                fog_seen_[u.id] = 0;
+                snapshot_capture = true;
+            } else {
+                continue;
+            }
+        } else if (fog_ready && u.player != cfg_.human_player &&
+                   !hud_fog_body_drawn(fog_body_state(u.player, int(vision_.state_at(u.x, u.y)), fog_hidden_black_),
+                                       FogVisibility(u.fog_visibility))) {
             continue;
+        }
         float body_opacity = 1.0f;
         bool cloak_fx = false;
+        bool cloak_enemy = false;
+        render::CloakView cloak_view = render::CloakView::None;
         if ((u.cloaked_effective() || u.burrowed) && cfg_.human_player >= 0) {
             const bool own_side = u.player == cfg_.human_player || world_.are_allied(u.player, cfg_.human_player);
-            if (!own_side && !world_.revealed_to(cfg_.human_player, u.id)) continue;
-            static const bool kBurrowShimmer = std::getenv("SC2_BURROW_SHIMMER") != nullptr;
-            if (u.cloaked_effective() && (kBurrowShimmer || !u.burrowed)) cloak_fx = true;
-            if (u.burrowed && own_side)
-                if (const char* bo = std::getenv("SC2_BURROW_OPACITY")) body_opacity = float(std::atof(bo));
+            if (!own_side && !world_.revealed_to(cfg_.human_player, u.id)) {
+                if (!cloak_enemy_drawn(u)) continue;
+                cloak_enemy = true;
+            }
+            static const bool kBurrowShimmer = std::getenv("OMC_BURROW_SHIMMER") != nullptr;
+            if (u.cloaked_effective() && (kBurrowShimmer || !u.burrowed)) {
+                cloak_fx = true;
+                cloak_view = own_side ? render::CloakView::Ally : cloak_enemy ? render::CloakView::Enemy : render::CloakView::Detected;
+            }
+            static const char* const kBurrowOpacity = std::getenv("OMC_BURROW_OPACITY");
+            if (u.burrowed && own_side && kBurrowOpacity) body_opacity = float(std::atof(kBurrowOpacity));
         }
         if (u.in_gas_structure) continue;
         if (u.loaded && world_.cargo_hidden()) continue;
@@ -5799,13 +6599,18 @@ void MeleeGame::emit_scene(std::vector<render::SceneInstance>& scene) {
         if (u.gathers_gas && u.mine_cd.raw() > 0 && u.gather_target != sim::kNoTarget &&
             u.gather_target < world_.units().size() && world_.units()[u.gather_target].is_gas)
             continue;
+        const render::CloakTransitions::Out cloak_state = cloak_tx_.update(u.id, cloak_view, cloak_clock_ms_);
+        cloak_fx = cloak_state.cloak_fx;
         render::SceneInstance inst;
         const formats::Model* m =
             (u.id < driver_.actors.size()) ? driver_.actors[u.id].model : nullptr;
         inst.model = m;
-        const std::array<float, 3> ms = unit_draw_scale(cat_, u.catalog_id);
+        const sim::Unit* shown_u = world_.morph_origin(u.id);
+        const std::string& shown_id = shown_u ? shown_u->catalog_id : u.catalog_id;
+        const bool shown_flying = shown_u ? shown_u->flying : u.flying;
+        const std::array<float, 3> ms = unit_draw_scale(cat_, shown_id);
         const float footprint_scale = std::max(ms[0], ms[1]);
-        const float native_span = cached_diameter(m);
+        const float native_span = cached_diameter(model_diam_cache_, m);
         const float visual_r =
             (native_span > 1e-3f ? native_span * 0.5f : float(u.radius.to_double())) *
             footprint_scale;
@@ -5818,9 +6623,9 @@ void MeleeGame::emit_scene(std::vector<render::SceneInstance>& scene) {
         }
         float wz = 0.0f;
         if (cat_) {
-            wz = cat_->unit_display_height(u.catalog_id);
-            if (u.flying && wz <= 0.0f) {
-                const float fh = cat_->unit_display_height(u.catalog_id + "Flying");
+            wz = display_height(shown_id, false);
+            if (shown_flying && wz <= 0.0f) {
+                const float fh = display_height(shown_id, true);
                 wz = fh > 0.0f ? fh : 3.25f;
                 const float rise = float(u.lift_rise.to_double());
                 const float total = float(u.lift_rise_delay.to_double()) + rise;
@@ -5834,9 +6639,9 @@ void MeleeGame::emit_scene(std::vector<render::SceneInstance>& scene) {
                     if (t > 0.0f) wz *= std::max(0.0f, 1.0f - t / float(u.land_desc.to_double()));
                 }
             }
-            if (morph_transition_models_ && world_.is_morphing(u.id)) {
+            if (morph_transition_models_ && world_.is_morphing(u.id) && !world_.is_morph_delayed(u.id)) {
                 const std::string to = world_.morph_target_id(u.id);
-                const float th = to.empty() ? wz : cat_->unit_display_height(to);
+                const float th = to.empty() ? wz : display_height(to, false);
                 if (!to.empty() && th != wz) {
                     const float el = float((u.morph_total - u.morph_timer).to_double());
                     const float s = std::min(1.0f, std::max(0.0f, el / 1.0f));
@@ -5844,7 +6649,7 @@ void MeleeGame::emit_scene(std::vector<render::SceneInstance>& scene) {
                 }
             }
         }
-        wz += (u.flying || wz > 0.0f) ? air_z_at(wx, wy) : ground_z_at(wx, wy);
+        wz += (shown_flying || wz > 0.0f) ? air_z_at(wx, wy) : ground_z_at(wx, wy);
         inst.world = render::translation(wx, wy, wz) * render::scaling(ms[0], ms[1], ms[2]);
         if (u.id < driver_.actors.size() && m) {
             render::ActorInstance& a = driver_.actors[u.id];
@@ -5900,7 +6705,8 @@ void MeleeGame::emit_scene(std::vector<render::SceneInstance>& scene) {
             }
             inst.time_ms = a.current_time();
             inst.global_layers = a.global_layers();
-            if (std::getenv("SC2_GLOBAL_LAYER_TRACE") && !inst.global_layers.empty()) {
+            static const bool kGlobalLayerTrace = std::getenv("OMC_GLOBAL_LAYER_TRACE") != nullptr;
+            if (kGlobalLayerTrace && !inst.global_layers.empty()) {
                 static int ng = 0;
                 if (ng++ < 24)
                     std::fprintf(stderr, "[gl] tick %d unit %u %s seq %d t %.0f | layers %zu first seq %u t %.0f\n", world_.tick(), unsigned(u.id), u.catalog_id.c_str(),
@@ -5939,8 +6745,8 @@ void MeleeGame::emit_scene(std::vector<render::SceneInstance>& scene) {
                             ba.turret_start_rad = float(ts->yaw_start) * d2r;
                             ba.turret_idle_rate_rad = float(ts->yaw_idle_rate) * d2r;
                             ba.turret_spin = ts->idle == "Spin";
-                            ba.turret_hold = ts->idle == "Hold" && !std::getenv("SC2_TURRET_HOLD_RESETS");
-                            if (!std::getenv("SC2_NO_TURRET_FIDGET")) {
+                            ba.turret_hold = ts->idle == "Hold" && !std::getenv("OMC_TURRET_HOLD_RESETS");
+                            if (!std::getenv("OMC_NO_TURRET_FIDGET")) {
                                 ba.turret_fidget_min_s = float(ts->fidget_delay_min);
                                 ba.turret_fidget_max_s = float(ts->fidget_delay_max);
                                 ba.turret_fidget_turn_rad = float(ts->fidget_turn_angle) * d2r;
@@ -5965,7 +6771,7 @@ void MeleeGame::emit_scene(std::vector<render::SceneInstance>& scene) {
                 inst.turret_bone = ba.turret_bone;
                 inst.turret_yaw = ba.turret_yaw;
             }
-            static const bool no_reach = std::getenv("SC2_NO_TENTACLE_REACH") != nullptr;
+            static const bool no_reach = std::getenv("OMC_NO_TENTACLE_REACH") != nullptr;
             if (!no_reach && !ba.reach_bound) {
                 ba.reach_bound = true;
                 if (cat_ && !u.wpn_id.empty()) {
@@ -6028,7 +6834,7 @@ void MeleeGame::emit_scene(std::vector<render::SceneInstance>& scene) {
                         live = true;
                         break;
                     }
-                static const bool no_return = std::getenv("SC2_NO_TENTACLE_RETURN") != nullptr;
+                static const bool no_return = std::getenv("OMC_NO_TENTACLE_RETURN") != nullptr;
                 const float gt = (float(world_.tick()) + alpha) / float(sim::World::kTicksPerSecond);
                 if (live) {
                     ba.reach_live = true;
@@ -6039,7 +6845,7 @@ void MeleeGame::emit_scene(std::vector<render::SceneInstance>& scene) {
                     ba.retract_t0 = -1.0f;
                 } else if (ba.reach_live) {
                     ba.reach_live = false;
-                    static const bool kTurnAtHead = std::getenv("SC2_REACH_TURN_AT_HEAD") != nullptr;
+                    static const bool kTurnAtHead = std::getenv("OMC_REACH_TURN_AT_HEAD") != nullptr;
                     if (!kTurnAtHead && ba.reach_has_target && ba.reach_target_id < world_.units().size()) {
                         const sim::Unit& tu = world_.unit(ba.reach_target_id);
                         ba.reach_last_x = float(tu.x.to_double());
@@ -6072,7 +6878,7 @@ void MeleeGame::emit_scene(std::vector<render::SceneInstance>& scene) {
                             d = std::min(v0 > 0.0f ? v0 : vm, vm) * t;
                         }
                     }
-                    if (std::getenv("SC2_REACH_TRACE"))
+                    if (std::getenv("OMC_REACH_TRACE"))
                         std::fprintf(stderr, "[reach] tick %.2f t %.3f d %.2f of %.2f (v0 %.2f a %.2f vmax %.2f delay %.3f)\n", double(gt * float(sim::World::kTicksPerSecond)),
                                      double(t), double(d), double(ba.retract_dist), double(ba.retract_v0), double(ba.retract_acc), double(ba.retract_vmax),
                                      double(ba.retract_delay));
@@ -6103,7 +6909,7 @@ void MeleeGame::emit_scene(std::vector<render::SceneInstance>& scene) {
                 const std::string key = u.catalog_id + (unpowered ? "#unpowered" : "#depleted");
                 auto tit = tint_cache_.find(key);
                 if (tit == tint_cache_.end()) {
-                    static const bool kTintAny = std::getenv("SC2_UNPOWERED_TINT_ANY_ROW") != nullptr;
+                    static const bool kTintAny = std::getenv("OMC_UNPOWERED_TINT_ANY_ROW") != nullptr;
                     const auto t = unpowered ? cat_->actor_tint(u.catalog_id, "BehaviorLevel.PowerUser", kTintAny ? "Level 0" : ".Start; Level 0")
                                              : cat_->actor_tint(u.catalog_id, "Behavior.Harvestable", ".Deplete");
                     tit = tint_cache_.emplace(key, t).first;
@@ -6196,9 +7002,15 @@ void MeleeGame::emit_scene(std::vector<render::SceneInstance>& scene) {
         if (cloak_fx) {
             inst.fx.kind = render::FxKind::Cloak;
             inst.fx.t = float(clock_ms_ * 0.001);
-            inst.fx.p0[0] = kCloakOpacity;
-            inst.fx.p0[1] = kCloakDisplaceStrength * kCloakUvPerStrength;
-        } else if (u.constructing && u.warp_forming) {
+            static const bool kLookOld = std::getenv("OMC_CLOAK_LOOK_OLD") != nullptr;
+            if (!kLookOld && cloak_look_.valid() && cloak_state.seq >= 0) {
+                inst.fx.p0[0] = cloak_state.look.opacity;
+                inst.fx.p0[1] = cloak_state.look.strength * kCloakUvPerStrength;
+            } else {
+                inst.fx.p0[0] = cloak_enemy && cloak_enemy_look_ == 1 ? 0.0f : kCloakOpacity;
+                inst.fx.p0[1] = kCloakDisplaceStrength * kCloakUvPerStrength;
+            }
+        } else if (u.constructing && u.warp_forming && !draws_authored_warp_in(u.catalog_id, inst.model)) {
             double p = u.build_progress.to_double();
             if (!(p >= 0.0)) p = 0.0;
             if (p > 1.0) p = 1.0;
@@ -6222,24 +7034,80 @@ void MeleeGame::emit_scene(std::vector<render::SceneInstance>& scene) {
             const float hdr = 1.0f + 9.0f * f;
             for (int k = 0; k < 3; ++k) inst.tint[std::size_t(k)] *= hdr;
         }
-        if (morph_transition_models_ && world_.is_morphing(u.id))
+        if (morph_transition_models_ && world_.is_morphing(u.id) && !world_.is_morph_delayed(u.id))
             if (const MorphShow* show = morph_show(u)) {
                 const double elapsed = (u.morph_total - u.morph_timer).to_double();
                 if (elapsed >= show->delay_s) {
                     inst.model = show->model;
                     inst.seq = show->seq;
                     inst.time_ms = float(std::min(double(show->len_ms), (elapsed - show->delay_s) * 1000.0));
+                    const double run_ms = (elapsed - show->delay_s) * 1000.0;
+                    if (show->stand_seq >= 0 && show->stand_ms > 0.0f && run_ms > double(show->len_ms)) {
+                        inst.seq = show->stand_seq;
+                        inst.time_ms = float(std::fmod(run_ms - double(show->len_ms), double(show->stand_ms)));
+                    }
                     inst.blend_seq = -1;
                     inst.blend_weight = 0.0f;
                     inst.turret_bone = -1;
                     inst.global_layers.clear();
                 }
             }
-        if (inst.model) {
+        if (inst.model && !cloak_enemy) {
             if (pick_pose_.size() <= u.id) pick_pose_.resize(std::size_t(u.id) + 1);
             pick_pose_[u.id] = PickPose{inst.model, inst.world, inst.seq, inst.time_ms, pick_frame_};
         }
         scene.push_back(inst);
+        if (snapshot_capture) {
+            FogSnapshot s;
+            s.inst = inst;
+            s.inst.team = team_colour_for(cat_, u.player, false);
+            s.inst.tint = render::SceneInstance{}.tint;
+            s.inst.blend_seq = -1;
+            s.inst.blend_weight = 0.0f;
+            s.inst.trail_id = 0;
+            s.catalog_id = u.catalog_id;
+            s.player = u.player;
+            s.x = float(u.x.to_double());
+            s.y = float(u.y.to_double());
+            s.minimap_radius = float(u.minimap_radius.to_double());
+            s.constructing = u.constructing;
+            s.build_progress = float(u.build_progress.to_double());
+            if (const auto sp = fog_splat_frame_.find(u.id); sp != fog_splat_frame_.end()) {
+                s.splat = sp->second;
+                s.has_splat = true;
+            }
+            fog_snaps_[u.id] = std::move(s);
+        }
+        if (cloak_enemy) continue;
+        if (zone_markers_ && world_.has_zone(u.id) && models_ && ui_store_) {
+            const auto zm = zone_marker_.find(u.id);
+            const std::string actor = zm != zone_marker_.end() ? zm->second.first : zone_marker_of(u.catalog_id);
+            float zsc[3] = {1.0f, 1.0f, 1.0f};
+            if (const formats::Model* mm = actor.empty() ? nullptr : models_->scaffold_model(*ui_store_, actor, zsc)) {
+                render::SceneInstance zi;
+                zi.model = mm;
+                const float zx = float(u.zone_x.to_double()), zy = float(u.zone_y.to_double());
+                zi.world = render::translation(zx, zy, ground_z_at(zx, zy)) * render::scaling(zsc[0], zsc[1], zsc[2]);
+                zi.team = inst.team;
+                const double run_ms = zm != zone_marker_.end() ? double(world_.tick() - zm->second.second) * 1000.0 /
+                                                                     double(sim::World::kTicksPerSecond)
+                                                               : 1.0e6;
+                const int birth = render::select_sequence(*mm, {"Birth"}, 0);
+                const int stand = render::select_sequence(*mm, {"Stand"}, 0);
+                const float blen = birth >= 0 ? float(mm->sequences[std::size_t(birth)].length_ms()) : 0.0f;
+                if (birth >= 0 && run_ms < double(blen)) {
+                    zi.seq = birth;
+                    zi.time_ms = float(run_ms);
+                } else if (stand >= 0) {
+                    zi.seq = stand;
+                    const float sl = float(mm->sequences[std::size_t(stand)].length_ms());
+                    zi.time_ms = sl > 0.0f ? float(std::fmod(run_ms - double(blen), double(sl))) : 0.0f;
+                } else {
+                    zi.seq = -1;
+                }
+                scene.push_back(zi);
+            }
+        }
         scene.insert(scene.end(), burn_flames.begin(), burn_flames.end());
         if (u.id < driver_.actors.size() && models_ && ui_store_ && cat_) {
             render::ActorInstance& host = driver_.actors[u.id];
@@ -6248,7 +7116,8 @@ void MeleeGame::emit_scene(std::vector<render::SceneInstance>& scene) {
                 if (!ch.rig) {
                     float sc3[3] = {1.0f, 1.0f, 1.0f};
                     const formats::Model* sm = models_->scaffold_model(*ui_store_, ch.name, sc3);
-                    if (std::getenv("SC2_CHILD_TRACE")) {
+                    static const bool kChildTrace = std::getenv("OMC_CHILD_TRACE") != nullptr;
+                    if (kChildTrace) {
                         static std::set<std::string> told;
                         if (told.insert(ch.name).second) {
                             std::fprintf(stderr, "[child] %s of %s: model %s (verts %u particles %zu seqs %zu)\n", ch.name.c_str(), u.catalog_id.c_str(), sm ? "yes" : "NO",
@@ -6269,9 +7138,9 @@ void MeleeGame::emit_scene(std::vector<render::SceneInstance>& scene) {
                     ch.rig->has_oneshot = false;
                     for (int k = 0; k < 3; ++k) ch.scale[k] = sc3[k];
                     if (auto f = cat_->actor_host_forward(ch.name)) ch.yaw = std::atan2(f->second, f->first);
-                    static const bool kChildQuarter = std::getenv("SC2_CHILD_YAW_NO_QUARTER") == nullptr;
+                    static const bool kChildQuarter = std::getenv("OMC_CHILD_YAW_NO_QUARTER") == nullptr;
                     if (kChildQuarter && cat_->actor_host_forward(ch.name)) ch.yaw += 1.5707963f;
-                    static const bool kChildHostScale = std::getenv("SC2_CHILD_HOST_SCALE") != nullptr;
+                    static const bool kChildHostScale = std::getenv("OMC_CHILD_HOST_SCALE") != nullptr;
                     if (kChildHostScale && sc3[0] == 1.0f && sc3[1] == 1.0f && sc3[2] == 1.0f) {
                         const std::array<float, 3> hs = data::resolve_unit_model_scale(*cat_, data::unit_actor_id(*cat_, u.catalog_id));
                         for (int k = 0; k < 3; ++k) ch.scale[k] = hs[std::size_t(k)];
@@ -6281,7 +7150,7 @@ void MeleeGame::emit_scene(std::vector<render::SceneInstance>& scene) {
                             auto ladder = cat_->actor_progress_stages(r.args[0]);
                             if (!ladder.empty()) ch.ladder = std::move(ladder);
                         }
-                    static const bool kEffectChild = std::getenv("SC2_NO_EFFECT_CHILD") == nullptr;
+                    static const bool kEffectChild = std::getenv("OMC_NO_EFFECT_CHILD") == nullptr;
                     if (kEffectChild && ch.ladder.empty() && !u.constructing)
                         for (const render::ActorEventRule& r : ch.rules)
                             if (r.head == "ActorCreation" && r.verb == "AnimPlay" && r.args.size() >= 2) {
@@ -6356,26 +7225,34 @@ void MeleeGame::emit_scene(std::vector<render::SceneInstance>& scene) {
                 }
                 render::SceneInstance c;
                 c.model = rig.model;
-                static const float kChildYawAdd = std::getenv("SC2_CHILD_YAW_ADD") ? float(std::atof(std::getenv("SC2_CHILD_YAW_ADD"))) * 0.01745329252f : 0.0f;
-                static const float kChildScale = std::getenv("SC2_CHILD_SCALE") ? float(std::atof(std::getenv("SC2_CHILD_SCALE"))) : 1.0f;
+                static const float kChildYawAdd = std::getenv("OMC_CHILD_YAW_ADD") ? float(std::atof(std::getenv("OMC_CHILD_YAW_ADD"))) * 0.01745329252f : 0.0f;
+                static const float kChildScale = std::getenv("OMC_CHILD_SCALE") ? float(std::atof(std::getenv("OMC_CHILD_SCALE"))) : 1.0f;
                 c.world = render::translation(wx, wy, wz) * render::rotation_z(ch.yaw + kChildYawAdd) *
                           render::scaling(ch.scale[0] * kChildScale, ch.scale[1] * kChildScale, ch.scale[2] * kChildScale);
                 c.seq = rig.current_sequence();
                 c.time_ms = rig.current_time();
                 c.team = inst.team;
-                static const bool kChildEmissive = std::getenv("SC2_CHILD_NO_TEAM_EMISSIVE") == nullptr;
+                static const bool kChildEmissive = std::getenv("OMC_CHILD_NO_TEAM_EMISSIVE") == nullptr;
                 if (kChildEmissive) c.team_emissive = inst.team_emissive;
                 bool self_lit_team = false;
-                if (!construction_child_team_ && c.model)
-                    for (const formats::M3Material& mm : c.model->materials) {
-                        if (mm.emis_op != 4) continue;
-                        std::string dif, emi;
-                        for (const formats::M3Layer& ly : mm.layers) {
-                            if (ly.usage == "Diffuse") dif = ly.image_path;
-                            else if (ly.usage == "Emissive") emi = ly.image_path;
+                if (!construction_child_team_ && c.model) {
+                    std::unordered_map<const formats::Model*, bool>& self_lit_of = self_lit_cache_;
+                    auto sl = self_lit_of.find(c.model);
+                    if (sl == self_lit_of.end()) {
+                        bool lit = false;
+                        for (const formats::M3Material& mm : c.model->materials) {
+                            if (mm.emis_op != 4) continue;
+                            std::string dif, emi;
+                            for (const formats::M3Layer& ly : mm.layers) {
+                                if (ly.usage == "Diffuse") dif = ly.image_path;
+                                else if (ly.usage == "Emissive") emi = ly.image_path;
+                            }
+                            if (!emi.empty() && emi == dif) lit = true;
                         }
-                        if (!emi.empty() && emi == dif) self_lit_team = true;
+                        sl = self_lit_of.emplace(c.model, lit).first;
                     }
+                    self_lit_team = sl->second;
+                }
                 if (self_lit_team) {
                     c.team = {0.0f, 0.0f, 0.0f, -1.0f};
                     c.team_emissive = {0.0f, 0.0f, 0.0f, -1.0f};
@@ -6406,7 +7283,7 @@ void MeleeGame::emit_scene(std::vector<render::SceneInstance>& scene) {
                 oz = att.m[14] * ms[2];
                 float cf = fl > 1e-3f ? fx / fl : 1.0f;
                 float sf = fl > 1e-3f ? fy / fl : 0.0f;
-                static const bool kOffsetQuarter = std::getenv("SC2_CARRY_OFFSET_NO_QUARTER") == nullptr;
+                static const bool kOffsetQuarter = std::getenv("OMC_CARRY_OFFSET_NO_QUARTER") == nullptr;
                 if (kOffsetQuarter) { const float t = cf; cf = -sf; sf = t; }
                 ox = lx * cf - ly * sf;
                 oy = lx * sf + ly * cf;
@@ -6416,7 +7293,8 @@ void MeleeGame::emit_scene(std::vector<render::SceneInstance>& scene) {
                 oy = fl > 1e-3f ? fy / fl * off : 0.0f;
             }
             float cs = ms[0];
-            if (const char* e = std::getenv("SC2_CARRY_SCALE")) cs = float(std::atof(e));
+            static const char* const kCarryScale = std::getenv("OMC_CARRY_SCALE");
+            if (kCarryScale) cs = float(std::atof(kCarryScale));
             const formats::Model* cm = nullptr;
             if (models_ && ui_store_ && u.carry_source != sim::kNoTarget &&
                 u.carry_source < world_.units().size()) {
@@ -6424,7 +7302,8 @@ void MeleeGame::emit_scene(std::vector<render::SceneInstance>& scene) {
                 if (!src.empty()) cm = models_->carry_model(*ui_store_, src);
             }
             if (!cm) continue;
-            if (std::getenv("SC2_CARRY_TRACE")) {
+            static const bool kCarryTrace = std::getenv("OMC_CARRY_TRACE") != nullptr;
+            if (kCarryTrace) {
                 static int carry_traced = 0;
                 if (carry_traced < 24) {
                     ++carry_traced;
@@ -6442,18 +7321,19 @@ void MeleeGame::emit_scene(std::vector<render::SceneInstance>& scene) {
             chunk.model = cm;
             chunk.world = render::translation(wx + ox, wy + oy, wz + oz) *
                           render::scaling(cs, cs, cs);
-            static const bool kCarryTurn = std::getenv("SC2_CARRY_UNTURNED") == nullptr;
+            static const bool kCarryTurn = std::getenv("OMC_CARRY_UNTURNED") == nullptr;
             if (kCarryTurn && fl > 1e-3f) {
                 render::Mat4 hp = att;
                 const bool has_hp = std::fabs(hp.m[0]) + std::fabs(hp.m[1]) + std::fabs(hp.m[2]) > 1e-3f;
                 if (!has_hp) hp = render::scaling(1.0f, 1.0f, 1.0f);
                 hp.m[12] = 0.0f; hp.m[13] = 0.0f; hp.m[14] = 0.0f;
-                static const float kCarryQuarter = std::getenv("SC2_CARRY_YAW_NO_QUARTER") ? 0.0f : 1.5707963f;
+                static const float kCarryQuarter = std::getenv("OMC_CARRY_YAW_NO_QUARTER") ? 0.0f : 1.5707963f;
                 chunk.world = render::translation(wx + ox, wy + oy, wz + oz) * render::rotation_z(std::atan2(fy, fx) + kCarryQuarter) * hp *
                               render::scaling(cs, cs, cs);
             }
             chunk.team = {0, 0, 0, -1.0f};
-            chunk.seq = (!cm->sequences.empty() && std::getenv("SC2_CARRY_SEQ")) ? render::select_sequence(*cm, {"Stand"}, u.id) : -1;
+            static const bool kCarrySeq = std::getenv("OMC_CARRY_SEQ") != nullptr;
+            chunk.seq = (!cm->sequences.empty() && kCarrySeq) ? render::select_sequence(*cm, {"Stand"}, u.id) : -1;
             chunk.time_ms = float(clock_ms_);
             scene.push_back(chunk);
         }
@@ -6624,12 +7504,18 @@ void MeleeGame::emit_scene(std::vector<render::SceneInstance>& scene) {
             emit_beam(scene, pa, pb, 0.25f);
         }
     }
+    const std::size_t fx_from = tag_pass(units_from, render::PassGroup::Units);
 
     for (const sim::HealerInstance& h : world_.healers()) {
         if (h.caster >= world_.units().size() || h.target >= world_.units().size()) continue;
         const sim::Unit& src = world_.units()[h.caster];
         const sim::Unit& dst = world_.units()[h.target];
         if (!src.alive || !dst.alive) continue;
+        static const bool kHealBeamOld = std::getenv("OMC_HEAL_BEAM_OLD") != nullptr;
+        if (!kHealBeamOld && std::any_of(beams_.begin(), beams_.end(), [&](const BeamFx& b) {
+                return b.heal && b.model && b.attacker == h.caster && b.target == h.target && b.phase < 2;
+            }))
+            continue;
         float pa[3], pb[3];
         unit_attach_world(src, nullptr, nullptr, pa);
         unit_attach_world(dst, nullptr, nullptr, pb);
@@ -6684,12 +7570,14 @@ void MeleeGame::emit_scene(std::vector<render::SceneInstance>& scene) {
         inst.tint = all ? std::array<float, 3>{0.6f, 1.0f, 0.6f} : std::array<float, 3>{1.0f, 0.45f, 0.45f};
         scene.push_back(inst);
     }
+    emit_order_cues(scene);
 
     for (const Corpse& c : corpses_) {
         if (!c.model) continue;
         if (fog_ready && c.player != cfg_.human_player &&
             !hud_fog_body_drawn(fog_body_state(c.player, int(vision_.state_at(sim::Fixed::from_double(c.x), sim::Fixed::from_double(c.y))), fog_hidden_black_), FogVisibility(c.fog_visibility)))
             continue;
+        if (fog_hides_enemy(c.player, c.x, c.y, c.fog_visibility)) continue;
         render::SceneInstance inst;
         inst.model = c.model;
         inst.world = render::translation(c.x, c.y, c.z) * c.orient * render::scaling(c.scale[0], c.scale[1], c.scale[2]);
@@ -6751,7 +7639,7 @@ void MeleeGame::emit_scene(std::vector<render::SceneInstance>& scene) {
         scene.push_back(inst);
     }
 
-    static const bool kAddonView = std::getenv("SC2_NO_ADDON_BUILD_VIEW") == nullptr;
+    static const bool kAddonView = std::getenv("OMC_NO_ADDON_BUILD_VIEW") == nullptr;
     if (kAddonView && cat_ && models_ && ui_store_) {
         for (const Unit& host : world_.units()) {
             if (!host.alive || host.addon_building == 0) {
@@ -6875,7 +7763,7 @@ void MeleeGame::emit_scene(std::vector<render::SceneInstance>& scene) {
             const sim::Unit& shooter = world_.units()[sv.attacker];
             const std::string& wid = sv.slot == 1 ? shooter.wpn2_id : shooter.wpn_id;
             const formats::Model* mm = models_->missile_model(*ui_store_, wid);
-            if (std::getenv("SC2_SHOT_TRACE")) {
+            if (std::getenv("OMC_SHOT_TRACE")) {
                 static std::set<std::string> told;
                 if (told.insert(shooter.catalog_id + "/" + wid).second)
                     std::fprintf(stderr, "[shot] %s weapon '%s' slot %d in flight -> %s\n", shooter.catalog_id.c_str(), wid.c_str(), int(sv.slot), mm ? "a missile model" : "NO MODEL");
@@ -6924,7 +7812,7 @@ void MeleeGame::emit_scene(std::vector<render::SceneInstance>& scene) {
             shot.world = render::translation(sx, sy, sz) * render::rotation_z(yaw + 1.5707963f);
             shot.team = {0, 0, 0, -1.0f};
             shot.seq = -1;
-            static const bool kShotPath = std::getenv("SC2_SHOT_NO_PATH") == nullptr;
+            static const bool kShotPath = std::getenv("OMC_SHOT_NO_PATH") == nullptr;
             if (kShotPath && sv.speed.raw() > 0) {
                 shot.path_from = {float(sv.launch_x.to_double()), float(sv.launch_y.to_double()), shot_launch_z};
                 shot.path_speed = float(sv.speed.to_double());
@@ -6945,30 +7833,122 @@ void MeleeGame::emit_scene(std::vector<render::SceneInstance>& scene) {
             scene.push_back(spent);
             ++it;
         }
+        if (cat_)
+            for (const sim::PendingEffect& pe : world_.pending_effects()) {
+                if (pe.missile_tag == 0 || pe.flight.raw() <= 0) continue;
+                if (effect_tag_names_.empty())
+                    for (const std::string& id : cat_->ids("CEffect")) effect_tag_names_.emplace(behavior_id_hash(id), id);
+                const auto nm = effect_tag_names_.find(pe.missile_tag);
+                if (nm == effect_tag_names_.end()) continue;
+                const formats::Model* mm = models_->missile_model(*ui_store_, nm->second);
+                if (!mm) continue;
+                float tx = float(pe.ctx.tx.to_double()), ty = float(pe.ctx.ty.to_double());
+                if (pe.home && pe.ctx.target < world_.units().size() && world_.units()[pe.ctx.target].alive) {
+                    tx = float(world_.units()[pe.ctx.target].x.to_double());
+                    ty = float(world_.units()[pe.ctx.target].y.to_double());
+                }
+                const float lx = float(pe.lx.to_double()), ly = float(pe.ly.to_double());
+                if (fog_ready && vision_.state_at(pe.lx, pe.ly) != sim::Visibility::Visible &&
+                    vision_.state_at(pe.ctx.tx, pe.ctx.ty) != sim::Visibility::Visible)
+                    continue;
+                const float prog = std::min(1.0f, std::max(0.0f, 1.0f - float(pe.remaining.to_double() / pe.flight.to_double())));
+                const float mx = lx + (tx - lx) * prog, my = ly + (ty - ly) * prog;
+                float launch_z = ground_z_at(lx, ly) + 1.0f;
+                if (pe.ctx.source < world_.units().size()) {
+                    const sim::Unit& su = world_.units()[pe.ctx.source];
+                    float a3[3];
+                    unit_attach_world(su, "Ref_Weapon", "Ref_Center", a3);
+                    launch_z = a3[2];
+                }
+                const float impact_z = ground_z_at(tx, ty) + 0.5f;
+                render::SceneInstance shot;
+                shot.model = mm;
+                const float yaw = (tx != lx || ty != ly) ? std::atan2(ty - ly, tx - lx) : 0.0f;
+                shot.world = render::translation(mx, my, launch_z + (impact_z - launch_z) * prog) * render::rotation_z(yaw + 1.5707963f);
+                shot.team = {0, 0, 0, -1.0f};
+                shot.seq = -1;
+                scene.push_back(shot);
+            }
     }
 
+    const std::size_t fluff_from = tag_pass(fx_from, render::PassGroup::Effects);
     if (fluff_ && models_ && ui_store_) {
-        static const float kFluffRange = std::getenv("SC2_FLUFF_RANGE") ? float(std::atof(std::getenv("SC2_FLUFF_RANGE"))) : 40.0f;
+        static const float kFluffRange = std::getenv("OMC_FLUFF_RANGE") ? float(std::atof(std::getenv("OMC_FLUFF_RANGE"))) : 40.0f;
         const float fx = camctl_.focus.x, fy = camctl_.focus.y;
-        for (const formats::PlacedDoodad& d : *fluff_) {
+        if (fluff_draw_.size() != fluff_->size()) fluff_draw_.assign(fluff_->size(), DoodadDraw{});
+        for (std::size_t di = 0; di < fluff_->size(); ++di) {
+            const formats::PlacedDoodad& d = (*fluff_)[di];
             const float dx = d.x - fx, dy = d.y - fy;
             if (dx * dx + dy * dy > kFluffRange * kFluffRange) continue;
-            const formats::Model* fm = models_->foliage_model(*ui_store_, d.type, d.variation);
-            if (!fm) continue;
+            DoodadDraw& dd = fluff_draw_[di];
+            if (!dd.ready || !same_placement(dd.src, d)) {
+                dd = DoodadDraw{};
+                dd.src = d;
+                dd.ready = true;
+                dd.model = models_->foliage_model(*ui_store_, d.type, d.variation);
+                if (dd.model) dd.world = app::doodad_world_matrix(d);
+            }
+            if (!dd.model) continue;
             render::SceneInstance inst;
-            inst.model = fm;
-            inst.world = app::doodad_world_matrix(d);
+            inst.model = dd.model;
+            inst.world = dd.world;
             inst.team = {0, 0, 0, -2.0f};
             inst.seq = -1;
             scene.push_back(inst);
         }
     }
+    const std::size_t doodads_from = tag_pass(fluff_from, render::PassGroup::Foliage);
     if (doodads_ && models_ && ui_store_) {
-        const char* const env_doodad_var = std::getenv("SC2_DOODAD_VAR");
-        const char* const env_doodad_skip = std::getenv("SC2_DOODAD_SKIP");
-        const char* const env_doodad_xform = std::getenv("SC2_DOODAD_XFORM");
-        const char* const env_doodad_seq = std::getenv("SC2_DOODAD_SEQ");
-        for (const formats::PlacedDoodad& d : *doodads_) {
+        const char* const env_doodad_var = std::getenv("OMC_DOODAD_VAR");
+        const char* const env_doodad_skip = std::getenv("OMC_DOODAD_SKIP");
+        const char* const env_doodad_xform = std::getenv("OMC_DOODAD_XFORM");
+        const char* const env_doodad_seq = std::getenv("OMC_DOODAD_SEQ");
+        static const bool kDoodadClock = std::getenv("OMC_DOODAD_FROZEN") == nullptr;
+        static const bool kDoodadTakes = std::getenv("OMC_DOODAD_NO_VARIATIONS") == nullptr;
+        const bool reuse = !env_doodad_var && !env_doodad_skip && !env_doodad_xform && !env_doodad_seq;
+        const std::uint8_t density = std::uint8_t(render::render_quality().doodads);
+        if (reuse && doodad_draw_.size() != doodads_->size()) doodad_draw_.assign(doodads_->size(), DoodadDraw{});
+        for (std::size_t di = 0; di < doodads_->size(); ++di) {
+            const formats::PlacedDoodad& d = (*doodads_)[di];
+            if (reuse) {
+                DoodadDraw& dd = doodad_draw_[di];
+                if (!dd.ready || !same_placement(dd.src, d)) {
+                    dd = DoodadDraw{};
+                    dd.src = d;
+                    dd.ready = true;
+                    dd.model = models_->doodad_model(*ui_store_, d.type, d.variation);
+                    if (dd.model) {
+                        dd.world = app::doodad_world_matrix(d);
+                        dd.seed = doodad_seed(d);
+                        dd.seq = render::select_sequence(*dd.model, {"Stand"}, dd.seed);
+                        auto tk = stand_takes_.find(dd.model);
+                        if (tk == stand_takes_.end()) tk = stand_takes_.emplace(dd.model, render::variation_takes(*dd.model, "Stand")).first;
+                        dd.takes = &tk->second;
+                        dd.thin_at = app::doodad_thin_level(cat_, d, *dd.model);
+                    }
+                }
+                if (!dd.model) continue;
+                if (dd.thin_at != 0 && density >= dd.thin_at) continue;
+                render::SceneInstance inst;
+                inst.model = dd.model;
+                inst.world = dd.world;
+                inst.team = {0, 0, 0, -2.0f};
+                inst.seq = dd.seq;
+                if (kDoodadClock && inst.seq >= 0 && std::size_t(inst.seq) < dd.model->sequences.size()) {
+                    const double len = double(dd.model->sequences[std::size_t(inst.seq)].length_ms());
+                    if (len > 0.0) inst.time_ms = float(std::fmod(clock_ms_, len));
+                }
+                if (kDoodadTakes && kDoodadClock && inst.seq >= 0) {
+                    float take_ms = 0.0f;
+                    const int take = render::select_variation(*dd.model, *dd.takes, dd.seed, double(clock_ms_), &take_ms, dd.walk);
+                    if (take >= 0) {
+                        inst.seq = take;
+                        inst.time_ms = take_ms;
+                    }
+                }
+                scene.push_back(inst);
+                continue;
+            }
             int dvar = d.variation;
             if (const char* dv = env_doodad_var) {
                 const std::string spec = dv;
@@ -6990,20 +7970,12 @@ void MeleeGame::emit_scene(std::vector<render::SceneInstance>& scene) {
                     inst.world = render::translation(0.0f, 0.0f, dz) * inst.world * render::scaling(sxy, sxy, sz);
             }
             inst.team = {0, 0, 0, -2.0f};
-            std::uint64_t dseed = 1469598103934665603ull;
-            for (char ch : d.type) dseed = (dseed ^ std::uint64_t(std::uint8_t(ch))) * 1099511628211ull;
-            for (float f : {d.x, d.y}) {
-                std::uint32_t bits = 0;
-                std::memcpy(&bits, &f, sizeof(bits));
-                dseed = (dseed ^ std::uint64_t(bits)) * 1099511628211ull;
-            }
+            const std::uint64_t dseed = doodad_seed(d);
             inst.seq = render::select_sequence(*dm, {"Stand"}, dseed);
-            static const bool kDoodadClock = std::getenv("SC2_DOODAD_FROZEN") == nullptr;
             if (kDoodadClock && inst.seq >= 0 && std::size_t(inst.seq) < dm->sequences.size()) {
                 const double len = double(dm->sequences[std::size_t(inst.seq)].length_ms());
                 if (len > 0.0) inst.time_ms = float(std::fmod(clock_ms_, len));
             }
-            static const bool kDoodadTakes = std::getenv("SC2_DOODAD_NO_VARIATIONS") == nullptr;
             if (kDoodadTakes && kDoodadClock && inst.seq >= 0) {
                 float take_ms = 0.0f;
                 const int take = render::select_variation(*dm, "Stand", dseed, double(clock_ms_), &take_ms);
@@ -7033,7 +8005,9 @@ void MeleeGame::emit_scene(std::vector<render::SceneInstance>& scene) {
             scene.push_back(inst);
         }
     }
+    const std::size_t cliffs_from = tag_pass(doodads_from, render::PassGroup::Doodads);
     if (cliffs_) scene.insert(scene.end(), cliffs_->begin(), cliffs_->end());
+    tag_pass(cliffs_from, render::PassGroup::Terrain);
 }
 
 void MeleeGame::set_spawn_models(int player, const formats::Model* worker,
@@ -7095,6 +8069,7 @@ void MeleeGame::pause_menu_rects(std::uint32_t view_w, std::uint32_t view_h, Pau
 MeleeGame::PauseRects MeleeGame::pause_rects_all(std::uint32_t view_w, std::uint32_t view_h) const {
     PauseRects out;
     pause_menu_rects(view_w, view_h, out.resume, out.quit);
+    bool settings_placed = false;
     if (ui_store_ && view_w && view_h)
         if (const HudPauseRects* pr = hud_pause_rects(*ui_store_, float(view_w) / float(view_h))) {
             const double sc = double(view_h) / double(kRefHeight);
@@ -7103,7 +8078,17 @@ MeleeGame::PauseRects MeleeGame::pause_rects_all(std::uint32_t view_w, std::uint
             };
             if (pr->save.ok()) { out.save = at(pr->save); out.has_save = true; }
             if (pr->load.ok()) { out.load = at(pr->load); out.has_load = true; }
+            if (pr->settings.ok() && at(pr->resume).y0 == out.resume.y0) {
+                out.settings = at(pr->settings);
+                settings_placed = true;
+            }
         }
+    if (!settings_placed) {
+        const int h = out.resume.y1 - out.resume.y0;
+        const int gap = std::max(4, (out.quit.y0 - out.resume.y1) > 0 ? out.quit.y0 - out.resume.y1 : 20);
+        out.settings = {out.resume.x0, out.resume.y0 - gap - h, out.resume.x1, out.resume.y0 - gap};
+    }
+    out.has_settings = bool(on_settings_);
     return out;
 }
 
@@ -7160,8 +8145,31 @@ void MeleeGame::audio_ui_event(std::uint32_t unit_id, data::UnitEvent ev, float 
     audio_->play_event(u.catalog_id, ev, gain, listener_distance_to(u), listener_pan_to(u));
 }
 
+void MeleeGame::snap_build_site(sim::Fixed& wx, sim::Fixed& wy) const {
+    if (!cat_ || build_proto_.catalog_id.empty()) return;
+    double sfx = 0.5, sfy = 0.5;
+    if (!cat_->unit_placement_grid_phase(build_proto_.catalog_id, sfx, sfy)) return;
+    auto snap = [](sim::Fixed v, double phase) { return sim::Fixed::from_double(std::floor(v.to_double() - phase + 0.5) + phase); };
+    wx = snap(wx, sfx);
+    wy = snap(wy, sfy);
+}
+
+bool MeleeGame::build_site_on_grid(sim::Fixed wx, sim::Fixed wy) const {
+    if (!world_.placement().configured()) return true;
+    int gcx = 0, gcy = 0;
+    world_.placement().to_cell(wx, wy, gcx, gcy);
+    int gminx = 0, gmaxx = 0, gminy = 0, gmaxy = 0;
+    for (const std::pair<std::int16_t, std::int16_t>& o : build_proto_.footprint_offsets) {
+        if (o.first < gminx) gminx = o.first;
+        if (o.first > gmaxx) gmaxx = o.first;
+        if (o.second < gminy) gminy = o.second;
+        if (o.second > gmaxy) gmaxy = o.second;
+    }
+    return world_.placement().can_place(gcx + gminx, gcy + gminy, gmaxx - gminx + 1, gmaxy - gminy + 1, build_proto_.requires_vespene);
+}
+
 void MeleeGame::apply_start_grants() {
-    if (std::getenv("SC2_NO_START_GRANTS") || !cat_) return;
+    if (std::getenv("OMC_NO_START_GRANTS") || !cat_) return;
     for (std::uint32_t h = 0; h < world_.units().size(); ++h) {
         const sim::Unit& hall = world_.unit(h);
         if (!hall.alive || hall.player < 0 || hall.catalog_id.empty() || !cat_->find("CUnit", hall.catalog_id)) continue;
@@ -7178,7 +8186,7 @@ void MeleeGame::apply_start_grants() {
                 if (u.name == "Upgrades")
                     if (const std::string* up = u.attr("Upgrade"); up && !up->empty() && u.attr_or("Count", "1") != "0") {
                         world_.grant_upgrade(hall.player, *up);
-                        if (std::getenv("SC2_START_RALLY_TRACE"))
+                        if (std::getenv("OMC_START_RALLY_TRACE"))
                             std::fprintf(stderr, "[start-grant] %s %u (player %d): %s -> %s\n", hall.catalog_id.c_str(), h, hall.player, eff->c_str(), up->c_str());
                     }
         }
@@ -7186,12 +8194,12 @@ void MeleeGame::apply_start_grants() {
 }
 
 void MeleeGame::apply_start_rally() {
-    if (!std::getenv("SC2_NO_START_RALLY") && cat_) {
+    if (!std::getenv("OMC_NO_START_RALLY") && cat_) {
         const sim::Fixed reach = sim::Fixed::from_ratio(13, 2);
         const std::size_t n = world_.units().size();
         for (std::uint32_t h = 0; h < n; ++h) {
             const sim::Unit& hall = world_.unit(h);
-            if (std::getenv("SC2_START_RALLY_TRACE") && (hall.catalog_id == "CommandCenter" || hall.catalog_id == "Nexus" || hall.catalog_id == "Hatchery"))
+            if (std::getenv("OMC_START_RALLY_TRACE") && (hall.catalog_id == "CommandCenter" || hall.catalog_id == "Nexus" || hall.catalog_id == "Hatchery"))
                 std::fprintf(stderr, "[start-rally] candidate %s %u alive %d player %d dropoff %d has_rally %d worker_rally %d rally_abil '%s'\n", hall.catalog_id.c_str(), h,
                              int(hall.alive), hall.player, int(hall.drop_off_ground), int(hall.has_rally), int(hall.has_worker_rally),
                              cat_->unit_rally_ability(hall.catalog_id).c_str());
@@ -7209,7 +8217,7 @@ void MeleeGame::apply_start_rally() {
                 sim::Fixed bx = (dx.raw() < 0 ? sim::Fixed() - dx : dx) - one, by = (dy.raw() < 0 ? sim::Fixed() - dy : dy) - half;
                 if (bx.raw() < 0) bx = sim::Fixed();
                 if (by.raw() < 0) by = sim::Fixed();
-                if (std::getenv("SC2_START_RALLY_TRACE"))
+                if (std::getenv("OMC_START_RALLY_TRACE"))
                     std::fprintf(stderr, "[start-rally]   field %u at (%.2f, %.2f): centre %.2f, footprint %.2f\n", f, fld.x.to_double(), fld.y.to_double(),
                                  std::sqrt(d2.to_double()), std::sqrt((bx * bx + by * by).to_double()));
                 if (bx * bx + by * by > reach * reach) continue;
@@ -7217,7 +8225,7 @@ void MeleeGame::apply_start_rally() {
             }
             if (best == sim::kNoTarget) continue;
             world_.set_rally(h, world_.unit(best).x, world_.unit(best).y);
-            if (std::getenv("SC2_START_RALLY_TRACE"))
+            if (std::getenv("OMC_START_RALLY_TRACE"))
                 std::fprintf(stderr, "[start-rally] %s %u at (%.2f, %.2f) -> field %u at (%.2f, %.2f), %.2f away (radius %.3f)\n", hall.catalog_id.c_str(), h,
                              hall.x.to_double(), hall.y.to_double(), best, world_.unit(best).x.to_double(), world_.unit(best).y.to_double(),
                              std::sqrt(best_d2.to_double()), world_.unit(best).radius.to_double());
@@ -7262,7 +8270,7 @@ bool MeleeGame::step(const render::InputState& in, float dt_ms,
 
     const bool esc_edge = in.quit && !prev_esc_;
     prev_esc_ = in.quit;
-    static const bool esc_opens = std::getenv("SC2_ESC_OPENS_MENU") != nullptr;
+    static const bool esc_opens = std::getenv("OMC_ESC_OPENS_MENU") != nullptr;
     bool menu_key = false;
     if (cat_ && !cat_->hotkeys().empty()) menu_key = ui_hotkey_fires(cat_->hotkeys(), "MenuGame", in);
     else
@@ -7289,7 +8297,8 @@ bool MeleeGame::step(const render::InputState& in, float dt_ms,
             }
             else {
                 const PauseRects all = pause_rects_all(in.view_w, in.view_h);
-                if (all.has_save && hit(all.save) && on_save_) on_save_();
+                if (all.has_settings && hit(all.settings)) on_settings_();
+                else if (all.has_save && hit(all.save) && on_save_) on_save_();
                 else if (all.has_load && hit(all.load) && on_load_) on_load_();
             }
         }
@@ -7374,9 +8383,10 @@ bool MeleeGame::step(const render::InputState& in, float dt_ms,
                 continue;
             }
             if (world_.issue_worker_build(q.worker, q.x, q.y, q.proto, q.cost, q.gas, q.time,
-                                          sim::Fixed::from_int(2), build_verb_for(q.worker)) &&
-                q.is_producer)
-                human_producer_pending_ = true;
+                                          sim::Fixed::from_int(2), build_verb_for(q.worker))) {
+                cue_build_issued(q.worker, q.x, q.y, q.proto.catalog_id);
+                if (q.is_producer) human_producer_pending_ = true;
+            }
             issued_this_frame.push_back(q.worker);
             build_queue_.erase(build_queue_.begin() + i);
         }
@@ -7502,13 +8512,19 @@ bool MeleeGame::step(const render::InputState& in, float dt_ms,
         if (!start_grants_done_) {
             start_grants_done_ = true;
             apply_start_grants();
+            static const bool kStartGrantFlashOld = std::getenv("OMC_START_GRANT_FLASH_OLD") != nullptr;
+            if (!kStartGrantFlashOld)
+                for (std::size_t p = 0; p < upg_seen_.size(); ++p) upg_seen_[p] = world_.researched(int32_t(p)).size();
         }
         if (!replay_drive_ && !start_rally_done_) {
             start_rally_done_ = true;
             apply_start_rally();
         }
-        world_.step();
-        if (const char* lt = std::getenv("SC2_LIFE_TRACE")) {
+        {
+            OMC_PROF_SCOPE("st.world");
+            world_.step();
+        }
+        if (const char* lt = std::getenv("OMC_LIFE_TRACE")) {
             static std::map<std::uint32_t, double> last;
             for (const sim::Unit& lu : world_.units()) {
                 if (!lu.alive || lu.catalog_id != lt) continue;
@@ -7519,7 +8535,7 @@ bool MeleeGame::step(const render::InputState& in, float dt_ms,
                 last[lu.id] = v;
             }
         }
-        if (research_) research_->apply_completed();
+        if (research_) research_->apply_completed(upgrade_fold_new_);
         if (research_ && cfg_.human_player >= 0)
             for (const std::pair<std::int32_t, std::string>& done : research_->just_completed())
                 if (int(done.first) == cfg_.human_player) {
@@ -7539,9 +8555,11 @@ bool MeleeGame::step(const render::InputState& in, float dt_ms,
         accum_ms_ -= tick_ms;
         ticked = true;
         auto drive_ai = [&](size_t p) {
-            if (world_.player(int32_t(p)).defeated) return;
+            if (ai_paused_ || world_.player(int32_t(p)).defeated) return;
+            OMC_PROF_SCOPE("st.ai");
             ais_[p]->update(world_);
             maybe_ai_research(int(p));
+            if (ai_inject_) run_ai_inject(int(p));
             if (cast_policy_) cast_policy_->run(world_, int(p));
         };
         auto own_period = [&](size_t p) { return p < ai_own_period_.size() ? ai_own_period_[p] : 0; };
@@ -7561,6 +8579,7 @@ bool MeleeGame::step(const render::InputState& in, float dt_ms,
             if (cast_policy_ && cfg_.human_player >= 0)
                 cast_policy_->run_autocast(world_, cfg_.human_player);
         }
+        if (!replay_drive_) run_morph_autocast();
     }
     step_lap.lap("st.sim");
 
@@ -7624,7 +8643,7 @@ bool MeleeGame::step(const render::InputState& in, float dt_ms,
         if (bound_building_.size() < n) bound_building_.resize(n, 0);
         for (std::size_t id = 0; id < n; ++id) {
             const Unit& bu = world_.unit(std::uint32_t(id));
-            const std::string& cid = bu.catalog_id;
+            const std::string& cid = world_.morph_shown_id(std::uint32_t(id));
             const std::uint8_t building = bu.constructing ? 1 : 0;
             if (bound_cat_[id] == cid && bound_building_[id] == building) continue;
             bound_cat_[id] = cid;
@@ -7634,12 +8653,12 @@ bool MeleeGame::step(const render::InputState& in, float dt_ms,
             if (!m)
                 if (const std::string& osw = option_model_swap(actor_cat_.get(), cid); !osw.empty()) {
                     m = models_->cmodel(*ui_store_, osw);
-                    if (std::getenv("SC2_SHADER_OPTION_TRACE"))
+                    if (std::getenv("OMC_SHADER_OPTION_TRACE"))
                         std::fprintf(stderr, "[optswap] unit %zu %s -> %s: %s\n", id, cid.c_str(), osw.c_str(), m ? "bound" : "DID NOT RESOLVE");
                 }
-            static const bool kVarById = std::getenv("SC2_UNIT_VARIATION_BY_ID") != nullptr;
+            static const bool kVarById = std::getenv("OMC_UNIT_VARIATION_BY_ID") != nullptr;
             const int authored_var = (!kVarById && id < layout_.unit_variation.size()) ? layout_.unit_variation[id] : -1;
-            if (!m && !std::getenv("SC2_NO_UNIT_VARIATIONS"))
+            if (!m && !std::getenv("OMC_NO_UNIT_VARIATIONS"))
                 m = models_->ensure_variation(*ui_store_, cid, authored_var >= 0 ? unsigned(authored_var) : unsigned(id));
             if (!m) m = models_->ensure(*ui_store_, cid);
             if (m) driver_.set_model(std::uint32_t(id), m);
@@ -7647,7 +8666,10 @@ bool MeleeGame::step(const render::InputState& in, float dt_ms,
     }
 
     step_lap.lap("st.bind");
-    driver_.observe(world_, dt_ms, ticked);
+    const float actor_dt = !actor_game_clock_ ? dt_ms
+                                              : (clock_.paused() ? 0.0f : dt_ms * float(clock_.multiplier(clock_.speed())));
+    driver_.observe(world_, actor_dt, ticked);
+    cloak_clock_ms_ += double(actor_dt);
     step_lap.lap("st.driver");
     drain_train_events();
     if (audio_) {
@@ -7724,9 +8746,15 @@ bool MeleeGame::step(const render::InputState& in, float dt_ms,
                 death_seen_[id] = 1;
                 if (u.player >= 0) {
                     spawn_corpse(u);
-                    splat_quads_.erase(id);
+                    const auto snap = fog_snaps_.find(id);
+                    if (snap == fog_snaps_.end() || !snap->second.has_splat) splat_quads_.erase(id);
                 }
             }
+        }
+        if (constructing_seen_.size() < world_.units().size()) constructing_seen_.resize(world_.units().size(), 0);
+        for (std::uint32_t id = 0; id < world_.units().size(); ++id) {
+            const Unit& u = world_.unit(id);
+            constructing_seen_[id] = (u.alive && u.constructing) ? 1 : 0;
         }
     }
     if (ticked && models_ && ui_store_) {
@@ -7735,7 +8763,7 @@ bool MeleeGame::step(const render::InputState& in, float dt_ms,
             const Unit& shooter = world_.units()[h.attacker];
             const Unit& victim = world_.units()[h.target];
             const std::string& wid = h.slot == 1 ? shooter.wpn2_id : shooter.wpn_id;
-            static const bool kFlareOld = std::getenv("SC2_SHIELD_FLARE_OLD") != nullptr;
+            static const bool kFlareOld = std::getenv("OMC_SHIELD_FLARE_OLD") != nullptr;
             static const data::Catalog* flare_cat = nullptr;
             static app::ShieldFlareSpec flare;
             if (cat_ && flare_cat != cat_) { flare = app::shield_flare_spec(*cat_); flare_cat = cat_; }
@@ -7777,7 +8805,7 @@ bool MeleeGame::step(const render::InputState& in, float dt_ms,
                 }
             }
             const formats::Model* fm = models_->impact_model(*ui_store_, wid);
-            if (std::getenv("SC2_SHOT_TRACE")) {
+            if (std::getenv("OMC_SHOT_TRACE")) {
                 static std::set<std::string> told_impact;
                 if (told_impact.insert(shooter.catalog_id + "/" + wid).second)
                     std::fprintf(stderr, "[impact] %s weapon '%s' hit -> %s (%zu clips)\n", shooter.catalog_id.c_str(), wid.c_str(), fm ? "an impact model" : "NO IMPACT",
@@ -7855,7 +8883,7 @@ bool MeleeGame::step(const render::InputState& in, float dt_ms,
             if (!world_.units()[h.caster].alive || !world_.units()[h.target].alive) continue;
             beam_refresh(h.caster, h.target, 0, "MedivacHealBeam", true, 250.0f);
         }
-    static const bool kBatteryBeamOld = std::getenv("SC2_BATTERY_BEAM_OLD") != nullptr;
+    static const bool kBatteryBeamOld = std::getenv("OMC_BATTERY_BEAM_OLD") != nullptr;
     if (ticked && !kBatteryBeamOld && cat_)
         for (const sim::HealerInstance& h : world_.healers()) {
             if (h.vital == sim::HealVital::Life) continue;
@@ -7937,10 +8965,15 @@ bool MeleeGame::step(const render::InputState& in, float dt_ms,
                          impact_fx_.end());
     }
     if (!corpses_.empty()) {
-        for (Corpse& c : corpses_) c.time_ms += dt_s * 1000.0f;
-        corpses_.erase(std::remove_if(corpses_.begin(), corpses_.end(),
-                                      [](const Corpse& c) { return c.time_ms >= c.length_ms; }),
-                       corpses_.end());
+        static const bool kDeadOld = std::getenv("OMC_CORPSE_DEAD_OLD") != nullptr;
+        const float dt_ms = dt_s * 1000.0f;
+        std::size_t keep = 0;
+        for (std::size_t i = 0; i < corpses_.size(); ++i)
+            if (advance_corpse(corpses_[i], dt_ms, !kDeadOld)) {
+                if (keep != i) corpses_[keep] = corpses_[i];
+                ++keep;
+            }
+        corpses_.resize(keep);
     }
     if (layout_.players.size() > 2 && !MatchResult::sole_player_rule()) world_.refresh_defeats();
     if (!cfg_.no_victory && surrendered_player_ < 0)
@@ -7966,7 +8999,7 @@ bool MeleeGame::step(const render::InputState& in, float dt_ms,
         mem_step_marked_ = true;
     }
     cam = camctl_.camera();
-    static const bool esc_ends = std::getenv("SC2_ESC_FRAME_ENDS_MATCH") != nullptr;
+    static const bool esc_ends = std::getenv("OMC_ESC_FRAME_ENDS_MATCH") != nullptr;
     return esc_ends ? !in.quit : true;
 }
 
@@ -8043,7 +9076,7 @@ void MeleeGame::warm_selection_assets(std::uint32_t view_w, std::uint32_t view_h
         if (warmed_types_.count(u.catalog_id)) continue;
         warmed_types_.insert(u.catalog_id);
         if (later) {
-            SC2_PROF_SCOPE("ov.warm_request");
+            OMC_PROF_SCOPE("ov.warm_request");
             if (!models_ || models_->prefetch_portrait(*ui_store_, u.catalog_id)) portrait_call(u.catalog_id, 2);
             warm_pending_.push_back({u.id, u.catalog_id});
             render::frame_prof_count("warm.requested", 1.0);
@@ -8068,7 +9101,7 @@ void MeleeGame::warm_selection_assets(std::uint32_t view_w, std::uint32_t view_h
         render::frame_prof_count("warm.pending", double(warm_pending_.size()));
     }
     if (picks.empty()) return;
-    SC2_PROF_SCOPE("ov.warm");
+    OMC_PROF_SCOPE("ov.warm");
     render::frame_prof_count("warm.types", double(picks.size()));
     if (portrait_async_ && !later)
         for (std::uint32_t id : picks) portrait_call(world_.unit(id).catalog_id, 2);
@@ -8142,6 +9175,175 @@ void MeleeGame::ensure_minimap_terrain() {
     if (minimap_terrain_.empty()) { minimap_tw_ = minimap_th_ = 0; }
 }
 
+bool MeleeGame::cloak_enemy_drawn(const sim::Unit& u) const {
+    static const bool kOld = std::getenv("OMC_CLOAK_ENEMY_OLD") != nullptr;
+    if (kOld || !cat_ || u.burrowed || !u.cloaked_effective()) return false;
+    if (cloak_enemy_look_ < 0) {
+        const auto enemy = cat_->cloak_transition("None", "Enemy");
+        const auto detected = cat_->cloak_transition("None", "Detected");
+        if (!enemy || enemy->loop.empty() || cat_->actor_cloak_model().empty())
+            cloak_enemy_look_ = 0;
+        else
+            cloak_enemy_look_ = (!detected || detected->loop != enemy->loop) ? 1 : 2;
+    }
+    return cloak_enemy_look_ > 0;
+}
+
+void MeleeGame::bind_cloak_look() {
+    if (cloak_look_bound_ == 1 || cloak_look_bound_ == -1 || !cat_) return;
+    if (cloak_look_bound_ == 0) {
+        static const bool kEnterOld = std::getenv("OMC_CLOAK_TRANSITION_OLD") != nullptr;
+        const data::Catalog* cat = cat_;
+        cloak_tx_.bind(
+            &cloak_look_,
+            [cat](render::CloakView from, render::CloakView to, std::string& enter, std::string& loop) {
+                const auto t = cat->cloak_transition(render::cloak_view_name(from), render::cloak_view_name(to));
+                if (!t) return false;
+                enter = t->enter;
+                loop = t->loop;
+                return true;
+            },
+            !kEnterOld);
+        cloak_look_bound_ = 2;
+    }
+    if (!models_ || !ui_store_) return;
+    cloak_look_bound_ = -1;
+    const std::string id = cat_->actor_cloak_model();
+    const formats::Model* m = id.empty() ? nullptr : models_->cmodel(*ui_store_, id);
+    casc::Storage* store = ui_store_;
+    auto load_mask = [store](const std::string& path) {
+        std::vector<float> hist;
+        static const char* kRoots[] = {"mods/core.sc2mod/base.sc2assets/", "mods/liberty.sc2mod/base.sc2assets/",
+                                       "mods/swarm.sc2mod/base.sc2assets/", "mods/void.sc2mod/base.sc2assets/", ""};
+        for (const char* root : kRoots) {
+            try {
+                const std::vector<std::uint8_t> bytes = store->read_by_name(std::string(root) + path);
+                formats::DdsInfo info;
+                const std::vector<std::uint8_t> rgba = formats::dds_decode_rgba(bytes, info);
+                if (rgba.size() < 4 || !info.width || !info.height) continue;
+                const std::size_t n = rgba.size() / 4;
+                std::uint8_t lo[4] = {255, 255, 255, 255}, hi[4] = {0, 0, 0, 0};
+                for (std::size_t i = 0; i < n; ++i)
+                    for (int k = 0; k < 4; ++k) {
+                        lo[k] = std::min(lo[k], rgba[i * 4 + std::size_t(k)]);
+                        hi[k] = std::max(hi[k], rgba[i * 4 + std::size_t(k)]);
+                    }
+                const int ch = (lo[0] == hi[0] && lo[3] != hi[3]) ? 3 : 0;
+                hist.assign(256, 0.0f);
+                for (std::size_t i = 0; i < n; ++i) hist[rgba[i * 4 + std::size_t(ch)]] += 1.0f;
+                for (float& h : hist) h /= float(n);
+                break;
+            } catch (...) {
+            }
+        }
+        return hist;
+    };
+    if (m && cloak_look_.bind(m, load_mask)) cloak_look_bound_ = 1;
+}
+
+void MeleeGame::refresh_creep_seen() {
+    static const bool kOld = std::getenv("OMC_CREEP_FOG_OLD") != nullptr;
+    const sim::CreepGrid& live = world_.creep().grid();
+    creep_fogged_ = !kOld && ground_fog_ && !reveal_map_ && cfg_.human_player >= 0 && vision_.width() > 0 && live.width() > 0 &&
+                    live.height() > 0;
+    if (!creep_fogged_) {
+        creep_seen_tick_ = -1;
+        return;
+    }
+    const std::uint64_t dims = (std::uint64_t(std::uint32_t(live.width())) << 48) ^ (std::uint64_t(std::uint32_t(live.height())) << 32) ^
+                               (std::uint64_t(std::uint32_t(vision_.width())) << 16) ^ std::uint64_t(std::uint32_t(vision_.height()));
+    const int w = live.width(), h = live.height();
+    if (dims != creep_seen_dims_ || creep_seen_.width() != w || creep_seen_.height() != h) {
+        creep_seen_dims_ = dims;
+        creep_seen_.configure(w, h, live.cell_size(), live.origin_x(), live.origin_y());
+        creep_vis_index_.assign(std::size_t(w) * std::size_t(h), -1);
+        const sim::Fixed half = live.cell_size() / sim::Fixed::from_int(2);
+        for (int cy = 0; cy < h; ++cy)
+            for (int cx = 0; cx < w; ++cx) {
+                const sim::Fixed wx = live.origin_x() + live.cell_size() * sim::Fixed::from_int(cx) + half;
+                const sim::Fixed wy = live.origin_y() + live.cell_size() * sim::Fixed::from_int(cy) + half;
+                int vx = -1, vy = -1;
+                vision_.to_cell(wx, wy, vx, vy);
+                if (vx < 0 || vy < 0 || vx >= vision_.width() || vy >= vision_.height() || vx > 0xFFFF || vy > 0x7FFF) continue;
+                creep_vis_index_[std::size_t(cy) * std::size_t(w) + std::size_t(cx)] = std::int32_t(vx | (vy << 16));
+            }
+        creep_seen_tick_ = -1;
+        creep_seen_dirty_ = true;
+    }
+    if (creep_seen_tick_ == std::int64_t(world_.tick())) return;
+    creep_seen_tick_ = std::int64_t(world_.tick());
+    const std::vector<std::uint8_t>& lc = live.cells();
+    std::vector<std::uint8_t>& sc = creep_seen_.cells_mut();
+    bool changed = false;
+    for (std::size_t i = 0; i < creep_vis_index_.size(); ++i) {
+        const std::int32_t vi = creep_vis_index_[i];
+        if (vi < 0) continue;
+        if (vision_.state(vi & 0xFFFF, vi >> 16) != sim::Visibility::Visible) continue;
+        const std::uint8_t v = lc[i] ? 1 : 0;
+        if (sc[i] != v) {
+            sc[i] = v;
+            changed = true;
+        }
+    }
+    if (changed) creep_seen_dirty_ = true;
+}
+
+void MeleeGame::minimap_fog_content(HudContent& content) {
+    if (cfg_.human_player < 0) return;
+    static const bool kCloakOld = std::getenv("OMC_MINIMAP_CLOAK_OLD") != nullptr;
+    if (!kCloakOld && !reveal_map_) {
+        content.minimap_hidden.assign(world_.units().size(), 0);
+        for (const Unit& u : world_.units()) {
+            if (!u.alive || u.player < 0 || u.player == cfg_.human_player || world_.are_allied(u.player, cfg_.human_player)) continue;
+            if (!u.cloaked_effective() && !u.burrowed) continue;
+            if (world_.revealed_to(cfg_.human_player, u.id)) continue;
+            content.minimap_hidden[u.id] = 1;
+        }
+    }
+    for (const auto& kv : fog_snaps_) {
+        HudContent::MinimapSnapshot s;
+        s.unit = kv.first;
+        s.player = kv.second.player;
+        s.x = kv.second.x;
+        s.y = kv.second.y;
+        s.radius = kv.second.minimap_radius;
+        content.minimap_snapshots.push_back(s);
+    }
+    static const bool kCreepOld = std::getenv("OMC_MINIMAP_CREEP_OLD") != nullptr;
+    if (kCreepOld) return;
+    if (!creep_minimap_rgb_set_ && ui_store_ && !creep_diffuse_.empty()) {
+        creep_minimap_rgb_set_ = true;
+        static const char* kRoots[] = {"mods/core.sc2mod/base.sc2assets/", "mods/liberty.sc2mod/base.sc2assets/",
+                                       "mods/swarm.sc2mod/base.sc2assets/", "mods/void.sc2mod/base.sc2assets/", ""};
+        for (const char* root : kRoots) {
+            try {
+                const std::vector<std::uint8_t> bytes = ui_store_->read_by_name(std::string(root) + creep_diffuse_);
+                formats::DdsInfo info;
+                const std::vector<std::uint8_t> rgba = formats::dds_decode_rgba(bytes, info);
+                if (rgba.size() < 4 || !info.width || !info.height) continue;
+                double acc[3] = {0.0, 0.0, 0.0};
+                const std::size_t n = rgba.size() / 4;
+                for (std::size_t i = 0; i < n; ++i)
+                    for (int k = 0; k < 3; ++k) acc[k] += rgba[i * 4 + std::size_t(k)];
+                for (int k = 0; k < 3; ++k) creep_minimap_rgb_[k] = std::uint8_t(std::min(255.0, acc[k] / double(n) + 0.5));
+                break;
+            } catch (...) {
+            }
+        }
+    }
+    if (creep_minimap_rgb_[0] == 0 && creep_minimap_rgb_[1] == 0 && creep_minimap_rgb_[2] == 0) return;
+    const sim::CreepGrid& g = creep_fogged_ ? creep_seen_ : world_.creep().grid();
+    if (g.width() <= 0 || g.height() <= 0) return;
+    content.minimap_creep = &g.cells();
+    content.creep_w = g.width();
+    content.creep_h = g.height();
+    content.creep_x0 = float(g.origin_x().to_double());
+    content.creep_y0 = float(g.origin_y().to_double());
+    content.creep_cell = float(g.cell_size().to_double());
+    for (int k = 0; k < 3; ++k) content.creep_rgb[k] = creep_minimap_rgb_[k];
+    content.creep_alpha = 1.0f;
+}
+
 void MeleeGame::update_minimap_fog(int viewed) {
     if (map_w_ <= 0.0f || map_h_ <= 0.0f) { minimap_fog_.clear(); minimap_fw_ = minimap_fh_ = 0; return; }
     const sim::Bounds bounds{sim::Fixed(), sim::Fixed(),
@@ -8181,10 +9383,14 @@ void MeleeGame::update_minimap_fog(int viewed) {
     ground_fog_field_.h = std::uint32_t(H);
     ground_fog_field_.world_w = map_w_;
     ground_fog_field_.world_h = map_h_;
-    ground_fog_field_.alpha.resize(std::size_t(W) * std::size_t(H));
     const bool snap = fog_blend_.size() != minimap_fog_.size() || fog_blend_speed_ <= 0.0f || fog_dt_s_ <= 0.0f;
     if (snap) fog_blend_.assign(minimap_fog_.size(), 0.0f);
     const float max_step = 255.0f * fog_blend_speed_ * fog_dt_s_;
+    static std::vector<std::uint8_t> cell_a, prev_cell_a;
+    static const MeleeGame* prev_game = nullptr;
+    static int prev_w = 0, prev_h = 0;
+    static float prev_key[6] = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
+    cell_a.resize(minimap_fog_.size());
     for (std::size_t i = 0; i < minimap_fog_.size(); ++i) {
         const int st = int(minimap_fog_[i]);
         const float target = st == int(sim::Visibility::Explored) ? float(fog_veil_alpha_) : float(hud_fog_veil_alpha(st));
@@ -8192,53 +9398,75 @@ void MeleeGame::update_minimap_fog(int viewed) {
         if (snap) cur = target;
         else if (cur < target) cur = std::min(target, cur + max_step);
         else if (cur > target) cur = std::max(target, cur - max_step);
-        const std::uint8_t a = std::uint8_t(cur + 0.5f);
-        const int cx = int(i % std::size_t(fw)), cy = int(i / std::size_t(fw));
-        for (int sy = 0; sy < S; ++sy)
-            for (int sx = 0; sx < S; ++sx)
-                ground_fog_field_.alpha[std::size_t(cy * S + sy) * std::size_t(W) + std::size_t(cx * S + sx)] = a;
+        cell_a[i] = std::uint8_t(cur + 0.5f);
     }
-    static const bool kRimBlurred = std::getenv("SC2_BOUNDS_VEIL_BLURRED") != nullptr;
+    const bool extra_veils = std::getenv("OMC_PLAYABLE_VEIL") || std::getenv("OMC_PIT_VEIL") || std::getenv("OMC_LEVEL_VEIL") ||
+                             std::getenv("OMC_PLAYABLE_RAMP") || std::getenv("OMC_FOG_FIELD_UNCACHED");
+    const float field_key[6] = {map_w_, map_h_, playable_x0_, playable_y0_, playable_x1_, playable_y1_};
+    if (!extra_veils && prev_game == this && prev_w == W && prev_h == H && ground_fog_field_.alpha.size() == std::size_t(W) * std::size_t(H) &&
+        std::equal(field_key, field_key + 6, prev_key) && prev_cell_a == cell_a)
+        return;
+    prev_game = nullptr;
+    ground_fog_field_.alpha.resize(std::size_t(W) * std::size_t(H));
+    for (int cy = 0; cy < fh; ++cy)
+        for (int cx = 0; cx < fw; ++cx) {
+            const std::uint8_t a = cell_a[std::size_t(cy) * std::size_t(fw) + std::size_t(cx)];
+            for (int sy = 0; sy < S; ++sy) {
+                std::uint8_t* row = &ground_fog_field_.alpha[std::size_t(cy * S + sy) * std::size_t(W) + std::size_t(cx * S)];
+                for (int sx = 0; sx < S; ++sx) row[sx] = a;
+            }
+        }
+    static const bool kRimBlurred = std::getenv("OMC_BOUNDS_VEIL_BLURRED") != nullptr;
     const auto lay_rim = [&]() {
-        if (map_w_ > 0.0f && map_h_ > 0.0f && !std::getenv("SC2_NO_BOUNDS_VEIL")) {
+        if (map_w_ > 0.0f && map_h_ > 0.0f && !std::getenv("OMC_NO_BOUNDS_VEIL")) {
             const float cw = map_w_ / float(W), ch = map_h_ / float(H);
-            static const float kInset = std::getenv("SC2_BOUNDS_VEIL_INSET") ? float(std::atof(std::getenv("SC2_BOUNDS_VEIL_INSET"))) : 1.5f;
+            static const float kInset = std::getenv("OMC_BOUNDS_VEIL_INSET") ? float(std::atof(std::getenv("OMC_BOUNDS_VEIL_INSET"))) : 1.5f;
             static bool traced = false;
-            if (!traced && std::getenv("SC2_BOUNDS_VEIL_TRACE")) {
+            if (!traced && std::getenv("OMC_BOUNDS_VEIL_TRACE")) {
                 traced = true;
                 std::fprintf(stderr, "[bounds] map %.1f x %.1f playable %.1f %.1f %.1f %.1f inset %.1f\n", double(map_w_), double(map_h_), double(playable_x0_), double(playable_y0_),
                              double(playable_x1_), double(playable_y1_), double(kInset));
             }
-            static const char* kRimPlay = std::getenv("SC2_RIM_PLAYABLE");
+            static const char* kRimPlay = std::getenv("OMC_RIM_PLAYABLE");
             float rx0 = kInset, ry0 = kInset, rx1 = map_w_ - kInset, ry1 = map_h_ - kInset;
             if (kRimPlay && playable_x1_ > playable_x0_ && playable_y1_ > playable_y0_) {
                 const float e = float(std::atof(kRimPlay));
                 rx0 = playable_x0_ - e; ry0 = playable_y0_ - e; rx1 = playable_x1_ + e; ry1 = playable_y1_ + e;
             }
-            for (int y = 0; y < H; ++y)
-                for (int x = 0; x < W; ++x) {
-                    const float wx = (float(x) + 0.5f) * cw, wy = (float(y) + 0.5f) * ch;
-                    if (wx < rx0 || wx > rx1 || wy < ry0 || wy > ry1)
-                        ground_fog_field_.alpha[std::size_t(y) * std::size_t(W) + std::size_t(x)] = 255;
+            static std::vector<std::uint8_t> out_x;
+            out_x.resize(std::size_t(W));
+            for (int x = 0; x < W; ++x) {
+                const float wx = (float(x) + 0.5f) * cw;
+                out_x[std::size_t(x)] = (wx < rx0 || wx > rx1) ? 255 : 0;
+            }
+            for (int y = 0; y < H; ++y) {
+                const float wy = (float(y) + 0.5f) * ch;
+                std::uint8_t* row = &ground_fog_field_.alpha[std::size_t(y) * std::size_t(W)];
+                if (wy < ry0 || wy > ry1) {
+                    std::memset(row, 255, std::size_t(W));
+                    continue;
                 }
+                const std::uint8_t* mask = out_x.data();
+                for (int x = 0; x < W; ++x) row[x] = std::uint8_t(row[x] | mask[x]);
+            }
         }
     };
     if (kRimBlurred) lay_rim();
-    if (const char* pv = std::getenv("SC2_PLAYABLE_VEIL"); pv && playable_x1_ > playable_x0_ && playable_y1_ > playable_y0_ && map_w_ > 0.0f && map_h_ > 0.0f) {
+    if (const char* pv = std::getenv("OMC_PLAYABLE_VEIL"); pv && playable_x1_ > playable_x0_ && playable_y1_ > playable_y0_ && map_w_ > 0.0f && map_h_ > 0.0f) {
         const int pa = std::min(255, std::max(0, std::atoi(pv)));
         const float cw = map_w_ / float(W), ch = map_h_ / float(H);
         for (int y = 0; y < H; ++y)
             for (int x = 0; x < W; ++x) {
                 const float wx = (float(x) + 0.5f) * cw, wy = (float(y) + 0.5f) * ch;
                 if (wx < playable_x0_ || wx > playable_x1_ || wy < playable_y0_ || wy > playable_y1_) {
-                    static const char* kLow = std::getenv("SC2_PLAYABLE_VEIL_LOW");
+                    static const char* kLow = std::getenv("OMC_PLAYABLE_VEIL_LOW");
                     if (kLow && ground_z_at(wx, wy) >= float(std::atof(kLow))) continue;
                     std::uint8_t& a = ground_fog_field_.alpha[std::size_t(y) * std::size_t(W) + std::size_t(x)];
                     a = std::uint8_t(std::max(int(a), pa));
                 }
             }
     }
-    if (const char* pt = std::getenv("SC2_PIT_VEIL"); pt && world_.nav().configured() && world_.nav().has_levels() && playable_x1_ > playable_x0_ &&
+    if (const char* pt = std::getenv("OMC_PIT_VEIL"); pt && world_.nav().configured() && world_.nav().has_levels() && playable_x1_ > playable_x0_ &&
                                                       playable_y1_ > playable_y0_ && map_w_ > 0.0f && map_h_ > 0.0f) {
         const int pa = std::min(255, std::max(0, std::atoi(pt)));
         const sim::NavGrid& nv = world_.nav();
@@ -8261,12 +9489,12 @@ void MeleeGame::update_minimap_fog(int viewed) {
                 ++veiled;
             }
         static bool told = false;
-        if (!told && std::getenv("SC2_BOUNDS_VEIL_TRACE")) {
+        if (!told && std::getenv("OMC_BOUNDS_VEIL_TRACE")) {
             told = true;
             std::fprintf(stderr, "[pit] lowest level inside the playable rectangle %d, %zu field cells veiled\n", min_in, veiled);
         }
     }
-    if (const char* lv = std::getenv("SC2_LEVEL_VEIL"); lv && world_.nav().configured() && map_w_ > 0.0f && map_h_ > 0.0f) {
+    if (const char* lv = std::getenv("OMC_LEVEL_VEIL"); lv && world_.nav().configured() && map_w_ > 0.0f && map_h_ > 0.0f) {
         int lvl = 0, pa = 0;
         if (std::sscanf(lv, "%d:%d", &lvl, &pa) == 2) {
             pa = std::min(255, std::max(0, pa));
@@ -8286,13 +9514,13 @@ void MeleeGame::update_minimap_fog(int viewed) {
                     ++veiled;
                 }
             static bool told = false;
-            if (!told && std::getenv("SC2_BOUNDS_VEIL_TRACE")) {
+            if (!told && std::getenv("OMC_BOUNDS_VEIL_TRACE")) {
                 told = true;
                 std::fprintf(stderr, "[level] cells by level %d %d %d %d %d %d %d %d, %zu veiled\n", hist[0], hist[1], hist[2], hist[3], hist[4], hist[5], hist[6], hist[7], veiled);
             }
         }
     }
-    if (const char* pr = std::getenv("SC2_PLAYABLE_RAMP"); pr && playable_x1_ > playable_x0_ && playable_y1_ > playable_y0_ && map_w_ > 0.0f && map_h_ > 0.0f) {
+    if (const char* pr = std::getenv("OMC_PLAYABLE_RAMP"); pr && playable_x1_ > playable_x0_ && playable_y1_ > playable_y0_ && map_w_ > 0.0f && map_h_ > 0.0f) {
         float d0 = 0.0f, rr = 1.0f;
         if (std::sscanf(pr, "%f:%f", &d0, &rr) == 2 && rr > 0.0f) {
             const float cw = map_w_ / float(W), ch = map_h_ / float(H);
@@ -8309,24 +9537,17 @@ void MeleeGame::update_minimap_fog(int viewed) {
         }
     }
     {
-        std::vector<std::uint8_t> tmp(ground_fog_field_.alpha.size());
-        for (int pass = 0; pass < 2; ++pass) {
-            const int R = pass == 0 ? 2 : 1;
-            for (int y = 0; y < H; ++y)
-                for (int x = 0; x < W; ++x) {
-                    int sum = 0, n = 0;
-                    for (int k = -R; k <= R; ++k) { const int xx = x + k; if (xx < 0 || xx >= W) continue; sum += ground_fog_field_.alpha[std::size_t(y) * W + xx]; ++n; }
-                    tmp[std::size_t(y) * W + x] = std::uint8_t(sum / n);
-                }
-            for (int y = 0; y < H; ++y)
-                for (int x = 0; x < W; ++x) {
-                    int sum = 0, n = 0;
-                    for (int k = -R; k <= R; ++k) { const int yy = y + k; if (yy < 0 || yy >= H) continue; sum += tmp[std::size_t(yy) * W + x]; ++n; }
-                    ground_fog_field_.alpha[std::size_t(y) * W + x] = std::uint8_t(sum / n);
-                }
-        }
+        static std::vector<std::uint8_t> tmp;
+        tmp.resize(ground_fog_field_.alpha.size());
+        fog_box_pass<2>(ground_fog_field_.alpha.data(), tmp.data(), W, H);
+        fog_box_pass<1>(ground_fog_field_.alpha.data(), tmp.data(), W, H);
     }
     if (!kRimBlurred) lay_rim();
+    prev_cell_a = cell_a;
+    prev_game = this;
+    prev_w = W;
+    prev_h = H;
+    std::copy(field_key, field_key + 6, prev_key);
 }
 
 void MeleeGame::ensure_overlay_font() {
@@ -8364,7 +9585,7 @@ void MeleeGame::ensure_overlay_font() {
 }
 
 const render::OverlayFont* MeleeGame::style_face(const std::string& font_path) {
-    if (font_path.empty() || !ui_store_ || std::getenv("SC2_NO_HEADER_FACE")) return nullptr;
+    if (font_path.empty() || !ui_store_ || std::getenv("OMC_NO_HEADER_FACE")) return nullptr;
     auto it = style_faces_.find(font_path);
     if (it == style_faces_.end()) {
         it = style_faces_.emplace(font_path, render::OverlayFont{}).first;
@@ -8375,7 +9596,7 @@ const render::OverlayFont* MeleeGame::style_face(const std::string& font_path) {
             auto bytes = ui_store_->read_by_name("mods/core.sc2mod/base.sc2data/" + p);
             it->second.load(bytes);
         } catch (const std::exception&) {   }
-        if (std::getenv("SC2_LABEL_FACE_TRACE"))
+        if (std::getenv("OMC_LABEL_FACE_TRACE"))
             std::fprintf(stderr, "[labelface] %s loaded %d\n", p.c_str(), int(it->second.valid()));
     }
     return it->second.valid() ? &it->second : nullptr;
@@ -8399,6 +9620,7 @@ void MeleeGame::ensure_console_texture(std::uint32_t view_w, std::uint32_t view_
     const bool resized = console_renderer_ && cat_ && view_w && view_h && console_view_w_ && console_view_h_ &&
                          (view_w != console_view_w_ || view_h != console_view_h_);
     if (console_tried_ && !resized) return;
+    if (console_race_assets() && cfg_.human_player >= 0 && hall_race() < 0 && world_.tick() < sim::World::kTicksPerSecond) return;
     console_tried_ = true;
     if (!ui_store_) return;
     if (console_renderer_ && cat_) {
@@ -8454,7 +9676,7 @@ void MeleeGame::drain_train_events() {
 
 void MeleeGame::build_overlay(std::uint32_t view_w, std::uint32_t view_h,
                               std::vector<std::uint8_t>& out) {
-    SC2_PROF_SCOPE("build_overlay");
+    OMC_PROF_SCOPE("build_overlay");
     out.clear();
     if (!view_w || !view_h) return;
     if (!warming_ && !mem_marked_) render::mem_mark("first frame: step (sim, scene, world models)");
@@ -8516,14 +9738,14 @@ void MeleeGame::build_overlay(std::uint32_t view_w, std::uint32_t view_h,
         const Unit& lu = world_.unit(lead);
         content.equipment = equipment_for(lu.player, &lu);
         if (selection_.size() == 1 && !pane_queue(lead).empty()) content.equipment.clear();
-        if (selection_.size() > 1 && !std::getenv("SC2_NO_GROUP_PORTRAIT")) content.equipment.clear();
+        if (selection_.size() > 1 && !std::getenv("OMC_NO_GROUP_PORTRAIT")) content.equipment.clear();
         hud_equipment_ = content.equipment;
         content.lead_kills = lu.kills;
-        if (std::getenv("SC2_PORTRAIT_TRACE"))
+        if (std::getenv("OMC_PORTRAIT_TRACE"))
             std::fprintf(stderr, "equipment: lead %s cells %zu%s%s rect ok %d\n", lu.catalog_id.c_str(), content.equipment.size(),
                          content.equipment.empty() ? "" : " first ", content.equipment.empty() ? "" : content.equipment[0].icon.c_str(),
                          int(hud_authored_ && hud_authored_->equipment.ok()));
-    } else if (std::getenv("SC2_PORTRAIT_TRACE") && !selection_.empty()) {
+    } else if (std::getenv("OMC_PORTRAIT_TRACE") && !selection_.empty()) {
         std::fprintf(stderr, "equipment: no cast lead for a selection of %zu\n", selection_.size());
     }
     if (const ui::StyleSet* ss = hud_style_set()) {
@@ -8622,7 +9844,7 @@ void MeleeGame::build_overlay(std::uint32_t view_w, std::uint32_t view_h,
                 tc.set = true;
             }
             if (cfg_.human_player >= 0 && std::size_t(cfg_.human_player) < content.player_colors.size() &&
-                !std::getenv("SC2_MINIMAP_TEAM_COLOURS")) {
+                !std::getenv("OMC_MINIMAP_TEAM_COLOURS")) {
                 HudContent::MinimapTeamColor& own = content.player_colors[std::size_t(cfg_.human_player)];
                 own.rgb[0] = 0; own.rgb[1] = 140; own.rgb[2] = 0;
                 own.sel_rgb[0] = 0; own.sel_rgb[1] = 255; own.sel_rgb[2] = 0;
@@ -8646,25 +9868,22 @@ void MeleeGame::build_overlay(std::uint32_t view_w, std::uint32_t view_h,
             flash_hp_[u.id] = now;
         }
         const double hold_ms = cat_ ? cat_->unit_damage_flash_ms() : 3000.0;
-        const std::vector<data::TeamColor> pal = cat_ ? data::team_colors(*cat_)
-                                                      : std::vector<data::TeamColor>{};
         for (const sim::Unit& u : world_.units()) {
             if (!u.alive || u.loaded || u.in_gas_structure || u.id >= flash_ms_.size()) continue;
             if (u.minimap_radius.raw() <= 0) continue;
             if (clock_ms_ - flash_ms_[u.id] > hold_ms) continue;
             HudContent::MinimapFlash fl;
             fl.unit = u.id;
-            const int slot = u.player + 1;
-            for (const data::TeamColor& tc : pal)
-                if (tc.slot == slot) {
-                    fl.r = std::uint8_t(tc.attacked[0] * 255.0f + 0.5f);
-                    fl.g = std::uint8_t(tc.attacked[1] * 255.0f + 0.5f);
-                    fl.b = std::uint8_t(tc.attacked[2] * 255.0f + 0.5f);
-                    break;
-                }
+            if (cat_) {
+                const std::array<std::uint8_t, 3> c = minimap_attacked_rgb(cat_, u.player);
+                fl.r = c[0];
+                fl.g = c[1];
+                fl.b = c[2];
+            }
             content.minimap_flashes.push_back(fl);
         }
     }
+    minimap_fog_content(content);
 
     if (cat_) {
         const data::Catalog::MinimapColors mc = cat_->minimap_colors();
@@ -8701,9 +9920,9 @@ void MeleeGame::build_overlay(std::uint32_t view_w, std::uint32_t view_h,
     CameraFootprint cam;
     if (map_w_ > 0.0f && map_h_ > 0.0f) {
         Control ctrl = make_control(camctl_.view_proj(aspect), view_w, view_h, viewed);
-        if (!std::getenv("SC2_MINIMAP_QUAD_TERRAIN_HIT")) ctrl.set_ground_height(nullptr);
+        if (!std::getenv("OMC_MINIMAP_QUAD_TERRAIN_HIT")) ctrl.set_ground_height(nullptr);
         const float cxs[4] = {0.0f, float(view_w), float(view_w), 0.0f};
-        const float quad_bottom = std::getenv("SC2_MINIMAP_QUAD_Z0") ? float(view_h) : float(view_h) * 0.75f;
+        const float quad_bottom = std::getenv("OMC_MINIMAP_QUAD_Z0") ? float(view_h) : float(view_h) * 0.75f;
         const float cys[4] = {0.0f, 0.0f, quad_bottom, quad_bottom};
         cam.valid = true;
         for (int k = 0; k < 4 && cam.valid; ++k) {
@@ -8713,16 +9932,16 @@ void MeleeGame::build_overlay(std::uint32_t view_w, std::uint32_t view_h,
                 cam.y[k] = float(wy.to_double());
                 const render::Vec3 e = camctl_.eye();
                 const float gz = ground_z_at(camctl_.focus.x, camctl_.focus.y);
-                if (k == 0 && std::getenv("SC2_STATUS_ANCHOR_TRACE")) {
+                if (k == 0 && std::getenv("OMC_STATUS_ANCHOR_TRACE")) {
                     static int quad_traced = 0;
                     if (quad_traced++ < 2)
                         std::fprintf(stderr, "[minimapquad] eye %.2f %.2f %.2f focus %.2f %.2f %.2f ground %.2f target z %.2f\n", double(e.x), double(e.y), double(e.z),
                                      double(camctl_.focus.x), double(camctl_.focus.y), double(camctl_.focus.z), double(gz), double(camctl_.target().z));
                 }
-                if (!std::getenv("SC2_MINIMAP_QUAD_Z0") && e.z > gz + 1.0f && e.z > 1.0f) {
+                if (!std::getenv("OMC_MINIMAP_QUAD_Z0") && e.z > gz + 1.0f && e.z > 1.0f) {
                     const float x0 = cam.x[k], y0 = cam.y[k];
-                    float h = std::getenv("SC2_MINIMAP_QUAD_TERRAIN_HIT") ? gz : camctl_.target().z;
-                    if (std::getenv("SC2_MINIMAP_QUAD_TERRAIN"))
+                    float h = std::getenv("OMC_MINIMAP_QUAD_TERRAIN_HIT") ? gz : camctl_.target().z;
+                    if (std::getenv("OMC_MINIMAP_QUAD_TERRAIN"))
                         for (int it = 0; it < 4; ++it) {
                             const float tt = (e.z - h) / e.z;
                             h = ground_z_at(e.x + (x0 - e.x) * tt, e.y + (y0 - e.y) * tt);
@@ -8741,7 +9960,7 @@ void MeleeGame::build_overlay(std::uint32_t view_w, std::uint32_t view_h,
     update_minimap_fog(viewed);
     MinimapBackdrop backdrop;
     backdrop.extent = minimap_extent();
-    if (std::getenv("SC2_ENV_TRACE")) {
+    if (std::getenv("OMC_ENV_TRACE")) {
         static bool traced = false;
         if (!traced) {
             traced = true;
@@ -8756,7 +9975,7 @@ void MeleeGame::build_overlay(std::uint32_t view_w, std::uint32_t view_h,
         if (minimap_terrain_authored_ && !minimap_terrain_cropped_ && playable_x1_ > playable_x0_ && playable_y1_ > playable_y0_) {
             minimap_terrain_cropped_ = true;
             const int pw = int(playable_x1_ - playable_x0_ + 0.5f), ph = int(playable_y1_ - playable_y0_ + 0.5f);
-            if (!std::getenv("SC2_MINIMAP_TGA_PADDED") && pw > 0 && ph > 0 && (pw < minimap_tw_ || ph < minimap_th_) &&
+            if (!std::getenv("OMC_MINIMAP_TGA_PADDED") && pw > 0 && ph > 0 && (pw < minimap_tw_ || ph < minimap_th_) &&
                 minimap_terrain_.size() == std::size_t(minimap_tw_) * std::size_t(minimap_th_) * 3) {
                 const int cw = std::min(pw, minimap_tw_), ch = std::min(ph, minimap_th_);
                 const int ox = (minimap_tw_ - cw) / 2, oy = (minimap_th_ - ch) / 2;
@@ -8821,29 +10040,28 @@ void MeleeGame::build_overlay(std::uint32_t view_w, std::uint32_t view_h,
                            console_panel.authored && console_panel.authored->info.ok() && MatchResult::banner(outcome_)[0] == '\0';
     if (unit_pane) content.selection_summary.clear();
     content.widget_art = cfg_.human_player >= 0 && ui_store_ && console_panel.authored &&
-                         !std::getenv("SC2_NO_CONSOLE_WIDGET_ART");
+                         !std::getenv("OMC_NO_CONSOLE_WIDGET_ART");
     draw::set_forced_font_px(forced_px);
     ov_lap.lap("ov.layout");
-    std::vector<std::uint8_t> hud;
+    static std::vector<std::uint8_t> hud;
     {
-        SC2_PROF_SCOPE("ov.hud_render");
-        hud =
-        HudRender::render(content, world_, map_w_, map_h_, view_w, view_h, &cam, &backdrop,
-                          console_tex_.ok() ? &console_panel : nullptr);
+        OMC_PROF_SCOPE("ov.hud_render");
+        HudRender::render_into(hud, content, world_, map_w_, map_h_, view_w, view_h, &cam, &backdrop,
+                               console_tex_.ok() ? &console_panel : nullptr);
     }
     draw::set_forced_font_px(0);
     ov_lap.lap("ov.hud");
     std::vector<float> status_anchor_z(world_.units().size(), 0.0f);
     std::vector<float> status_bar_w(world_.units().size(), 0.0f);
     std::vector<float> status_bar_off(world_.units().size(), 0.0f);
-    const bool bar_offset_rule = cat_ && !std::getenv("SC2_STATUS_ANCHOR_OVERHEAD");
-    static const bool kPrepUncached = std::getenv("SC2_STATUS_PREP_UNCACHED") != nullptr;
-    const bool anchor_bounds_once = std::getenv("SC2_STATUS_ANCHOR_BOUNDS") != nullptr;
-    const bool anchor_trace_once = std::getenv("SC2_STATUS_ANCHOR_TRACE") != nullptr;
-    const bool bar_by_radius_once = std::getenv("SC2_BAR_WIDTH_BY_RADIUS") != nullptr;
-    auto anchor_bounds = [&] { return kPrepUncached ? std::getenv("SC2_STATUS_ANCHOR_BOUNDS") != nullptr : anchor_bounds_once; };
-    auto anchor_trace = [&] { return kPrepUncached ? std::getenv("SC2_STATUS_ANCHOR_TRACE") != nullptr : anchor_trace_once; };
-    auto bar_by_radius = [&] { return kPrepUncached ? std::getenv("SC2_BAR_WIDTH_BY_RADIUS") != nullptr : bar_by_radius_once; };
+    const bool bar_offset_rule = cat_ && !std::getenv("OMC_STATUS_ANCHOR_OVERHEAD");
+    static const bool kPrepUncached = std::getenv("OMC_STATUS_PREP_UNCACHED") != nullptr;
+    const bool anchor_bounds_once = std::getenv("OMC_STATUS_ANCHOR_BOUNDS") != nullptr;
+    const bool anchor_trace_once = std::getenv("OMC_STATUS_ANCHOR_TRACE") != nullptr;
+    const bool bar_by_radius_once = std::getenv("OMC_BAR_WIDTH_BY_RADIUS") != nullptr;
+    auto anchor_bounds = [&] { return kPrepUncached ? std::getenv("OMC_STATUS_ANCHOR_BOUNDS") != nullptr : anchor_bounds_once; };
+    auto anchor_trace = [&] { return kPrepUncached ? std::getenv("OMC_STATUS_ANCHOR_TRACE") != nullptr : anchor_trace_once; };
+    auto bar_by_radius = [&] { return kPrepUncached ? std::getenv("OMC_BAR_WIDTH_BY_RADIUS") != nullptr : bar_by_radius_once; };
     auto display_height = [&](const std::string& id) {
         if (kPrepUncached) return cat_->unit_display_height(id);
         auto hit = display_h_cache_.find(id);
@@ -8854,7 +10072,7 @@ void MeleeGame::build_overlay(std::uint32_t view_w, std::uint32_t view_h,
         if (!u.alive) continue;
         const float ux = float(u.x.to_double()), uy = float(u.y.to_double());
         const formats::Model* m = (u.id < driver_.actors.size()) ? driver_.actors[u.id].model : nullptr;
-        static std::unordered_map<const formats::Model*, float> ref_z;
+        std::unordered_map<const formats::Model*, float>& ref_z = ref_z_cache_;
         float top = m ? m->bounds_max[2] : float(u.radius.to_double());
         if (m && !anchor_bounds()) {
             auto it = ref_z.find(m);
@@ -8886,7 +10104,7 @@ void MeleeGame::build_overlay(std::uint32_t view_w, std::uint32_t view_h,
                 oit = authored_off.emplace(u.catalog_id, float(cat_->scalar_num("CActorUnit", u.catalog_id, "BarOffset").value_or(100.0))).first;
             status_bar_off[u.id] = oit->second;
             status_anchor_z[u.id] = ground_z_at(ux, uy);
-            static const bool kAirOrigin = std::getenv("SC2_STATUS_AIR_ON_GROUND") == nullptr;
+            static const bool kAirOrigin = std::getenv("OMC_STATUS_AIR_ON_GROUND") == nullptr;
             float dh = kAirOrigin ? display_height(u.catalog_id) : 0.0f;
             if (kAirOrigin && u.flying && dh <= 0.0f) {
                 const float fh = display_height(u.catalog_id + "Flying");
@@ -8908,16 +10126,21 @@ void MeleeGame::build_overlay(std::uint32_t view_w, std::uint32_t view_h,
     }
     ov_lap.lap("ov.status_prep");
     std::vector<std::uint32_t> status_sel = selection_;
-    static const bool kNoHover = std::getenv("SC2_NO_HOVER") != nullptr;
+    static const bool kNoHover = std::getenv("OMC_NO_HOVER") != nullptr;
     if (!kNoHover && cfg_.human_player >= 0 && !hud_covers_point(view_w, view_h, console_tex_.ok() ? &console_panel : nullptr, mouse_x_, mouse_y_) && !hud_buttons_.at(mouse_x_, mouse_y_)) {
         Control hctrl = make_control(camctl_.view_proj(aspect), view_w, view_h, viewed);
         const ScreenPoint mp{mouse_x_, mouse_y_};
-        std::uint32_t hov = std::getenv("SC2_CLICK_PICK_OLD") ? hctrl.pick_own(world_, mp) : click_select_at(hctrl, mp);
-        if (hov == sim::kNoTarget && std::getenv("SC2_CLICK_PICK_OLD")) hov = hctrl.pick_target(world_, mp);
+        std::uint32_t hov = std::getenv("OMC_CLICK_PICK_OLD") ? hctrl.pick_own(world_, mp) : click_select_at(hctrl, mp);
+        if (hov == sim::kNoTarget && std::getenv("OMC_CLICK_PICK_OLD")) hov = hctrl.pick_target(world_, mp);
         if (hov < world_.units().size() && !reveal_map_ && cfg_.human_player >= 0 && vision_.width() > 0) {
             const Unit& hu = world_.units()[hov];
             if (hu.player != cfg_.human_player &&
                 !hud_fog_body_drawn(fog_body_state(hu.player, int(vision_.state_at(hu.x, hu.y)), fog_hidden_black_), FogVisibility(hu.fog_visibility)))
+                hov = sim::kNoTarget;
+            static const bool kHoverLeakOld = std::getenv("OMC_FOG_LEAK_OLD") != nullptr || std::getenv("OMC_FOG_SNAPSHOT_OLD") != nullptr;
+            if (!kHoverLeakOld && ground_fog_ && hov != sim::kNoTarget && hu.player >= 0 && hu.player != cfg_.human_player &&
+                !world_.are_allied(hu.player, cfg_.human_player) && FogVisibility(hu.fog_visibility) != FogVisibility::Visible &&
+                vision_.state_at(hu.x, hu.y) != sim::Visibility::Visible && fog_snaps_.find(hov) == fog_snaps_.end())
                 hov = sim::kNoTarget;
         }
         if (hov < world_.units().size() && !world_.units()[hov].unselectable &&
@@ -8931,14 +10154,14 @@ void MeleeGame::build_overlay(std::uint32_t view_w, std::uint32_t view_h,
     render::UnitOverlay::StatusBarOptions status_opts;
     status_opts.mode = status_bar_mode_;
     status_opts.reveal_all = alt_held_;
-    status_opts.own_rows = !std::getenv("SC2_NO_OWN_STATUS_ROWS");
+    status_opts.own_rows = !std::getenv("OMC_NO_OWN_STATUS_ROWS");
     status_opts.viewer_player = viewed;
     status_opts.selection = &status_sel;
     status_opts.anchor_z = &status_anchor_z;
     status_opts.bar_width = &status_bar_w;
     status_opts.bar_offset = &status_bar_off;
     std::vector<std::uint8_t> status_cargo_ok(world_.units().size(), 1);
-    if (cat_ && !std::getenv("SC2_CARGO_ROW_ALWAYS"))
+    if (cat_ && !std::getenv("OMC_CARGO_ROW_ALWAYS"))
         for (const Unit& u : world_.units()) {
             if (!u.alive || u.cargo_space <= 0 || u.catalog_id.empty()) continue;
             static std::unordered_map<std::string, std::string> load_req;
@@ -8984,12 +10207,13 @@ void MeleeGame::build_overlay(std::uint32_t view_w, std::uint32_t view_h,
         status_opts.shield_trail = &status_trail_shield_;
     }
     ov_lap.lap("ov.status_opts");
-    std::vector<std::uint8_t> units =
-        unit_overlay_.render_status(world_, camctl_.view_proj(aspect), view_w, view_h, status_opts);
+    static std::vector<std::uint8_t> units;
+    static int units_y0 = 0, units_y1 = -1;
+    unit_overlay_.render_status_into(units, units_y0, units_y1, world_, camctl_.view_proj(aspect), view_w, view_h, status_opts);
     if (keep_status_layer_) status_layer_ = units;
     ov_lap.lap("ov.status");
 
-    { SC2_PROF_SCOPE("ov.clear"); out.assign(std::size_t(view_w) * view_h * 4, 0); }
+    { OMC_PROF_SCOPE("ov.clear"); out.assign(std::size_t(view_w) * view_h * 4, 0); }
 
     if (!ground_fog_ && !reveal_map_ && cfg_.human_player >= 0 && map_w_ > 0.0f && map_h_ > 0.0f && !minimap_fog_.empty()) {
         Control fctrl = make_control(camctl_.view_proj(aspect), view_w, view_h, viewed);
@@ -9084,8 +10308,9 @@ void MeleeGame::build_overlay(std::uint32_t view_w, std::uint32_t view_h,
 
     ov_lap.lap("ov.fog");
     {
-        SC2_PROF_SCOPE("ov.alpha_over");
-        alpha_over(out, units);
+        OMC_PROF_SCOPE("ov.alpha_over");
+        if (units_y0 <= units_y1)
+            alpha_over(out, units, std::size_t(units_y0) * std::size_t(view_w) * 4, std::size_t(units_y1 + 1) * std::size_t(view_w) * 4);
         alpha_over(out, hud);
     }
     ov_lap.lap("ov.compose");
@@ -9254,7 +10479,9 @@ void MeleeGame::build_overlay(std::uint32_t view_w, std::uint32_t view_h,
             }
         }
 
-        if (cfg_.human_player >= 0)
+        static const bool kWaypointPathOld = std::getenv("OMC_WAYPOINT_PATH_OLD") != nullptr;
+        if (!kWaypointPathOld && cfg_.human_player >= 0) draw_order_paths(view_w, view_h, out, ovctrl, clip_console);
+        if (kWaypointPathOld && cfg_.human_player >= 0)
             for (std::uint32_t id : selection_) {
                 if (id >= world_.units().size()) continue;
                 const Unit& u = world_.unit(id);
@@ -9271,7 +10498,7 @@ void MeleeGame::build_overlay(std::uint32_t view_w, std::uint32_t view_h,
                 }
             }
 
-        if (cfg_.human_player >= 0 && cat_)
+        if (kWaypointPathOld && cfg_.human_player >= 0 && cat_)
             for (std::uint32_t id : selection_) {
                 if (id >= world_.units().size()) continue;
                 const Unit& u = world_.unit(id);
@@ -9286,7 +10513,7 @@ void MeleeGame::build_overlay(std::uint32_t view_w, std::uint32_t view_h,
                     if (auto col = cat_->ability_rally_color(ab)) {
                         rr = (*col)[0]; rg = (*col)[1]; rb = (*col)[2];
                     }
-                const IconAtlas::Icon* wpl = (ui_store_ && !std::getenv("SC2_RALLY_LINE_PLAIN")) ? &icons_.get(*ui_store_, "Assets/Textures/waypointline.dds") : nullptr;
+                const IconAtlas::Icon* wpl = (ui_store_ && !std::getenv("OMC_RALLY_LINE_PLAIN")) ? &icons_.get(*ui_store_, "Assets/Textures/waypointline.dds") : nullptr;
                 const double seg_len = std::hypot(double(tx - ux), double(ty - uy));
                 if (wpl && wpl->ok() && seg_len > 1.0) {
                     const double dxn = double(tx - ux) / seg_len, dyn = double(ty - uy) / seg_len;
@@ -9321,19 +10548,19 @@ void MeleeGame::build_overlay(std::uint32_t view_w, std::uint32_t view_h,
                 } else {
                     line(ux, uy, tx, ty, rr, rg, rb, 170);
                 }
-                if (std::getenv("SC2_RALLY_LINE_PLAIN")) marker(tx, ty, rr, rg, rb);
+                if (std::getenv("OMC_RALLY_LINE_PLAIN")) marker(tx, ty, rr, rg, rb);
             }
 
     }
 
     ov_lap.lap("ov.labels");
-    static const bool kIconUncached = std::getenv("SC2_HUD_ICON_UNCACHED") != nullptr;
+    static const bool kIconUncached = std::getenv("OMC_HUD_ICON_UNCACHED") != nullptr;
     auto blit_icon_tinted = [&](const IconAtlas::Icon& ic, int dx0, int dy0, int dx1, int dy1,
                                 float tr, float tg, float tb) {
         if (!ic.ok() || dx1 <= dx0 || dy1 <= dy0) return;
         const int dw = dx1 - dx0, dh = dy1 - dy0;
         const float tint[3] = {tr, tg, tb};
-        static const bool tint_nearest_all = std::getenv("SC2_HUD_ICON_NEAREST") != nullptr;
+        static const bool tint_nearest_all = std::getenv("OMC_HUD_ICON_NEAREST") != nullptr;
         if (!kIconUncached) {
             const std::vector<float>& lay = icon_resample_.box4(ic, dw, dh, tint_nearest_all);
             for (int y = 0; y < dh; ++y)
@@ -9355,7 +10582,7 @@ void MeleeGame::build_overlay(std::uint32_t view_w, std::uint32_t view_h,
         }
         for (int y = 0; y < dh; ++y)
             for (int x = 0; x < dw; ++x) {
-                static const bool tint_nearest = std::getenv("SC2_HUD_ICON_NEAREST") != nullptr;
+                static const bool tint_nearest = std::getenv("OMC_HUD_ICON_NEAREST") != nullptr;
                 float a = 0.0f, rgb[3] = {0.0f, 0.0f, 0.0f};
                 if (tint_nearest || (int(ic.w) <= dw && int(ic.h) <= dh)) {
                     const int sx = x * int(ic.w) / dw, sy = y * int(ic.h) / dh;
@@ -9408,7 +10635,7 @@ void MeleeGame::build_overlay(std::uint32_t view_w, std::uint32_t view_h,
     auto blit_icon = [&](const IconAtlas::Icon& ic, int dx0, int dy0, int dx1, int dy1) {
         if (!ic.ok() || dx1 <= dx0 || dy1 <= dy0) return;
         const int dw = dx1 - dx0, dh = dy1 - dy0;
-        static const bool nearest_only = std::getenv("SC2_HUD_ICON_NEAREST") != nullptr;
+        static const bool nearest_only = std::getenv("OMC_HUD_ICON_NEAREST") != nullptr;
         if (!nearest_only && (int(ic.w) > dw || int(ic.h) > dh) && !kIconUncached) {
             const std::vector<double>& lay = icon_resample_.area(ic, dw, dh);
             for (int y = 0; y < dh; ++y)
@@ -9529,8 +10756,8 @@ void MeleeGame::build_overlay(std::uint32_t view_w, std::uint32_t view_h,
                         portrait_lead = lead_now;
                         portrait_start_ms = double(clock_ms_);
                     }
-                    static const bool match_clock = std::getenv("SC2_PORTRAIT_FROM_SELECTION") == nullptr;
-                    portrait_time_ms() = std::getenv("SC2_PORTRAIT_STILL") ? 0.0f
+                    static const bool match_clock = std::getenv("OMC_PORTRAIT_FROM_SELECTION") == nullptr;
+                    portrait_time_ms() = std::getenv("OMC_PORTRAIT_STILL") ? 0.0f
                                          : match_clock ? float(clock_ms_) : float(std::max(1.0, double(clock_ms_) - portrait_start_ms));
                     {
                         PortraitDof& pd = portrait_dof();
@@ -9547,10 +10774,10 @@ void MeleeGame::build_overlay(std::uint32_t view_w, std::uint32_t view_h,
                     last_portrait_h_ = ph;
                     {
                         static std::uint32_t told_w = 0, told_h = 0;
-                        if (std::getenv("SC2_MEM_TRACE") && (pw != told_w || ph != told_h)) {
+                        if (std::getenv("OMC_MEM_TRACE") && (pw != told_w || ph != told_h)) {
                             told_w = pw;
                             told_h = ph;
-                            std::printf("crafter-sc: portrait pane %ux%u px at a %ux%u view\n", pw, ph, view_w, view_h);
+                            std::printf("overmindcore: portrait pane %ux%u px at a %ux%u view\n", pw, ph, view_w, view_h);
                         }
                     }
                     if (preuse) {
@@ -9558,7 +10785,7 @@ void MeleeGame::build_overlay(std::uint32_t view_w, std::uint32_t view_h,
                     } else {
                         portrait_load_mode() = portrait_async_ && !warming_ ? 1 : 0;
                         try { img = portrait_renderer_(*ui_store_, p->model, p->fov_rad, p->cam_bone, p->znear, p->zfar, pw, ph, p->light.found ? &p->light : nullptr); } catch (const std::exception& e) {
-                            if (std::getenv("SC2_PORTRAIT_TRACE")) std::fprintf(stderr, "portrait: render threw %s\n", e.what());
+                            if (std::getenv("OMC_PORTRAIT_TRACE")) std::fprintf(stderr, "portrait: render threw %s\n", e.what());
                         }
                         portrait_load_mode() = 0;
                         if (portrait_hz_ > 0.0f && !warming_) {
@@ -9571,7 +10798,7 @@ void MeleeGame::build_overlay(std::uint32_t view_w, std::uint32_t view_h,
                     }
                     render::frame_prof_count("portrait.reused", preuse ? 1.0 : 0.0);
                     ov_lap.lap("ov.portrait_render");
-                    if (std::getenv("SC2_PORTRAIT_TRACE")) {
+                    if (std::getenv("OMC_PORTRAIT_TRACE")) {
                         std::size_t covered = 0;
                         for (std::size_t q = 3; q < img.size(); q += 4) covered += img[q] != 0;
                         std::fprintf(stderr, "portrait: %s %ux%u -> %zu bytes, %zu covered, fov %.3f cam bone %d near %.3f far %.3f verts %u\n", p->path.c_str(), pw, ph,
@@ -9594,16 +10821,16 @@ void MeleeGame::build_overlay(std::uint32_t view_w, std::uint32_t view_h,
                                 out[di + 3] = std::uint8_t(a + (out[di + 3] * (255 - a)) / 255);
                             }
                         req.drawn = true;
-                        if (std::getenv("SC2_PORTRAIT_TRACE"))
+                        if (std::getenv("OMC_PORTRAIT_TRACE"))
                             std::fprintf(stderr, "portrait: console picture ok %d %ux%u view %ux%u\n", int(console_tex_.ok()), unsigned(console_tex_.w), unsigned(console_tex_.h), view_w, view_h);
-                        if (console_tex_.ok() && console_tex_.w == view_w && console_tex_.h <= view_h && !std::getenv("SC2_PORTRAIT_OVER_CONSOLE")) {
+                        if (console_tex_.ok() && console_tex_.w == view_w && console_tex_.h <= view_h && !std::getenv("OMC_PORTRAIT_OVER_CONSOLE")) {
                             const int coy = int(view_h) - int(console_tex_.h);
                             const int ccx = (req.rect.x0 + req.rect.x1) / 2, ccy = (req.rect.y0 + req.rect.y1) / 2 - coy;
                             const bool well_open = ccx >= 0 && ccy >= 0 && ccx < int(view_w) && ccy < int(console_tex_.h);
                             const std::size_t wc = well_open ? (std::size_t(ccy) * view_w + std::size_t(ccx)) * 4 : 0;
                             const int well_rgb[3] = {well_open ? int(console_tex_.rgba[wc]) : 0, well_open ? int(console_tex_.rgba[wc + 1]) : 0,
                                                      well_open ? int(console_tex_.rgba[wc + 2]) : 0};
-                            if (std::getenv("SC2_PORTRAIT_TRACE")) {
+                            if (std::getenv("OMC_PORTRAIT_TRACE")) {
                                 std::size_t clear = 0, total = 0;
                                 for (int dy = std::max(coy, req.rect.y0); dy < std::min(int(view_h), req.rect.y1); ++dy)
                                     for (int dx = std::max(0, req.rect.x0); dx < std::min(int(view_w), req.rect.x1); ++dx) {
@@ -9635,7 +10862,7 @@ void MeleeGame::build_overlay(std::uint32_t view_w, std::uint32_t view_h,
     };
     if (!unit_pane && cfg_.human_player >= 0 && selection_.size() > 1 && selection_[0] < world_.units().size() &&
         world_.unit(selection_[0]).alive && world_.unit(selection_[0]).player == cfg_.human_player &&
-        MatchResult::banner(outcome_)[0] == '\0' && !std::getenv("SC2_NO_GROUP_PORTRAIT"))
+        MatchResult::banner(outcome_)[0] == '\0' && !std::getenv("OMC_NO_GROUP_PORTRAIT"))
         draw_portrait(world_.unit(selection_[0]).catalog_id);
     ov_lap.lap("ov.portrait");
     if (cfg_.human_player >= 0 && selection_.size() == 1 &&
@@ -9669,7 +10896,7 @@ void MeleeGame::build_overlay(std::uint32_t view_w, std::uint32_t view_h,
             const Row rows[3] = {{ar->vital_shield, su.shields.to_double(), su.shields_max.to_double()},
                                  {ar->vital_life, su.hp.to_double(), su.hp_max.to_double()},
                                  {ar->vital_energy, su.energy.to_double(), su.energy_max.to_double()}};
-            const bool vital_shuffle = !std::getenv("SC2_VITAL_ROWS_FIXED");
+            const bool vital_shuffle = !std::getenv("OMC_VITAL_ROWS_FIXED");
             int vital_slot = 0;
             for (const Row& row : rows) {
                 if (row.max <= 0.0 || !row.rect.ok()) continue;
@@ -9680,20 +10907,20 @@ void MeleeGame::build_overlay(std::uint32_t view_w, std::uint32_t view_h,
                                  int(place.x1 * vsc + 0.5), int(place.y1 * vsc + 0.5)};
                 if (lr.w() <= 0 || lr.h() <= 0) continue;
                 char vt[48];
-                static const bool vital_no_gap = std::getenv("SC2_VITAL_NO_GAP") != nullptr;
+                static const bool vital_no_gap = std::getenv("OMC_VITAL_NO_GAP") != nullptr;
                 std::snprintf(vt, sizeof(vt), vital_no_gap ? "%d/%d" : "%d/ %d", int(row.cur + 0.5), int(row.max + 0.5));
-                static const bool vital_whole_px = std::getenv("SC2_VITAL_WHOLE_PX") != nullptr;
+                static const bool vital_whole_px = std::getenv("OMC_VITAL_WHOLE_PX") != nullptr;
                 draw::set_forced_font_px(vital_whole_px ? int(14.0 * vsc + 0.5) : render::OverlayFont::fractional(14.0 * vsc));
                 const FaceScope vital_face(style_face(vl.font));
                 const int vw = text_w_rgba(vt, 1);
                 const int vx = (!vl.set || vl.centred) ? lr.x0 + (lr.w() - vw) / 2 : lr.x0;
                 const int vy = lr.y0 + std::max(0, (lr.h() - ui::kFontH) / 2);
-                if (std::getenv("SC2_LABEL_FACE_TRACE") && &row == &rows[1])
+                if (std::getenv("OMC_LABEL_FACE_TRACE") && &row == &rows[1])
                     std::fprintf(stderr, "[labelface] vital rect %d %d %d %d text y %d px %d\n", lr.x0, lr.y0, lr.x1, lr.y1, vy, int(14.0 * vsc + 0.5));
                 int vr = vl.set ? vl.r : 220, vg = vl.set ? vl.g : 226, vb = vl.set ? vl.b : 235;
                 if (&row == &rows[1]) {
                     const double lf = row.max > 0.0 ? row.cur / row.max : 1.0;
-                    if (std::getenv("SC2_VITAL_ROWS_FIXED")) hc(float(lf), vr, vg, vb);
+                    if (std::getenv("OMC_VITAL_ROWS_FIXED")) hc(float(lf), vr, vg, vb);
                     else if (lf >= 0.75) { vr = 22; vg = 229; vb = 0; }
                     else if (lf >= 0.5) { vr = 229; vg = 221; vb = 0; }
                     else if (lf >= 0.25) { vr = 229; vg = 129; vb = 0; }
@@ -9727,7 +10954,7 @@ void MeleeGame::build_overlay(std::uint32_t view_w, std::uint32_t view_h,
             const float bar_top = ip.y0 + 10.0f + 26.0f;
             pane.life_bar = {int(ip.x0 * sc + 0.5), int(bar_top * sc + 0.5), int((ip.x0 + 128.0f) * sc + 0.5), int((bar_top + 16.0f) * sc + 0.5)};
             pane.life_frac = hpf;
-            if (std::getenv("SC2_PANE_LIFE_BAR")) {
+            if (std::getenv("OMC_PANE_LIFE_BAR")) {
                 int r = 0, g = 0, b = 0;
                 hc(hpf, r, g, b);
                 const int fill_x1 = pane.life_bar.x0 + int((pane.life_bar.x1 - pane.life_bar.x0) * hpf + 0.5f);
@@ -9755,7 +10982,7 @@ void MeleeGame::build_overlay(std::uint32_t view_w, std::uint32_t view_h,
             const LabelLook fl = resolve_label_style(
                 hud_style_set(), hud_authored_ ? hud_authored_->style_unit_info : std::string(),
                 human_race());
-            if (std::getenv("SC2_PANE_LIFE_BAR"))
+            if (std::getenv("OMC_PANE_LIFE_BAR"))
                 draw_text_rgba(out, view_w, view_h, pane.life_bar.x1 + 8, pane.life_bar.y0,
                                pane.info.c_str(), 1, fl.set ? fl.r : 210, fl.set ? fl.g : 214,
                                fl.set ? fl.b : 220);
@@ -9775,7 +11002,7 @@ void MeleeGame::build_overlay(std::uint32_t view_w, std::uint32_t view_h,
                     if (li == 1 && val[1].empty()) continue;
                     const int lw = text_w_rgba(lab[li], 1), vw = text_w_rgba(val[li], 1);
                     const int lx = (unit_x0 + unit_x1) / 2 - (lw + vw) / 2;
-                    static const bool info_low = std::getenv("SC2_PANE_INFO_LOW") != nullptr;
+                    static const bool info_low = std::getenv("OMC_PANE_INFO_LOW") != nullptr;
                     const int ly = bottom - ifpx - (info_low ? 2 : 2 + int(5.0 * sc + 0.5)) - (li == 0 ? int(20.0 * sc + 0.5) : 0);
                     draw_text_rgba(out, view_w, view_h, lx, ly, lab[li].c_str(), 1, race == 1 ? 110 : race == 2 ? 245 : 155,
                                    race == 1 ? 170 : race == 2 ? 140 : 255, race == 1 ? 255 : race == 2 ? 70 : 190);
@@ -9810,7 +11037,7 @@ void MeleeGame::build_overlay(std::uint32_t view_w, std::uint32_t view_h,
             }
             hud_unit_pane_ = std::move(pane);
         }
-        if (std::getenv("SC2_PORTRAIT_TRACE"))
+        if (std::getenv("OMC_PORTRAIT_TRACE"))
             std::fprintf(stderr, "portrait: unit_pane %d models %d store %d rect ok %d (%.1f %.1f %.1f %.1f) renderer %d unit %s\n", int(unit_pane),
                          int(models_ != nullptr), int(ui_store_ != nullptr), int(console_panel.authored && console_panel.authored->portrait.ok()),
                          console_panel.authored ? double(console_panel.authored->portrait.x0) : 0.0, console_panel.authored ? double(console_panel.authored->portrait.y0) : 0.0,
@@ -9844,7 +11071,7 @@ void MeleeGame::build_overlay(std::uint32_t view_w, std::uint32_t view_h,
         }
         if (wm_model && !drew_authored) {
             const int MW = PW - 8, MH = PH - 16;
-            const WireMask& msk = wire_mask(wm_model, MW, MH);
+            const WireMask& msk = wire_mask(wire_mask_cache_, wm_model, MW, MH);
             const int mx0 = px0 + 4, my0 = py0 + 12;
             int r, g, b; hc(hpf, r, g, b);
             const bool shielded = su.shields.raw() > 0;
@@ -9896,12 +11123,12 @@ void MeleeGame::build_overlay(std::uint32_t view_w, std::uint32_t view_h,
                 frac = float(world_.build_progress(sel).to_double());
                 subject = world_.unit(sel).catalog_id;
             } else if (world_.pending_progress(sel, f)) {
-                if (std::getenv("SC2_QUEUE_PROGRESS_PANE")) {
+                if (std::getenv("OMC_QUEUE_PROGRESS_PANE")) {
                     frac = float(f.to_double());
                     const std::vector<sim::World::QueueSlotView> q = world_.queue_view(sel);
                     if (!q.empty()) subject = q.front().catalog_id;
                 }
-            } else if (std::getenv("SC2_RESEARCH_PANE_OLD") && world_.research_progress(cfg_.human_player, f, rid)) {
+            } else if (std::getenv("OMC_RESEARCH_PANE_OLD") && world_.research_progress(cfg_.human_player, f, rid)) {
                 frac = float(f.to_double());
                 subject = rid;
             }
@@ -9967,7 +11194,7 @@ void MeleeGame::build_overlay(std::uint32_t view_w, std::uint32_t view_h,
             const HudAuthoredRects::R& q = *kRects[i];
             if (!q.ok()) continue;
             std::string path = cat_->resolve_asset(std::string(kTokens[i]) + suffix);
-            if (i < 2 && !std::getenv("SC2_RESOURCE_ICON_PLATES")) {
+            if (i < 2 && !std::getenv("OMC_RESOURCE_ICON_PLATES")) {
                 const std::string bare = cat_->resolve_asset(std::string(i == 0 ? "@@UI/ResourceIconNoBackground0" : "@@UI/ResourceIconNoBackground1") + suffix);
                 if (!bare.empty() && bare[0] != '@' && icons_.get(*ui_store_, bare.c_str()).ok()) path = bare;
             }
@@ -9984,7 +11211,7 @@ void MeleeGame::build_overlay(std::uint32_t view_w, std::uint32_t view_h,
         const int fpx = std::max(6, int(16.0 * hsc + 0.5));
         draw::set_forced_font_px(fpx);
         const LabelLook tag_look = resolve_label_style(hud_style_set(), "TextTag", int(console_panel.race));
-        const FaceScope harvest_face(std::getenv("SC2_HARVEST_LABEL_DEFAULT_FACE")
+        const FaceScope harvest_face(std::getenv("OMC_HARVEST_LABEL_DEFAULT_FACE")
                                          ? nullptr
                                          : style_face(tag_look.set && !tag_look.font.empty() ? tag_look.font : std::string("UI/Fonts/EurostileExt-Reg.otf")));
         for (const HarvestLabel& hl : harvest_labels) {
@@ -10025,11 +11252,12 @@ void MeleeGame::build_overlay(std::uint32_t view_w, std::uint32_t view_h,
             const int tw = text_w_rgba(text, 1);
             const int w = pad + isz + gap + tw + pad, h = std::max(isz, fpx) + int(8.0 * hsc + 0.5);
             const int x0 = hl.sx - w / 2, y0 = hl.sy + h / 2;
+            static const bool kPlateOpaque = std::getenv("OMC_HARVEST_PLATE_OPAQUE") != nullptr;
             for (int y = std::max(0, y0); y < std::min(int(view_h), y0 + h); ++y)
                 for (int x = std::max(0, x0); x < std::min(int(view_w), x0 + w); ++x) {
                     if (hud_covers_point(view_w, view_h, &console_panel, float(x), float(y))) continue;
                     const std::size_t di = (std::size_t(y) * view_w + std::size_t(x)) * 4;
-                    if (out[di + 3] == 0 && !std::getenv("SC2_HARVEST_PLATE_OPAQUE")) {
+                    if (out[di + 3] == 0 && !kPlateOpaque) {
                         out[di] = out[di + 1] = out[di + 2] = 0;
                         out[di + 3] = 102;
                         continue;
@@ -10049,7 +11277,7 @@ void MeleeGame::build_overlay(std::uint32_t view_w, std::uint32_t view_h,
     ov_lap.lap("ov.resources");
     bool console_cell_art = false;
     refresh_hud_buttons(view_w, view_h);
-    if (cfg_.human_player >= 0 && ui_store_ && console_panel.authored && !std::getenv("SC2_NO_CONSOLE_WIDGET_ART")) {
+    if (cfg_.human_player >= 0 && ui_store_ && console_panel.authored && !std::getenv("OMC_NO_CONSOLE_WIDGET_ART")) {
         const int hr = human_race();
         const char* skin = hr == 1 ? "defaultprotoss" : hr == 2 ? "defaultzerg" : "defaultterran";
         const char* race3 = hr == 1 ? "prot" : hr == 2 ? "zerg" : "terr";
@@ -10084,16 +11312,24 @@ void MeleeGame::build_overlay(std::uint32_t view_w, std::uint32_t view_h,
             const std::string bg = skin_tex("helperbutton_background");
             const std::string icon_w = std::string("Assets/Textures/ui_console_helperbutton_icon_worker_") + race3 + ".dds";
             const std::string icon_a = std::string("Assets/Textures/ui_console_helperbutton_icon_army_") + race3 + ".dds";
-            const double kLeft[2] = {0.0, 87.0};
-            const std::string* kIcon[2] = {&icon_w, &icon_a};
-            const char* kKey[2] = {"F1", "F2"};
+            const std::string wsfx = ui::layout_race_suffix(hr);
+            std::string icon_g = cat_ ? cat_->resolve_asset("@@@UI/WarpButtonIcon", wsfx, wsfx) : std::string();
+            if ((icon_g.empty() || icon_g[0] == '@') && cat_) icon_g = cat_->resolve_asset("@@UI/WarpButtonIcon", wsfx);
+            if (icon_g.empty() || icon_g[0] == '@') icon_g = "Assets/Textures/ui_console_helperbutton_icon_warpgate_prot.dds";
+            for (char& ch : icon_g)
+                if (ch == '\\') ch = '/';
+            const double kLeft[3] = {0.0, 87.0, 174.0};
+            const std::string* kIcon[3] = {&icon_w, &icon_a, &icon_g};
+            const char* kKey[3] = {"F1", "F2", ""};
             const double bottom = 1200.0 - 327.0 + 25.0;
             const float kIconTint[3][3] = {{0.0f, 200.0f, 120.0f}, {100.0f, 180.0f, 255.0f}, {255.0f, 120.0f, 20.0f}};
             const float kCountTint[3][3] = {{60.0f, 255.0f, 150.0f}, {40.0f, 100.0f, 255.0f}, {150.0f, 100.0f, 50.0f}};
             const int ri = hr == 1 ? 1 : hr == 2 ? 2 : 0;
-            const int kCount[2] = {content.idle_workers, content.army_units};
+            const int kCount[3] = {content.idle_workers, content.army_units, content.warp_gates_ready};
             const IconAtlas::Icon& counter = icons_.get(*ui_store_, "Assets/Textures/ui_console_menubutton_counter.dds");
-            for (int i = 0; i < 2; ++i) {
+            static const bool kWarpButtonArtOld = std::getenv("OMC_WARP_BUTTON_ART_OLD") != nullptr;
+            const int helpers = kWarpButtonArtOld || content.warp_gates_ready <= 0 ? 2 : 3;
+            for (int i = 0; i < helpers; ++i) {
                 const bool on = kCount[i] > 0;
                 const double top = bottom - 72.0;
                 blit_icon(icons_.get(*ui_store_, bg.c_str()), px(kLeft[i]), px(bottom - 62.0), px(kLeft[i] + 92.0), px(bottom));
@@ -10101,16 +11337,16 @@ void MeleeGame::build_overlay(std::uint32_t view_w, std::uint32_t view_h,
                 blit_icon_tinted(icons_.get(*ui_store_, kIcon[i]->c_str()), px(kLeft[i] + 9.0), px(bottom - 53.0), px(kLeft[i] + 81.0),
                                  px(bottom - 11.0), on ? kIconTint[ri][0] / 255.0f : ig, on ? kIconTint[ri][1] / 255.0f : ig,
                                  on ? kIconTint[ri][2] / 255.0f : ig);
-                if (i == 0 && on && !std::getenv("SC2_NO_HELPER_GLOW")) {
+                if (i == 0 && on && !std::getenv("OMC_NO_HELPER_GLOW")) {
                     const float gl = hud_helper_glow(hud_ui_.selection.glow_t);
                     blit_icon_add(icons_.get(*ui_store_, bg.c_str()), px(kLeft[i]), px(bottom - 62.0), px(kLeft[i] + 92.0), px(bottom), gl, 1.0f, 1.0f, 1.0f);
                     blit_icon_add(icons_.get(*ui_store_, kIcon[i]->c_str()), px(kLeft[i] + 9.0), px(bottom - 53.0), px(kLeft[i] + 81.0), px(bottom - 11.0),
                                   gl * 200.0f / 255.0f, kIconTint[ri][0] / 255.0f, kIconTint[ri][1] / 255.0f, kIconTint[ri][2] / 255.0f);
                 }
-                draw_text_rgba(out, view_w, view_h, px(kLeft[i] + 50.0), px(bottom - 31.0), kKey[i], 1, 235, 240, 236);
+                if (kKey[i][0]) draw_text_rgba(out, view_w, view_h, px(kLeft[i] + 50.0), px(bottom - 31.0), kKey[i], 1, 235, 240, 236);
                 if (counter.ok()) {
                     const int cx0 = px(kLeft[i] + 48.0), cy0 = px(top), cx1 = px(kLeft[i] + 92.0), cy1 = px(top + 28.0);
-                    static const bool wide_corner = std::getenv("SC2_HELPER_COUNT_WIDE_CORNER") != nullptr;
+                    static const bool wide_corner = std::getenv("OMC_HELPER_COUNT_WIDE_CORNER") != nullptr;
                     const int cs = 8, cd = std::max(1, px(8.0));
                     if (!wide_corner) {
                         const float dk = 0.5f;
@@ -10138,7 +11374,7 @@ void MeleeGame::build_overlay(std::uint32_t view_w, std::uint32_t view_h,
                     const int fpx = std::max(6, px(16.0));
                     const int saved_px = draw::forced_font_px();
                     draw::set_forced_font_px(fpx);
-                    const FaceScope count_face(std::getenv("SC2_HELPER_COUNT_DEFAULT_FACE") ? nullptr : style_font("IdleButtonCharge", "UI/Fonts/Eurostile-Reg.otf"));
+                    const FaceScope count_face(std::getenv("OMC_HELPER_COUNT_DEFAULT_FACE") ? nullptr : style_font("IdleButtonCharge", "UI/Fonts/Eurostile-Reg.otf"));
                     const int nw = text_w_rgba(n, 1);
                     const int g = on ? 235 : 112;
                     const int dxy = wide_corner ? 1 : -1;
@@ -10154,10 +11390,10 @@ void MeleeGame::build_overlay(std::uint32_t view_w, std::uint32_t view_h,
                 const int fpx = std::max(6, px(20.0));
                 const int saved_px = draw::forced_font_px();
                 draw::set_forced_font_px(fpx);
-                const FaceScope clock_face(std::getenv("SC2_CLOCK_DEFAULT_FACE") ? nullptr : style_font("MissionTimePanel", "UI/Fonts/EurostileExt-Reg.otf"));
+                const FaceScope clock_face(std::getenv("OMC_CLOCK_DEFAULT_FACE") ? nullptr : style_font("MissionTimePanel", "UI/Fonts/EurostileExt-Reg.otf"));
                 const int tw_digits = text_w_rgba(clock, 1);
-                const int tw = tw_digits + (std::getenv("SC2_CLOCK_LABEL_TIGHT") ? 0 : int(8.0 * sc + 0.5));
-                if (std::getenv("SC2_ENV_TRACE")) {
+                const int tw = tw_digits + (std::getenv("OMC_CLOCK_LABEL_TIGHT") ? 0 : int(8.0 * sc + 0.5));
+                if (std::getenv("OMC_ENV_TRACE")) {
                     static bool once = false;
                     if (!once) {
                         once = true;
@@ -10190,12 +11426,12 @@ void MeleeGame::build_overlay(std::uint32_t view_w, std::uint32_t view_h,
                         }
                 }
                 const int lr = hr == 1 ? 110 : hr == 2 ? 245 : 155, lg = hr == 1 ? 170 : hr == 2 ? 140 : 255, lb = hr == 1 ? 255 : hr == 2 ? 70 : 190;
-                const int ink_dx = std::getenv("SC2_CLOCK_LABEL_TIGHT") ? 0 : int(2.0 * sc + 0.5);
+                const int ink_dx = std::getenv("OMC_CLOCK_LABEL_TIGHT") ? 0 : int(2.0 * sc + 0.5);
                 draw_text_rgba(out, view_w, view_h, tx + ink_dx, (px(1200.0 - 302.0 - 37.0) + px(1200.0 - 302.0 - 4.0)) / 2 - fpx / 2 - px(3.0), clock.c_str(), 1, lr, lg, lb);
                 draw::set_forced_font_px(saved_px);
             }
         }
-        if (!std::getenv("SC2_NO_ALLIANCE_BUTTON")) {
+        if (!std::getenv("OMC_NO_ALLIANCE_BUTTON")) {
             const int ar = human_race();
             const char* suf = ar == 1 ? "_protoss" : ar == 2 ? "_zerg" : "";
             const HudButton* hb = hud_buttons_.find(HudButtonId::Alliance);
@@ -10232,7 +11468,7 @@ void MeleeGame::build_overlay(std::uint32_t view_w, std::uint32_t view_h,
                 if (i < 3)
                     blit_icon_tinted(icons_.get(*ui_store_, kBtnIcon[i]), px(x0 + 2.0), px(y0 + 2.0), px(x0 + 34.0), px(y0 + 34.0),
                                      0.0f, 200.0f / 255.0f, 120.0f / 255.0f);
-                if (i == 2 && !std::getenv("SC2_NO_SOCIAL_BADGE")) {
+                if (i == 2 && !std::getenv("OMC_NO_SOCIAL_BADGE")) {
                     const IconAtlas::Icon& badge = icons_.get(*ui_store_, "Assets/Textures/ui_console_menubutton_counter.dds");
                     const float kBadgeTint[3][3] = {{60.0f, 255.0f, 150.0f}, {40.0f, 100.0f, 255.0f}, {150.0f, 100.0f, 50.0f}};
                     const int bri = hr == 1 ? 1 : hr == 2 ? 2 : 0;
@@ -10254,7 +11490,7 @@ void MeleeGame::build_overlay(std::uint32_t view_w, std::uint32_t view_h,
                     const int fpx = std::max(6, px(16.0));
                     const int saved_px = draw::forced_font_px();
                     draw::set_forced_font_px(fpx);
-                    const FaceScope menu_face(std::getenv("SC2_MENU_LABEL_DEFAULT_FACE") ? nullptr : style_font("MenuBarButton", "UI/Fonts/Eurostile-Bol.otf"));
+                    const FaceScope menu_face(std::getenv("OMC_MENU_LABEL_DEFAULT_FACE") ? nullptr : style_font("MenuBarButton", "UI/Fonts/Eurostile-Bol.otf"));
                     const int mw = text_w_rgba("Menu", 1);
                     const int lr = hr == 1 ? 110 : hr == 2 ? 245 : 155, lg = hr == 1 ? 170 : hr == 2 ? 140 : 255, lb = hr == 1 ? 255 : hr == 2 ? 70 : 190;
                     draw_text_rgba(out, view_w, view_h, (px(x0) + px(x0 + kBtnW[i])) / 2 - mw / 2, (px(y0) + px(y0 + 36.0)) / 2 - fpx / 2 - 1, "Menu", 1, lr, lg, lb);
@@ -10290,7 +11526,7 @@ void MeleeGame::build_overlay(std::uint32_t view_w, std::uint32_t view_h,
         bool any_group = false;
         for (int slot : order)
             if (!groups_.recall(slot).empty()) any_group = true;
-        const bool bare_tab = !any_group && !std::getenv("SC2_NO_EMPTY_GROUP_TAB");
+        const bool bare_tab = !any_group && !std::getenv("OMC_NO_EMPTY_GROUP_TAB");
         for (int slot : order) {
             const std::vector<std::uint32_t> ids = groups_.recall(slot);
             if (ids.empty() && bare_tab && slot == 1) {
@@ -10371,7 +11607,7 @@ void MeleeGame::build_overlay(std::uint32_t view_w, std::uint32_t view_h,
     ov_lap.lap("ov.alerts");
 
     hud_page_buttons_.clear();
-    const int page_buttons = (group_pages < 1 && !group_pane.empty() && !std::getenv("SC2_NO_GROUP_PORTRAIT")) ? 1 : group_pages;
+    const int page_buttons = (group_pages < 1 && !group_pane.empty() && !std::getenv("OMC_NO_GROUP_PORTRAIT")) ? 1 : group_pages;
     if ((group_pages > 1 || page_buttons == 1) && ui_store_ && cat_ && console_panel.authored && console_panel.authored->page_buttons_ok) {
         const double sc = double(view_h) / double(kRefHeight);
         const std::string normal = cat_->resolve_asset("@@UI/GroupPageButtonNormal");
@@ -10384,7 +11620,7 @@ void MeleeGame::build_overlay(std::uint32_t view_w, std::uint32_t view_h,
             const std::string& img = p == group_page_ ? hover : normal;
             if (!img.empty() && img[0] != '@') {
                 const IconAtlas::Icon& tab = icons_.get(*ui_store_, img.c_str());
-                if (tab.ok() && tab.h >= 2 && pb.rect.w() > 0 && pb.rect.h() > 0 && !std::getenv("SC2_NO_GROUP_PORTRAIT")) {
+                if (tab.ok() && tab.h >= 2 && pb.rect.w() > 0 && pb.rect.h() > 0 && !std::getenv("OMC_NO_GROUP_PORTRAIT")) {
                     int tc[3] = {40, 125, 75};
                     hud_console_color(*ui_store_, console_panel.race, "StandardBorder", tc);
                     const int half = int(tab.h) / 2;
@@ -10427,7 +11663,7 @@ void MeleeGame::build_overlay(std::uint32_t view_w, std::uint32_t view_h,
                     const std::string cellp = std::string("Assets/Textures/ui_console_commandbutton_normal_") +
                                               (ghr == 1 ? "defaultprotoss" : ghr == 2 ? "defaultzerg" : "defaultterran") + ".dds";
                     bool framed = false;
-                    if (!std::getenv("SC2_NO_GROUP_PORTRAIT")) {
+                    if (!std::getenv("OMC_NO_GROUP_PORTRAIT")) {
                         const std::string fpath = cat_->resolve_asset("@@UI/ButtonBorderQueueActiveNormal", ui::layout_race_suffix(console_panel.race));
                         const IconAtlas::Icon* ft = (!fpath.empty() && fpath[0] != '@') ? &icons_.get(*ui_store_, fpath.c_str()) : nullptr;
                         if (ft && ft->ok() && ft->h >= 2 && s.w() > 0 && s.h() > 0) {
@@ -10567,7 +11803,7 @@ void MeleeGame::build_overlay(std::uint32_t view_w, std::uint32_t view_h,
         if (ui_store_) hud_console_color(*ui_store_, console_panel.race, "StandardButtonBorder", slot_border);
         const std::vector<PaneQueueSlot> queue = pane_queue(sel);
         auto queue_border = [&](const HudRect& s, int slot_no, const int* tint) {
-            if (!cat_ || std::getenv("SC2_QUEUE_SLOT_BOXES") || s.w() <= 0 || s.h() <= 0) return false;
+            if (!cat_ || std::getenv("OMC_QUEUE_SLOT_BOXES") || s.w() <= 0 || s.h() <= 0) return false;
             char key[64];
             if (slot_no <= 1) std::snprintf(key, sizeof key, "@@UI/ButtonBorderQueueActiveNormal");
             else std::snprintf(key, sizeof key, "@@UI/ButtonBorderQueueInactive%02dNormal", slot_no);
@@ -10590,7 +11826,7 @@ void MeleeGame::build_overlay(std::uint32_t view_w, std::uint32_t view_h,
                 }
             return true;
         };
-        if (!queue.empty() && !std::getenv("SC2_QUEUE_PANE_OLD")) {
+        if (!queue.empty() && !std::getenv("OMC_QUEUE_PANE_OLD")) {
             const double qs = double(view_h) / double(kRefHeight);
             int icon_col[3] = {155, 255, 190};
             hud_console_color(*ui_store_, console_panel.race, "StandardButtonIcon", icon_col);
@@ -10616,7 +11852,7 @@ void MeleeGame::build_overlay(std::uint32_t view_w, std::uint32_t view_h,
             const HudRect a = hud_queue_slot(view_w, view_h, 0, &console_panel);
             if (a.w() > 0) {
                 const int bx0 = a.x1 + int(4.0 * qs + 0.5), bx1 = bx0 + int(128.0 * qs + 0.5);
-                const bool old_bar = std::getenv("SC2_QUEUE_SLOT_BOXES") != nullptr;
+                const bool old_bar = std::getenv("OMC_QUEUE_SLOT_BOXES") != nullptr;
                 const int by1 = a.y1 - int(4.0 * qs + 0.5), by0 = by1 - std::max(3, int((old_bar ? 8.0 : 13.0) * qs + 0.5));
                 const int inset = old_bar ? 1 : std::max(1, int(4.0 * qs + 0.5));
                 const float pf = queue[0].progress < 0.0f ? 0.0f : (queue[0].progress > 1.0f ? 1.0f : queue[0].progress);
@@ -10652,7 +11888,7 @@ void MeleeGame::build_overlay(std::uint32_t view_w, std::uint32_t view_h,
             if (s.w() <= 0) continue;
             slot_backdrop(s);
             slot_icon(s, queue[q].subject);
-            if (queue[q].progress > 0.0f && std::getenv("SC2_QUEUE_PANE_OLD")) slot_bar(s, queue[q].progress, 0, 200, 200);
+            if (queue[q].progress > 0.0f && std::getenv("OMC_QUEUE_PANE_OLD")) slot_bar(s, queue[q].progress, 0, 200, 200);
             {
                 int qcol[3] = {155, 255, 190};
                 hud_console_color(*ui_store_, console_panel.race, "StandardButtonIcon", qcol);
@@ -10670,11 +11906,11 @@ void MeleeGame::build_overlay(std::uint32_t view_w, std::uint32_t view_h,
             const IconAtlas::Icon& ic = icons_.get(*ui_store_, hud_equipment_[q].icon);
             if (!ic.ok()) continue;
             blit_icon(ic, s.x0 + 2, s.y0 + 2, s.x1 - 2, s.y1 - 2);
-            if (cat_ && !std::getenv("SC2_NO_EQUIPMENT_BORDER")) {
+            if (cat_ && !std::getenv("OMC_NO_EQUIPMENT_BORDER")) {
                 const std::string esfx = ui::layout_race_suffix(console_panel.race);
                 std::string border = cat_->resolve_asset("@@@UI/ButtonBorderEquipment", esfx, esfx);
                 if (border.empty() || border[0] == '@') border = cat_->resolve_asset("@@UI/ButtonBorderEquipment", esfx);
-                if (std::getenv("SC2_LABEL_FACE_TRACE") && q == 0) std::fprintf(stderr, "[labelface] equipment border %s\n", border.c_str());
+                if (std::getenv("OMC_LABEL_FACE_TRACE") && q == 0) std::fprintf(stderr, "[labelface] equipment border %s\n", border.c_str());
                 if (!border.empty() && border[0] != '@') {
                     int bc[3] = {40, 125, 75};
                     hud_console_color(*ui_store_, console_panel.race, "StandardButtonBorder", bc);
@@ -10685,7 +11921,7 @@ void MeleeGame::build_overlay(std::uint32_t view_w, std::uint32_t view_h,
             {
                 char lv[8];
                 std::snprintf(lv, sizeof lv, "%d", hud_equipment_[q].level);
-                if (cat_ && !std::getenv("SC2_NO_EQUIPMENT_BORDER")) {
+                if (cat_ && !std::getenv("OMC_NO_EQUIPMENT_BORDER")) {
                     const double esc = double(view_h) / double(kRefHeight);
                     const LabelLook ll = resolve_label_style(hud_style_set(), "EquipmentIconLevel", human_race());
                     const FaceScope level_face(style_face(ll.font));
@@ -10741,7 +11977,7 @@ void MeleeGame::build_overlay(std::uint32_t view_w, std::uint32_t view_h,
             if (btn.state == ButtonState::Disabled) { br = 40; bg = 22; bb = 22; }
             else if (btn.state != ButtonState::Empty) { br = 26, bg = 34, bb = 48; }
             bool cell_active = false;
-            if (console_cell_art && btn.state == ButtonState::Enabled && !btn.icon.empty() && !std::getenv("SC2_NO_ACTIVE_ORDER_CELL")) {
+            if (console_cell_art && btn.state == ButtonState::Enabled && !btn.icon.empty() && !std::getenv("OMC_NO_ACTIVE_ORDER_CELL")) {
                 std::string icn = btn.icon;
                 for (char& ch : icn) ch = char(std::tolower(static_cast<unsigned char>(ch)));
                 auto has = [&](const char* s) { return icn.find(s) != std::string::npos; };
@@ -10783,7 +12019,7 @@ void MeleeGame::build_overlay(std::uint32_t view_w, std::uint32_t view_h,
                             for (int k = 0; k < 3; ++k) out[di + k] = std::uint8_t(l * a + out[di + k] * (1.0f - a) + 0.5f);
                         }
             }
-            const bool grey_disabled = console_cell_art && !std::getenv("SC2_DISABLED_CELL_DARK");
+            const bool grey_disabled = console_cell_art && !std::getenv("OMC_DISABLED_CELL_DARK");
             if (!console_cell_art || (btn.state == ButtonState::Disabled && !grey_disabled))
             for (int y = c.y0; y < c.y1 && y < int(view_h); ++y)
                 for (int x = c.x0; x < c.x1 && x < int(view_w); ++x) {
@@ -10828,17 +12064,17 @@ void MeleeGame::build_overlay(std::uint32_t view_w, std::uint32_t view_h,
                         }
                     const bool terran_card = console_cell_art && human_race() == 0 && white_art && !cell_active;
                     float tr = 1.0f, tg = 1.0f, tb = 1.0f;
-                    if (std::getenv("SC2_CARD_TINT_OLD")) {
+                    if (std::getenv("OMC_CARD_TINT_OLD")) {
                         if (terran_card) { tr = 136.0f / 255.0f; tg = 227.0f / 255.0f; tb = 162.0f / 255.0f; }
                     } else if (console_cell_art && white_art && !cell_active) {
                         int ic3[3] = {155, 255, 190};
                         hud_console_color(*ui_store_, console_panel.race, "StandardButtonIcon", ic3);
                         tr = float(ic3[0]) / 255.0f; tg = float(ic3[1]) / 255.0f; tb = float(ic3[2]) / 255.0f;
                     }
-                    static const int kIconInset = std::getenv("SC2_CARD_ICON_INSET") ? std::atoi(std::getenv("SC2_CARD_ICON_INSET")) : 0;
+                    static const int kIconInset = std::getenv("OMC_CARD_ICON_INSET") ? std::atoi(std::getenv("OMC_CARD_ICON_INSET")) : 0;
                     blit_icon_tinted(card_ic, c.x0 + kIconInset, c.y0 + kIconInset, c.x1 - kIconInset, c.y1 - kIconInset, tr, tg, tb);
-                    const std::string cell_key = !btn.hotkey.empty() ? btn.hotkey : (btn.is_cancel && !std::getenv("SC2_CANCEL_RED_BOX") ? std::string("Esc") : std::string());
-                    static const bool kLetterPlate = std::getenv("SC2_CARD_LETTER_BARE") == nullptr && std::getenv("SC2_CARD_TINT_OLD") == nullptr;
+                    const std::string cell_key = !btn.hotkey.empty() ? btn.hotkey : (btn.is_cancel && !std::getenv("OMC_CANCEL_RED_BOX") ? std::string("Esc") : std::string());
+                    static const bool kLetterPlate = std::getenv("OMC_CARD_LETTER_BARE") == nullptr && std::getenv("OMC_CARD_TINT_OLD") == nullptr;
                     if (kLetterPlate && console_cell_art && !cell_key.empty() && cell_key.size() <= 3) {
                         const int tx = c.x0 + 5, ty = c.y0 + 5;
                         const int pw = text_w_rgba(cell_key, 1) + 3;
@@ -10851,7 +12087,7 @@ void MeleeGame::build_overlay(std::uint32_t view_w, std::uint32_t view_h,
                         draw_text_rgba(out, view_w, view_h, tx, ty, cell_key.c_str(), 1, 240, 250, 242);
                     } else
                     if (console_cell_art && !cell_key.empty() && cell_key.size() <= 3)
-                        draw_text_rgba(out, view_w, view_h, c.x0 + (std::getenv("SC2_CARD_TINT_OLD") ? 3 : 5), c.y0 + (std::getenv("SC2_CARD_TINT_OLD") ? 2 : 4), cell_key.c_str(), 1, 240, 250, 242);
+                        draw_text_rgba(out, view_w, view_h, c.x0 + (std::getenv("OMC_CARD_TINT_OLD") ? 3 : 5), c.y0 + (std::getenv("OMC_CARD_TINT_OLD") ? 2 : 4), cell_key.c_str(), 1, 240, 250, 242);
                 }
                 if (btn.charges >= 0) {
                     const LabelLook cl = resolve_label_style(hud_style_set(), "GameButtonCharge", int(console_panel.race));
@@ -10890,7 +12126,7 @@ void MeleeGame::build_overlay(std::uint32_t view_w, std::uint32_t view_h,
                             out[di] = out[di + 1] = out[di + 2] = std::uint8_t(l + 0.5f);
                         }
                     if (!btn.hotkey.empty() && btn.hotkey.size() <= 2)
-                        draw_text_rgba(out, view_w, view_h, c.x0 + (std::getenv("SC2_CARD_TINT_OLD") ? 3 : 5), c.y0 + (std::getenv("SC2_CARD_TINT_OLD") ? 2 : 4), btn.hotkey.c_str(), 1, 240, 250, 242);
+                        draw_text_rgba(out, view_w, view_h, c.x0 + (std::getenv("OMC_CARD_TINT_OLD") ? 3 : 5), c.y0 + (std::getenv("OMC_CARD_TINT_OLD") ? 2 : 4), btn.hotkey.c_str(), 1, 240, 250, 242);
                 } else if (btn.state == ButtonState::Disabled)
                     for (int y = c.y0; y < c.y1 && y < int(view_h); ++y)
                         for (int x = c.x0; x < c.x1 && x < int(view_w); ++x) {
@@ -10903,7 +12139,7 @@ void MeleeGame::build_overlay(std::uint32_t view_w, std::uint32_t view_h,
                 const std::uint8_t lr = btn.is_cancel ? 200 : 130;
                 const std::uint8_t lg = btn.is_cancel ? 90 : 160;
                 const std::uint8_t lb = btn.is_cancel ? 90 : 200;
-                if (!console_cell_art || (btn.is_cancel && std::getenv("SC2_CANCEL_RED_BOX"))) draw_box_rgba(out, view_w, view_h, c.x0, c.y0, c.x1, c.y1, lr, lg, lb);
+                if (!console_cell_art || (btn.is_cancel && std::getenv("OMC_CANCEL_RED_BOX"))) draw_box_rgba(out, view_w, view_h, c.x0, c.y0, c.x1, c.y1, lr, lg, lb);
             } else if (!console_cell_art) {
                 draw_box_rgba(out, view_w, view_h, c.x0, c.y0, c.x1, c.y1, 60, 70, 88);
             }
@@ -10994,7 +12230,7 @@ void MeleeGame::build_overlay(std::uint32_t view_w, std::uint32_t view_h,
     ov_lap.lap("ov.command_card");
     if (!warming_) render::mem_lap_marks() = false;
 
-    static const bool kShowFps = std::getenv("SC2_SHOW_FPS") != nullptr;
+    static const bool kShowFps = std::getenv("OMC_SHOW_FPS") != nullptr;
     if (kShowFps) {
         char fps[24];
         std::snprintf(fps, sizeof(fps), "FPS %d", int(fps_smooth_ + 0.5f));
@@ -11013,43 +12249,45 @@ void MeleeGame::build_overlay(std::uint32_t view_w, std::uint32_t view_h,
         draw::fill_a(out, view_w, view_h, 0, 0, int(view_w), int(view_h), 0, 0, 0, theme::kAlphaScrim);
         PauseRect resume, quit;
         pause_menu_rects(view_w, view_h, resume, quit);
-        int px0 = resume.x0 - 30, py0 = resume.y0 - 90, px1 = resume.x1 + 30, py1 = quit.y1 + 30;
+        const PauseRects all = pause_rects_all(view_w, view_h);
+        const int top_row = all.has_settings ? std::min(resume.y0, all.settings.y0) : resume.y0;
+        int px0 = resume.x0 - 30, py0 = top_row - 90, px1 = resume.x1 + 30, py1 = quit.y1 + 30;
         if (ui_store_ && view_w && view_h)
             if (const HudPauseRects* pr = hud_pause_rects(*ui_store_, float(view_w) / float(view_h))) {
                 const double sc = double(view_h) / double(kRefHeight);
                 px0 = int(pr->panel.x0 * sc + 0.5); py0 = int(pr->panel.y0 * sc + 0.5);
                 px1 = int(pr->panel.x1 * sc + 0.5); py1 = int(pr->panel.y1 * sc + 0.5);
+                if (all.has_settings && all.settings.y0 < py0 + 60) py0 = all.settings.y0 - 90;
             }
         draw::vgrad(out, view_w, view_h, px0, py0, px1, py1, theme::kSurfaceRaised.r, theme::kSurfaceRaised.g, theme::kSurfaceRaised.b,
                     theme::kSurface.r, theme::kSurface.g, theme::kSurface.b, 255, 255);
         draw::box_a(out, view_w, view_h, px0, py0, px1, py1, theme::kBorderStrong.r, theme::kBorderStrong.g, theme::kBorderStrong.b, 255);
         const std::string title = "GAME MENU";
-        const PauseRects all = pause_rects_all(view_w, view_h);
-        static const bool text_leak = std::getenv("SC2_PAUSE_TEXT_LEAK") != nullptr;
+        static const bool text_leak = std::getenv("OMC_PAUSE_TEXT_LEAK") != nullptr;
         const bool sized = ui_store_ && !text_leak;
         const int saved_pause_px = draw::forced_font_px();
         const double psc = double(view_h) / double(kRefHeight);
         const int label_px = sized ? std::max(6, int(20.0 * psc + 0.5)) : draw::font_px_for(2);
         const int title_px = sized ? std::max(6, int(24.0 * psc + 0.5)) : draw::font_px_for(3);
-        int first_row_y = resume.y0;
+        int first_row_y = top_row;
         if (sized) {
-            first_row_y = std::min(resume.y0, quit.y0);
+            first_row_y = std::min(top_row, quit.y0);
             if (all.has_load) first_row_y = std::min(first_row_y, all.load.y0);
             if (all.has_save) first_row_y = std::min(first_row_y, all.save.y0);
             draw::set_forced_font_px(title_px);
         }
         draw::text(out, view_w, view_h, (px0 + px1 - draw::text_w(title, 3)) / 2,
-                   sized ? py0 + std::max(4, (first_row_y - py0 - title_px) / 2) : py0 + std::max(12, (resume.y0 - py0 - ui::kFontH * 3) / 2),
+                   sized ? py0 + std::max(4, (first_row_y - py0 - title_px) / 2) : py0 + std::max(12, (top_row - py0 - ui::kFontH * 3) / 2),
                    title, 3, theme::kTextHi.r, theme::kTextHi.g, theme::kTextHi.b);
         if (sized) draw::set_forced_font_px(label_px);
-        const PauseRect* rects[4] = {&all.load, &all.save, &resume, &quit};
-        const char* labels[4] = {"LOAD GAME", "SAVE GAME", "RESUME GAME", "QUIT GAME"};
-        for (int i = 0; i < 4; ++i) {
-            if ((i == 0 && !all.has_load) || (i == 1 && !all.has_save)) continue;
+        const PauseRect* rects[5] = {&all.load, &all.save, &all.settings, &resume, &quit};
+        const char* labels[5] = {"LOAD GAME", "SAVE GAME", "SETTINGS", "RESUME GAME", "QUIT GAME"};
+        for (int i = 0; i < 5; ++i) {
+            if ((i == 0 && !all.has_load) || (i == 1 && !all.has_save) || (i == 2 && !all.has_settings)) continue;
             const PauseRect& r = *rects[i];
             const bool hot = mouse_x_ >= float(r.x0) && mouse_x_ < float(r.x1) &&
                              mouse_y_ >= float(r.y0) && mouse_y_ < float(r.y1);
-            const bool is_quit = i == 3;
+            const bool is_quit = i == 4;
             draw::vgrad(out, view_w, view_h, r.x0, r.y0, r.x1, r.y1, theme::kMenuBtnTop.r, theme::kMenuBtnTop.g, theme::kMenuBtnTop.b,
                         theme::kMenuBtnBottom.r, theme::kMenuBtnBottom.g, theme::kMenuBtnBottom.b, 255, 255);
             const theme::Rgb edge = hot ? theme::kAccent : is_quit ? theme::kBorderQuit : theme::kBorderCtl;

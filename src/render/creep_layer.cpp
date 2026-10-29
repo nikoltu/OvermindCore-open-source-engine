@@ -1,13 +1,13 @@
-#include "sc2/render/creep_layer.hpp"
+#include "omc/render/creep_layer.hpp"
 
 #include <algorithm>
 #include <cmath>
 #include <cstddef>
 
-#include "sc2/casc/storage.hpp"
-#include "sc2/formats/dds.hpp"
+#include "omc/casc/storage.hpp"
+#include "omc/formats/dds.hpp"
 
-namespace sc2::render {
+namespace omc::render {
 
 void set_model_diffuse(formats::Model& m, const std::string& diffuse_path) {
     m.materials.clear();

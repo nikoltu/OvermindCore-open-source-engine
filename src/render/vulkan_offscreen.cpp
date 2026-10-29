@@ -1,27 +1,27 @@
-#include "sc2/render/offscreen.hpp"
+#include "omc/render/offscreen.hpp"
 
-#include "sc2/render/anim.hpp"
-#include "sc2/render/scene.hpp"
+#include "omc/render/anim.hpp"
+#include "omc/render/scene.hpp"
 
 #include <cstdio>
 #include <cstdlib>
 
-#include "sc2/data/environment.hpp"
+#include "omc/data/environment.hpp"
 #include <cmath>
 #include <algorithm>
 #include <vector>
 
-#include "sc2/app/console_panel.hpp"
-#include "sc2/data/catalog.hpp"
-#include "sc2/render/frame_prof.hpp"
-#include "sc2/render/scene_renderer.hpp"
-#include "sc2/render/texture_decode.hpp"
-#include "sc2/formats/m3.hpp"
-#include "sc2/render/mat4.hpp"
-#include "sc2/app/ui_canvas.hpp"
-#include "sc2/ui/layout.hpp"
+#include "omc/app/console_panel.hpp"
+#include "omc/data/catalog.hpp"
+#include "omc/render/frame_prof.hpp"
+#include "omc/render/scene_renderer.hpp"
+#include "omc/render/texture_decode.hpp"
+#include "omc/formats/m3.hpp"
+#include "omc/render/mat4.hpp"
+#include "omc/app/ui_canvas.hpp"
+#include "omc/ui/layout.hpp"
 
-namespace sc2::render {
+namespace omc::render {
 
 RenderResult render_model(const formats::Model& model, uint32_t width,
                           uint32_t height, const casc::Storage* storage,
@@ -41,7 +41,7 @@ RenderResult render_model(const formats::Model& model, uint32_t width,
 
 }
 
-namespace sc2::app {
+namespace omc::app {
 
 namespace {
 struct ConsoleStubs {
@@ -111,7 +111,7 @@ std::vector<std::uint8_t> render_portrait(casc::Storage& store, const formats::M
     inst.seq = model.sequences.empty() ? -1 : 0;
     for (std::size_t q = 0; q < model.sequences.size(); ++q)
         if (model.sequences[q].name == "Stand") { inst.seq = int(q); break; }
-    if (const char* want = std::getenv("SC2_PORTRAIT_SEQ"))
+    if (const char* want = std::getenv("OMC_PORTRAIT_SEQ"))
         for (std::size_t q = 0; q < model.sequences.size(); ++q)
             if (model.sequences[q].name == want) { inst.seq = int(q); break; }
     inst.time_ms = 0.0f;
@@ -154,8 +154,8 @@ std::vector<std::uint8_t> render_portrait(casc::Storage& store, const formats::M
         cam.znear = 0.01f;
         cam.zfar = 100.0f;
     }
-    if (const PortraitDof& pd = portrait_dof(); pd.amount > 0.0f && pd.end > pd.start && !std::getenv("SC2_NO_PORTRAIT_DOF")) {
-        static const float kRadius = std::getenv("SC2_PORTRAIT_DOF_RADIUS") ? float(std::atof(std::getenv("SC2_PORTRAIT_DOF_RADIUS"))) : 3.0f;
+    if (const PortraitDof& pd = portrait_dof(); pd.amount > 0.0f && pd.end > pd.start && !std::getenv("OMC_NO_PORTRAIT_DOF")) {
+        static const float kRadius = std::getenv("OMC_PORTRAIT_DOF_RADIUS") ? float(std::atof(std::getenv("OMC_PORTRAIT_DOF_RADIUS"))) : 3.0f;
         cam.dof_focus = pd.focus;
         cam.dof_start = pd.start;
         cam.dof_end = pd.end;
@@ -165,8 +165,8 @@ std::vector<std::uint8_t> render_portrait(casc::Storage& store, const formats::M
     std::vector<render::SceneInstance> scene{inst};
     data::EnvLight flipped;
     if (env && env->found)
-        if (const char* fl = std::getenv("SC2_PORTRAIT_LIGHT_FLIP") ? std::getenv("SC2_PORTRAIT_LIGHT_FLIP")
-                             : std::getenv("SC2_PORTRAIT_RIG_TURNED") ? "rot270" : nullptr) {
+        if (const char* fl = std::getenv("OMC_PORTRAIT_LIGHT_FLIP") ? std::getenv("OMC_PORTRAIT_LIGHT_FLIP")
+                             : std::getenv("OMC_PORTRAIT_RIG_TURNED") ? "rot270" : nullptr) {
             flipped = *env;
             const std::string mode = fl;
             const double sx = (mode == "x" || mode == "xy" || mode == "neg") ? -1.0 : 1.0;
@@ -197,7 +197,7 @@ std::vector<std::uint8_t> render_portrait(casc::Storage& store, const formats::M
         }
     data::EnvLight scaled;
     if (env && env->found)
-        if (const char* rg = std::getenv("SC2_PORTRAIT_RIG")) {
+        if (const char* rg = std::getenv("OMC_PORTRAIT_RIG")) {
             float m[5] = {1, 1, 1, 1, 1};
             std::sscanf(rg, "%f,%f,%f,%f,%f", &m[0], &m[1], &m[2], &m[3], &m[4]);
             scaled = *env;
@@ -210,7 +210,7 @@ std::vector<std::uint8_t> render_portrait(casc::Storage& store, const formats::M
         }
     try {
         const data::EnvLight* pe = env && env->found ? env : nullptr;
-        if (std::getenv("SC2_PORTRAIT_ONE_SHOT")) {
+        if (std::getenv("OMC_PORTRAIT_ONE_SHOT")) {
             const render::RenderResult r = render::render_scene(scene, w, h, &cam, &store, "", false, pe);
             if (r.rgba.size() == std::size_t(w) * h * 4) return r.rgba;
             return {};
@@ -223,7 +223,7 @@ std::vector<std::uint8_t> render_portrait(casc::Storage& store, const formats::M
                                render::SceneRenderer::request_model_textures(model, &store, std::string(), render::render_scene_session_texture_max());
             if (mode == 2) {
                 if (!ready) return {};
-                static const std::size_t kBudget = std::size_t(std::getenv("SC2_PORTRAIT_UPLOAD_MB") ? std::max(0, std::atoi(std::getenv("SC2_PORTRAIT_UPLOAD_MB"))) : 0) * 1048576u;
+                static const std::size_t kBudget = std::size_t(std::getenv("OMC_PORTRAIT_UPLOAD_MB") ? std::max(0, std::atoi(std::getenv("OMC_PORTRAIT_UPLOAD_MB"))) : 0) * 1048576u;
                 if (kBudget == 0 || w <= 1 || h <= 1) return std::vector<std::uint8_t>{1};
                 bool up = false;
                 render::render_scene_session(key, scene, w, h, cam, &store, pe, kBudget, &up);
@@ -243,7 +243,7 @@ ConsoleTexture render_console_models(casc::Storage& store, const data::Catalog& 
                                      const ConsoleView& view) {
     ConsoleTexture tex;
     if (!width) return tex;
-    const data::Catalog::ConsoleSkinModels m = cat.console_skin_models(skin_id);
+    const data::Catalog::ConsoleSkinModels m = cat.console_skin_models(skin_id, console_asset_race(skin_id));
     if (!m.ok()) return tex;
 
     const std::string* paths[3] = {&m.minimap, &m.info, &m.command};
@@ -282,7 +282,7 @@ ConsoleTexture render_console_models(casc::Storage& store, const data::Catalog& 
         }
     }
 
-    if (view.frame_w >= 1.0f && view.frame_h >= 1.0f && !std::getenv("SC2_CONSOLE_STUBS")) {
+    if (view.frame_w >= 1.0f && view.frame_h >= 1.0f && !std::getenv("OMC_CONSOLE_STUBS")) {
         const float kViewUnitsH = 1.5f;
         const float aspect = view.frame_w / view.frame_h;
         const float half_w = 0.5f * kViewUnitsH * aspect;
@@ -319,20 +319,20 @@ ConsoleTexture render_console_models(casc::Storage& store, const data::Catalog& 
             {
                 std::string light_id = "Console";
                 if (auto l = cat.scalar("CConsoleSkin", skin_id, "Light"); l && !l->empty()) light_id = *l;
-                if (!std::getenv("SC2_CONSOLE_NO_LIGHT")) env = data::resolve_environment_light(cat, light_id);
+                if (!std::getenv("OMC_CONSOLE_NO_LIGHT")) env = data::resolve_environment_light(cat, light_id);
                 env.params["ExposureAsAuthored"] = 1.0;
                 env.params["NoShadows"] = 1.0;
                 env.params["SpecNoEnergyDim"] = 1.0;
-                if (view.map_env && view.map_env->found && !std::getenv("SC2_CONSOLE_NO_MAP_COLORIZE"))
+                if (view.map_env && view.map_env->found && !std::getenv("OMC_CONSOLE_NO_MAP_COLORIZE"))
                     for (const auto& kv : view.map_env->params)
                         if (kv.first == "Colorize" || kv.first.compare(0, 12, "Colorization") == 0) env.params[kv.first] = kv.second;
                 if (view.map_env && view.map_env->found && view.map_env->has_hdr && view.map_env->hdr_exposure > 0.0 &&
-                    !std::getenv("SC2_CONSOLE_OWN_EXPOSURE")) {
+                    !std::getenv("OMC_CONSOLE_OWN_EXPOSURE")) {
                     env.hdr_exposure = view.map_env->hdr_exposure;
                     env.has_hdr = true;
                     env.params["HDRExposure"] = view.map_env->hdr_exposure;
                 }
-                if (const char* fl = std::getenv("SC2_CONSOLE_LIGHT_FLIP"))
+                if (const char* fl = std::getenv("OMC_CONSOLE_LIGHT_FLIP"))
                     for (const char* c = fl; *c; ++c) {
                         const int a = *c == 'x' ? 0 : *c == 'y' ? 1 : *c == 'z' ? 2 : -1;
                         if (a < 0) continue;
@@ -344,7 +344,8 @@ ConsoleTexture render_console_models(casc::Storage& store, const data::Catalog& 
             }
             try {
                 if (render::mem_lap_marks()) render::mem_mark("console: three models decoded");
-                render::RenderResult r = render::render_scene(one_view, out_w, out_h, &cam, &store, "", false, env.found ? &env : nullptr);
+                render::RenderResult r = render::render_scene(one_view, out_w, out_h, &cam, &store, "", false, env.found ? &env : nullptr, nullptr, 0,
+                                                              nullptr, render::console_texture_half());
                 if (render::mem_lap_marks()) render::mem_mark("console: renderer released");
                 if (r.rgba.size() == std::size_t(out_w) * out_h * 4) {
                     for (std::size_t q = 0; q + 3 < r.rgba.size(); q += 4)
@@ -431,7 +432,8 @@ ConsoleTexture render_console_models(casc::Storage& store, const data::Catalog& 
                     try {
                         const render::RenderResult r =
                             render::render_scene(solo, std::uint32_t(rect[i]->w + 0.5f),
-                                                 std::uint32_t(rect[i]->h + 0.5f), &cam, &store, "");
+                                                 std::uint32_t(rect[i]->h + 0.5f), &cam, &store, "", false, nullptr, nullptr, 0, nullptr,
+                                                 render::console_texture_half());
                         if (r.rgba.size() != std::size_t(r.width) * r.height * 4) {
                             all_drawn = false;
                             break;
@@ -484,7 +486,8 @@ ConsoleTexture render_console_models(casc::Storage& store, const data::Catalog& 
     cam.zfar = 1000.0f;
 
     try {
-        const render::RenderResult r = render::render_scene(scene, width, height, &cam, &store, "");
+        const render::RenderResult r = render::render_scene(scene, width, height, &cam, &store, "", false, nullptr, nullptr, 0, nullptr,
+                                                            render::console_texture_half());
         if (r.width != width || r.height != height ||
             r.rgba.size() != std::size_t(width) * height * 4)
             return tex;

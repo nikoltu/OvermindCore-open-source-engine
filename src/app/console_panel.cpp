@@ -1,13 +1,13 @@
-#include "sc2/app/console_panel.hpp"
+#include "omc/app/console_panel.hpp"
 
-#include "sc2/data/catalog.hpp"
-#include "sc2/formats/dds.hpp"
-#include "sc2/formats/m3.hpp"
+#include "omc/data/catalog.hpp"
+#include "omc/formats/dds.hpp"
+#include "omc/formats/m3.hpp"
 
 #include <algorithm>
 #include <vector>
 
-namespace sc2::app {
+namespace omc::app {
 
 static const char* const kRoots[] = {
     "mods/liberty.sc2mod/base.sc2assets/", "mods/core.sc2mod/base.sc2assets/",
@@ -110,6 +110,21 @@ void composite_console(std::vector<std::uint8_t>& img, std::uint32_t view_w,
 const char* console_skin_id_for_race(int race) {
     return race == 1 ? "ConsoleProtoss_Default" : race == 2 ? "ConsoleZerg_Default"
                                                             : "ConsoleTerran_Default";
+}
+
+bool& console_race_assets() {
+    static bool on = true;
+    return on;
+}
+
+const char* console_skin_race(const std::string& skin_id) {
+    for (int r = 0; r < 3; ++r)
+        if (skin_id == console_skin_id_for_race(r)) return r == 1 ? "Prot" : r == 2 ? "Zerg" : "Terr";
+    return "";
+}
+
+std::string console_asset_race(const std::string& skin_id) {
+    return console_race_assets() ? std::string(console_skin_race(skin_id)) : std::string();
 }
 
 }

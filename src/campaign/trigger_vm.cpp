@@ -1,11 +1,11 @@
-#include "sc2/campaign/trigger_vm.hpp"
+#include "omc/campaign/trigger_vm.hpp"
 
 #include <cctype>
 #include <cstdio>
 #include <cstdlib>
 #include <string>
 
-namespace sc2::campaign {
+namespace omc::campaign {
 
 bool Value::as_bool() const {
     switch (type) {

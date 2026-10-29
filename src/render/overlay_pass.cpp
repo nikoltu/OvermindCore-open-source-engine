@@ -1,4 +1,4 @@
-#include "sc2/render/overlay_pass.hpp"
+#include "omc/render/overlay_pass.hpp"
 
 #include <vulkan/vulkan.h>
 
@@ -9,9 +9,9 @@
 #include <string>
 #include <vector>
 
-#include "sc2/render/device.hpp"
-#include "sc2/render/vk_helpers.hpp"
-#include "sc2/render/vk_raii.hpp"
+#include "omc/render/device.hpp"
+#include "omc/render/vk_helpers.hpp"
+#include "omc/render/vk_raii.hpp"
 
 static const uint32_t kOverlayVertSpv[] =
 #include "overlay.vert.spv.h"
@@ -20,7 +20,7 @@ static const uint32_t kOverlayFragSpv[] =
 #include "overlay.frag.spv.h"
     ;
 
-namespace sc2::render {
+namespace omc::render {
 
 namespace {
 
@@ -127,6 +127,81 @@ Unique<VkPipeline> make_overlay_pipeline(VkDevice dev, VkRenderPass pass,
     return Unique<VkPipeline>(raw, [dev](VkPipeline p) { vkDestroyPipeline(dev, p, nullptr); });
 }
 
+}
+
+std::vector<OverlayRowSpan> overlay_changed_rows(std::vector<uint8_t>& shown, const std::vector<uint8_t>& next,
+                                                 uint32_t width, uint32_t height) {
+    std::vector<OverlayRowSpan> spans;
+    const size_t row = size_t(width) * 4;
+    if (!width || !height || next.size() != row * height) return spans;
+    if (shown.size() != next.size()) {
+        shown = next;
+        spans.push_back({0, height});
+        return spans;
+    }
+    constexpr uint32_t kGap = 8;
+    constexpr size_t kMaxSpans = 64;
+    for (uint32_t y = 0; y < height; ++y) {
+        const size_t off = size_t(y) * row;
+        if (std::memcmp(shown.data() + off, next.data() + off, row) == 0) continue;
+        std::memcpy(shown.data() + off, next.data() + off, row);
+        if (!spans.empty() && y <= spans.back().y1 + kGap)
+            spans.back().y1 = y + 1;
+        else
+            spans.push_back({y, y + 1});
+    }
+    if (spans.size() > kMaxSpans) {
+        const OverlayRowSpan all{spans.front().y0, spans.back().y1};
+        spans.assign(1, all);
+    }
+    return spans;
+}
+
+bool record_overlay_upload(VkDevice dev, VkCommandBuffer cmd, VkDeviceMemory stage_mem, VkBuffer stage, VkImage image,
+                           std::vector<uint8_t>& shown, const std::vector<uint8_t>& next, uint32_t width, uint32_t height,
+                           VkImageLayout settled_layout) {
+    const bool first = shown.size() != next.size();
+    const std::vector<OverlayRowSpan> spans = overlay_changed_rows(shown, next, width, height);
+    if (spans.empty()) return false;
+    const VkDeviceSize row = VkDeviceSize(width) * 4;
+    const VkDeviceSize lo = spans.front().y0 * row, hi = spans.back().y1 * row;
+    void* p = nullptr;
+    check(vkMapMemory(dev, stage_mem, lo, hi - lo, 0, &p), "vkMapMemory(overlay upload)");
+    std::vector<VkBufferImageCopy> rgns;
+    rgns.reserve(spans.size());
+    for (const OverlayRowSpan& sp : spans) {
+        const VkDeviceSize off = sp.y0 * row, len = VkDeviceSize(sp.y1 - sp.y0) * row;
+        std::memcpy(static_cast<uint8_t*>(p) + (off - lo), next.data() + off, size_t(len));
+        VkBufferImageCopy rgn{};
+        rgn.bufferOffset = off;
+        rgn.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+        rgn.imageOffset = {0, int32_t(sp.y0), 0};
+        rgn.imageExtent = {width, sp.y1 - sp.y0, 1};
+        rgns.push_back(rgn);
+    }
+    vkUnmapMemory(dev, stage_mem);
+    const bool sampled = settled_layout == VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+    VkImageMemoryBarrier b{};
+    b.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+    b.oldLayout = first ? VK_IMAGE_LAYOUT_UNDEFINED : settled_layout;
+    b.newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+    b.srcQueueFamilyIndex = b.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    b.image = image;
+    b.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+    b.srcAccessMask = first || sampled ? 0 : VK_ACCESS_TRANSFER_WRITE_BIT;
+    b.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+    const VkPipelineStageFlags src_stage =
+        first ? VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT : sampled ? VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT : VK_PIPELINE_STAGE_TRANSFER_BIT;
+    vkCmdPipelineBarrier(cmd, src_stage, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr, 1, &b);
+    vkCmdCopyBufferToImage(cmd, stage, image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, uint32_t(rgns.size()), rgns.data());
+    if (sampled) {
+        b.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+        b.newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+        b.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+        b.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+        vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, 0, 0, nullptr, 0, nullptr, 1, &b);
+    }
+    return true;
 }
 
 std::vector<uint8_t> composite_overlay(const std::vector<uint8_t>& base_rgba,

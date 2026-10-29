@@ -1,20 +1,21 @@
-#include "sc2/app/install.hpp"
+#include "omc/app/install.hpp"
 
 #include <filesystem>
 #include <fstream>
 #include <map>
 #include <sstream>
 
-#include "sc2/platform/file.hpp"
+#include "omc/app/install_ids.hpp"
+#include "omc/platform/file.hpp"
 
 namespace fs = std::filesystem;
 
-namespace sc2::app {
+namespace omc::app {
 
 static std::string build_config_field(const std::string& install_root,
                                       const std::string& key) {
     std::error_code ec;
-    std::string cfg = install_root + "/SC2Data/config";
+    std::string cfg = install_root + "/" + install_ids::kConfigDir;
     for (auto it = fs::recursive_directory_iterator(cfg, ec);
          it != fs::recursive_directory_iterator(); it.increment(ec)) {
         if (ec) break;
@@ -67,16 +68,16 @@ static std::map<std::string, std::string> parse_build_info(const std::string& te
 InstallInfo probe_install(const std::string& install_root) {
     InstallInfo info;
     info.install_root = install_root;
-    info.data_dir = install_root + "/SC2Data/data";
+    info.data_dir = install_root + "/" + install_ids::kDataDir;
 
     if (!platform::file_exists(install_root)) {
         info.message = "folder does not exist";
         return info;
     }
 
-    std::string bi = install_root + "/.build.info";
+    std::string bi = install_root + "/" + install_ids::kBuildInfoFile;
     if (!platform::file_exists(bi)) {
-        info.message = "not an SC2 install (.build.info missing)";
+        info.message = "not a game installation (.build.info missing)";
         return info;
     }
     try {
@@ -93,22 +94,22 @@ InstallInfo probe_install(const std::string& install_root) {
     }
 
     if (!platform::file_exists(info.data_dir)) {
-        info.message = "SC2Data/data folder missing";
+        info.message = std::string(install_ids::kDataDir) + " folder missing";
         return info;
     }
     if (platform::list_dir(info.data_dir, ".idx").empty()) {
-        info.message = "no .idx files in SC2Data/data (install incomplete?)";
+        info.message = std::string("no .idx files in ") + install_ids::kDataDir + " (install incomplete?)";
         return info;
     }
     if (!platform::file_exists(info.data_dir + "/data.000")) {
-        info.message = "no data.### blobs in SC2Data/data";
+        info.message = std::string("no data.### blobs in ") + install_ids::kDataDir;
         return info;
     }
 
     info.product = build_config_field(install_root, "build-product");
-    if (info.product != "SC2") {
+    if (info.product != install_ids::kBuildProduct) {
         info.message =
-            "not an SC2 install (build-product '" + info.product + "')";
+            "not a game installation (build-product '" + info.product + "')";
         return info;
     }
     if (info.build.empty())
@@ -119,9 +120,9 @@ InstallInfo probe_install(const std::string& install_root) {
     info.valid = true;
     info.compatible = (info.build == supported_build());
     if (info.compatible)
-        info.message = "valid SC2 install, build " + info.build + " (verified)";
+        info.message = "valid game installation, build " + info.build + " (verified)";
     else
-        info.message = "valid SC2 install, build " + info.build +
+        info.message = "valid game installation, build " + info.build +
                        " (engine verified against " + supported_build() +
                        "; proceeding, formats are build-stable)";
     return info;

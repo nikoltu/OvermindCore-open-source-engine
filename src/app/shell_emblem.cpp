@@ -1,13 +1,13 @@
-#include "sc2/app/shell_emblem.hpp"
+#include "omc/app/shell_emblem.hpp"
 
 #include <vector>
 
-#include "sc2/formats/dds.hpp"
+#include "omc/formats/dds.hpp"
 
 #include "emblem.dds.h"
 #include "emblem_sm.dds.h"
 
-namespace sc2::app {
+namespace omc::app {
 
 namespace {
 IconAtlas::Icon decode(const unsigned char* bytes, std::size_t len) {

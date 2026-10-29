@@ -1,8 +1,8 @@
-#include "sc2/formats/png.hpp"
+#include "omc/formats/png.hpp"
 
 #include <stdexcept>
 
-namespace sc2::formats {
+namespace omc::formats {
 
 namespace {
 

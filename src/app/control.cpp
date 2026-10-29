@@ -1,4 +1,4 @@
-#include "sc2/app/control.hpp"
+#include "omc/app/control.hpp"
 
 #include <algorithm>
 #include <array>
@@ -6,9 +6,9 @@
 #include <cstdlib>
 #include <string>
 
-#include "sc2/sim/weapon.hpp"
+#include "omc/sim/weapon.hpp"
 
-namespace sc2::app {
+namespace omc::app {
 
 using sim::Fixed;
 using sim::kNoTarget;
@@ -138,7 +138,7 @@ float ray_volume_t(const PickVolume& v, const float o[3], const float d[3]) {
         return sphere(c, r);
     }
     float h = 0.5f * v.size[1];
-    static const char* cap = std::getenv("SC2_659_CAPSULE");
+    static const char* cap = std::getenv("OMC_659_CAPSULE");
     if (cap && cap[0] == 'h') h = v.size[1];
     float lo_c[3] = {lo[0], lo[1], lo[2]}, ld_c[3] = {ld[0], ld[1], ld[2]};
     if (cap && (cap[0] == 'x' || cap[0] == 'y')) {
@@ -335,7 +335,7 @@ std::vector<uint32_t> Control::box_select_672(const sim::World& world, const Scr
         if (!project(ux, uy, fz, fx, fy)) continue;
         if (fx < minx - 400.0f || fx > maxx + 400.0f || fy < miny - 400.0f || fy > maxy + 600.0f) continue;
         ScreenRect br;
-        static const char* vw = std::getenv("SC2_672_BOX_VOLUMES");
+        static const char* vw = std::getenv("OMC_672_BOX_VOLUMES");
         if (!volume_screen_rect(u.id, br, vw ? std::atoi(vw) : 1)) {
             if (u.player < 0) continue;
             br = ScreenRect{fx, fy, fx, fy};

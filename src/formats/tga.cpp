@@ -1,10 +1,10 @@
-#include "sc2/formats/tga.hpp"
+#include "omc/formats/tga.hpp"
 
 #include <cstddef>
 #include <stdexcept>
 #include <string>
 
-namespace sc2::formats {
+namespace omc::formats {
 
 std::vector<uint8_t> decode_tga(const std::vector<uint8_t>& bytes, TgaInfo& out) {
     if (bytes.size() < 18) throw std::runtime_error("tga: file shorter than its 18-byte header");

@@ -1,6 +1,6 @@
-#include "sc2/app/melee_commands.hpp"
+#include "omc/app/melee_commands.hpp"
 
-namespace sc2::app {
+namespace omc::app {
 
 using sim::Fixed;
 

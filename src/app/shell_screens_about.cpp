@@ -1,6 +1,6 @@
-#include "sc2/app/shell_screens.hpp"
+#include "omc/app/shell_screens.hpp"
 
-namespace sc2::app::shell {
+namespace omc::app::shell {
 
 bool screen_about(Ui&, ShellCtx&) { return false; }
 

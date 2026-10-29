@@ -1,16 +1,16 @@
-#include "sc2/campaign/mission_load.hpp"
+#include "omc/campaign/mission_load.hpp"
 
 #include <exception>
 #include <stdexcept>
 #include <utility>
 
-#include "sc2/casc/storage.hpp"
-#include "sc2/formats/map_info.hpp"
-#include "sc2/formats/placed_objects.hpp"
-#include "sc2/formats/terrain.hpp"
-#include "sc2/formats/terrain_grid.hpp"
+#include "omc/casc/storage.hpp"
+#include "omc/formats/map_info.hpp"
+#include "omc/formats/placed_objects.hpp"
+#include "omc/formats/terrain.hpp"
+#include "omc/formats/terrain_grid.hpp"
 
-namespace sc2::campaign {
+namespace omc::campaign {
 
 std::vector<std::string> liberty_campaign_roots() {
     return {

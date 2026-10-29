@@ -1,8 +1,8 @@
-#include "sc2/api/orders.hpp"
+#include "omc/api/orders.hpp"
 
 #include "s2clientprotocol/sc2api.pb.h"
 
-namespace sc2::api {
+namespace omc::api {
 
 const char* protocol_ability_name(sim::OrderType type) {
     switch (type) {

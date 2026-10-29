@@ -1,4 +1,4 @@
-#include "sc2/render/anim.hpp"
+#include "omc/render/anim.hpp"
 
 #include <algorithm>
 #include <cmath>
@@ -7,7 +7,7 @@
 #include <sstream>
 #include <string>
 
-namespace sc2::render {
+namespace omc::render {
 
 namespace {
 
@@ -106,7 +106,7 @@ Mat4 bind_matrix(const formats::Model& m, size_t b) {
 }
 
 bool region_visible(const formats::Model& m, int seq, float time_ms, std::size_t region, const ClipLayers* global) {
-    static const bool kOff = std::getenv("SC2_NO_BATCH_BONE_VISIBILITY") != nullptr || std::getenv("SC2_NO_BONE_VISIBILITY") != nullptr;
+    static const bool kOff = std::getenv("OMC_NO_BATCH_BONE_VISIBILITY") != nullptr || std::getenv("OMC_NO_BONE_VISIBILITY") != nullptr;
     if (kOff || seq < 0 || region >= m.region_bone.size()) return true;
     const int b = m.region_bone[region];
     if (b < 0 || std::size_t(b) >= m.bones.size()) return true;
@@ -130,10 +130,10 @@ std::vector<Mat4> pose_world(const formats::Model& m, uint32_t seq, float time_m
     float t = time_ms;
     if (seq < m.sequences.size()) t += float(m.sequences[seq].start_ms);
 
-    static const bool kUiKeep = std::getenv("SC2_BONE_VIS_UI_KEEP") != nullptr;
+    static const bool kUiKeep = std::getenv("OMC_BONE_VIS_UI_KEEP") != nullptr;
     const bool ui_model = kUiKeep && m.name.find("\\UI\\") != std::string::npos;
-    static const std::string kBoneVisTraceValue = std::getenv("SC2_BONE_VIS_TRACE") ? std::getenv("SC2_BONE_VIS_TRACE") : "";
-    static const char* const kBoneVisTrace = std::getenv("SC2_BONE_VIS_TRACE") ? kBoneVisTraceValue.c_str() : nullptr;
+    static const std::string kBoneVisTraceValue = std::getenv("OMC_BONE_VIS_TRACE") ? std::getenv("OMC_BONE_VIS_TRACE") : "";
+    static const char* const kBoneVisTrace = std::getenv("OMC_BONE_VIS_TRACE") ? kBoneVisTraceValue.c_str() : nullptr;
     std::vector<Mat4> local(n);
     for (size_t b = 0; b < n; ++b) {
         const formats::M3Bone& bone = m.bones[b];
@@ -141,10 +141,10 @@ std::vector<Mat4> pose_world(const formats::Model& m, uint32_t seq, float time_m
         field(m, seq, bone.location, t, 3, T, global);
         field(m, seq, bone.rotation, t, 4, R, global);
         field(m, seq, bone.scale, t, 3, S, global);
-        static const bool kBoneVis = std::getenv("SC2_NO_BONE_VISIBILITY") == nullptr;
+        static const bool kBoneVis = std::getenv("OMC_NO_BONE_VISIBILITY") == nullptr;
         if (kBoneVisTrace && bone.visibility.anim_flags == 0) {
             static int told_static = 0;
-            const char* want = std::getenv("SC2_BONE_VIS_MODEL");
+            const char* want = std::getenv("OMC_BONE_VIS_MODEL");
             if (want && m.name.find(want) != std::string::npos && told_static++ < 600)
                 std::fprintf(stderr, "[bonevis-static] %s parent %d model %s init %.0f\n", bone.name.c_str(), int(bone.parent), m.name.c_str(), double(bone.visibility.init[0]));
         }
@@ -263,9 +263,8 @@ int select_sequence(const formats::Model& m, const std::vector<std::string>& tok
     return cands[0];
 }
 
-int select_variation(const formats::Model& m, const std::string& token, uint64_t seed, double clock_ms, float* time_ms) {
-    std::vector<int> cands;
-    uint64_t total = 0;
+VariationTakes variation_takes(const formats::Model& m, const std::string& token) {
+    VariationTakes v;
     for (size_t i = 0; i < m.sequences.size(); ++i) {
         std::vector<std::string> t = tokenize(m.sequences[i].name);
         bool named = false, other = false;
@@ -274,14 +273,35 @@ int select_variation(const formats::Model& m, const std::string& token, uint64_t
             else if (s.find_first_not_of("0123456789") != std::string::npos) other = true;
         }
         if (!named || other) continue;
-        cands.push_back(int(i));
-        total += m.sequences[i].frequency ? m.sequences[i].frequency : 1;
+        v.cands.push_back(int(i));
+        v.total += m.sequences[i].frequency ? m.sequences[i].frequency : 1;
     }
+    return v;
+}
+
+int select_variation(const formats::Model& m, const std::string& token, uint64_t seed, double clock_ms, float* time_ms) {
+    VariationWalk walk;
+    return select_variation(m, variation_takes(m, token), seed, clock_ms, time_ms, walk);
+}
+
+int select_variation(const formats::Model& m, const VariationTakes& takes, uint64_t seed, double clock_ms, float* time_ms,
+                     VariationWalk& walk) {
+    constexpr uint64_t kMaxLoops = 100000;
     if (time_ms) *time_ms = 0.0f;
-    if (cands.empty()) return -1;
-    double t = clock_ms > 0.0 ? clock_ms : 0.0;
+    if (takes.cands.empty()) return -1;
+    const std::vector<int>& cands = takes.cands;
+    const uint64_t total = takes.total;
+    const double clock = clock_ms > 0.0 ? clock_ms : 0.0;
+    uint64_t loop = 0;
+    double consumed = 0.0;
+    if (walk.valid && walk.seed == seed && clock >= walk.clock_ms) {
+        loop = walk.loop;
+        consumed = walk.consumed_ms;
+    }
+    double t = clock - consumed;
     int seq = cands[0];
-    for (uint64_t loop = 0; loop < 100000; ++loop) {
+    bool stopped = false;
+    for (; loop < kMaxLoops; ++loop) {
         uint64_t h = seed + loop * 0x9E3779B97F4A7C15ULL;
         h ^= h >> 33; h *= 0xff51afd7ed558ccdULL; h ^= h >> 33; h *= 0xc4ceb9fe1a85ec53ULL; h ^= h >> 33;
         uint64_t pick = h % total;
@@ -292,9 +312,15 @@ int select_variation(const formats::Model& m, const std::string& token, uint64_t
             pick -= w;
         }
         const double len = double(m.sequences[size_t(seq)].length_ms());
-        if (len <= 0.0 || t < len) break;
+        if (len <= 0.0 || t < len) { stopped = true; break; }
         t -= len;
+        consumed += len;
     }
+    walk.valid = stopped;
+    walk.seed = seed;
+    walk.clock_ms = clock;
+    walk.loop = loop;
+    walk.consumed_ms = consumed;
     if (time_ms) *time_ms = float(t);
     return seq;
 }

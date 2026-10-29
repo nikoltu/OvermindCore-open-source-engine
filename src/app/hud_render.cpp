@@ -1,8 +1,8 @@
 #include <cstring>
-#include "sc2/render/frame_prof.hpp"
-#include "sc2/app/hud_render.hpp"
+#include "omc/render/frame_prof.hpp"
+#include "omc/app/hud_render.hpp"
 
-#include "sc2/app/overlay_draw.hpp"
+#include "omc/app/overlay_draw.hpp"
 
 #include <algorithm>
 #include <cmath>
@@ -10,11 +10,11 @@
 #include <cstdlib>
 #include <string>
 
-#include "sc2/app/console_panel.hpp"
-#include "sc2/sim/world.hpp"
-#include "sc2/ui/font.hpp"
+#include "omc/app/console_panel.hpp"
+#include "omc/sim/world.hpp"
+#include "omc/ui/font.hpp"
 
-namespace sc2::app {
+namespace omc::app {
 
 namespace {
 
@@ -50,8 +50,14 @@ ConsoleGeom console_geom(std::uint32_t out_w, std::uint32_t out_h, const Console
 void blend(std::vector<std::uint8_t>& img, std::uint32_t w, std::uint32_t h, int x, int y,
            std::uint8_t r, std::uint8_t g, std::uint8_t b, float a) {
     if (x < 0 || y < 0 || x >= int(w) || y >= int(h) || a <= 0.0f) return;
-    if (a > 1.0f) a = 1.0f;
     std::size_t i = (std::size_t(y) * w + x) * 4;
+    if (a >= 1.0f) {
+        img[i] = r;
+        img[i + 1] = g;
+        img[i + 2] = b;
+        img[i + 3] = 255;
+        return;
+    }
     float da = img[i + 3] / 255.0f;
     float oa = a + da * (1.0f - a);
     if (oa <= 0.0f) return;
@@ -322,7 +328,7 @@ HudRect hud_cargo_slot(std::uint32_t out_w, std::uint32_t out_h, int slot, const
 HudRect hud_queue_slot(std::uint32_t out_w, std::uint32_t out_h, int slot, const ConsolePanel* console) {
     (void)out_w;
     if (slot >= 0 && slot < 8 && console && console->authored && console->authored->ok && console->authored->info.ok() &&
-        out_h > 0 && !std::getenv("SC2_QUEUE_SLOTS_SOLVED")) {
+        out_h > 0 && !std::getenv("OMC_QUEUE_SLOTS_SOLVED")) {
         const double s = double(out_h) / double(kRefHeight);
         const double left = double(console->authored->info.x1) - 201.0 - (4.0 * 64.0 + 3.0 * 2.0) * 0.5;
         const double top = double(console->authored->info.y0) + 63.0;
@@ -481,8 +487,20 @@ std::vector<std::uint8_t> HudRender::render(const HudContent& content, const sim
                                             std::uint32_t out_h, const CameraFootprint* cam,
                                             const MinimapBackdrop* backdrop,
                                             const ConsolePanel* console) {
-    std::vector<std::uint8_t> img(std::size_t(out_w) * out_h * 4, 0);
-    if (out_w == 0 || out_h == 0) return img;
+    std::vector<std::uint8_t> img;
+    render_into(img, content, world, map_w, map_h, out_w, out_h, cam, backdrop, console);
+    return img;
+}
+
+void HudRender::render_into(std::vector<std::uint8_t>& img, const HudContent& content,
+                            const sim::World& world, float map_w, float map_h,
+                            std::uint32_t out_w, std::uint32_t out_h, const CameraFootprint* cam,
+                            const MinimapBackdrop* backdrop, const ConsolePanel* console) {
+    const std::size_t img_bytes = std::size_t(out_w) * out_h * 4;
+    if (out_w == 0 || out_h == 0) {
+        img.assign(img_bytes, 0);
+        return;
+    }
 
     const int W = int(out_w), H = int(out_h);
     const int ph = hud_panel_height(out_w, out_h, console);
@@ -496,11 +514,13 @@ std::vector<std::uint8_t> HudRender::render(const HudContent& content, const sim
         const bool base_hit = s_px == static_cast<const void*>(console->rgba->data()) &&
                               s_sz == console->rgba->size() && s_w == out_w && s_h == out_h &&
                               s_tw == std::uint32_t(console->tw) && s_th == std::uint32_t(console->th) &&
-                              s_base.size() == img.size();
+                              s_base.size() == img_bytes;
         const auto t_cc0 = std::chrono::steady_clock::now();
         if (base_hit) {
-            std::memcpy(img.data(), s_base.data(), img.size());
+            img.resize(img_bytes);
+            std::memcpy(img.data(), s_base.data(), img_bytes);
         } else {
+            img.assign(img_bytes, 0);
             {
                 constexpr double kInfoStubTopFrac = (double(kRefHeight) - 232.0) / double(kRefHeight);
                 const int band_y0 = int(double(H) * kInfoStubTopFrac + 0.5);
@@ -515,6 +535,7 @@ std::vector<std::uint8_t> HudRender::render(const HudContent& content, const sim
         }
         render::frame_prof_add("hud.console_composite", std::chrono::duration_cast<std::chrono::duration<double, std::milli>>(std::chrono::steady_clock::now() - t_cc0).count());
     } else {
+        img.assign(img_bytes, 0);
         fill_rect(img, out_w, out_h, 0, panel_y0, W, H, 14, 16, 22, 0.72f);
         for (int x = 0; x < W; ++x) blend(img, out_w, out_h, x, panel_y0, 90, 120, 160, 0.85f);
     }
@@ -553,7 +574,7 @@ std::vector<std::uint8_t> HudRender::render(const HudContent& content, const sim
                 if (!authored_rect(console, *labs[i], out_h, lr)) continue;
                 const int ly = lr.y0 + std::max(0, (lr.h() - ui::kFontH * 2) / 2);
                 const bool red = blocked && i == 2;
-                static const bool cream = std::getenv("SC2_RESOURCE_ICON_PLATES") != nullptr;
+                static const bool cream = std::getenv("OMC_RESOURCE_ICON_PLATES") != nullptr;
                 draw_text(img, out_w, out_h, lr.x0 + 2, ly, vals[i], 2,
                           red ? kSupplyBlockedR : (cream ? 235 : 255), red ? kSupplyBlockedG : (cream ? 236 : 255),
                           red ? kSupplyBlockedB : (cream ? 210 : 255), lr.x0, lr.y0, lr.x1, lr.y1);
@@ -590,7 +611,7 @@ std::vector<std::uint8_t> HudRender::render(const HudContent& content, const sim
                           backdrop->fog->size() >=
                               std::size_t(backdrop->fw) * std::size_t(backdrop->fh);
     const auto t_mm0 = std::chrono::steady_clock::now();
-    static const bool mm_uncached = std::getenv("SC2_MINIMAP_TEXEL_UNCACHED") != nullptr;
+    static const bool mm_uncached = std::getenv("OMC_MINIMAP_TEXEL_UNCACHED") != nullptr;
     struct MmTexel { float r, g, b, ax, ay; int x0, y0, x1, y1; };
     struct MmCache {
         const void* terrain = nullptr;
@@ -603,7 +624,7 @@ std::vector<std::uint8_t> HudRender::render(const HudContent& content, const sim
     static MmCache mmc;
     if (have_terrain && mm.w() > 1 && mm.h() > 1 && !mm_uncached) {
         const int mw = mm.w(), mh = mm.h();
-        static const bool mm_nearest_c = std::getenv("SC2_MINIMAP_NEAREST") != nullptr;
+        static const bool mm_nearest_c = std::getenv("OMC_MINIMAP_NEAREST") != nullptr;
         const std::vector<std::uint8_t>& tv = *backdrop->terrain;
         std::size_t probe = 1469598103u;
         for (std::size_t i = 0; i < tv.size(); i += 997) probe = (probe ^ tv[i]) * 1099511628211ull;
@@ -732,7 +753,7 @@ std::vector<std::uint8_t> HudRender::render(const HudContent& content, const sim
                 float r = (*backdrop->terrain)[si];
                 float g = (*backdrop->terrain)[si + 1];
                 float b = (*backdrop->terrain)[si + 2];
-                static const bool mm_nearest = std::getenv("SC2_MINIMAP_NEAREST") != nullptr;
+                static const bool mm_nearest = std::getenv("OMC_MINIMAP_NEAREST") != nullptr;
                 if (!mm_nearest) {
                     const float ux = tfx * float(backdrop->tw) - 0.5f, uy = tfy * float(backdrop->th) - 0.5f;
                     const int x0i = std::max(0, std::min(backdrop->tw - 1, int(std::floor(ux)))), y0i = std::max(0, std::min(backdrop->th - 1, int(std::floor(uy))));
@@ -770,8 +791,43 @@ std::vector<std::uint8_t> HudRender::render(const HudContent& content, const sim
     } else {
         fill_rect(img, out_w, out_h, mm.x0, mm.y0, mm.x1, mm.y1, 8, 10, 14, 0.92f);
     }
-    if (!(console && console->authored) || std::getenv("SC2_MINIMAP_BOX"))
+    if (!(console && console->authored) || std::getenv("OMC_MINIMAP_BOX"))
         stroke_rect(img, out_w, out_h, mm.x0, mm.y0, mm.x1, mm.y1, 70, 90, 120, 0.9f);
+    if (content.minimap_creep && content.creep_alpha > 0.0f && content.creep_w > 0 && content.creep_h > 0 &&
+        content.creep_cell > 0.0f && content.minimap_creep->size() >= std::size_t(content.creep_w) * std::size_t(content.creep_h) &&
+        mm.w() > 1 && mm.h() > 1 && mext.ok()) {
+        const int mw = mm.w(), mh = mm.h();
+        std::vector<int> col(std::size_t(mw), -1), row(std::size_t(mh), -1);
+        std::vector<int> fcol(std::size_t(mw), 0), frow(std::size_t(mh), 0);
+        for (int px = 0; px < mw; ++px) {
+            float wx, wy;
+            hud_minimap_pixel_to_world(mm, mext, float(mm.x0 + px), float(mm.y0), wx, wy);
+            const int cx = int(std::floor((wx - content.creep_x0) / content.creep_cell));
+            col[std::size_t(px)] = cx >= 0 && cx < content.creep_w ? cx : -1;
+            if (have_fog && map_w > 0.0f) fcol[std::size_t(px)] = std::max(0, std::min(backdrop->fw - 1, int(wx / map_w * float(backdrop->fw))));
+        }
+        for (int py = 0; py < mh; ++py) {
+            float wx, wy;
+            hud_minimap_pixel_to_world(mm, mext, float(mm.x0), float(mm.y0 + py), wx, wy);
+            const int cy = int(std::floor((wy - content.creep_y0) / content.creep_cell));
+            row[std::size_t(py)] = cy >= 0 && cy < content.creep_h ? cy : -1;
+            if (have_fog && map_h > 0.0f) frow[std::size_t(py)] = std::max(0, std::min(backdrop->fh - 1, int(wy / map_h * float(backdrop->fh))));
+        }
+        const std::vector<std::uint8_t>& cr = *content.minimap_creep;
+        for (int py = 0; py < mh; ++py) {
+            const int cy = row[std::size_t(py)];
+            if (cy < 0) continue;
+            for (int px = 0; px < mw; ++px) {
+                const int cx = col[std::size_t(px)];
+                if (cx < 0 || !cr[std::size_t(cy) * std::size_t(content.creep_w) + std::size_t(cx)]) continue;
+                float f = 1.0f;
+                if (have_fog)
+                    f = hud_minimap_fog_factor((*backdrop->fog)[std::size_t(frow[std::size_t(py)]) * std::size_t(backdrop->fw) + std::size_t(fcol[std::size_t(px)])]);
+                blend(img, out_w, out_h, mm.x0 + px, mm.y0 + py, std::uint8_t(float(content.creep_rgb[0]) * f + 0.5f),
+                      std::uint8_t(float(content.creep_rgb[1]) * f + 0.5f), std::uint8_t(float(content.creep_rgb[2]) * f + 0.5f), content.creep_alpha);
+            }
+        }
+    }
     if (map_w > 0.0f && map_h > 0.0f && mm.w() > 1 && mm.h() > 1) {
         const auto t_bl0 = std::chrono::steady_clock::now();
         std::vector<std::uint32_t> blip_order;
@@ -788,36 +844,12 @@ std::vector<std::uint8_t> HudRender::render(const HudContent& content, const sim
         }
         struct BlipMark { int bx, by, lo, hi, border; std::uint8_t r, g, b; };
         std::vector<BlipMark> marks;
-        for (std::uint32_t blip_id : blip_order) {
-            if (blip_id >= world.units().size()) continue;
-            const sim::Unit& u = world.units()[blip_id];
-            if (!u.alive) continue;
-            if (u.in_gas_structure) continue;
-            if (u.loaded && world.cargo_hidden()) continue;
-            float fx = float(u.x.to_double()) / map_w;
-            float fy = float(u.y.to_double()) / map_h;
-            if (fx < 0.0f) fx = 0.0f;
-            else if (fx > 1.0f) fx = 1.0f;
-            if (fy < 0.0f) fy = 0.0f;
-            else if (fy > 1.0f) fy = 1.0f;
-            const bool known_resource = u.player < 0 && u.resource_left > 0;
-            if (have_fog && backdrop->viewer_player >= 0 && !known_resource &&
-                int(u.player) != backdrop->viewer_player) {
-                int cx = int(fx * float(backdrop->fw));
-                int cy = int(fy * float(backdrop->fh));
-                if (cx >= backdrop->fw) cx = backdrop->fw - 1;
-                if (cy >= backdrop->fh) cy = backdrop->fh - 1;
-                if (cx < 0) cx = 0;
-                if (cy < 0) cy = 0;
-                const std::uint8_t code =
-                    (*backdrop->fog)[std::size_t(cy) * std::size_t(backdrop->fw) + std::size_t(cx)];
-                if (code != 2) continue;
-            }
-            if (u.minimap_radius.raw() <= 0) continue;
+        auto blip_of = [&](const sim::Unit& u) {
+            if (u.minimap_radius.raw() <= 0) return;
             bool has_icon = false;
             for (const HudContent::MinimapIcon& mi : content.minimap_icons)
                 if (mi.unit == u.id && mi.rgba) { has_icon = true; break; }
-            if (has_icon) continue;
+            if (has_icon) return;
             int bx, by;
             hud_minimap_world_to_pixel(mm, mext, float(u.x.to_double()), float(u.y.to_double()), bx, by);
             std::uint8_t r, g, b;
@@ -849,7 +881,7 @@ std::vector<std::uint8_t> HudRender::render(const HudContent& content, const sim
             const bool floored = 2 * span + 1 < min_dot;
             const int dot_lo = -(min_dot / 2), dot_hi = dot_lo + min_dot - 1;
             const int border = content.border_px > 0 ? content.border_px : 0;
-            static const bool blip_odd = std::getenv("SC2_MINIMAP_BLIP_ODD") != nullptr;
+            static const bool blip_odd = std::getenv("OMC_MINIMAP_BLIP_ODD") != nullptr;
             int lo, hi;
             if (floored) {
                 lo = dot_lo;
@@ -880,6 +912,43 @@ std::vector<std::uint8_t> HudRender::render(const HudContent& content, const sim
             } else {
                 marks.push_back(BlipMark{bx, by, lo, hi, border, r, g, b});
             }
+        };
+        for (std::uint32_t blip_id : blip_order) {
+            if (blip_id >= world.units().size()) continue;
+            const sim::Unit& u = world.units()[blip_id];
+            if (!u.alive) continue;
+            if (blip_id < content.minimap_hidden.size() && content.minimap_hidden[blip_id]) continue;
+            if (u.in_gas_structure) continue;
+            if (u.loaded && world.cargo_hidden()) continue;
+            float fx = float(u.x.to_double()) / map_w;
+            float fy = float(u.y.to_double()) / map_h;
+            if (fx < 0.0f) fx = 0.0f;
+            else if (fx > 1.0f) fx = 1.0f;
+            if (fy < 0.0f) fy = 0.0f;
+            else if (fy > 1.0f) fy = 1.0f;
+            const bool known_resource = u.player < 0 && u.resource_left > 0;
+            if (have_fog && backdrop->viewer_player >= 0 && !known_resource &&
+                int(u.player) != backdrop->viewer_player) {
+                int cx = int(fx * float(backdrop->fw));
+                int cy = int(fy * float(backdrop->fh));
+                if (cx >= backdrop->fw) cx = backdrop->fw - 1;
+                if (cy >= backdrop->fh) cy = backdrop->fh - 1;
+                if (cx < 0) cx = 0;
+                if (cy < 0) cy = 0;
+                const std::uint8_t code =
+                    (*backdrop->fog)[std::size_t(cy) * std::size_t(backdrop->fw) + std::size_t(cx)];
+                if (code != 2) continue;
+            }
+            blip_of(u);
+        }
+        for (const HudContent::MinimapSnapshot& sn : content.minimap_snapshots) {
+            sim::Unit v;
+            v.id = 0xFFFFFFFFu;
+            v.player = sn.player;
+            v.x = sim::Fixed::from_double(sn.x);
+            v.y = sim::Fixed::from_double(sn.y);
+            v.minimap_radius = sim::Fixed::from_double(sn.radius);
+            blip_of(v);
         }
         for (int pass = 0; pass < 2; ++pass)
             for (const BlipMark& mk : marks) {
@@ -970,7 +1039,7 @@ std::vector<std::uint8_t> HudRender::render(const HudContent& content, const sim
             const HudRect ec = hud_equipment_cell(out_w, out_h, q, console, equip_n);
             if (ec.w() <= 0) break;
             fill_rect(img, out_w, out_h, ec.x0, ec.y0, ec.x1, ec.y1, 10, 12, 16, 0.85f);
-            if (std::getenv("SC2_NO_EQUIPMENT_BORDER")) stroke_rect(img, out_w, out_h, ec.x0, ec.y0, ec.x1, ec.y1, 60, 70, 80, 0.9f);
+            if (std::getenv("OMC_NO_EQUIPMENT_BORDER")) stroke_rect(img, out_w, out_h, ec.x0, ec.y0, ec.x1, ec.y1, 60, 70, 80, 0.9f);
         }
     } else if (!content.equipment.empty() || content.lead_kills > 0) {
         HudRect ep;
@@ -1021,7 +1090,8 @@ std::vector<std::uint8_t> HudRender::render(const HudContent& content, const sim
         }
     }
 
-    if (content.warp_gates_ready > 0) {
+    static const bool kWarpButtonArtOld = std::getenv("OMC_WARP_BUTTON_ART_OLD") != nullptr;
+    if (content.warp_gates_ready > 0 && (!content.widget_art || kWarpButtonArtOld)) {
         const HudRect wb = hud_warp_button_rect(out_w, out_h, console);
         if (wb.w() > 2 && wb.h() > 2) {
             fill_rect(img, out_w, out_h, wb.x0, wb.y0, wb.x1, wb.y1, 18, 24, 32, 0.80f);
@@ -1139,8 +1209,6 @@ std::vector<std::uint8_t> HudRender::render(const HudContent& content, const sim
             }
         }
     }
-
-    return img;
 }
 
 }

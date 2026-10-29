@@ -1,9 +1,9 @@
-#include "sc2/asset/manager.hpp"
+#include "omc/asset/manager.hpp"
 
-#include "sc2/casc/blte.hpp"
-#include "sc2/casc/storage.hpp"
+#include "omc/casc/blte.hpp"
+#include "omc/casc/storage.hpp"
 
-namespace sc2::asset {
+namespace omc::asset {
 
 AssetManager::PrewarmResult AssetManager::prewarm(
     const std::vector<std::string>& names) {

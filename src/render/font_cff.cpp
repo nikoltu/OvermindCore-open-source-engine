@@ -1,4 +1,4 @@
-#include "sc2/render/font_cff.hpp"
+#include "omc/render/font_cff.hpp"
 
 #include <algorithm>
 #include <cmath>
@@ -7,7 +7,7 @@
 #include <map>
 #include <string>
 
-namespace sc2::render {
+namespace omc::render {
 namespace {
 
 std::uint8_t rd_u8(const std::uint8_t* p, std::size_t n, std::size_t off) {

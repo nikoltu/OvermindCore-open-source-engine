@@ -1,12 +1,14 @@
-#include "sc2/app/shell_screens.hpp"
+#include "omc/app/shell_screens.hpp"
 
 #include <algorithm>
 
-#include "sc2/app/shell_emblem.hpp"
+#include "omc/app/shell_emblem.hpp"
 
-namespace sc2::app::shell {
+namespace omc::app::shell {
 
 namespace v2 = theme::v2;
+
+constexpr std::uint8_t kOverMatchAlpha = 210;
 
 ScreenFn screen_fn(ScreenId id) {
     switch (id) {
@@ -31,7 +33,8 @@ bool chrome(Ui& ui, ShellCtx& ctx, const std::string& title, unsigned flags, con
     const std::vector<FluidSpan> body_spans = ui.fluid_spans();
     ui.fluid({FluidSpan{720.0f, 1700.0f, 1.0f}});
     ui.show_badges = ctx.settings.hotkey_badges();
-    ui.background(ctx.settings.bg_motion());
+    if (ctx.in_match()) ui.fill(Rect{0, 0, int(ui.view_w()), int(ui.view_h())}, v2::kBgBase, kOverMatchAlpha);
+    else ui.background(ctx.settings.bg_motion());
     const int line = std::max(1, ui.px(v2::kLineW));
     if (!(flags & kChromeBare)) {
         const Rect bar = ui.band(L::kTopBar.y, L::kTopBar.h);
@@ -42,7 +45,7 @@ bool chrome(Ui& ui, ShellCtx& ctx, const std::string& title, unsigned flags, con
             const Rect em = ui.at(L::kEmblem);
             const IconAtlas::Icon& icon = shell_emblem(true);
             ui.picture(em, &icon);
-            ui.text(ui.at(L::kCrafterScWordmark), "CRAFTER SC", v2::kH2, v2::kTextHi);
+            ui.text(ui.at(L::kProductWordmark), "OVERMINDCORE", v2::kH2, v2::kTextHi);
         } else {
             if (flags & kChromeBack) {
                 const FlowEdge* e = ctx.router.cancel_edge();
@@ -85,7 +88,7 @@ bool chrome(Ui& ui, ShellCtx& ctx, const std::string& title, unsigned flags, con
     ui.publish_region("chrome/hint", hint);
     const Rect block = ui.at(L::kHintBar);
     const int margin = ui.px(v2::kMargin);
-    const std::string ver = std::string("crafter-sc ") + ctx.version();
+    const std::string ver = std::string("overmindcore ") + ctx.version();
     const int vw = ui.text_width(ver, v2::kSmall);
     const Rect vr{block.x1 - margin - vw, hint.y0, block.x1 - margin, hint.y1};
     ui.text(vr, ver, v2::kSmall, v2::kTextMuted, Align::Right);

@@ -1,14 +1,15 @@
-#include "sc2/app/shell_ui.hpp"
+#include "omc/app/shell_ui.hpp"
 
 #include <algorithm>
+#include <cctype>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
 
-#include "sc2/ai/difficulty.hpp"
-#include "sc2/app/ui_settings.hpp"
+#include "omc/ai/difficulty.hpp"
+#include "omc/app/ui_settings.hpp"
 
-namespace sc2::app {
+namespace omc::app {
 
 std::string ShellSettings::get(const std::string& key) const {
     if (get_) return get_(key);
@@ -154,6 +155,161 @@ float ShellSettings::ui_scale() const { return parse_ui_scale(get(kUiScaleKey));
 bool ShellSettings::set_ui_scale(float v) {
     v = std::max(kUiScaleMin, std::min(kUiScaleMax, v));
     return set(kUiScaleKey, format_ui_scale(v));
+}
+
+const std::vector<ShellSettings::Level>& ShellSettings::portrait_texture_levels() {
+    static const std::vector<Level> k = {{"full", "Full", 0}, {"1024", "1024", 1024}, {"512", "512", 512}};
+    return k;
+}
+
+const std::vector<ShellSettings::Level>& ShellSettings::console_texture_levels() {
+    static const std::vector<Level> k = {{"full", "Full", 0}, {"half", "Half", 1}};
+    return k;
+}
+
+const std::vector<ShellSettings::Level>& ShellSettings::portrait_rate_levels() {
+    static const std::vector<Level> k = {{"every", "Every frame", 0}, {"30", "30 / s", 30}, {"15", "15 / s", 15}};
+    return k;
+}
+
+const std::vector<ShellSettings::Level>& ShellSettings::shadow_quality_levels() {
+    static const std::vector<Level> k = {{"full", "Full", 0}, {"units", "Units only", 1}, {"off", "Off", 2}};
+    return k;
+}
+
+const std::vector<ShellSettings::Level>& ShellSettings::render_scale_levels() {
+    static const std::vector<Level> k = {{"100", "100 %", 100}, {"75", "75 %", 75}, {"50", "50 %", 50}};
+    return k;
+}
+
+const std::vector<ShellSettings::Level>& ShellSettings::shadow_map_levels() {
+    static const std::vector<Level> k = {{"2048", "2048", 2048}, {"1024", "1024", 1024}, {"512", "512", 512}};
+    return k;
+}
+
+const std::vector<ShellSettings::Level>& ShellSettings::terrain_quality_levels() {
+    static const std::vector<Level> k = {{"high", "High", 0}, {"medium", "Medium", 1}, {"low", "Low", 2}};
+    return k;
+}
+
+const std::vector<ShellSettings::Level>& ShellSettings::doodad_density_levels() {
+    static const std::vector<Level> k = {{"all", "All", 0}, {"medium", "Medium", 1}, {"low", "Low", 2}};
+    return k;
+}
+
+const std::vector<std::string>& ShellSettings::preset_names() {
+    static const std::vector<std::string> k = [] {
+        std::vector<std::string> v;
+        for (const Preset& p : kPresets) v.push_back(p.name);
+        return v;
+    }();
+    return k;
+}
+
+int ShellSettings::quality_preset() const {
+    for (int i = 0; i < kPresetCount; ++i) {
+        const Preset& p = kPresets[i];
+        if (shadow_quality_level() == p.shadows && shadow_map_level() == p.shadow_map && terrain_quality_level() == p.terrain &&
+            doodad_density_level() == p.doodads && render_scale_level() == p.render_scale)
+            return i;
+    }
+    return -1;
+}
+
+bool ShellSettings::set_quality_preset(int preset) {
+    if (preset < 0 || preset >= kPresetCount) return false;
+    const Preset& p = kPresets[preset];
+    bool ok = set_level(kShadowQualityKey, shadow_quality_levels(), p.shadows);
+    ok = set_level(kShadowMapKey, shadow_map_levels(), p.shadow_map) && ok;
+    ok = set_level(kTerrainQualityKey, terrain_quality_levels(), p.terrain) && ok;
+    ok = set_level(kDoodadDensityKey, doodad_density_levels(), p.doodads) && ok;
+    ok = set_level(kRenderScaleKey, render_scale_levels(), p.render_scale) && ok;
+    return ok;
+}
+
+static render::RenderQuality quality_from(int shadows, int shadow_map, int terrain, int doodads, int render_scale) {
+    render::RenderQuality q;
+    q.shadows = render::ShadowQuality(ShellSettings::shadow_quality_levels()[std::size_t(shadows)].value);
+    q.shadow_dim = std::uint32_t(ShellSettings::shadow_map_levels()[std::size_t(shadow_map)].value);
+    q.terrain = render::TerrainQuality(ShellSettings::terrain_quality_levels()[std::size_t(terrain)].value);
+    q.doodads = render::DoodadDensity(ShellSettings::doodad_density_levels()[std::size_t(doodads)].value);
+    q.scale_pct = ShellSettings::render_scale_levels()[std::size_t(render_scale)].value;
+    return q;
+}
+
+render::RenderQuality ShellSettings::scene_quality() const {
+    return quality_from(shadow_quality_level(), shadow_map_level(), terrain_quality_level(), doodad_density_level(), render_scale_level());
+}
+
+render::RenderQuality ShellSettings::preset_quality(int preset) {
+    const Preset& p = kPresets[std::max(0, std::min(kPresetCount - 1, preset))];
+    return quality_from(p.shadows, p.shadow_map, p.terrain, p.doodads, p.render_scale);
+}
+
+bool ShellSettings::apply_quality_spec(const std::string& spec, render::RenderQuality& q) {
+    bool ok = true;
+    std::size_t at = 0;
+    while (at <= spec.size()) {
+        std::size_t end = spec.find(',', at);
+        if (end == std::string::npos) end = spec.size();
+        std::string kv = spec.substr(at, end - at);
+        at = end + 1;
+        for (char& ch : kv) ch = char(std::tolower(static_cast<unsigned char>(ch)));
+        const std::size_t eq = kv.find('=');
+        if (kv.empty()) continue;
+        if (eq == std::string::npos) {
+            ok = false;
+            continue;
+        }
+        const std::string k = kv.substr(0, eq), v = kv.substr(eq + 1);
+        auto pick = [&](const std::vector<Level>& levels, int& out) {
+            for (std::size_t i = 0; i < levels.size(); ++i) {
+                if (v == levels[i].token) {
+                    out = levels[i].value;
+                    return true;
+                }
+            }
+            return false;
+        };
+        int val = 0;
+        if (k == "preset") {
+            bool hit = false;
+            for (int i = 0; i < kPresetCount; ++i) {
+                std::string n = kPresets[i].name;
+                for (char& ch : n) ch = char(std::tolower(static_cast<unsigned char>(ch)));
+                if (n == v) {
+                    q = preset_quality(i);
+                    hit = true;
+                }
+            }
+            ok = hit && ok;
+        } else if (k == "shadows" && pick(shadow_quality_levels(), val)) {
+            q.shadows = render::ShadowQuality(val);
+        } else if (k == "scale" && pick(render_scale_levels(), val)) {
+            q.scale_pct = val;
+        } else if (k == "shadowmap" && pick(shadow_map_levels(), val)) {
+            q.shadow_dim = std::uint32_t(val);
+        } else if (k == "terrain" && pick(terrain_quality_levels(), val)) {
+            q.terrain = render::TerrainQuality(val);
+        } else if (k == "doodads" && pick(doodad_density_levels(), val)) {
+            q.doodads = render::DoodadDensity(val);
+        } else {
+            ok = false;
+        }
+    }
+    return ok;
+}
+
+int ShellSettings::level(const char* key, const std::vector<Level>& levels, int dflt) const {
+    const std::string v = get(key);
+    for (std::size_t i = 0; i < levels.size(); ++i)
+        if (v == levels[i].token) return int(i);
+    return dflt;
+}
+
+bool ShellSettings::set_level(const char* key, const std::vector<Level>& levels, int index) {
+    if (index < 0 || index >= int(levels.size())) return false;
+    return set(key, levels[std::size_t(index)].token);
 }
 
 std::string ShellSettings::profile_name() const {
@@ -316,7 +472,6 @@ const char* shell_tooltip(const std::string& key) {
         {"FindMatchButton", "Versus A.I.: pick the map, the races and the difficulty, then start."},
         {"CustomButton", "Custom game: browse every map the install ships and any folder of your own."},
         {"ReplayButton", "Replays: watch a recorded match at its recorded seed."},
-        {"SandboxButton", "Sandbox: one race, no opponent, spawn any unit and watch it."},
         {"ProfileButton", "Profile: your name, emblem, preferred race and match record."},
         {"menu/Options", "Options: gameplay, sound, video and hotkeys. Changes apply at once."},
         {"Credits entry", "Who made this client."},

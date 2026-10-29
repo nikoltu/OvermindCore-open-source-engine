@@ -1,9 +1,9 @@
-#include "sc2/data/sound_events.hpp"
+#include "omc/data/sound_events.hpp"
 
-#include "sc2/data/actor_catalog.hpp"
-#include "sc2/data/audio.hpp"
+#include "omc/data/actor_catalog.hpp"
+#include "omc/data/audio.hpp"
 
-namespace sc2::data {
+namespace omc::data {
 
 const char* to_string(UnitEvent event) {
     switch (event) {

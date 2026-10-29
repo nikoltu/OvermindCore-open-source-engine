@@ -1,4 +1,4 @@
-#include "sc2/formats/mpq.hpp"
+#include "omc/formats/mpq.hpp"
 
 #include <algorithm>
 #include <array>
@@ -6,10 +6,10 @@
 #include <string>
 #include <utility>
 
-#include "sc2/core/byte_reader.hpp"
-#include "sc2/core/inflate.hpp"
+#include "omc/core/byte_reader.hpp"
+#include "omc/core/inflate.hpp"
 
-namespace sc2::formats {
+namespace omc::formats {
 
 using core::ByteReader;
 

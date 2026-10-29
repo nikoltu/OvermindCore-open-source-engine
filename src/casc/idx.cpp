@@ -1,14 +1,14 @@
-#include "sc2/casc/idx.hpp"
+#include "omc/casc/idx.hpp"
 
 #include <algorithm>
 #include <stdexcept>
 
-#include "sc2/casc/encoding.hpp"
+#include "omc/casc/encoding.hpp"
 
-#include "sc2/core/byte_reader.hpp"
-#include "sc2/platform/file.hpp"
+#include "omc/core/byte_reader.hpp"
+#include "omc/platform/file.hpp"
 
-namespace sc2::casc {
+namespace omc::casc {
 
 using core::ByteReader;
 

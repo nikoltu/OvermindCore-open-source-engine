@@ -1,15 +1,15 @@
-#include "sc2/app/menu.hpp"
+#include "omc/app/menu.hpp"
 
 #include <cctype>
 #include <exception>
 #include <string>
 #include <vector>
 
-#include "sc2/app/glue_screen.hpp"
-#include "sc2/casc/storage.hpp"
-#include "sc2/ui/interact.hpp"
+#include "omc/app/glue_screen.hpp"
+#include "omc/casc/storage.hpp"
+#include "omc/ui/interact.hpp"
 
-namespace sc2::app {
+namespace omc::app {
 
 namespace {
 

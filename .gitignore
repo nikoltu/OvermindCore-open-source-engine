@@ -1,17 +1,9 @@
-/build/
+/build*/
 /out/
-# The reference oracle is a private verification tool — never committed.
-/oracle/
 *.o
 *.obj
 *.exe
 *.bin
 *.log
-# Stray test-render PNGs land in the repo root; real assets live under assets/ (kept).
 /*.png
-# Run/dump artifacts (sc2oracle_dump writes a dir named by its dumpId; CTest scratch).
-/Egg/
-/Testing/
-# Python bytecode from the test harnesses.
 __pycache__/
-/build*/

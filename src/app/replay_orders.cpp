@@ -1,10 +1,10 @@
-#include "sc2/app/replay_orders.hpp"
+#include "omc/app/replay_orders.hpp"
 
 #include <cstring>
 #include <fstream>
 #include <map>
 
-namespace sc2::app {
+namespace omc::app {
 namespace {
 
 using formats::ReplayValue;

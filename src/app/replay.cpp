@@ -1,10 +1,10 @@
-#include "sc2/app/replay.hpp"
+#include "omc/app/replay.hpp"
 
 #include <cstring>
 #include <fstream>
 #include <iterator>
 
-namespace sc2::app {
+namespace omc::app {
 
 void apply_timed_order(sim::World& w, const TimedOrder& t) {
     switch (record_kind(t)) {

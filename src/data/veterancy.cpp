@@ -1,8 +1,8 @@
-#include "sc2/data/veterancy.hpp"
+#include "omc/data/veterancy.hpp"
 
 #include <cstdlib>
 
-namespace sc2::data {
+namespace omc::data {
 
 using core::XmlNode;
 using sim::Fixed;

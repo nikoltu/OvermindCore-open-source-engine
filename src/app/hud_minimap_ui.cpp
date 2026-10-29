@@ -1,11 +1,11 @@
-#include "sc2/app/melee_game.hpp"
+#include "omc/app/melee_game.hpp"
 
 #include <cstdio>
 #include <cstdlib>
 
-#include "sc2/data/catalog.hpp"
+#include "omc/data/catalog.hpp"
 
-namespace sc2::app {
+namespace omc::app {
 
 bool MeleeGame::hud_minimap_on_button(const HudPress& p) {
     if (!p.left) return false;
@@ -41,7 +41,7 @@ static bool mouse_spec_fires(const data::StringTable& hk, const char* name, cons
 }
 
 bool MeleeGame::hud_minimap_take_click(const render::InputState& in, bool have_point, float wx, float wy) {
-    static const bool legacy = std::getenv("SC2_HUD_BUTTONS_LEGACY") != nullptr;
+    static const bool legacy = std::getenv("OMC_HUD_BUTTONS_LEGACY") != nullptr;
     if (legacy || !cat_) return false;
     HudMinimapUi& m = hud_ui_.minimap;
     const data::StringTable& hk = cat_->hotkeys();
@@ -58,7 +58,7 @@ bool MeleeGame::hud_minimap_take_click(const render::InputState& in, bool have_p
     ping.y = wy;
     m.pings.push_back(ping);
     m.ping_armed = false;
-    if (std::getenv("SC2_ENV_TRACE")) std::fprintf(stderr, "[hud] ping at %.1f,%.1f%s\n", double(wx), double(wy), quick ? " (quick)" : "");
+    if (std::getenv("OMC_ENV_TRACE")) std::fprintf(stderr, "[hud] ping at %.1f,%.1f%s\n", double(wx), double(wy), quick ? " (quick)" : "");
     return true;
 }
 

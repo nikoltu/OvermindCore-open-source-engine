@@ -1,5 +1,5 @@
-#include "sc2/data/environment.hpp"
-#include "sc2/render/scene.hpp"
+#include "omc/data/environment.hpp"
+#include "omc/render/scene.hpp"
 
 #include <vulkan/vulkan.h>
 
@@ -17,15 +17,15 @@
 #include <unordered_map>
 #include <vector>
 
-#include "sc2/casc/storage.hpp"
-#include "sc2/formats/dds.hpp"
-#include "sc2/render/anim.hpp"
-#include "sc2/render/device.hpp"
-#include "sc2/render/frame_prof.hpp"
-#include "sc2/render/scene_renderer.hpp"
-#include "sc2/render/texture_decode.hpp"
-#include "sc2/render/vk_helpers.hpp"
-#include "sc2/render/vk_raii.hpp"
+#include "omc/casc/storage.hpp"
+#include "omc/formats/dds.hpp"
+#include "omc/render/anim.hpp"
+#include "omc/render/device.hpp"
+#include "omc/render/frame_prof.hpp"
+#include "omc/render/scene_renderer.hpp"
+#include "omc/render/texture_decode.hpp"
+#include "omc/render/vk_helpers.hpp"
+#include "omc/render/vk_raii.hpp"
 #include "mesh_build.hpp"
 
 static const uint32_t kMeshVertSpv[] =
@@ -50,7 +50,7 @@ static const uint32_t kTonemapFragSpv[] =
 #include "tonemap.frag.spv.h"
     ;
 
-namespace sc2::render {
+namespace omc::render {
 
 namespace {
 
@@ -73,7 +73,7 @@ RenderResult render_scene(const std::vector<SceneInstance>& instances,
                           const casc::Storage* storage,
                           const std::string& texture_root, bool enable_particles,
                           const data::EnvLight* env, const FogField* fog, uint32_t resize_from,
-                          const float* window_shadow_clip) {
+                          const float* window_shadow_clip, bool halve_textures) {
     std::vector<const SceneInstance*> live;
     for (const auto& inst : instances)
         if (inst.model && inst.model->vertex_count && !inst.model->indices.empty())
@@ -95,6 +95,7 @@ RenderResult render_scene(const std::vector<SceneInstance>& instances,
         tun.clear_color[0] = tun.clear_color[1] = tun.clear_color[2] = 0.0f;
     }
     tun.upload_batch_mb = upload_batch_budget_mb();
+    tun.halve_textures = halve_textures;
     SceneRenderer sr(pd, dev, queue, gfx, resize_from ? resize_from : width, resize_from ? resize_from : height,
                      VK_FORMAT_R8G8B8A8_UNORM, storage, texture_root, tun);
     if (resize_from) sr.resize(width, height);
@@ -215,10 +216,7 @@ bool render_scene_session_exists(const std::string& key, uint32_t width, uint32_
     return g_session_find && g_session_find(key, width, height);
 }
 
-uint32_t render_scene_session_texture_max() {
-    static const uint32_t v = std::getenv("SC2_PORTRAIT_TEX_MAX") ? uint32_t(std::max(0, std::atoi(std::getenv("SC2_PORTRAIT_TEX_MAX")))) : 1024u;
-    return v;
-}
+uint32_t render_scene_session_texture_max() { return portrait_texture_cap(); }
 
 RenderResult render_scene_session(const std::string& key, const std::vector<SceneInstance>& instances, uint32_t width, uint32_t height,
                                   const Camera& cam, const casc::Storage* storage, const data::EnvLight* env,
@@ -237,14 +235,15 @@ RenderResult render_scene_session(const std::string& key, const std::vector<Scen
     struct Session {
         std::string key;
         uint32_t w = 0, h = 0;
+        uint32_t cap = 0;
         std::unique_ptr<SceneRenderer> sr;
         Buffer readback;
         Unique<VkCommandPool> pool;
         VkCommandBuffer cmd = VK_NULL_HANDLE;
         Unique<VkFence> fence;
     };
-    static const std::size_t kKeep = std::getenv("SC2_PORTRAIT_SESSION_ONE") ? 1u : 24u;
-    static const bool kOwnShadow = std::getenv("SC2_PORTRAIT_SHADOW_OWN") != nullptr;
+    static const std::size_t kKeep = std::getenv("OMC_PORTRAIT_SESSION_ONE") ? 1u : 24u;
+    static const bool kOwnShadow = std::getenv("OMC_PORTRAIT_SHADOW_OWN") != nullptr;
     static std::shared_ptr<Image> shared_shadow;
     static std::vector<std::unique_ptr<Session>> sessions;
     struct KeysOf {
@@ -272,6 +271,12 @@ RenderResult render_scene_session(const std::string& key, const std::vector<Scen
         for (const auto& s : sessions) b += s->sr->gpu_bytes_estimate();
         return b;
     };
+    const uint32_t cap_now = render_scene_session_texture_max();
+    if (std::any_of(sessions.begin(), sessions.end(), [&](const std::unique_ptr<Session>& s) { return s->cap != cap_now; })) {
+        vkDeviceWaitIdle(dev);
+        sessions.erase(std::remove_if(sessions.begin(), sessions.end(), [&](const std::unique_ptr<Session>& s) { return s->cap != cap_now; }),
+                       sessions.end());
+    }
     const std::size_t bytes_before = sessions_bytes();
     bool made = false;
     std::size_t hit = sessions.size();
@@ -280,7 +285,7 @@ RenderResult render_scene_session(const std::string& key, const std::vector<Scen
     if (hit < sessions.size()) {
         std::rotate(sessions.begin(), sessions.begin() + std::ptrdiff_t(hit), sessions.begin() + std::ptrdiff_t(hit) + 1);
     } else {
-        SC2_PROF_SCOPE("ps.new");
+        OMC_PROF_SCOPE("ps.new");
         made = true;
         if (sessions.size() >= kKeep) {
             vkDeviceWaitIdle(dev);
@@ -290,11 +295,13 @@ RenderResult render_scene_session(const std::string& key, const std::vector<Scen
         s->key = key;
         s->w = width;
         s->h = height;
+        s->cap = cap_now;
         SceneRenderer::Tunables tun;
-        tun.max_texture_dim = render_scene_session_texture_max();
+        tun.max_texture_dim = cap_now;
+        tun.gpu_timing = gpu_prof_switch() ? 2 : 0;
         if (!kOwnShadow) {
             uint32_t dim = tun.shadow_dim;
-            if (const char* sd = std::getenv("SC2_SHADOW_DIM")) {
+            if (const char* sd = std::getenv("OMC_SHADOW_DIM")) {
                 const int v = std::atoi(sd);
                 if (v >= 1024 && v <= 8192) dim = uint32_t(v);
             }
@@ -331,17 +338,17 @@ RenderResult render_scene_session(const std::string& key, const std::vector<Scen
     Session& S = *sessions.front();
     SceneRenderer& sr = *S.sr;
     if (preload_done) {
-        SC2_PROF_SCOPE("ps.preload");
+        OMC_PROF_SCOPE("ps.preload");
         bool done = true;
         for (const SceneInstance* inst : live) done = sr.preload_model_textures(*inst->model, preload_budget) && done;
         *preload_done = done;
         return RenderResult{};
     }
-    { SC2_PROF_SCOPE("ps.prepare"); sr.prepare(live, nullptr); }
+    { OMC_PROF_SCOPE("ps.prepare"); sr.prepare(live, nullptr); }
     if (made) {
         const double d = (double(sessions_bytes()) - double(bytes_before)) / (1024.0 * 1024.0);
         frame_prof_count("ps.mb_add", d);
-        if (std::getenv("SC2_PORTRAIT_MEM_TRACE"))
+        if (std::getenv("OMC_PORTRAIT_MEM_TRACE"))
             std::fprintf(stderr, "portrait sessions: %zu, %.1f MB (+%.1f)\n", sessions.size(), double(sessions_bytes()) / (1024.0 * 1024.0), d);
     }
 
@@ -376,7 +383,7 @@ RenderResult render_scene_session(const std::string& key, const std::vector<Scen
     si.commandBufferCount = 1;
     si.pCommandBuffers = &S.cmd;
     {
-        SC2_PROF_SCOPE("ps.gpu");
+        OMC_PROF_SCOPE("ps.gpu");
         check(vkQueueSubmit(queue, 1, &si, fence), "vkQueueSubmit(session)");
         check(vkWaitForFences(dev, 1, &fence, VK_TRUE, UINT64_MAX), "vkWaitForFences(session)");
     }

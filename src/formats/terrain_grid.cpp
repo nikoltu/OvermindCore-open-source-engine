@@ -1,8 +1,8 @@
-#include "sc2/formats/terrain_grid.hpp"
+#include "omc/formats/terrain_grid.hpp"
 
 #include <cmath>
 
-namespace sc2::formats {
+namespace omc::formats {
 
 TerrainGrid build_terrain_grid(const HeightMap& hm, const std::vector<uint8_t>& data,
                                const TerrainQuantize& q, float slope_threshold) {

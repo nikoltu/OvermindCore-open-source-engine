@@ -1,11 +1,11 @@
-#include "sc2/app/match_result.hpp"
+#include "omc/app/match_result.hpp"
 
 #include <cstdlib>
 
-namespace sc2::app {
+namespace omc::app {
 
 bool MatchResult::sole_player_rule() {
-    return std::getenv("SC2_MELEE_SOLE_PLAYER_WIN") != nullptr;
+    return std::getenv("OMC_MELEE_SOLE_PLAYER_WIN") != nullptr;
 }
 
 bool MatchResult::viewer_defeated(const sim::World& w, int human_player) {

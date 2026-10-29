@@ -1,12 +1,12 @@
-#include "sc2/data/audio.hpp"
+#include "omc/data/audio.hpp"
 
 #include <algorithm>
 #include <cstdlib>
 
-#include "sc2/core/xml.hpp"
-#include "sc2/data/catalog.hpp"
+#include "omc/core/xml.hpp"
+#include "omc/data/catalog.hpp"
 
-namespace sc2::data {
+namespace omc::data {
 
 using core::XmlNode;
 

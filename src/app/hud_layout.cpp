@@ -1,5 +1,6 @@
-#include "sc2/app/hud_layout.hpp"
+#include "omc/app/hud_layout.hpp"
 
+#include <algorithm>
 #include <cmath>
 #include <cstdlib>
 #include <exception>
@@ -9,11 +10,11 @@
 #include <utility>
 #include <vector>
 
-#include "sc2/app/ui_layout_source.hpp"
-#include "sc2/casc/storage.hpp"
-#include "sc2/ui/layout.hpp"
+#include "omc/app/ui_layout_source.hpp"
+#include "omc/casc/storage.hpp"
+#include "omc/ui/layout.hpp"
 
-namespace sc2::app {
+namespace omc::app {
 
 namespace {
 
@@ -82,8 +83,11 @@ const HudPauseRects* hud_pause_rects(casc::Storage& store, float aspect) {
                 if (r->save.ok()) place(r->save, index);
                 ++index;
             }
+            r->settings = r->quit;
+            place(r->settings, index++);
             place(r->quit, index++);
             place(r->resume, index++);
+            r->panel.y1 = std::max(r->panel.y1, r->resume.y1 + 30.0f);
         }
         r->ok = r->panel.ok() && r->resume.ok() && r->quit.ok();
         slot = std::move(r);

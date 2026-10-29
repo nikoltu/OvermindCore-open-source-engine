@@ -1,8 +1,0 @@
-# Local, personal build assets only — never committed. Keeps trademarked/cosmetic art out of
-# the clean-room source tree; the icon is compiled into crafter-sc only on this machine.
-#
-# The pattern is a GLOB, not three names: `app_icon_2/3/4.png` were committed straight past the
-# two literal lines this file used to carry, referenced by nothing, and found only by an audit.
-# A rename must not be able to defeat the rule the file exists to state.
-app_icon*.png
-app_icon*.ico

@@ -1,13 +1,17 @@
-#include "sc2/render/unit_overlay.hpp"
+#include "omc/render/unit_overlay.hpp"
 
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 
-namespace sc2::render {
+namespace omc::render {
 
 namespace {
+
+int g_dirty_y0 = 0;
+int g_dirty_y1 = -1;
 
 struct Color {
     uint8_t r, g, b, a;
@@ -31,6 +35,8 @@ bool project(const Mat4& mvp, float x, float y, float z, uint32_t view_w,
 void blend(std::vector<uint8_t>& buf, uint32_t w, uint32_t h, int x, int y,
            const Color& c) {
     if (x < 0 || y < 0 || x >= int(w) || y >= int(h)) return;
+    if (y < g_dirty_y0) g_dirty_y0 = y;
+    if (y > g_dirty_y1) g_dirty_y1 = y;
     const size_t i = (size_t(y) * size_t(w) + size_t(x)) * 4;
     const int a = c.a;
     const int ia = 255 - a;
@@ -130,8 +136,27 @@ void draw_shaded_row(std::vector<uint8_t>& buf, uint32_t w, uint32_t h, int left
 
 std::vector<uint8_t> UnitOverlay::render_status(const sim::World& w, const Mat4& mvp, uint32_t view_w,
                                                 uint32_t view_h, const StatusBarOptions& o) const {
-    std::vector<uint8_t> rgba(size_t(view_w) * size_t(view_h) * 4, 0);
-    if (view_w == 0 || view_h == 0) return rgba;
+    std::vector<uint8_t> rgba;
+    int y0 = 0, y1 = -1;
+    render_status_into(rgba, y0, y1, w, mvp, view_w, view_h, o);
+    return rgba;
+}
+
+void UnitOverlay::render_status_into(std::vector<uint8_t>& rgba, int& dirty_y0, int& dirty_y1, const sim::World& w,
+                                     const Mat4& mvp, uint32_t view_w, uint32_t view_h, const StatusBarOptions& o) const {
+    const size_t bytes = size_t(view_w) * size_t(view_h) * 4;
+    if (rgba.size() != bytes) {
+        rgba.assign(bytes, 0);
+    } else if (dirty_y0 <= dirty_y1) {
+        const int y0 = dirty_y0 < 0 ? 0 : dirty_y0;
+        const int y1 = dirty_y1 >= int(view_h) ? int(view_h) - 1 : dirty_y1;
+        if (y0 <= y1) std::memset(rgba.data() + size_t(y0) * size_t(view_w) * 4, 0, size_t(y1 - y0 + 1) * size_t(view_w) * 4);
+    }
+    dirty_y0 = 0;
+    dirty_y1 = -1;
+    if (view_w == 0 || view_h == 0) return;
+    g_dirty_y0 = int(view_h);
+    g_dirty_y1 = -1;
     using Mode = StatusBarOptions::Mode;
 
     constexpr Color kLifeBand[4] = {{208, 34, 0, 255}, {229, 129, 0, 255}, {229, 221, 0, 255}, {22, 229, 0, 255}};
@@ -146,7 +171,7 @@ std::vector<uint8_t> UnitOverlay::render_status(const sim::World& w, const Mat4&
     auto selected = [&](uint32_t id) {
         return o.selection && std::find(o.selection->begin(), o.selection->end(), id) != o.selection->end();
     };
-    static const bool kResearchRowOld = std::getenv("SC2_RESEARCH_PANE_OLD") != nullptr;
+    static const bool kResearchRowOld = std::getenv("OMC_RESEARCH_PANE_OLD") != nullptr;
     auto queue_progress = [&](uint32_t id, sim::Fixed& f) {
         if (w.pending_progress(id, f)) return true;
         if (kResearchRowOld) return false;
@@ -179,7 +204,7 @@ std::vector<uint8_t> UnitOverlay::render_status(const sim::World& w, const Mat4&
                 case Mode::Normal:
                 case Mode::Targeting: vitals = vitals || (selected(u.id) && (hurt || !o.own_rows)); break;
             }
-            static const bool kSalvageBarOld = std::getenv("SC2_SALVAGE_BAR_OLD") != nullptr;
+            static const bool kSalvageBarOld = std::getenv("OMC_SALVAGE_BAR_OLD") != nullptr;
             const bool salvaging = !kSalvageBarOld && u.salvage_timer.raw() > 0 && u.salvage_total.raw() > 0 &&
                                    o.viewer_player >= 0 && (u.player == o.viewer_player || w.are_allied(u.player, o.viewer_player));
             if (!vitals && !cargo && !training && !salvaging) continue;
@@ -205,7 +230,7 @@ std::vector<uint8_t> UnitOverlay::render_status(const sim::World& w, const Mat4&
             struct Row { double frac; Color fill; Color empty; int segs; double trail; };
             Row rows[8];
             int n = 0;
-            static const bool kWholeStack = std::getenv("SC2_STATUS_DAMAGED_WHOLE_STACK") != nullptr;
+            static const bool kWholeStack = std::getenv("OMC_STATUS_DAMAGED_WHOLE_STACK") != nullptr;
             const bool short_only = !kWholeStack && o.mode == Mode::Damaged && !o.reveal_all && !selected(u.id);
             const bool row_shield = shield && (!short_only || u.shields < u.shields_max);
             const bool row_life = !short_only || u.hp < u.hp_max;
@@ -334,7 +359,10 @@ std::vector<uint8_t> UnitOverlay::render_status(const sim::World& w, const Mat4&
             draw_status_row(rgba, view_w, view_h, left, next_top, df, kDuration, 1);
         }
     }
-    return rgba;
+    if (g_dirty_y0 <= g_dirty_y1) {
+        dirty_y0 = g_dirty_y0;
+        dirty_y1 = g_dirty_y1;
+    }
 }
 
 std::vector<uint8_t> UnitOverlay::render(const sim::World& w, const Mat4& mvp,

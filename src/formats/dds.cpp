@@ -1,13 +1,13 @@
-#include "sc2/formats/dds.hpp"
+#include "omc/formats/dds.hpp"
 
 #include <algorithm>
 #include <cmath>
 #include <stdexcept>
 #include <string>
 
-#include "sc2/core/byte_reader.hpp"
+#include "omc/core/byte_reader.hpp"
 
-namespace sc2::formats {
+namespace omc::formats {
 
 using core::ByteReader;
 

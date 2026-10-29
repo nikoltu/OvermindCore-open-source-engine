@@ -1,8 +1,8 @@
-#include "sc2/ui/interact.hpp"
+#include "omc/ui/interact.hpp"
 
 #include <string>
 
-namespace sc2::ui {
+namespace omc::ui {
 
 namespace {
 bool ends_with(const std::string& s, const char* suffix) {

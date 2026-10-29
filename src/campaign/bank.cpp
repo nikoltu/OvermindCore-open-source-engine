@@ -1,11 +1,11 @@
-#include "sc2/campaign/bank.hpp"
+#include "omc/campaign/bank.hpp"
 
 #include <cstdio>
 #include <sstream>
 
-#include "sc2/core/xml.hpp"
+#include "omc/core/xml.hpp"
 
-namespace sc2::campaign {
+namespace omc::campaign {
 
 void Bank::set_int(const std::string& section, const std::string& key,
                    int64_t v) {

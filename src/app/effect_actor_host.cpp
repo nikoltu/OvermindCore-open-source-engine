@@ -1,15 +1,15 @@
-#include "sc2/app/effect_actor_host.hpp"
+#include "omc/app/effect_actor_host.hpp"
 
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
 
-#include "sc2/app/ability.hpp"
-#include "sc2/data/catalog.hpp"
-#include "sc2/render/anim.hpp"
+#include "omc/app/ability.hpp"
+#include "omc/data/catalog.hpp"
+#include "omc/render/anim.hpp"
 
-namespace sc2::app {
+namespace omc::app {
 
 namespace {
 
@@ -279,6 +279,25 @@ void EffectActorHost::observe(const sim::World& w, float dt_ms, bool ticked) {
     for (const sim::PresentationEvent& pe : w.presentation_events()) {
         if (pe.seq <= last_seq_) continue;
         last_seq_ = pe.seq;
+        if (pe.abil) {
+            const std::string& aid = name_of(abil_names_, "CAbil", pe.fx_tag);
+            if (aid.empty()) continue;
+            Edge e;
+            e.head = "Abil";
+            e.subject = aid;
+            e.sub = "SourceCastStart";
+            e.instance = pe.instance;
+            e.caster = pe.source;
+            e.target = pe.target;
+            e.on_unit = pe.source;
+            e.src_x = float(pe.src_x.to_double());
+            e.src_y = float(pe.src_y.to_double());
+            e.tx = float(pe.tx.to_double());
+            e.ty = float(pe.ty.to_double());
+            e.player = pe.player;
+            edge(w, e);
+            continue;
+        }
         const std::string& id = name_of(effect_names_, "CEffect", pe.fx_tag);
         if (id.empty()) continue;
         Edge e;

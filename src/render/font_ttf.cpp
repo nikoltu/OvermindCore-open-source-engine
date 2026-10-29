@@ -1,10 +1,10 @@
-#include "sc2/render/font_ttf.hpp"
+#include "omc/render/font_ttf.hpp"
 
 #include <algorithm>
 #include <cmath>
 #include <cstring>
 
-namespace sc2::render {
+namespace omc::render {
 namespace {
 
 std::uint16_t rd_u16(const std::uint8_t* p, std::size_t n, std::size_t off) {

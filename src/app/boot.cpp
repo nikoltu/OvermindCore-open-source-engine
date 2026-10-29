@@ -1,15 +1,15 @@
-#include "sc2/app/boot.hpp"
+#include "omc/app/boot.hpp"
 
 #include <cstdlib>
 #include <string>
 #include <vector>
 
-#include "sc2/asset/manager.hpp"
-#include "sc2/casc/storage.hpp"
-#include "sc2/data/catalog.hpp"
-#include "sc2/data/melee_mods.hpp"
+#include "omc/asset/manager.hpp"
+#include "omc/casc/storage.hpp"
+#include "omc/data/catalog.hpp"
+#include "omc/data/melee_mods.hpp"
 
-namespace sc2::app {
+namespace omc::app {
 
 std::vector<StartupStep> plan_startup(const std::vector<std::string>& extra_files) {
     std::vector<StartupStep> plan;
@@ -36,7 +36,7 @@ void run_startup_step(const StartupStep& step, const std::string& data_dir, casc
             break;
         case StartupStep::Kind::Model:
         default:
-            if (!std::getenv("SC2_MODELS_OWN_CATALOG")) models.share_catalog(&cat);
+            if (!std::getenv("OMC_MODELS_OWN_CATALOG")) models.share_catalog(&cat);
             models.ensure(store, step.arg);
             break;
     }

@@ -1,4 +1,4 @@
-#include "sc2/app/ability.hpp"
+#include "omc/app/ability.hpp"
 
 #include <algorithm>
 #include <cstdio>
@@ -6,12 +6,12 @@
 #include <functional>
 #include <utility>
 
-#include "sc2/app/spawn.hpp"
-#include "sc2/core/xml.hpp"
-#include "sc2/data/economy.hpp"
-#include "sc2/sim/weapon.hpp"
+#include "omc/app/spawn.hpp"
+#include "omc/core/xml.hpp"
+#include "omc/data/economy.hpp"
+#include "omc/sim/weapon.hpp"
 
-namespace sc2::app {
+namespace omc::app {
 
 using sim::Fixed;
 
@@ -27,7 +27,7 @@ static std::uint32_t filter_attr_bit(const std::string& tok) {
 }
 
 static void buff_attr_bonus(const data::Catalog::BehaviorBuff& bb, std::uint32_t& attr, Fixed& amount) {
-    static const bool off = std::getenv("SC2_NO_BUFF_ATTR_BONUS") != nullptr;
+    static const bool off = std::getenv("OMC_NO_BUFF_ATTR_BONUS") != nullptr;
     if (off) return;
     for (const auto& [tok, v] : bb.damage_attr_bonus) {
         const std::uint32_t bit = filter_attr_bit(tok);
@@ -59,7 +59,7 @@ static void parse_ability_filters(const data::Catalog& cat, const std::string& a
     };
     each(req, [&](const std::string& t) {
         if (t == "HasEnergy") b.require_energy = true;
-        else if (t == "CanHaveEnergy") b.require_energy_pool = std::getenv("SC2_NO_CAN_HAVE_ENERGY") == nullptr;
+        else if (t == "CanHaveEnergy") b.require_energy_pool = std::getenv("OMC_NO_CAN_HAVE_ENERGY") == nullptr;
         else if (t == "Ground") b.requires_ground = true;
         else b.req_attr_mask |= filter_attr_bit(t);
     });
@@ -361,7 +361,7 @@ void apply_unit_upgrades(const data::Catalog& cat, const data::UpgradeCatalog& u
 
     u.speed        = Fixed::from_double(fold_field(up, researched, "Unit", unit_name, "Speed",
                                                    u.speed.to_double()));
-    if (!std::getenv("SC2_UPGRADE_NO_ACCEL_FOLD"))
+    if (!std::getenv("OMC_UPGRADE_NO_ACCEL_FOLD"))
         u.accel = Fixed::from_double(fold_field(up, researched, "Unit", unit_name, "Acceleration",
                                                 u.accel.to_double()));
     u.shield_armor = Fixed::from_double(fold_field(up, researched, "Unit", unit_name, "ShieldArmor",
@@ -400,7 +400,7 @@ void apply_unit_upgrades(const data::Catalog& cat, const data::UpgradeCatalog& u
     if (!weapons.empty())
         u.acquire_range = Fixed::from_double(fold_field(up, researched, "Weapon", weapons[0], "MinScanRange",
                                                         u.acquire_range.to_double()));
-    static const bool rate_last_wins = std::getenv("SC2_RATE_LAST_WINS") != nullptr;
+    static const bool rate_last_wins = std::getenv("OMC_RATE_LAST_WINS") != nullptr;
     double rate[2] = {0.0, 0.0};
     if (rate_last_wins) {
         for (const std::string& upg : researched) {
@@ -456,21 +456,25 @@ static bool revert_differs(const UpgradeRevert& r, const sim::Unit& u) {
 
 std::size_t apply_upgrade_to_live(sim::World& w, const data::Catalog& cat,
                                   const data::UpgradeCatalog& up, const std::string& upgrade_id,
-                                  int player, std::vector<UpgradeRevert>* revert) {
+                                  int player, std::vector<UpgradeRevert>* revert, bool units) {
     if (!up.contains(upgrade_id)) return 0;
     const std::vector<std::string> just{upgrade_id};
     std::size_t pushed = 0;
-    for (std::uint32_t id = 0; id < w.units().size(); ++id) {
+    const std::vector<std::string>& list = w.researched(player);
+    const auto at = std::find(list.begin(), list.end(), upgrade_id);
+    const std::uint32_t idx = at == list.end() ? 0xFFFFFFFFu : std::uint32_t(at - list.begin());
+    for (std::uint32_t id = 0; units && id < w.units().size(); ++id) {
         sim::Unit& u = w.unit(id);
         if (!u.alive || u.player != player || u.catalog_id.empty()) continue;
         const UpgradeRevert pre = snapshot_revert(id, u);
         apply_unit_upgrades(cat, up, u.catalog_id, just, u);
+        if (u.upgrades_folded == idx) u.upgrades_folded = idx + 1;
         if (revert && revert_differs(pre, u)) {
             revert->push_back(pre);
             ++pushed;
         }
     }
-    static const bool no_beh = std::getenv("SC2_UPGRADE_NO_BEHAVIOR_FOLD") != nullptr;
+    static const bool no_beh = std::getenv("OMC_UPGRADE_NO_BEHAVIOR_FOLD") != nullptr;
     if (!no_beh) {
         std::vector<std::pair<std::string, std::string>> done;
         for (const data::UpgradeEffect& e : up.resolve(upgrade_id)) {
@@ -492,6 +496,21 @@ std::size_t apply_upgrade_to_live(sim::World& w, const data::Catalog& cat,
         }
     }
     return pushed;
+}
+
+std::size_t fold_lagging_upgrades(sim::World& w, const data::Catalog& cat, const data::UpgradeCatalog& up) {
+    std::size_t folded = 0;
+    for (std::uint32_t id = 0; id < w.units().size(); ++id) {
+        sim::Unit& u = w.unit(id);
+        if (!u.alive || u.player < 0 || u.catalog_id.empty()) continue;
+        const std::vector<std::string>& list = w.researched(u.player);
+        if (u.upgrades_folded >= list.size()) continue;
+        const std::vector<std::string> rest(list.begin() + std::ptrdiff_t(u.upgrades_folded), list.end());
+        apply_unit_upgrades(cat, up, u.catalog_id, rest, u);
+        u.upgrades_folded = std::uint32_t(list.size());
+        ++folded;
+    }
+    return folded;
 }
 
 void revert_live_upgrade(sim::World& w, std::vector<UpgradeRevert>& revert, std::size_t count) {
@@ -1104,7 +1123,7 @@ static std::optional<AbilityBuild> make_ability_cascade(const data::Catalog& cat
             pers.periodic = 0;
             b.tree = {dmg, pers};
             b.tree_root = 1;
-            static const bool kVictimBuff = std::getenv("SC2_PERSIST_NO_VICTIM_BUFF") == nullptr;
+            static const bool kVictimBuff = std::getenv("OMC_PERSIST_NO_VICTIM_BUFF") == nullptr;
             const std::optional<std::string> vb = kVictimBuff ? cat.effect_apply_behavior(eff) : std::nullopt;
             const auto vbb = vb ? cat.behavior_buff(*vb) : std::nullopt;
             if (vb && vbb && vbb->duration > 0.0) {
@@ -1438,7 +1457,7 @@ int compile_validator(const data::Catalog& cat, const std::string& vid, std::vec
         op.kind = sim::ValidatorOp::Filters;
         if (g_full_tolerated) g_full_tolerated->push_back("Validator " + vid + " (marker count, always passes)");
     } else if (tag == "CValidatorLocationEnumArea") {
-        static const bool off = std::getenv("SC2_NO_ENUM_AREA_VALIDATOR") != nullptr;
+        static const bool off = std::getenv("OMC_NO_ENUM_AREA_VALIDATOR") != nullptr;
         if (off) return -1;
         const core::XmlNode* area = nullptr;
         int areas = 0;
@@ -1607,6 +1626,9 @@ int32_t build_effect_rec(const data::Catalog& cat, const std::string& eff, Abili
         if (tn.fx_tag == 0 &&
             (!cat.actors_on("Effect", eff, "Start").empty() || !cat.actors_on("Effect", eff, "Stop").empty()))
             tn.fx_tag = behavior_id_hash(eff);
+        static const bool kMissileOld = std::getenv("OMC_EFFECT_MISSILE_OLD") != nullptr;
+        if (!kMissileOld && tn.kind == sim::EffectKind::LaunchMissile && tn.missile_tag == 0 && cat.weapon_missile_model_id(eff))
+            tn.missile_tag = behavior_id_hash(eff);
     }
     else if (b.full_tree && !eff.empty()) b.unbuilt.push_back("Effect " + eff + " (" + cat.effect_subclass(eff) + ")");
     if (idx >= 0 && b.full_tree && cat.effect_subclass(eff) != "Teleport")
@@ -1615,7 +1637,7 @@ int32_t build_effect_rec(const data::Catalog& cat, const std::string& eff, Abili
                 f.name == "ImpactLocation" || f.name == "LaunchLocation" || f.name == "TargetLocation")
                 if (const std::string* fx = f.attr("Effect"); fx && !fx->empty())
                     b.unbuilt.push_back("Frame " + f.name + " Effect=" + *fx + " on " + eff);
-    if (const char* t = std::getenv("SC2_ABIL_TRACE"); t && *t && *t != '0')
+    if (const char* t = std::getenv("OMC_ABIL_TRACE"); t && *t && *t != '0')
         std::fprintf(stderr, "[abil] %*s%s (%s) -> %s\n", depth * 2, "", eff.c_str(),
                      cat.effect_subclass(eff).c_str(), idx >= 0 ? "built" : "REFUSED");
     return idx;
@@ -1770,7 +1792,7 @@ int32_t build_effect_node(const data::Catalog& cat, const std::string& eff, Abil
             const int r = compile_validator(cat, pv, n.validators, 0, false);
             if (r >= 0) n.periodic_validator_roots.push_back(std::uint16_t(r));
         }
-        static const bool countless_old = std::getenv("SC2_PERSIST_COUNTLESS_PERIODIC") != nullptr;
+        static const bool countless_old = std::getenv("OMC_PERSIST_COUNTLESS_PERIODIC") != nullptr;
         const bool countless_timer = b.full_tree && !countless_old && !per && n.period_count <= 0 &&
                                      n.persist_expire_delay.raw() > 0 &&
                                      !cat.scalar("CEffect", eff, "ExpireEffect").value_or("").empty();
@@ -2059,7 +2081,7 @@ int32_t build_effect_node(const data::Catalog& cat, const std::string& eff, Abil
         auto bb = cat.behavior_buff(*beh);
         if (!bb && cat.find("CBehavior", *beh)) {
             bb = data::Catalog::BehaviorBuff{};
-            static const bool kNoLifecycle = std::getenv("SC2_TAG_BUFF_NO_LIFECYCLE") != nullptr;
+            static const bool kNoLifecycle = std::getenv("OMC_TAG_BUFF_NO_LIFECYCLE") != nullptr;
             if (!kNoLifecycle) {
                 bb->initial_effect = cat.scalar("CBehavior", *beh, "InitialEffect").value_or("");
                 bb->expire_effect = cat.scalar("CBehavior", *beh, "ExpireEffect").value_or("");
@@ -2468,7 +2490,7 @@ std::optional<AbilityBuild> make_ability_flat(const data::Catalog& cat, const st
 }
 
 std::optional<AbilityBuild> make_ability_ai(const data::Catalog& cat, const std::string& abil_id) {
-    return env_flag("SC2_AI_EFFECT_TREE") ? make_ability(cat, abil_id) : make_ability_flat(cat, abil_id);
+    return env_flag("OMC_AI_EFFECT_TREE") ? make_ability(cat, abil_id) : make_ability_flat(cat, abil_id);
 }
 
 static bool build_generic_tree(const data::Catalog& cat, const std::string& abil_id, const std::string& eff,
@@ -2500,7 +2522,7 @@ std::vector<std::string> effect_tree_gaps(const data::Catalog& cat, const std::s
 std::optional<AbilityBuild> make_ability(const data::Catalog& cat, const std::string& abil_id) {
     bool cascade = false;
     std::optional<AbilityBuild> flat = make_ability_cascade(cat, abil_id, cascade);
-    if (!cascade || env_flag("SC2_EFFECT_TREE_OFF")) return flat;
+    if (!cascade || env_flag("OMC_EFFECT_TREE_OFF")) return flat;
     const std::string eff = cat.cabil_effect_link(abil_id);
     if (eff.empty()) return flat;
     AbilityBuild t;

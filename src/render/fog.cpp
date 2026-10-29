@@ -1,6 +1,6 @@
-#include "sc2/render/fog.hpp"
+#include "omc/render/fog.hpp"
 
-namespace sc2::render {
+namespace omc::render {
 
 std::vector<uint8_t> FogOverlay::mask(const sim::VisionGrid& vis) const {
     const int w = vis.width();

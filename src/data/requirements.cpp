@@ -1,8 +1,8 @@
-#include "sc2/data/requirements.hpp"
+#include "omc/data/requirements.hpp"
 
 #include <cstdlib>
 
-namespace sc2::data {
+namespace omc::data {
 
 using core::XmlNode;
 

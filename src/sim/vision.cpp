@@ -1,9 +1,9 @@
-#include "sc2/sim/vision.hpp"
+#include "omc/sim/vision.hpp"
 
-#include "sc2/sim/terrain_map.hpp"
-#include "sc2/sim/world.hpp"
+#include "omc/sim/terrain_map.hpp"
+#include "omc/sim/world.hpp"
 
-namespace sc2::sim {
+namespace omc::sim {
 
 void VisionGrid::reconfigure(Fixed cell_size, const Bounds& bounds) {
     const bool same = !cells_.empty() && cell_ == cell_size &&

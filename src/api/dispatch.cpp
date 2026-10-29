@@ -1,4 +1,4 @@
-#include "sc2/api/server.hpp"
+#include "omc/api/server.hpp"
 
 #include <cstdint>
 #include <string>
@@ -6,12 +6,12 @@
 
 #include "s2clientprotocol/sc2api.pb.h"
 
-#include "sc2/api/bridge.hpp"
-#include "sc2/api/orders.hpp"
-#include "sc2/api/truth_pack.hpp"
-#include "sc2/app/melee_game.hpp"
+#include "omc/api/bridge.hpp"
+#include "omc/api/orders.hpp"
+#include "omc/api/truth_pack.hpp"
+#include "omc/app/melee_game.hpp"
 
-namespace sc2::api {
+namespace omc::api {
 
 namespace {
 
@@ -137,7 +137,7 @@ bool Dispatcher::handle(Host& host, const std::vector<std::uint8_t>& raw,
                 if (!cg.has_local_map()) {
                     out->set_error(SC2APIProtocol::ResponseCreateGame::MissingMap);
                     out->set_error_details(
-                        "this client serves local_map only. online service-served maps are an "
+                        "this client serves local_map only. online-served maps are an "
                         "owner-locked honest limit (design section 2.2); send map_data or "
                         "map_path.");
                     break;

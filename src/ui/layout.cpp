@@ -1,4 +1,4 @@
-#include "sc2/ui/layout.hpp"
+#include "omc/ui/layout.hpp"
 
 #include <cstdlib>
 #include <stdexcept>
@@ -6,9 +6,9 @@
 #include <unordered_set>
 #include <utility>
 
-#include "sc2/ui/font.hpp"
+#include "omc/ui/font.hpp"
 
-namespace sc2::ui {
+namespace omc::ui {
 
 using core::XmlNode;
 

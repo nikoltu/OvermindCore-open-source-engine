@@ -1,9 +1,9 @@
-#include "sc2/app/screen_router.hpp"
+#include "omc/app/screen_router.hpp"
 
 #include <algorithm>
 #include <cstring>
 
-namespace sc2::app {
+namespace omc::app {
 
 namespace {
 
@@ -17,9 +17,8 @@ const char* const kFlowIds[] = {
     "",
     "",
     "",
-    "",
 };
-const char* const kEngineNames[] = {"hotkeys", "sandbox", "profile", "portraits", "data_setup", "starting", "widgets"};
+const char* const kEngineNames[] = {"hotkeys", "profile", "portraits", "data_setup", "starting", "widgets"};
 static_assert(sizeof(kEngineNames) / sizeof(kEngineNames[0]) == std::size_t(ScreenId::Count) - std::size_t(ScreenId::Hotkeys),
               "every engine-only ScreenId needs a boot name");
 static_assert(sizeof(kFlowIds) / sizeof(kFlowIds[0]) == std::size_t(ScreenId::Count),
@@ -29,7 +28,7 @@ const char* const kNames[] = {
     "Boot", "Login", "Main Menu", "Home", "Campaign", "Difficulty", "Versus AI", "Custom Games",
     "Lobby", "Skirmish", "Options", "Load Game", "Save Replay", "Loading", "In Game",
     "Game Menu", "Game Result", "Score", "Replays", "Replay Controls", "Credits", "Hotkeys",
-    "Sandbox", "Profile", "Portraits", "Game Data", "Starting", "Widgets",
+    "Profile", "Portraits", "Game Data", "Starting", "Widgets",
 };
 static_assert(sizeof(kNames) / sizeof(kNames[0]) == std::size_t(ScreenId::Count),
               "every ScreenId needs a display name");
@@ -89,8 +88,6 @@ const FlowEdge kEdges[] = {
     {S::GlueRoot,          "Esc / close client",                              S::Boot,           K::Replace, true,  true},
     {S::Options,           "HotkeysButton",                                   S::Hotkeys,        K::Push,    true,  false},
     {S::Hotkeys,           "CancelButton",                                    S::Options,        K::Close,   true,  true},
-    {S::GlueRoot,          "SandboxButton",                                   S::Sandbox,        K::Replace, true,  false},
-    {S::Sandbox,           "Leave sandbox",                                   S::GlueRoot,       K::Pop,     true,  true},
     {S::GlueRoot,          "PlayButton",                                      S::Lobby,          K::Replace, true,  false},
     {S::VersusAI,          "CustomButton",                                    S::Custom,         K::Replace, true,  false},
     {S::VersusAI,          "ReplayButton",                                    S::ReplayBrowse,   K::Replace, true,  false},
@@ -183,7 +180,6 @@ const char* const kLayoutReplayCtl[] = {"UI/ObserverPanel.SC2Layout", "UI/Replay
 const char* const kLayoutCredits[] = {"Glue/ScreenCreditsSC2.SC2Layout",
                                       "Glue/CreditsPanel.SC2Layout", nullptr};
 const char* const kLayoutHotkeys[] = {"Glue/HotkeyDialog.SC2Layout", nullptr};
-const char* const kLayoutSandbox[] = {nullptr};
 const char* const kLayoutProfile[] = {nullptr};
 const char* const kLayoutNone[] = {nullptr};
 
@@ -192,7 +188,7 @@ const char* const* const kLayouts[] = {
     kLayoutCampDiff,  kLayoutVersusAI,  kLayoutCustom,     kLayoutLobby,       kLayoutSkirmish,
     kLayoutOptions,   kLayoutLoadGame,  kLayoutSaveReplay, kLayoutLoading,     kLayoutInGame,
     kLayoutPause,     kLayoutGameResult, kLayoutScore,     kLayoutReplayBrowse, kLayoutReplayCtl,
-    kLayoutCredits,   kLayoutHotkeys,   kLayoutSandbox,    kLayoutProfile,
+    kLayoutCredits,   kLayoutHotkeys,   kLayoutProfile,
     kLayoutNone,      kLayoutNone,      kLayoutNone,       kLayoutNone,
 };
 static_assert(sizeof(kLayouts) / sizeof(kLayouts[0]) == std::size_t(ScreenId::Count),

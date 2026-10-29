@@ -1,23 +1,24 @@
-#include "sc2/app/shipping_wiring.hpp"
+#include "omc/app/shipping_wiring.hpp"
 
 #include <cstdlib>
 #include <exception>
 #include <string>
 #include <utility>
 
-#include "sc2/app/ability.hpp"
-#include "sc2/app/melee_game.hpp"
-#include "sc2/app/melee_research.hpp"
-#include "sc2/data/catalog.hpp"
-#include "sc2/data/production.hpp"
-#include "sc2/data/requirements.hpp"
-#include "sc2/render/offscreen.hpp"
+#include "omc/ai/micro.hpp"
+#include "omc/app/ability.hpp"
+#include "omc/app/melee_game.hpp"
+#include "omc/app/melee_research.hpp"
+#include "omc/data/catalog.hpp"
+#include "omc/data/production.hpp"
+#include "omc/data/requirements.hpp"
+#include "omc/render/offscreen.hpp"
 
 #include <algorithm>
 #include <map>
 #include <set>
 
-namespace sc2::app {
+namespace omc::app {
 
 namespace {
 
@@ -101,6 +102,30 @@ void apply_shipping_wiring(MeleeGame& game, const data::Catalog& cat,
     game.enable_novas(cat);
     game.enable_ai_casting_from_roster(cat);
     game.enable_ai_tech_gate(cat);
+    game.set_train_gate_strict(std::getenv("OMC_TRAIN_GATE_OLD") == nullptr);
+    game.set_ai_stock_gas(std::getenv("OMC_AI_STOCK_SKIP_GAS") == nullptr);
+    game.set_ai_macro(std::getenv("OMC_AI_PENDING_CAP_OLD") == nullptr, std::getenv("OMC_AI_SUPPLY_MARGIN_OLD") == nullptr,
+                      std::getenv("OMC_AI_TECH_DUP_OLD") == nullptr, std::getenv("OMC_AI_EXTRA_PRODUCER_OLD") == nullptr,
+                      std::getenv("OMC_AI_ALT_WAIT_OLD") == nullptr, std::getenv("OMC_AI_GAS_IDLE_OLD") == nullptr);
+    game.set_ai_close_out(std::getenv("OMC_AI_EXPAND_OLD") == nullptr, std::getenv("OMC_AI_LARVA_MACRO_OLD") == nullptr,
+                          std::getenv("OMC_AI_HUNT_OLD") == nullptr, std::getenv("OMC_AI_EVICT_OLD") == nullptr,
+                          std::getenv("OMC_CARGO_NO_DROPOFF_OLD") == nullptr);
+    game.world().set_cargo_idle_without_dropoff(std::getenv("OMC_CARGO_NO_DROPOFF_OLD") == nullptr);
+    game.set_hall_needs_builder(std::getenv("OMC_AI_HALL_BUILDER_OLD") == nullptr);
+    game.set_hunt_gas(std::getenv("OMC_AI_HUNT_GAS_OLD") == nullptr);
+    game.set_worker_transfer(std::getenv("OMC_AI_TRANSFER_OLD") == nullptr);
+    game.world().set_stall_unreachable(std::getenv("OMC_MOVE_UNREACHABLE_OLD") == nullptr);
+    console_race_assets() = std::getenv("OMC_CONSOLE_RACE_OLD") == nullptr;
+    ai::focus_skips_neutral() = std::getenv("OMC_AI_FOCUS_NEUTRAL") == nullptr;
+    game.world().set_separation_respects_nav(std::getenv("OMC_SEPARATION_IGNORES_NAV") == nullptr);
+    game.world().set_pull_with_radius(std::getenv("OMC_PATH_PULL_CENTRE_LINE") == nullptr);
+    game.world().set_acquire_skips_neutral(std::getenv("OMC_ACQUIRE_NEUTRAL") == nullptr);
+    game.world().set_raise_evicts(std::getenv("OMC_DEPOT_RAISE_WAITS") == nullptr);
+    game.world().set_gather_bounce(std::getenv("OMC_GATHER_WAIT_OLD") == nullptr);
+    game.world().set_exit_open_spot(std::getenv("OMC_TRAIN_EXIT_OLD") == nullptr);
+    game.world().set_spawn_open_spot(std::getenv("OMC_LARVA_SPAWN_OLD") == nullptr);
+    game.world().set_return_dock_footprint(std::getenv("OMC_RETURN_DOCK_OLD") == nullptr);
+    game.world().set_unstick_bodies(std::getenv("OMC_BODY_UNSTICK_OLD") == nullptr);
 
     if (up && setup) {
         std::vector<MeleeResearchDriver::ProtoNames> names(setup->players.size());
@@ -129,20 +154,21 @@ void apply_shipping_wiring(MeleeGame& game, const data::Catalog& cat,
     game.world().set_train_affordability(true);
     game.world().set_attack_windup(true);
     game.world().set_projectile_travel(true);
-    game.world().set_accelerating_movers(std::getenv("SC2_MOVERS_CONSTANT") == nullptr);
-    game.world().set_turret_aim(std::getenv("SC2_TURRET_AIM_BODY") == nullptr);
-    game.world().set_exact_build_progress(std::getenv("SC2_BUILD_PROGRESS_TRUNCATED") == nullptr);
-    game.world().set_gas_worker_inside(std::getenv("SC2_GAS_WORKER_OUTSIDE") == nullptr);
-    game.world().set_gas_harvest_ordered(std::getenv("SC2_GAS_HARVEST_ANY") == nullptr);
-    game.world().set_cargo_hidden(std::getenv("SC2_CARGO_SHOWN") == nullptr);
-    game.world().set_cliff_leap(std::getenv("SC2_REAPER_ONE_CELL_LEAP") == nullptr);
-    game.world().set_morph_vital_fraction(std::getenv("SC2_MORPH_HP_ABSOLUTE") == nullptr);
-    game.world().set_path_nearest_fallback(std::getenv("SC2_PATH_STRAIGHT_FALLBACK") == nullptr);
-    game.world().set_smart_structure_contact(std::getenv("SC2_SMART_STRUCTURE_TO_CENTRE") == nullptr);
-    game.world().set_research_queue(std::getenv("SC2_RESEARCH_CONCURRENT") == nullptr);
-    game.world().set_research_dies_with_host(std::getenv("SC2_RESEARCH_OUTLIVES_HOST") == nullptr);
-    game.world().set_presentation_log(std::getenv("SC2_NO_EFFECT_ACTORS") == nullptr);
-    game.world().set_gather_dock_footprint(std::getenv("SC2_GATHER_DOCK_RADIUS") == nullptr);
+    game.world().set_accelerating_movers(std::getenv("OMC_MOVERS_CONSTANT") == nullptr);
+    game.world().set_turret_aim(std::getenv("OMC_TURRET_AIM_BODY") == nullptr);
+    game.world().set_exact_build_progress(std::getenv("OMC_BUILD_PROGRESS_TRUNCATED") == nullptr);
+    game.world().set_gas_worker_inside(std::getenv("OMC_GAS_WORKER_OUTSIDE") == nullptr);
+    game.world().set_gas_harvest_ordered(std::getenv("OMC_GAS_HARVEST_ANY") == nullptr);
+    game.world().set_cargo_hidden(std::getenv("OMC_CARGO_SHOWN") == nullptr);
+    game.world().set_cliff_leap(std::getenv("OMC_REAPER_ONE_CELL_LEAP") == nullptr);
+    game.world().set_morph_vital_fraction(std::getenv("OMC_MORPH_HP_ABSOLUTE") == nullptr);
+    game.world().set_path_nearest_fallback(std::getenv("OMC_PATH_STRAIGHT_FALLBACK") == nullptr);
+    game.world().set_smart_structure_contact(std::getenv("OMC_SMART_STRUCTURE_TO_CENTRE") == nullptr);
+    game.world().set_smart_lowered_open(std::getenv("OMC_SMART_LOWERED_DEPOT_CONTACT") == nullptr);
+    game.world().set_research_queue(std::getenv("OMC_RESEARCH_CONCURRENT") == nullptr);
+    game.world().set_research_dies_with_host(std::getenv("OMC_RESEARCH_OUTLIVES_HOST") == nullptr);
+    game.world().set_presentation_log(std::getenv("OMC_NO_EFFECT_ACTORS") == nullptr);
+    game.world().set_gather_dock_footprint(std::getenv("OMC_GATHER_DOCK_RADIUS") == nullptr);
     game.world().set_death_reveal(true);
     auto cgame = [&](const char* field) -> sim::Fixed {
         const auto v = cat.tag_default_scalar("CGame", field);
@@ -153,22 +179,35 @@ void apply_shipping_wiring(MeleeGame& game, const data::Catalog& cat,
     game.world().set_call_for_help(cgame("CallForHelpRadius"), cgame("CallForHelpPeriod"));
     game.world().set_attack_reveal(cgame("AttackRevealTime"));
     game.set_stalemate(cgame("StalemateTestTime"), cgame("StalemateWarningTime"));
-    game.set_selection_warm(std::getenv("SC2_NO_SELECTION_WARM") == nullptr);
+    game.set_selection_warm(std::getenv("OMC_NO_SELECTION_WARM") == nullptr);
     {
-        const char* hz = std::getenv("SC2_PORTRAIT_HZ");
+        const char* hz = std::getenv("OMC_PORTRAIT_HZ");
         game.set_portrait_hz(hz ? float(std::atof(hz)) : 30.0f);
     }
-    game.set_pick_broadphase(std::getenv("SC2_PICK_BROADPHASE_OLD") == nullptr);
-    game.set_select_rules_672(std::getenv("SC2_SELECT_MODES_OLD") == nullptr);
-    game.set_portrait_async(std::getenv("SC2_PORTRAIT_DECODE_SYNC") == nullptr);
-    game.set_warm_foreign(std::getenv("SC2_NO_WARM_FOREIGN") == nullptr);
-    game.set_card_cache(std::getenv("SC2_CARD_COMPOSE_EVERY_FRAME") == nullptr);
-    game.set_morph_transition_models(std::getenv("SC2_MORPH_NO_TRANSITION_MODEL") == nullptr);
-    game.set_construction_child_team(std::getenv("SC2_CHILD_TEAM_TINT") != nullptr);
-    render::world_async_loads() = std::getenv("SC2_WORLD_DECODE_SYNC") == nullptr;
-    render::offscreen_on_window_device() = std::getenv("SC2_OFFSCREEN_OWN_DEVICE") == nullptr;
-    render::texture_take_once() = std::getenv("SC2_TEX_TAKE_ONCE_OLD") == nullptr;
-    if (const char* mb = std::getenv("SC2_UPLOAD_BATCH_MB")) render::upload_batch_budget_mb() = std::size_t(std::max(0, std::atoi(mb)));
+    game.set_pick_broadphase(std::getenv("OMC_PICK_BROADPHASE_OLD") == nullptr);
+    game.set_select_rules_672(std::getenv("OMC_SELECT_MODES_OLD") == nullptr);
+    game.set_group_self_cast(std::getenv("OMC_GROUP_CAST_OLD") == nullptr);
+    game.set_group_cast_cell(std::getenv("OMC_GROUP_CAST_CELL_OLD") == nullptr);
+    game.set_best_unit_pick(std::getenv("OMC_BEST_UNIT_OLD") == nullptr);
+    game.set_portrait_async(std::getenv("OMC_PORTRAIT_DECODE_SYNC") == nullptr);
+    game.set_warm_foreign(std::getenv("OMC_NO_WARM_FOREIGN") == nullptr);
+    game.set_card_cache(std::getenv("OMC_CARD_COMPOSE_EVERY_FRAME") == nullptr);
+    game.set_morph_transition_models(std::getenv("OMC_MORPH_NO_TRANSITION_MODEL") == nullptr);
+    game.set_morph_upgrade_fold(std::getenv("OMC_MORPH_UPGRADES_IGNORED") == nullptr);
+    game.set_timed_burrow(std::getenv("OMC_BURROW_INSTANT") == nullptr);
+    game.set_timed_depot(std::getenv("OMC_DEPOT_MORPH_TIMED") != nullptr);
+    game.set_morph_lock_order(std::getenv("OMC_MORPH_LOCK_SIM_SECTIONS") == nullptr);
+    game.set_morph_cocoon_models(std::getenv("OMC_MORPH_NO_COCOON_MODEL") == nullptr);
+    game.set_morph_swap_at_data(std::getenv("OMC_MORPH_SWAP_AT_END") == nullptr);
+    game.set_morph_behaviors_sim(std::getenv("OMC_MORPH_BEHAVIOR_SIM_OLD") == nullptr);
+    game.set_upgrade_fold_new(std::getenv("OMC_UPGRADE_FOLD_LIVE_ONLY") == nullptr);
+    game.set_zone_markers(std::getenv("OMC_NO_ZONE_MARKER") == nullptr);
+    game.set_actor_game_clock(std::getenv("OMC_ACTOR_WALL_CLOCK") == nullptr);
+    game.set_construction_child_team(std::getenv("OMC_CHILD_TEAM_TINT") != nullptr);
+    render::world_async_loads() = std::getenv("OMC_WORLD_DECODE_SYNC") == nullptr;
+    render::offscreen_on_window_device() = std::getenv("OMC_OFFSCREEN_OWN_DEVICE") == nullptr;
+    render::texture_take_once() = std::getenv("OMC_TEX_TAKE_ONCE_OLD") == nullptr;
+    if (const char* mb = std::getenv("OMC_UPLOAD_BATCH_MB")) render::upload_batch_budget_mb() = std::size_t(std::max(0, std::atoi(mb)));
     game.world().set_arc_movement(true);
 }
 

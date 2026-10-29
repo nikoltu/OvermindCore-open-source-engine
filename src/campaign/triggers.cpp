@@ -1,14 +1,14 @@
-#include "sc2/campaign/triggers.hpp"
+#include "omc/campaign/triggers.hpp"
 
 #include <exception>
 #include <string>
 #include <unordered_map>
 
-#include "sc2/campaign/mission_load.hpp"
-#include "sc2/casc/storage.hpp"
-#include "sc2/core/xml.hpp"
+#include "omc/campaign/mission_load.hpp"
+#include "omc/casc/storage.hpp"
+#include "omc/core/xml.hpp"
 
-namespace sc2::campaign {
+namespace omc::campaign {
 
 using core::XmlNode;
 

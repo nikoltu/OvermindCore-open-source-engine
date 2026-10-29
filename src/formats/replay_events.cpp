@@ -1,10 +1,10 @@
-#include "sc2/formats/replay_events.hpp"
+#include "omc/formats/replay_events.hpp"
 
 #include <algorithm>
 #include <stdexcept>
 #include <string>
 
-namespace sc2::formats {
+namespace omc::formats {
 namespace {
 
 enum class Kind : uint8_t {

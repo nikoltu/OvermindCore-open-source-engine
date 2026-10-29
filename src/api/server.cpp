@@ -1,4 +1,4 @@
-#include "sc2/api/server.hpp"
+#include "omc/api/server.hpp"
 
 #include <atomic>
 #include <condition_variable>
@@ -9,12 +9,12 @@
 
 #include "s2clientprotocol/sc2api.pb.h"
 
-#include "sc2/api/bridge.hpp"
-#include "sc2/api/ws.hpp"
-#include "sc2/app/melee_game.hpp"
-#include "sc2/app/platform.hpp"
+#include "omc/api/bridge.hpp"
+#include "omc/api/ws.hpp"
+#include "omc/app/melee_game.hpp"
+#include "omc/app/platform.hpp"
 
-namespace sc2::api {
+namespace omc::api {
 
 struct Server::Impl {
     std::unique_ptr<app::platform::Listener> listener;

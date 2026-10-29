@@ -1,8 +1,8 @@
-#include "sc2/audio/ogg.hpp"
+#include "omc/audio/ogg.hpp"
 
 #include <array>
 
-namespace sc2::audio::ogg {
+namespace omc::audio::ogg {
 
 namespace {
 

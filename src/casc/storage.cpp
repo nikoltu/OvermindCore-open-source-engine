@@ -1,4 +1,4 @@
-#include "sc2/casc/storage.hpp"
+#include "omc/casc/storage.hpp"
 
 #include <algorithm>
 #include <cctype>
@@ -8,12 +8,12 @@
 #include <fstream>
 #include <stdexcept>
 
-#include "sc2/casc/blte.hpp"
-#include "sc2/platform/file.hpp"
+#include "omc/casc/blte.hpp"
+#include "omc/platform/file.hpp"
 
 namespace fs = std::filesystem;
 
-namespace sc2::casc {
+namespace omc::casc {
 
 static constexpr size_t kBlobHeaderSize = 30;
 
@@ -138,7 +138,7 @@ std::string to_lower(std::string s) {
 void Storage::set_overlay(std::unordered_map<std::string, std::vector<uint8_t>> files) {
     std::lock_guard<std::mutex> lk(names_lock_.m);
     overlay_ = std::move(files);
-    if (std::getenv("SC2_MAP_ASSETS_TRACE")) std::fprintf(stderr, "[mapassets] overlay set, %zu files\n", overlay_.size());
+    if (std::getenv("OMC_MAP_ASSETS_TRACE")) std::fprintf(stderr, "[mapassets] overlay set, %zu files\n", overlay_.size());
     overlay_names_.clear();
 }
 
@@ -214,10 +214,10 @@ std::vector<uint8_t> Storage::read_by_name(const std::string& path) const {
     {
         std::lock_guard<std::mutex> lk(names_lock_.m);
         if (const std::vector<uint8_t>* ov = overlay_find(path)) {
-            if (std::getenv("SC2_MAP_ASSETS_TRACE")) std::fprintf(stderr, "[mapassets] read %s from the map\n", path.c_str());
+            if (std::getenv("OMC_MAP_ASSETS_TRACE")) std::fprintf(stderr, "[mapassets] read %s from the map\n", path.c_str());
             return *ov;
         }
-        if (std::getenv("SC2_MAP_ASSETS_TRACE") && to_lower(path).find(".m3") != std::string::npos)
+        if (std::getenv("OMC_MAP_ASSETS_TRACE") && to_lower(path).find(".m3") != std::string::npos)
             std::fprintf(stderr, "[mapassets] read %s from the stores\n", path.c_str());
         if (!has_mndx_) throw std::runtime_error("storage: MNDX names not loaded");
         const CKey* ck = mndx_.resolve(path);

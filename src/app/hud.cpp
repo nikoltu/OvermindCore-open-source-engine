@@ -1,8 +1,8 @@
-#include "sc2/app/hud.hpp"
+#include "omc/app/hud.hpp"
 
-#include "sc2/sim/world.hpp"
+#include "omc/sim/world.hpp"
 
-namespace sc2::app {
+namespace omc::app {
 
 HudContent HudModel::build(const sim::World& world, int player,
                            const std::vector<std::uint32_t>& selection) {

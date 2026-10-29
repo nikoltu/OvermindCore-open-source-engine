@@ -1,14 +1,13 @@
-#include "sc2/app/melee.hpp"
+#include "omc/app/melee.hpp"
 
 #include <algorithm>
 #include <cstdlib>
 
 #include <utility>
 
-#include "sc2/app/spawn.hpp"
-#include "sc2/ai/hd_builds.hpp"
+#include "omc/app/spawn.hpp"
 
-namespace sc2::app {
+namespace omc::app {
 
 using sim::Fixed;
 using sim::Order;
@@ -230,7 +229,7 @@ MeleeLayout build_melee(sim::World& w, const MeleeSetup& s) {
             ai::BuildItem{prod_proto, ps.producer_mineral_cost, ps.producer_gas_cost,
                           ps.producer_build_time, false};
         out.config.has_producer = true;
-        if (ps.supply_unit.supply_provides.raw() > 0 && !std::getenv("SC2_AI_NO_SUPPLY")) {
+        if (ps.supply_unit.supply_provides.raw() > 0 && !std::getenv("OMC_AI_NO_SUPPLY")) {
             out.config.supply_unit = ai::BuildItem{ps.supply_unit, ps.supply_mineral_cost, 0, ps.supply_build_time, false};
             out.config.has_supply = true;
         }
@@ -270,8 +269,7 @@ MeleeLayout build_melee(sim::World& w, const MeleeSetup& s) {
             for (const auto& ph : ps.wave_ladders[t])
                 out.config.wave_ladders[t].push_back(ai::MeleeConfig::WavePhase{ph.first, ph.second});
         out.config.stock = ps.stock;
-        if (!ps.hd_openings.empty())
-            if (const ai::hd::RaceTables* t = ai::hd::tables(ps.race_index)) {
+        if (!ps.hd_openings.empty()) {
                 std::uint64_t h = w.seed() * 0x9E3779B97F4A7C15ull + (std::uint64_t(p) + 1) * 0xD1B54A32D192ED03ull;
                 auto roll = [&](std::uint64_t mod) {
                     h ^= h >> 29;
@@ -283,25 +281,25 @@ MeleeLayout build_melee(sim::World& w, const MeleeSetup& s) {
                 auto weight_of = [&](const ai::hd::Pick& pk) {
                     return enemy_race == 1 ? pk.w_protoss : enemy_race == 2 ? pk.w_zerg : pk.w_terran;
                 };
-                auto pick_from = [&](const ai::hd::Menu* menus, int n_menus, const char* style) -> const char* {
+                auto pick_from = [&](const std::vector<ai::hd::Menu>& menus, const std::string& style) -> const char* {
                     const ai::hd::Menu* menu = nullptr;
-                    for (int i = 0; i < n_menus; ++i)
-                        if (std::string(menus[i].style) == style) { menu = &menus[i]; break; }
-                    if (!menu || menu->n_picks <= 0) return nullptr;
+                    for (const ai::hd::Menu& m : menus)
+                        if (m.style == style) { menu = &m; break; }
+                    if (!menu || menu->picks.empty()) return nullptr;
                     int total = 0;
-                    for (int i = 0; i < menu->n_picks; ++i) total += weight_of(menu->picks[i]);
-                    if (total <= 0) return menu->picks[0].build;
+                    for (const ai::hd::Pick& pk : menu->picks) total += weight_of(pk);
+                    if (total <= 0) return menu->picks[0].build.c_str();
                     int r = int(roll(std::uint64_t(total)));
-                    for (int i = 0; i < menu->n_picks; ++i) {
-                        r -= weight_of(menu->picks[i]);
-                        if (r < 0) return menu->picks[i].build;
+                    for (const ai::hd::Pick& pk : menu->picks) {
+                        r -= weight_of(pk);
+                        if (r < 0) return pk.build.c_str();
                     }
-                    return menu->picks[menu->n_picks - 1].build;
+                    return menu->picks.back().build.c_str();
                 };
-                if (t->n_open_menus > 0) {
-                    const char* style = t->open_menus[roll(std::uint64_t(t->n_open_menus))].style;
-                    const char* open_id = pick_from(t->open_menus, t->n_open_menus, style);
-                    const char* mid_id = pick_from(t->mid_menus, t->n_mid_menus, style);
+                if (!ps.hd_open_menus.empty()) {
+                    const std::string style = ps.hd_open_menus[roll(std::uint64_t(ps.hd_open_menus.size()))].style;
+                    const char* open_id = pick_from(ps.hd_open_menus, style);
+                    const char* mid_id = pick_from(ps.hd_mid_menus, style);
                     auto find = [](const std::vector<MeleePlayerSetup::HdBuildSteps>& v, const char* id) -> const MeleePlayerSetup::HdBuildSteps* {
                         if (!id) return nullptr;
                         for (const auto& b : v)
@@ -311,9 +309,9 @@ MeleeLayout build_melee(sim::World& w, const MeleeSetup& s) {
                     const MeleePlayerSetup::HdBuildSteps* open = find(ps.hd_openings, open_id);
                     const MeleePlayerSetup::HdBuildSteps* mid = find(ps.hd_mids, mid_id);
                     const MeleePlayerSetup::HdBuildSteps* late = nullptr;
-                    if (t->n_late_menus > 0) {
-                        const char* lstyle = t->late_menus[roll(std::uint64_t(t->n_late_menus))].style;
-                        late = find(ps.hd_lates, pick_from(t->late_menus, t->n_late_menus, lstyle));
+                    if (!ps.hd_late_menus.empty()) {
+                        const std::string lstyle = ps.hd_late_menus[roll(std::uint64_t(ps.hd_late_menus.size()))].style;
+                        late = find(ps.hd_lates, pick_from(ps.hd_late_menus, lstyle));
                     }
                     if (open) {
                         out.config.hd_stock = open->stock;

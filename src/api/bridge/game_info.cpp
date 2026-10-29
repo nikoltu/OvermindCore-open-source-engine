@@ -5,11 +5,11 @@
 
 #include "s2clientprotocol/sc2api.pb.h"
 
-#include "sc2/api/bridge.hpp"
-#include "sc2/app/melee_game.hpp"
-#include "sc2/formats/map_archive.hpp"
+#include "omc/api/bridge.hpp"
+#include "omc/app/melee_game.hpp"
+#include "omc/formats/map_archive.hpp"
 
-namespace sc2::api::bridge {
+namespace omc::api::bridge {
 
 namespace {
 

@@ -1,9 +1,9 @@
-#include "sc2/app/shell_screens.hpp"
+#include "omc/app/shell_screens.hpp"
 
 #include <cstdio>
 #include <filesystem>
 
-namespace sc2::app::shell {
+namespace omc::app::shell {
 
 namespace v2 = theme::v2;
 namespace L = layout::s10_home;
@@ -96,10 +96,6 @@ bool screen_home(Ui& ui, ShellCtx& ctx) {
         else ui.open_modal("quit");
     }
     {
-        Opts o;
-        o.trigger = "SandboxButton";
-        o.hint = "One race, no opponent: spawn any unit and watch it.";
-        if (ui.button("SandboxButton", ui.at(L::kSandbox), "Sandbox", ButtonKind::Ghost, o)) ctx.router.follow("SandboxButton");
         Opts a;
         a.trigger = "Credits entry";
         a.hint = "What this is, which build, licences.";
@@ -175,7 +171,7 @@ bool screen_home(Ui& ui, ShellCtx& ctx) {
         ui.use_escape();
         ui.open_modal("quit");
     }
-    if (confirm(ui, "quit", "Quit Crafter?", "The client closes. Settings are already saved.", "Stay", "Quit") == Confirm::Yes) ctx.quit();
+    if (confirm(ui, "quit", "Quit OvermindCore?", "The client closes. Settings are already saved.", "Stay", "Quit") == Confirm::Yes) ctx.quit();
     toasts(ui, ctx);
     return true;
 }

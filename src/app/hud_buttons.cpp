@@ -1,12 +1,12 @@
-#include "sc2/app/hud_buttons.hpp"
+#include "omc/app/hud_buttons.hpp"
 
 #include <cstdlib>
 
-#include "sc2/app/melee_game.hpp"
-#include "sc2/app/ui_hotkeys.hpp"
-#include "sc2/data/catalog.hpp"
+#include "omc/app/melee_game.hpp"
+#include "omc/app/ui_hotkeys.hpp"
+#include "omc/data/catalog.hpp"
 
-namespace sc2::app {
+namespace omc::app {
 
 const char* hud_button_name(HudButtonId id) {
     static const char* const kNames[] = {
@@ -194,12 +194,12 @@ bool MeleeGame::on_hud_button(const HudPress& p) {
         }
         case HudButtonId::Idle:
             if (!p.left || idle_worker_count() <= 0) return false;
-            if (p.ctrl && !std::getenv("SC2_HUD_BUTTONS_LEGACY")) set_selection(idle_workers());
+            if (p.ctrl && !std::getenv("OMC_HUD_BUTTONS_LEGACY")) set_selection(idle_workers());
             else select_next_idle_worker();
             return true;
         default: break;
     }
-    static const bool legacy = std::getenv("SC2_HUD_BUTTONS_LEGACY") != nullptr;
+    static const bool legacy = std::getenv("OMC_HUD_BUTTONS_LEGACY") != nullptr;
     if (legacy) return false;
     if (p.id == HudButtonId::MenuMenu) {
         if (!p.left) return false;
@@ -211,7 +211,7 @@ bool MeleeGame::on_hud_button(const HudPress& p) {
 }
 
 void MeleeGame::hud_dispatch_hotkeys(const render::InputState& in) {
-    static const bool legacy = std::getenv("SC2_HUD_BUTTONS_LEGACY") != nullptr;
+    static const bool legacy = std::getenv("OMC_HUD_BUTTONS_LEGACY") != nullptr;
     if (legacy || cfg_.human_player < 0 || !cat_ || cat_->hotkeys().empty()) return;
     const data::StringTable& hk = cat_->hotkeys();
     const std::vector<HudButton> buttons = hud_buttons_.all();

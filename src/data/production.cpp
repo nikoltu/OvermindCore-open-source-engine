@@ -1,8 +1,8 @@
-#include "sc2/data/production.hpp"
+#include "omc/data/production.hpp"
 
 #include <cstdlib>
 
-namespace sc2::data {
+namespace omc::data {
 
 void Production::build(const Catalog& cat) {
     edges_.clear();

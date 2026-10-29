@@ -1,9 +1,9 @@
-#include "sc2/formats/minimap.hpp"
+#include "omc/formats/minimap.hpp"
 
 #include <cmath>
 #include <stdexcept>
 
-namespace sc2::formats {
+namespace omc::formats {
 
 namespace {
 

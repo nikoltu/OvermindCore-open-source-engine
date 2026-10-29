@@ -1,15 +1,15 @@
 #include <cstdlib>
 #include <cstdio>
 #include <cctype>
-#include "sc2/formats/m3.hpp"
+#include "omc/formats/m3.hpp"
 
 #include <cmath>
 #include <cstring>
 #include <stdexcept>
 
-#include "sc2/core/byte_reader.hpp"
+#include "omc/core/byte_reader.hpp"
 
-namespace sc2::formats {
+namespace omc::formats {
 
 using core::ByteReader;
 
@@ -252,7 +252,7 @@ Model M3::decode_model() const {
             for (int a = 0; a < 4; ++a) m.tangents.push_back(float(p[stride - 4 + a]) / 255.0f * 2.0f - 1.0f);
         }
     }
-    if (has_uv && !std::getenv("SC2_NO_REGN_UV_SCALE")) {
+    if (has_uv && !std::getenv("OMC_NO_REGN_UV_SCALE")) {
         std::vector<char> done(m.vertex_count, 0);
         for (const M3Region& reg : m.regions) {
             if (reg.uv_multiply == 16.0f && reg.uv_offset == 0.0f) continue;
@@ -372,7 +372,7 @@ void M3::decode_materials(Model& m) const {
         if (!ls || m3_tag(ls->tag) != "LAYR") return false;
         M3Ref img = read_ref(ls->offset + 4);
         std::string path = read_char(img);
-        static const bool no_const = std::getenv("SC2_NO_CONST_COLOUR_LAYERS") != nullptr;
+        static const bool no_const = std::getenv("OMC_NO_CONST_COLOUR_LAYERS") != nullptr;
         const bool const_colour = path.empty() && !no_const && ls->offset + 40 <= data.size() &&
                                   (rd32(&data[ls->offset + 36]) & 0x400u) != 0;
         if (path.empty() && !const_colour) return false;
@@ -415,7 +415,7 @@ void M3::decode_materials(Model& m) const {
             };
             null1(48, a.bright_mult_null);
             null1(312 + d, a.brightness_null);
-            static const bool kFlipbook = std::getenv("SC2_NO_FLIPBOOK") == nullptr;
+            static const bool kFlipbook = std::getenv("OMC_NO_FLIPBOOK") == nullptr;
             const size_t fb = ls->version <= 23 ? 156 : 164;
             if (kFlipbook && ls->version <= 26 && rec >= fb + 20 && base + fb + 20 <= data.size()) {
                 const uint32_t rows = rd32(&data[base + fb]), cols = rd32(&data[base + fb + 4]);
@@ -562,7 +562,7 @@ void M3::decode_materials(Model& m) const {
     }
 
     std::vector<int> dis_material;
-    static const bool kDisplace = std::getenv("SC2_NO_DISPLACEMENT") == nullptr;
+    static const bool kDisplace = std::getenv("OMC_NO_DISPLACEMENT") == nullptr;
     if (const uint32_t di = find_tag("DIS_"); kDisplace && di != UINT32_MAX) {
         const M3Section* ds = section_by_index(di);
         if (ds && ds->version == 4 && section_bytes(di).size() >= size_t(ds->count) * 68)
@@ -592,7 +592,7 @@ void M3::decode_materials(Model& m) const {
         if (!cs || cmp_index >= cs->count) return -1;
         const size_t span = section_bytes(ci).size(), rec = span / std::max<uint32_t>(cs->count, 1);
         const size_t base = cs->offset + size_t(cmp_index) * rec;
-        if (std::getenv("SC2_BAT_TRACE")) {
+        if (std::getenv("OMC_BAT_TRACE")) {
             std::fprintf(stderr, "CMP_ count %u rec %zu ver %u refs:", cs->count, rec, cs->version);
             for (size_t off = base; off + 12 <= base + rec; off += 4) { const M3Ref r = read_ref(off); if (r.index < sections.size() && r.count) std::fprintf(stderr, " @%zu->%s(%u)", off - base, m3_tag(sections[r.index].tag).c_str(), r.count); }
             std::fprintf(stderr, "\n");
@@ -662,7 +662,7 @@ void M3::decode_materials(Model& m) const {
             uint32_t mref = rd16(&data[r + 10]);
             if (region >= m.regions.size() || mref >= m.material_refs.size()) continue;
             const M3MaterialRef& mr = m.material_refs[mref];
-            if (std::getenv("SC2_BAT_TRACE")) std::fprintf(stderr, "bat region %u mref %u type %u index %u\n", region, mref, mr.type, mr.index);
+            if (std::getenv("OMC_BAT_TRACE")) std::fprintf(stderr, "bat region %u mref %u type %u index %u\n", region, mref, mr.type, mr.index);
             if (mr.type == 1 && mr.index < m.materials.size())
                 m.region_material[region] = int(mr.index);
             if (mr.type == 2 && mr.index < dis_material.size()) m.region_material[region] = dis_material[mr.index];
@@ -1331,7 +1331,7 @@ std::vector<M3Particle> M3::decode_particles() const {
                 if (f.lifetime_init + 36 <= rec && base + f.lifetime_init + 36 <= data.size()) p.rand_life2 = rd32(&data[base + f.lifetime_init + 32]) != 0;
             }
             p.emission_rate = rf(base, f.rate_init);
-            if (std::getenv("SC2_PAR_OFFSETS"))
+            if (std::getenv("OMC_PAR_OFFSETS"))
                 std::fprintf(stderr, "[paroff] v%u base %zu rate %zu life %zu size %zu %zu %zu color0 %zu color1 %zu color2 %zu maxp %zu\n", unsigned(s.version), std::size_t(base),
                              std::size_t(base + f.rate_init), std::size_t(base + f.lifetime_init), std::size_t(base + f.size_start), std::size_t(base + f.size_mid), std::size_t(base + f.size_end),
                              std::size_t(base + f.color_init[0]), std::size_t(base + f.color_init[1]), std::size_t(base + f.color_init[2]), std::size_t(base + f.max_particles));
@@ -1353,7 +1353,7 @@ std::vector<M3Particle> M3::decode_particles() const {
             }
             if (base + rec <= data.size())
                 p.raw.assign(data.begin() + long(base), data.begin() + long(base + rec));
-            static const bool kBurst = std::getenv("SC2_NO_PAR_BURST") == nullptr;
+            static const bool kBurst = std::getenv("OMC_NO_PAR_BURST") == nullptr;
             if (kBurst && s.version == 21 && rec >= 712 && base + 712 <= data.size()) {
                 p.burst_interp = rd16(&data[base + 700]);
                 p.burst_flags = rd16(&data[base + 702]);
@@ -1402,7 +1402,7 @@ std::vector<M3Particle> M3::decode_particles() const {
                 p.emission_type = rd32(&data[base + t2]);
                 p.rand_size2 = rd32(&data[base + t2 + 4]) != 0;
                 for (int k = 0; k < 3; ++k) p.size2[k] = std::max(0.0f, fin(rf(base, t2 + 16 + 4 * uint32_t(k))));
-                static const bool kRot2Old = std::getenv("SC2_PAR_ROT2_OLD") != nullptr;
+                static const bool kRot2Old = std::getenv("OMC_PAR_ROT2_OLD") != nullptr;
                 for (int k = 0; k < 3; ++k) p.rot2[k] = fin(rf(base, t2 + (kRot2Old ? 52u : 56u) + 4 * uint32_t(k)));
                 p.rand_rot2 = rd32(&data[base + t2 + (kRot2Old ? 80u : 44u)]) != 0;
                 p.rand_color2 = rd32(&data[base + t2 + 84]) != 0;

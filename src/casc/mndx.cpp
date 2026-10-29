@@ -1,4 +1,4 @@
-#include "sc2/casc/mndx.hpp"
+#include "omc/casc/mndx.hpp"
 
 #include <algorithm>
 #include <array>
@@ -7,7 +7,7 @@
 #include <memory>
 #include <stdexcept>
 
-namespace sc2::casc {
+namespace omc::casc {
 namespace {
 
 constexpr uint32_t kMarSignature = 0x0052414D;
@@ -717,7 +717,7 @@ void Mndx::parse(const std::vector<uint8_t>& root_blob) {
     }
     std::sort(by_hash_.begin(), by_hash_.end());
     std::unordered_map<std::string, CKey>().swap(by_path_);
-    static const bool kPlainNames = std::getenv("SC2_CASC_NAMES_PLAIN") != nullptr;
+    static const bool kPlainNames = std::getenv("OMC_CASC_NAMES_PLAIN") != nullptr;
     if (kPlainNames) {
         entries_.shrink_to_fit();
         return;
@@ -839,7 +839,7 @@ std::size_t Mndx::memory_bytes() const {
 }
 
 bool casc_index_maps_old() {
-    static const bool old = std::getenv("SC2_CASC_INDEX_MAPS") != nullptr;
+    static const bool old = std::getenv("OMC_CASC_INDEX_MAPS") != nullptr;
     return old;
 }
 

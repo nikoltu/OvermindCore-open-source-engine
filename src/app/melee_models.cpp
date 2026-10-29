@@ -1,10 +1,10 @@
-#include "sc2/app/melee_models.hpp"
+#include "omc/app/melee_models.hpp"
 
 #include <cstring>
-#include "sc2/formats/m3.hpp"
-#include "sc2/render/anim.hpp"
-#include "sc2/render/vertex_ao.hpp"
-#include "sc2/render/texture_decode.hpp"
+#include "omc/formats/m3.hpp"
+#include "omc/render/anim.hpp"
+#include "omc/render/vertex_ao.hpp"
+#include "omc/render/texture_decode.hpp"
 #include <memory>
 #include <optional>
 #include <algorithm>
@@ -18,11 +18,11 @@
 #include <utility>
 #include <vector>
 
-#include "sc2/casc/storage.hpp"
-#include "sc2/data/actor_model.hpp"
-#include "sc2/data/catalog.hpp"
+#include "omc/casc/storage.hpp"
+#include "omc/data/actor_model.hpp"
+#include "omc/data/catalog.hpp"
 
-namespace sc2::app {
+namespace omc::app {
 
 namespace {
 
@@ -157,9 +157,9 @@ void bind_story_textures(const casc::Storage& store, formats::Model& model) {
 }
 
 void graft_required_anims(casc::Storage& store, const data::Catalog& cat, const std::string& model_id, formats::Model& model, bool story) {
-    static const bool kOverride = std::getenv("SC2_REQUIRED_ANIMS_OVERRIDE") != nullptr;
+    static const bool kOverride = std::getenv("OMC_REQUIRED_ANIMS_OVERRIDE") != nullptr;
     const bool had_own = !model.sequences.empty();
-    if ((had_own && !kOverride) || std::getenv("SC2_NO_REQUIRED_ANIMS") || !cat.find("CModel", model_id)) return;
+    if ((had_own && !kOverride) || std::getenv("OMC_NO_REQUIRED_ANIMS") || !cat.find("CModel", model_id)) return;
     for (const core::XmlNode& n : cat.resolved("CModel", model_id)) {
         if (n.name != "RequiredAnims") continue;
         const std::string* v = n.attr("value");
@@ -198,7 +198,7 @@ void graft_required_anims(casc::Storage& store, const data::Catalog& cat, const 
                 model.stg.push_back(std::move(g));
             }
         }
-        if (std::getenv("SC2_REQUIRED_ANIMS_TRACE"))
+        if (std::getenv("OMC_REQUIRED_ANIMS_TRACE"))
             std::fprintf(stderr, "[reqanims] %s: %zu clips from %s (model had %s)\n", model_id.c_str(), anims.sequences.size(), rel.c_str(), had_own ? "its own" : "none");
         for (formats::M3STC& c : anims.stc) model.stc.push_back(std::move(c));
     }
@@ -214,7 +214,7 @@ UnitModelSource unit_model_source(const casc::Storage& store, const data::Catalo
     std::optional<std::string> am = cat.scalar("CActorUnit", token, "Model");
     out.model_id = (!am || am->empty() || am->find("##unitName##") != std::string::npos) ? token : *am;
     out.path = data::resolve_unit_model(cat, token);
-    if (out.path && !std::getenv("SC2_NO_UNIT_FAMILY_PATH") && cat.scalar("CModel", out.model_id, "VariationCount")) {
+    if (out.path && !std::getenv("OMC_NO_UNIT_FAMILY_PATH") && cat.scalar("CModel", out.model_id, "VariationCount")) {
         const std::string& rel = *out.path;
         const std::size_t dot = rel.rfind(".m3");
         const bool numbered = dot != std::string::npos && dot >= 3 && rel[dot - 3] == '_' &&
@@ -224,7 +224,7 @@ UnitModelSource unit_model_source(const casc::Storage& store, const data::Catalo
             if (asset_ships(store, fam, story)) out.path = fam;
         }
     }
-    if (std::getenv("SC2_NO_OPTION_MODELSWAP") || !cat.find("CActorUnit", token)) return out;
+    if (std::getenv("OMC_NO_OPTION_MODELSWAP") || !cat.find("CActorUnit", token)) return out;
     for (const core::XmlNode& n : cat.resolved("CActorUnit", token)) {
         if (n.name != "On") continue;
         const std::string terms = n.attr_or("Terms", ""), send = n.attr_or("Send", "");
@@ -276,7 +276,7 @@ data::Catalog& MeleeModels::catalog(casc::Storage& store) {
 data::Catalog& MeleeModels::unit_catalog(casc::Storage& store, const std::string& token, bool& story) {
     story = false;
     data::Catalog& cat = catalog(store);
-    if (token.empty() || std::getenv("SC2_NO_STORY_MODELS") || cat.find("CActorUnit", data::unit_actor_id(cat, token))) return cat;
+    if (token.empty() || std::getenv("OMC_NO_STORY_MODELS") || cat.find("CActorUnit", data::unit_actor_id(cat, token))) return cat;
     if (!story_ready_) {
         story_ready_ = true;
         story_catalog_ = std::make_unique<data::Catalog>();
@@ -286,7 +286,7 @@ data::Catalog& MeleeModels::unit_catalog(casc::Storage& store, const std::string
         }
     }
     const bool found = story_catalog_->find("CActorUnit", token) != nullptr;
-    if (std::getenv("SC2_PLACED_DROP_TRACE"))
+    if (std::getenv("OMC_PLACED_DROP_TRACE"))
         std::fprintf(stderr, "[story-model] %s -> %s\n", token.c_str(), found ? "campaign actor" : "none");
     if (!found) return cat;
     story = true;
@@ -294,7 +294,7 @@ data::Catalog& MeleeModels::unit_catalog(casc::Storage& store, const std::string
 }
 
 void MeleeModels::resolve_one(casc::Storage& store, const std::string& token) {
-    if (!texture_prop_.empty() && !std::getenv("SC2_NO_TEXTURE_SETS")) {
+    if (!texture_prop_.empty() && !std::getenv("OMC_NO_TEXTURE_SETS")) {
         const std::string pkey = token + "@" + texture_prop_;
         if (!unit_prop_done_.count(pkey)) {
             unit_prop_done_.insert(pkey);
@@ -375,7 +375,7 @@ std::vector<std::string> MeleeModels::unit_candidates(casc::Storage& store, cons
 }
 
 bool MeleeModels::prefetch(casc::Storage& store, const std::string& token) {
-    if (token.empty() || models_.count(token) || std::getenv("SC2_MODEL_DECODE_SYNC")) return true;
+    if (token.empty() || models_.count(token) || std::getenv("OMC_MODEL_DECODE_SYNC")) return true;
     render::TextureDecodePool& pool = render::TextureDecodePool::instance();
     const std::string key = "m3tok:" + token;
     if (pool.ready(key)) return true;
@@ -450,7 +450,7 @@ const formats::Model* MeleeModels::ensure_variation(casc::Storage& store, const 
     if (decode_rel(store, rel, m, story)) {
         if (story) bind_story_textures(store, m);
         graft_required_anims(store, cat, src.model_id, m, story);
-        if (!texture_prop_.empty() && !std::getenv("SC2_NO_TEXTURE_SETS")) apply_texture_declares(store, cat, src.model_id, texture_prop_, m);
+        if (!texture_prop_.empty() && !std::getenv("OMC_NO_TEXTURE_SETS")) apply_texture_declares(store, cat, src.model_id, texture_prop_, m);
     }
     const formats::Model& kept = models_.emplace(key, std::move(m)).first->second;
     return kept.vertex_count ? &kept : nullptr;
@@ -537,7 +537,7 @@ const formats::Model* MeleeModels::death_model(casc::Storage& store, const std::
     if (!model_id) model_id = actor_model_id;
     if (auto path = cat.scalar("CModel", *model_id, "Model")) {
         std::string rel = *path;
-        static const bool kRawPath = std::getenv("SC2_DEATH_PATH_RAW") != nullptr;
+        static const bool kRawPath = std::getenv("OMC_DEATH_PATH_RAW") != nullptr;
         if (!kRawPath && rel.find("##") != std::string::npos) rel = cat.expand_entry_tokens("CModel", *model_id, rel);
         for (char& c : rel)
             if (c == '\\') c = '/';
@@ -576,11 +576,44 @@ const formats::Model* MeleeModels::scaffold_model(casc::Storage& store, const st
         }
         it = scaffolds_.emplace(actor_model_id, std::move(sc)).first;
     }
-    static const bool kMeshOnly = std::getenv("SC2_SCAFFOLD_MESH_ONLY") != nullptr;
+    static const bool kMeshOnly = std::getenv("OMC_SCAFFOLD_MESH_ONLY") != nullptr;
     const formats::Model& sm = it->second.model;
     if (sm.vertex_count == 0 && (kMeshOnly || (sm.particles.empty() && sm.ribbons.empty()))) return nullptr;
     for (int k = 0; k < 3; ++k) scale[k] = it->second.scale[k];
     return &it->second.model;
+}
+
+static void read_portrait_cam(const formats::M3& parsed, MeleeModels::Portrait& p) {
+    const formats::M3Section* cam = parsed.section_by_tag("CAM_");
+    if (!cam || cam->count == 0) return;
+    static const bool kCamV5Old = std::getenv("OMC_PORTRAIT_CAM_V5_OLD") != nullptr;
+    const std::size_t sh = cam->version >= 5 && !kCamV5Old ? 4 : 0;
+    const std::size_t base = std::size_t(cam->offset);
+    if (base + 72 + sh > parsed.data.size()) return;
+    auto f32 = [&](std::size_t at) {
+        float v = 0.0f;
+        std::memcpy(&v, &parsed.data[base + at], 4);
+        return v;
+    };
+    std::uint32_t bone = 0;
+    std::memcpy(&bone, &parsed.data[base], 4);
+    const float f = f32(24), zf = f32(48 + sh), zn = f32(68 + sh);
+    if (f > 0.01f && f < 3.14f) p.fov_rad = f;
+    if (zn > 0.0f && zf > zn) {
+        p.znear = zn;
+        p.zfar = zf;
+    }
+    p.cam_bone = int(bone);
+    const bool dof_layout = cam->version == 3 || (sh != 0 && cam->version == 5);
+    if (dof_layout && base + 172 + sh <= parsed.data.size()) {
+        const float fd = f32(108 + sh), fs = f32(128 + sh), fe2 = f32(148 + sh), da = f32(168 + sh);
+        if (fd > 0.0f && fd < 1000.0f && fs >= 0.0f && fe2 > fs && fe2 < 1000.0f && da > 0.0f && da <= 16.0f) {
+            p.dof_focus = fd;
+            p.dof_start = fs;
+            p.dof_end = fe2;
+            p.dof_amount = da;
+        }
+    }
 }
 
 const MeleeModels::Portrait* MeleeModels::portrait(casc::Storage& store, const std::string& unit_id) {
@@ -589,7 +622,7 @@ const MeleeModels::Portrait* MeleeModels::portrait(casc::Storage& store, const s
     Portrait p;
     data::Catalog& cat = catalog(store);
     std::string src_id, src_rel;
-    if (!std::getenv("SC2_MODEL_DECODE_SYNC") && portrait_source(store, unit_id, src_id, src_rel)) {
+    if (!std::getenv("OMC_MODEL_DECODE_SYNC") && portrait_source(store, unit_id, src_id, src_rel)) {
         const std::string& expand_id = src_id;
         const std::string& rel = src_rel;
         render::DecodedTexture pre;
@@ -601,35 +634,7 @@ const MeleeModels::Portrait* MeleeModels::portrait(casc::Storage& store, const s
             if (pre.ok && ri < pre.pick) continue;
             try {
                 formats::M3 parsed = pre.ok && ri == pre.pick ? std::move(*pre.m3) : formats::M3::parse(store.read_by_name(std::string(root) + rel));
-                if (const formats::M3Section* cam = parsed.section_by_tag("CAM_")) {
-                    if (cam->count > 0 && std::size_t(cam->offset) + 72 <= parsed.data.size()) {
-                        std::uint32_t bone = 0;
-                        float f = 0.0f, zf = 0.0f, zn = 0.0f;
-                        std::memcpy(&bone, &parsed.data[cam->offset], 4);
-                        std::memcpy(&f, &parsed.data[cam->offset + 24], 4);
-                        std::memcpy(&zf, &parsed.data[cam->offset + 48], 4);
-                        std::memcpy(&zn, &parsed.data[cam->offset + 68], 4);
-                        if (f > 0.01f && f < 3.14f) p.fov_rad = f;
-                        if (zn > 0.0f && zf > zn) {
-                            p.znear = zn;
-                            p.zfar = zf;
-                        }
-                        p.cam_bone = int(bone);
-                        if (cam->version == 3 && std::size_t(cam->offset) + 172 <= parsed.data.size()) {
-                            float fd = 0.0f, fs = 0.0f, fe2 = 0.0f, da = 0.0f;
-                            std::memcpy(&fd, &parsed.data[cam->offset + 108], 4);
-                            std::memcpy(&fs, &parsed.data[cam->offset + 128], 4);
-                            std::memcpy(&fe2, &parsed.data[cam->offset + 148], 4);
-                            std::memcpy(&da, &parsed.data[cam->offset + 168], 4);
-                            if (fd > 0.0f && fd < 1000.0f && fs >= 0.0f && fe2 > fs && fe2 < 1000.0f && da > 0.0f && da <= 16.0f) {
-                                p.dof_focus = fd;
-                                p.dof_start = fs;
-                                p.dof_end = fe2;
-                                p.dof_amount = da;
-                            }
-                        }
-                    }
-                }
+                read_portrait_cam(parsed, p);
                 p.model = pre.ok && ri == pre.pick ? std::move(*pre.model) : parsed.decode_model();
                 if (p.model.vertex_count) {
                     p.path = std::string(root) + rel;
@@ -668,35 +673,7 @@ const MeleeModels::Portrait* MeleeModels::portrait(casc::Storage& store, const s
         for (const char* root : kAssetRoots) {
             try {
                 formats::M3 parsed = formats::M3::parse(store.read_by_name(std::string(root) + rel));
-                if (const formats::M3Section* cam = parsed.section_by_tag("CAM_")) {
-                    if (cam->count > 0 && std::size_t(cam->offset) + 72 <= parsed.data.size()) {
-                        std::uint32_t bone = 0;
-                        float f = 0.0f, zf = 0.0f, zn = 0.0f;
-                        std::memcpy(&bone, &parsed.data[cam->offset], 4);
-                        std::memcpy(&f, &parsed.data[cam->offset + 24], 4);
-                        std::memcpy(&zf, &parsed.data[cam->offset + 48], 4);
-                        std::memcpy(&zn, &parsed.data[cam->offset + 68], 4);
-                        if (f > 0.01f && f < 3.14f) p.fov_rad = f;
-                        if (zn > 0.0f && zf > zn) {
-                            p.znear = zn;
-                            p.zfar = zf;
-                        }
-                        p.cam_bone = int(bone);
-                        if (cam->version == 3 && std::size_t(cam->offset) + 172 <= parsed.data.size()) {
-                            float fd = 0.0f, fs = 0.0f, fe2 = 0.0f, da = 0.0f;
-                            std::memcpy(&fd, &parsed.data[cam->offset + 108], 4);
-                            std::memcpy(&fs, &parsed.data[cam->offset + 128], 4);
-                            std::memcpy(&fe2, &parsed.data[cam->offset + 148], 4);
-                            std::memcpy(&da, &parsed.data[cam->offset + 168], 4);
-                            if (fd > 0.0f && fd < 1000.0f && fs >= 0.0f && fe2 > fs && fe2 < 1000.0f && da > 0.0f && da <= 16.0f) {
-                                p.dof_focus = fd;
-                                p.dof_start = fs;
-                                p.dof_end = fe2;
-                                p.dof_amount = da;
-                            }
-                        }
-                    }
-                }
+                read_portrait_cam(parsed, p);
                 p.model = parsed.decode_model();
                 if (p.model.vertex_count) {
                     p.path = std::string(root) + rel;
@@ -741,7 +718,7 @@ bool MeleeModels::portrait_source(casc::Storage& store, const std::string& unit_
 }
 
 bool MeleeModels::prefetch_portrait(casc::Storage& store, const std::string& unit_id) {
-    if (unit_id.empty() || portraits_.count(unit_id) || std::getenv("SC2_MODEL_DECODE_SYNC")) return true;
+    if (unit_id.empty() || portraits_.count(unit_id) || std::getenv("OMC_MODEL_DECODE_SYNC")) return true;
     render::TextureDecodePool& pool = render::TextureDecodePool::instance();
     const std::string key = "m3por:" + unit_id;
     if (pool.ready(key)) return true;
@@ -786,7 +763,7 @@ const formats::Model* MeleeModels::unit_splat(casc::Storage& store, const std::s
             if (!un || un->empty() || *un == "Bogus" || *un == "BogusBurrowed") continue;
             splat_actor_by_unit_.emplace(*un, id);
         }
-        if (!std::getenv("SC2_NO_BIRTH_SPLAT"))
+        if (!std::getenv("OMC_NO_BIRTH_SPLAT"))
             for (const std::string& id : cat.ids("CActorSplat"))
                 for (const core::XmlNode& n : cat.resolved("CActorSplat", id)) {
                     if (n.name != "On") continue;
@@ -807,7 +784,7 @@ const formats::Model* MeleeModels::unit_splat(casc::Storage& store, const std::s
             if (v > 0.0f) splat_scale_by_unit_[unit_id] = v;
         }
     }
-    if (model.materials.empty() && !std::getenv("SC2_NO_ACTOR_SPLAT")) {
+    if (model.materials.empty() && !std::getenv("OMC_NO_ACTOR_SPLAT")) {
         std::string created;
         for (const core::XmlNode& n : cat.resolved("CActorUnit", unit_id)) {
             if (n.name != "On") continue;
@@ -910,7 +887,7 @@ const MeleeModels::GroundDecal* MeleeModels::unit_ground_decal(casc::Storage& st
             }
             g.model.projectors = std::move(flat);
             if (g.model.projectors.empty()) continue;
-            static const bool kRest = std::getenv("SC2_DECAL_REST_VALUES") != nullptr;
+            static const bool kRest = std::getenv("OMC_DECAL_REST_VALUES") != nullptr;
             int stand = -1;
             for (std::size_t si = 0; si < g.model.sequences.size() && stand < 0; ++si)
                 if (g.model.sequences[si].name.compare(0, 5, "Stand") == 0) stand = int(si);
@@ -937,7 +914,7 @@ const MeleeModels::GroundDecal* MeleeModels::unit_ground_decal(casc::Storage& st
                         for (int k = 0; k < 3; ++k) a.uv_angle[k] = v[k];
                         render::animated_layer_field(g.model, s, a.uv_tiling_interp, a.uv_tiling_flags, a.uv_tiling_id, 0.0f, 2, a.uv_tiling, v);
                         a.uv_tiling[0] = v[0]; a.uv_tiling[1] = v[1];
-                        if (std::getenv("SC2_SPLAT_TRACE"))
+                        if (std::getenv("OMC_SPLAT_TRACE"))
                             std::fprintf(stderr, "[decalstand] %s %s %s '%s' mult %.3f add %.3f bright %.3f uvoff %.3f,%.3f uvang %.3f tile %.3f,%.3f\n", unit_id.c_str(), mat.name.c_str(),
                                          L.usage.c_str(), L.image_path.c_str(), double(a.bright_mult), double(a.midtone_offset), double(a.brightness), double(a.uv_offset[0]),
                                          double(a.uv_offset[1]), double(a.uv_angle[2]), double(a.uv_tiling[0]), double(a.uv_tiling[1]));
@@ -987,7 +964,7 @@ const formats::Model* MeleeModels::actor_splat(casc::Storage& store, const std::
 
 const formats::Model* MeleeModels::missile_model(casc::Storage& store, const std::string& weapon_id) {
     if (weapon_id.empty()) return nullptr;
-    static const bool kMeshOnly = std::getenv("SC2_MISSILE_MESH_ONLY") != nullptr;
+    static const bool kMeshOnly = std::getenv("OMC_MISSILE_MESH_ONLY") != nullptr;
     auto usable = [&](const formats::Model& m) { return m.vertex_count > 0 || (!kMeshOnly && (!m.particles.empty() || !m.ribbons.empty())); };
     if (auto it = missiles_.find(weapon_id); it != missiles_.end())
         return usable(it->second) ? &it->second : nullptr;
@@ -1009,7 +986,7 @@ const formats::Model* MeleeModels::missile_model(casc::Storage& store, const std
 
 const formats::Model* MeleeModels::impact_model(casc::Storage& store, const std::string& weapon_id) {
     if (weapon_id.empty()) return nullptr;
-    static const bool kImpactMeshOnly = std::getenv("SC2_MISSILE_MESH_ONLY") != nullptr;
+    static const bool kImpactMeshOnly = std::getenv("OMC_MISSILE_MESH_ONLY") != nullptr;
     if (auto it = impacts_.find(weapon_id); it != impacts_.end())
         return (it->second.vertex_count > 0 || (!kImpactMeshOnly && !it->second.particles.empty())) ? &it->second : nullptr;
     formats::Model model;
@@ -1252,7 +1229,7 @@ const formats::Model* MeleeModels::doodad_model(casc::Storage& store, const std:
         }
     }
     if (!drawable(model) && model.projectors.empty() && model.terrain_regions.empty()) doodad_misses_.insert(type);
-    if (std::getenv("SC2_X_RGB_NO_CUTOUT"))
+    if (std::getenv("OMC_X_RGB_NO_CUTOUT"))
         for (formats::M3Material& mat : model.materials) {
             bool mask = false, rgb = false;
             for (const formats::M3Layer& ly : mat.layers) {
@@ -1261,8 +1238,8 @@ const formats::Model* MeleeModels::doodad_model(casc::Storage& store, const std:
             }
             if (rgb && !mask) mat.cutout_thresh = 0;
         }
-    if (!std::getenv("SC2_NO_TEXTURE_SETS")) apply_texture_declares(store, cat, *model_id, texture_prop_, model);
-    if (std::getenv("SC2_VERTEX_AO") && cat.find("CModel", *model_id)) {
+    if (!std::getenv("OMC_NO_TEXTURE_SETS")) apply_texture_declares(store, cat, *model_id, texture_prop_, model);
+    if (std::getenv("OMC_VERTEX_AO") && cat.find("CModel", *model_id)) {
         bool ao_data = false;
         for (const core::XmlNode& n : cat.resolved("CModel", *model_id)) {
             if (n.name != "Flags") continue;
@@ -1272,12 +1249,12 @@ const formats::Model* MeleeModels::doodad_model(casc::Storage& store, const std:
         }
         if (ao_data) {
             render::VertexAoParams ap;
-            if (const char* e = std::getenv("SC2_VERTEX_AO_REACH")) ap.reach = float(std::atof(e));
-            if (const char* e = std::getenv("SC2_VERTEX_AO_RAYS")) ap.rays = std::atoi(e);
-            if (const char* e = std::getenv("SC2_VERTEX_AO_STRENGTH")) ap.strength = float(std::atof(e));
-            ap.ground = std::getenv("SC2_VERTEX_AO_GROUND") != nullptr;
+            if (const char* e = std::getenv("OMC_VERTEX_AO_REACH")) ap.reach = float(std::atof(e));
+            if (const char* e = std::getenv("OMC_VERTEX_AO_RAYS")) ap.rays = std::atoi(e);
+            if (const char* e = std::getenv("OMC_VERTEX_AO_STRENGTH")) ap.strength = float(std::atof(e));
+            ap.ground = std::getenv("OMC_VERTEX_AO_GROUND") != nullptr;
             render::bake_vertex_ao(model, ap);
-            if (std::getenv("SC2_VERTEX_AO_TRACE")) {
+            if (std::getenv("OMC_VERTEX_AO_TRACE")) {
                 std::size_t dark = 0;
                 unsigned lo = 255;
                 for (const std::uint8_t a : model.vertex_ao) { if (a < 230) ++dark; lo = std::min(lo, unsigned(a)); }

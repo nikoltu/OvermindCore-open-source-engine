@@ -1,4 +1,4 @@
-#include "sc2/app/platform.hpp"
+#include "omc/app/platform.hpp"
 
 #ifndef NOMINMAX
 #define NOMINMAX
@@ -24,7 +24,7 @@
 
 namespace fs = std::filesystem;
 
-namespace sc2::app::platform {
+namespace omc::app::platform {
 
 namespace {
 
@@ -46,7 +46,15 @@ std::wstring widen(const std::string& s) {
 fs::path config_dir() {
     const char* appdata = std::getenv("APPDATA");
     fs::path base = appdata && *appdata ? fs::path(appdata) : fs::temp_directory_path();
-    return base / "CrafterSC";
+    const fs::path dir = base / "OvermindCore";
+    static bool migrated = false;
+    if (!migrated) {
+        migrated = true;
+        std::error_code ec;
+        const fs::path legacy = base / "CrafterSC";
+        if (!fs::exists(dir, ec) && fs::is_directory(legacy, ec)) fs::copy(legacy, dir, fs::copy_options::recursive, ec);
+    }
+    return dir;
 }
 
 std::map<std::string, std::string> read_config() {
@@ -84,7 +92,7 @@ bool set_config(const std::string& key, const std::string& value) {
     kv[key] = value;
     std::ofstream out(config_path(), std::ios::trunc);
     if (!out) return false;
-    out << "# CrafterSC config\n";
+    out << "# OvermindCore config\n";
     for (const auto& [k, v] : kv) out << k << "=" << v << "\n";
     return bool(out);
 }
@@ -229,7 +237,7 @@ LoadingScreen::LoadingScreen(const std::string& title) : impl_(std::make_unique<
     WNDCLASSW wc = {};
     wc.lpfnWndProc = &Impl::proc;
     wc.hInstance = ::GetModuleHandle(nullptr);
-    wc.lpszClassName = L"CrafterSCLoading";
+    wc.lpszClassName = L"OvermindCoreLoading";
     wc.hCursor = ::LoadCursor(nullptr, IDC_ARROW);
     ::RegisterClassW(&wc);
 

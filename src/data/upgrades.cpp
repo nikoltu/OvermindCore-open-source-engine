@@ -1,12 +1,12 @@
-#include "sc2/data/upgrades.hpp"
+#include "omc/data/upgrades.hpp"
 
 #include <cstdlib>
 
-#include "sc2/casc/storage.hpp"
-#include "sc2/core/xml.hpp"
-#include "sc2/data/melee_mods.hpp"
+#include "omc/casc/storage.hpp"
+#include "omc/core/xml.hpp"
+#include "omc/data/melee_mods.hpp"
 
-namespace sc2::data {
+namespace omc::data {
 
 using core::XmlNode;
 

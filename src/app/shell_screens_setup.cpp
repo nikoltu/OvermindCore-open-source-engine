@@ -1,8 +1,8 @@
-#include "sc2/app/shell_screens.hpp"
+#include "omc/app/shell_screens.hpp"
 
 #include <algorithm>
 
-namespace sc2::app::shell {
+namespace omc::app::shell {
 
 namespace v2 = theme::v2;
 namespace L = layout::s20_skirmish_setup;
@@ -129,7 +129,7 @@ bool screen_setup(Ui& ui, ShellCtx& ctx) {
     int real_total = 0;
     for (const platform::MapEntry& e : maps) real_total += !e.path.empty();
     for (std::size_t i = 0; i < maps.size(); ++i)
-        if (maps[i].path.empty() && (needle.empty() || std::string("test arena (built-in)").find(needle) != std::string::npos)) order.push_back(int(i));
+        if (maps[i].path.empty() && ctx.has_arena() && (needle.empty() || std::string("test arena (built-in)").find(needle) != std::string::npos)) order.push_back(int(i));
 
     const int selected = ctx.selected_map();
     int sel_row = -1;

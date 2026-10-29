@@ -1,10 +1,10 @@
-#include "sc2/app/melee_game.hpp"
+#include "omc/app/melee_game.hpp"
 
-#include "sc2/app/overlay_draw.hpp"
-#include "sc2/app/ui_hotkeys.hpp"
-#include "sc2/data/catalog.hpp"
+#include "omc/app/overlay_draw.hpp"
+#include "omc/app/ui_hotkeys.hpp"
+#include "omc/data/catalog.hpp"
 
-namespace sc2::app {
+namespace omc::app {
 
 bool MeleeGame::hud_menu_on_button(const HudPress& p) {
     (void)p;

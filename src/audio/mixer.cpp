@@ -1,10 +1,10 @@
-#include "sc2/audio/mixer.hpp"
+#include "omc/audio/mixer.hpp"
 
 #include <cmath>
 #include <fstream>
 #include <stdexcept>
 
-namespace sc2::audio {
+namespace omc::audio {
 
 Mixer::Mixer(std::uint32_t out_rate, int out_channels)
     : out_rate_(out_rate), out_channels_(out_channels) {

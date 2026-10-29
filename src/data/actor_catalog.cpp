@@ -1,9 +1,9 @@
-#include "sc2/data/actor_catalog.hpp"
+#include "omc/data/actor_catalog.hpp"
 
-#include "sc2/core/xml.hpp"
-#include "sc2/data/catalog.hpp"
+#include "omc/core/xml.hpp"
+#include "omc/data/catalog.hpp"
 
-namespace sc2::data {
+namespace omc::data {
 
 using core::XmlNode;
 

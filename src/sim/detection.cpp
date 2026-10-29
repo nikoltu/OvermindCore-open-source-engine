@@ -1,8 +1,8 @@
-#include "sc2/sim/detection.hpp"
+#include "omc/sim/detection.hpp"
 
-#include "sc2/sim/world.hpp"
+#include "omc/sim/world.hpp"
 
-namespace sc2::sim {
+namespace omc::sim {
 
 void DetectionGrid::reconfigure(Fixed cell_size, const Bounds& bounds) {
     const bool same = !cells_.empty() && cell_ == cell_size &&

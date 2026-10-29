@@ -1,10 +1,10 @@
-#include "sc2/app/shell_screens.hpp"
+#include "omc/app/shell_screens.hpp"
 
 #include <algorithm>
 
-#include "sc2/app/portrait_catalog.hpp"
+#include "omc/app/portrait_catalog.hpp"
 
-namespace sc2::app::shell {
+namespace omc::app::shell {
 
 namespace v2 = theme::v2;
 

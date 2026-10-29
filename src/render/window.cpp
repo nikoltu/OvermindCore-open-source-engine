@@ -1,4 +1,4 @@
-#include "sc2/render/window.hpp"
+#include "omc/render/window.hpp"
 
 #ifndef NOMINMAX
 #define NOMINMAX
@@ -27,12 +27,12 @@
 #include <unordered_map>
 #include <vector>
 
-#include "sc2/casc/storage.hpp"
-#include "sc2/formats/dds.hpp"
-#include "sc2/render/anim.hpp"
-#include "sc2/render/vk_helpers.hpp"
-#include "sc2/render/vk_raii.hpp"
-#include "sc2/render/wsi_device.hpp"
+#include "omc/casc/storage.hpp"
+#include "omc/formats/dds.hpp"
+#include "omc/render/anim.hpp"
+#include "omc/render/vk_helpers.hpp"
+#include "omc/render/vk_raii.hpp"
+#include "omc/render/wsi_device.hpp"
 #include "mesh_build.hpp"
 
 static const uint32_t kMeshVertSpv[] =
@@ -42,7 +42,7 @@ static const uint32_t kMeshFragSpv[] =
 #include "mesh.frag.spv.h"
     ;
 
-namespace sc2::render {
+namespace omc::render {
 
 namespace {
 
@@ -72,7 +72,7 @@ struct Mesh {
 };
 
 const wchar_t* window_class(HINSTANCE hinst) {
-    static const wchar_t* kName = L"sc2_render_window";
+    static const wchar_t* kName = L"overmindcore_render_window";
     static bool registered = false;
     if (!registered) {
         WNDCLASSEXW wc{};
@@ -108,7 +108,7 @@ WindowResult render_window(const std::vector<SceneInstance>& instances,
     const wchar_t* cls = window_class(hinst);
     RECT rc{0, 0, LONG(width), LONG(height)};
     AdjustWindowRect(&rc, WS_OVERLAPPEDWINDOW, FALSE);
-    HWND rawWin = CreateWindowExW(0, cls, L"sc2 render", WS_OVERLAPPEDWINDOW,
+    HWND rawWin = CreateWindowExW(0, cls, L"OvermindCore render", WS_OVERLAPPEDWINDOW,
                                   CW_USEDEFAULT, CW_USEDEFAULT, rc.right - rc.left,
                                   rc.bottom - rc.top, nullptr, nullptr, hinst, nullptr);
     if (!rawWin) unavailable("CreateWindowEx failed");

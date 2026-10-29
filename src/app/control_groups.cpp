@@ -1,9 +1,9 @@
-#include "sc2/app/control_groups.hpp"
+#include "omc/app/control_groups.hpp"
 
 #include <algorithm>
 #include <vector>
 
-namespace sc2::app {
+namespace omc::app {
 
 namespace {
 

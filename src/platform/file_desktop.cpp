@@ -1,4 +1,4 @@
-#include "sc2/platform/file.hpp"
+#include "omc/platform/file.hpp"
 
 #include <algorithm>
 #include <filesystem>
@@ -7,7 +7,7 @@
 
 namespace fs = std::filesystem;
 
-namespace sc2::platform {
+namespace omc::platform {
 
 std::vector<uint8_t> read_file(const std::string& path) {
     std::ifstream f(path, std::ios::binary | std::ios::ate);

@@ -1,10 +1,10 @@
-#include "sc2/app/shell_screens.hpp"
+#include "omc/app/shell_screens.hpp"
 
 #include <cstdio>
 
-#include "sc2/app/shell_emblem.hpp"
+#include "omc/app/shell_emblem.hpp"
 
-namespace sc2::app::shell {
+namespace omc::app::shell {
 
 namespace v2 = theme::v2;
 

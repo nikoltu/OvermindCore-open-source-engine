@@ -1,9 +1,9 @@
-#include "sc2/app/shell_screens.hpp"
+#include "omc/app/shell_screens.hpp"
 
 #include <algorithm>
 #include <cstdio>
 
-namespace sc2::app::shell {
+namespace omc::app::shell {
 
 namespace v2 = theme::v2;
 namespace L = layout::s30_loading;

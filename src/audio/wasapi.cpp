@@ -1,4 +1,4 @@
-#include "sc2/audio/wasapi.hpp"
+#include "omc/audio/wasapi.hpp"
 
 #include <algorithm>
 #include <atomic>
@@ -22,7 +22,7 @@
 #include <mmdeviceapi.h>
 #include <mmreg.h>
 
-namespace sc2::audio {
+namespace omc::audio {
 
 namespace {
 
@@ -228,7 +228,7 @@ std::uint32_t WasapiSink::rate() const {
 
 #else
 
-namespace sc2::audio {
+namespace omc::audio {
 
 struct WasapiSink::Impl {};
 

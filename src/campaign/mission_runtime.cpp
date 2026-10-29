@@ -1,14 +1,14 @@
-#include "sc2/campaign/mission_runtime.hpp"
+#include "omc/campaign/mission_runtime.hpp"
 
 #include <cctype>
 #include <string>
 #include <vector>
 
-#include "sc2/app/map_world.hpp"
-#include "sc2/app/spawn.hpp"
-#include "sc2/data/catalog.hpp"
+#include "omc/app/map_world.hpp"
+#include "omc/app/spawn.hpp"
+#include "omc/data/catalog.hpp"
 
-namespace sc2::campaign {
+namespace omc::campaign {
 
 namespace {
 

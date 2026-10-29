@@ -1,17 +1,20 @@
 #include <algorithm>
 #include <cstdlib>
-#include "sc2/render/actor.hpp"
+#include "omc/render/actor.hpp"
 
 #include <cmath>
 #include <cstdio>
 #include <set>
 
-#include "sc2/render/actor_rules.hpp"
-#include "sc2/render/anim_select.hpp"
-#include "sc2/render/audio_sink.hpp"
-#include "sc2/render/frame_prof.hpp"
+#include "omc/render/actor_rules.hpp"
+#include "omc/render/anim_select.hpp"
+#include "omc/render/audio_sink.hpp"
+#include "omc/render/frame_prof.hpp"
 
-namespace sc2::render {
+namespace omc::render {
+
+static bool burrow_state(const sim::Unit& u) { return u.burrow_timer.raw() > 0 ? u.burrow_to : u.burrowed; }
+static bool depot_state(const sim::Unit& u) { return u.depot_timer.raw() > 0 ? u.depot_to : u.lowered; }
 
 namespace {
 const std::vector<std::string>& tokens_for(AnimState s) {
@@ -70,7 +73,7 @@ int ActorInstance::sequence_of(AnimState s) {
         if (r < 0 && model && !model->sequences.empty()) r = 0;
         if (r >= 0 && model && idle_loops > 0 && (s == AnimState::Stand || s == AnimState::FlyStand)) r = select_take(*model, r, seed, idle_loops);
         if (r >= 0 && model && walk_loops > 0 && (s == AnimState::Walk || s == AnimState::FlyWalk)) r = select_take(*model, r, seed, walk_loops);
-        static const bool kOneshotTakes = std::getenv("SC2_NO_ONESHOT_TAKES") == nullptr;
+        static const bool kOneshotTakes = std::getenv("OMC_NO_ONESHOT_TAKES") == nullptr;
         if (kOneshotTakes && r >= 0 && model && oneshot_plays > 0 && (s == AnimState::Attack || s == AnimState::Death || s == AnimState::Cast))
             r = select_take(*model, r, seed, oneshot_plays);
         cached_seq[i] = r;
@@ -152,10 +155,10 @@ void ActorInstance::bind_event_rules(std::vector<ActorEventRule> rules) {
 }
 
 int ActorInstance::apply_birth_groups(const std::string& unit_id) {
-    if (unit_id.empty() || std::getenv("SC2_NO_BIRTH_GROUPS")) return 0;
+    if (unit_id.empty() || std::getenv("OMC_NO_BIRTH_GROUPS")) return 0;
     int n = 0;
-    static const bool kBirthForever = std::getenv("SC2_NO_BIRTH_FOREVER_CLIPS") == nullptr;
-    if (const char* bt = std::getenv("SC2_BIRTH_TRACE"); bt && unit_id == bt) {
+    static const bool kBirthForever = std::getenv("OMC_NO_BIRTH_FOREVER_CLIPS") == nullptr;
+    if (const char* bt = std::getenv("OMC_BIRTH_TRACE"); bt && unit_id == bt) {
         std::fprintf(stderr, "[birth] %s: %zu rules bound\n", unit_id.c_str(), event_rules.size());
         for (const ActorEventRule& r : event_rules)
             if (r.head.find("Birth") != std::string::npos || r.verb == "AnimPlay") {
@@ -245,7 +248,7 @@ void ActorInstance::pump(float dt_ms) {
             if (!trigger_field_matches(r.subject, ev.subject)) continue;
             if (!trigger_field_matches(r.sub, ev.sub)) continue;
             if (!filters_match(r, ev, &unanswerable_filters, &status)) continue;
-            static const bool kTargetOnHost = std::getenv("SC2_ACTOR_TARGET_ON_HOST") != nullptr;
+            static const bool kTargetOnHost = std::getenv("OMC_ACTOR_TARGET_ON_HOST") != nullptr;
             if (!kTargetOnHost && !r.target.empty() && r.target != "::Host" && r.target != "::Self" && r.target != "::Main") {
                 for (std::size_t ci = 0; ci < children.size(); ++ci) {
                     if (children[ci].name != r.target) continue;
@@ -262,7 +265,7 @@ void ActorInstance::pump(float dt_ms) {
             }
             ++done;
             ++rules_fired;
-            if (std::getenv("SC2_BUS_TRACE")) {
+            if (std::getenv("OMC_BUS_TRACE")) {
                 std::fprintf(stderr, "[bus] %s.%s.%s -> %s", ev.head.c_str(), ev.subject.c_str(), ev.sub.c_str(), r.verb.c_str());
                 for (const std::string& a : r.args) std::fprintf(stderr, " %s", a.c_str());
                 std::fprintf(stderr, " | slots before:");
@@ -289,7 +292,7 @@ void ActorInstance::pump(float dt_ms) {
             } else if (r.verb == "AnimClear" && !r.args.empty()) {
                 anim_clear(r.args[0]);
             } else if (r.verb == "AnimGroupApply" || r.verb == "AnimBracketStart") {
-                static const bool kBracesEmpty = std::getenv("SC2_ANIM_GROUP_BRACES_AS_CLIP") == nullptr;
+                static const bool kBracesEmpty = std::getenv("OMC_ANIM_GROUP_BRACES_AS_CLIP") == nullptr;
                 const bool bare_group = kBracesEmpty && r.verb == "AnimGroupApply" && r.args.size() >= 3 && !r.args[0].empty() &&
                                         r.args[1] == "{}" && r.args[2] == "{}";
                 if (r.args.size() < 2 || bare_group) {
@@ -363,7 +366,7 @@ void ActorInstance::pump(float dt_ms) {
                         }
                     if (deferred) continue;
                 }
-                static const bool kRemoveClosing = std::getenv("SC2_ANIM_REMOVE_CLOSING") != nullptr;
+                static const bool kRemoveClosing = std::getenv("OMC_ANIM_REMOVE_CLOSING") != nullptr;
                 if (!kRemoveClosing) {
                     bool any = false, all_closing = true;
                     for (const AnimSlot& sl : slots)
@@ -411,7 +414,7 @@ void ActorInstance::pump(float dt_ms) {
                     set_status(r.args[0], cur + 1, false);
                 else
                     set_status(r.args[0], cur > 0 ? cur - 1 : 0, false);
-            } else if (r.verb == "SetTintColor" && !r.args.empty() && std::getenv("SC2_NO_BUS_TINT") == nullptr) {
+            } else if (r.verb == "SetTintColor" && !r.args.empty() && std::getenv("OMC_NO_BUS_TINT") == nullptr) {
                 int tr = 255, tg = 255, tb = 255;
                 if (std::sscanf(r.args[0].c_str(), "%d,%d,%d", &tr, &tg, &tb) == 3) {
                     bus_tint[0] = float(tr) / 255.0f;
@@ -420,7 +423,7 @@ void ActorInstance::pump(float dt_ms) {
                     bus_tint_set = true;
                 }
             } else if ((r.verb == "AnimSetPaused" && !r.args.empty()) || r.verb == "AnimSetPausedAll") {
-                static const bool kPause = std::getenv("SC2_NO_ANIM_PAUSE") == nullptr;
+                static const bool kPause = std::getenv("OMC_NO_ANIM_PAUSE") == nullptr;
                 if (!kPause) {
                     ++unhandled_verbs;
                     continue;
@@ -433,7 +436,7 @@ void ActorInstance::pump(float dt_ms) {
                     if (on && it == paused_names.end()) paused_names.push_back(r.args[0]);
                     if (!on && it != paused_names.end()) paused_names.erase(it);
                 }
-            } else if (r.verb == "Signal" && !r.args.empty() && std::getenv("SC2_NO_ACTOR_SIGNAL") == nullptr) {
+            } else if (r.verb == "Signal" && !r.args.empty() && std::getenv("OMC_NO_ACTOR_SIGNAL") == nullptr) {
                 raise("Signal", "Self", r.args[0]);
             } else if (r.verb == "Create" && !r.args.empty()) {
                 if (!has_child(r.args[0])) {
@@ -488,7 +491,7 @@ void ActorInstance::set_status(const std::string& name, int value, bool raise_se
 }
 
 static bool is_global_set(const std::vector<std::string>& props) {
-    static const bool kOff = std::getenv("SC2_NO_GLOBAL_LAYER") != nullptr;
+    static const bool kOff = std::getenv("OMC_NO_GLOBAL_LAYER") != nullptr;
     return !kOff && !props.empty() && props[0].size() > 2 && props[0].compare(0, 2, "GL") == 0;
 }
 
@@ -508,7 +511,7 @@ void ActorInstance::anim_play(const std::string& name, const std::vector<std::st
     s.priority = priority;
     s.time_ms = 0;
     s.sequence = model ? select_sequence(*model, props, seed) : -1;
-    static const bool kSlotTakes = std::getenv("SC2_NO_SLOT_TAKES") == nullptr;
+    static const bool kSlotTakes = std::getenv("OMC_NO_SLOT_TAKES") == nullptr;
     if (kSlotTakes && model && s.sequence >= 0) s.sequence = select_take(*model, s.sequence, seed, ++slot_plays);
     s.global = is_global_set(props);
     slots.push_back(s);
@@ -782,7 +785,7 @@ void ActorInstance::advance(float dt_ms) {
         }
         if (just_finished && !sl->closing_phase && !sl->content.empty()) {
             int cseq = select_sequence(*model, sl->content, seed);
-            static const bool kContentTakes = std::getenv("SC2_NO_SLOT_TAKES") == nullptr;
+            static const bool kContentTakes = std::getenv("OMC_NO_SLOT_TAKES") == nullptr;
             if (kContentTakes && cseq >= 0) cseq = select_take(*model, cseq, seed, ++slot_plays);
             if (cseq >= 0) {
                 sl->props = sl->content;
@@ -829,7 +832,7 @@ void ActorInstance::advance(float dt_ms) {
         }
     } else if (clock >= len) {
         clock -= len * float(int(clock / len));
-        static const bool kIdleTakes = std::getenv("SC2_NO_IDLE_TAKES") == nullptr;
+        static const bool kIdleTakes = std::getenv("OMC_NO_IDLE_TAKES") == nullptr;
         const AnimState st = current();
         if (kIdleTakes && (st == AnimState::Stand || st == AnimState::FlyStand)) {
             ++idle_loops;
@@ -837,7 +840,7 @@ void ActorInstance::advance(float dt_ms) {
             cached_seq[int(st)] = -2;
             if (sequence_of(st) != before) clock = 0.0f;
         }
-        static const bool kWalkTakes = std::getenv("SC2_NO_WALK_TAKES") == nullptr;
+        static const bool kWalkTakes = std::getenv("OMC_NO_WALK_TAKES") == nullptr;
         if (kWalkTakes && (st == AnimState::Walk || st == AnimState::FlyWalk)) {
             ++walk_loops;
             const int before = cached_seq[int(st)];
@@ -877,7 +880,7 @@ void ActorDriver::observe(const sim::World& world, float dt_ms, bool sim_ticked)
     if (shadows.size() < units.size()) shadows.resize(units.size());
     if (actors.size() < units.size()) actors.resize(units.size());
 
-    static const bool kUpgradeEvents = std::getenv("SC2_NO_UPGRADE_EVENTS") == nullptr;
+    static const bool kUpgradeEvents = std::getenv("OMC_NO_UPGRADE_EVENTS") == nullptr;
     if (kUpgradeEvents && validate_player) {
         std::set<int> players;
         for (const sim::Unit& u : units)
@@ -892,9 +895,21 @@ void ActorDriver::observe(const sim::World& world, float dt_ms, bool sim_ticked)
         }
     }
 
+    static const bool kFinishOld = std::getenv("OMC_BURROW_FINISH_OLD") != nullptr;
     for (size_t i = 0; i < units.size(); ++i) {
         const sim::Unit& u = units[i];
         Shadow& s = shadows[i];
+        auto burrow_finish = [&]() {
+            s.burrow_finish_ms = -1.0f;
+            const BurrowPair bp = burrow_pair(u.catalog_id);
+            const bool down = s.burrow_finish_down;
+            const std::string& abil = down ? bp.down_ability : bp.up_ability;
+            if (!abil.empty())
+                actors[i].raise("AbilMorph", abil, "Finish",
+                                {{"AbilKey", down ? bp.down_key : bp.up_key},
+                                 {"MorphFrom", down ? u.catalog_id : bp.variant},
+                                 {"MorphTo", down ? bp.variant : u.catalog_id}});
+        };
         ActorInstance& a = actors[i];
 
         if (!s.known) {
@@ -931,7 +946,7 @@ void ActorDriver::observe(const sim::World& world, float dt_ms, bool sim_ticked)
             s.moving = false;
             s.x = u.x; s.y = u.y; s.cooldown = u.cooldown; s.cast_count = u.cast_count;
             s.flying = u.flying;
-            s.burrowed = u.burrowed;
+            s.burrowed = burrow_state(u);
             s.lowered = u.lowered;
             if (u.lowered && depot_pair && unit_rules && !u.catalog_id.empty()) {
                 const BurrowPair dp = depot_pair(u.catalog_id);
@@ -979,10 +994,10 @@ void ActorDriver::observe(const sim::World& world, float dt_ms, bool sim_ticked)
                 a.facing_known = true;
             }
 
-            if (u.alive && u.burrowed != s.burrowed && burrow_pair && !u.catalog_id.empty()) {
+            if (u.alive && burrow_state(u) != s.burrowed && burrow_pair && !u.catalog_id.empty()) {
                 const BurrowPair bp = burrow_pair(u.catalog_id);
                 if (!bp.down_ability.empty() && !bp.variant.empty()) {
-                    const bool down = u.burrowed;
+                    const bool down = burrow_state(u);
                     const std::string& abil = down ? bp.down_ability : bp.up_ability;
                     const std::string& key = down ? bp.down_key : bp.up_key;
                     const std::string& from = down ? u.catalog_id : bp.variant;
@@ -992,25 +1007,17 @@ void ActorDriver::observe(const sim::World& world, float dt_ms, bool sim_ticked)
                         {"AbilKey", key}, {"MorphFrom", from}, {"MorphTo", to}};
                     if (!abil.empty()) {
                         a.raise("AbilMorph", abil, "Start", ctx);
-                        s.burrow_finish_ms = float(down ? bp.down_ms : bp.up_ms);
+                        s.burrow_finish_ms = u.burrow_timer.raw() > 0 ? float(u.burrow_timer.to_double() * 1000.0)
+                                                                       : float(down ? bp.down_ms : bp.up_ms);
                         s.burrow_finish_down = down;
+                        s.burrow_sim_timed = u.burrow_timer.raw() > 0;
                     }
                 }
             }
 
-            if (s.burrow_finish_ms >= 0.0f && burrow_pair && !u.catalog_id.empty()) {
+            if (kFinishOld && s.burrow_finish_ms >= 0.0f && burrow_pair && !u.catalog_id.empty()) {
                 s.burrow_finish_ms -= dt_ms;
-                if (s.burrow_finish_ms <= 0.0f) {
-                    s.burrow_finish_ms = -1.0f;
-                    const BurrowPair bp = burrow_pair(u.catalog_id);
-                    const bool down = s.burrow_finish_down;
-                    const std::string& abil = down ? bp.down_ability : bp.up_ability;
-                    if (!abil.empty())
-                        a.raise("AbilMorph", abil, "Finish",
-                                {{"AbilKey", down ? bp.down_key : bp.up_key},
-                                 {"MorphFrom", down ? u.catalog_id : bp.variant},
-                                 {"MorphTo", down ? bp.variant : u.catalog_id}});
-                }
+                if (s.burrow_finish_ms <= 0.0f) burrow_finish();
             }
 
             {
@@ -1024,24 +1031,30 @@ void ActorDriver::observe(const sim::World& world, float dt_ms, bool sim_ticked)
                             {{"MorphFrom", from}, {"MorphTo", to}});
                 };
                 if (depot_pair && !u.catalog_id.empty() &&
-                    (u.lowered != s.lowered || s.depot_finish_ms >= 0.0f)) {
+                    (depot_state(u) != s.lowered || s.depot_finish_ms >= 0.0f)) {
                     const BurrowPair dp = depot_pair(u.catalog_id);
                     if (!dp.variant.empty()) {
-                        if (u.alive && u.lowered != s.lowered) {
+                        if (u.alive && depot_state(u) != s.lowered) {
                             if (s.depot_finish_ms >= 0.0f) depot_finish(dp);
-                            const bool down = u.lowered;
+                            const bool down = depot_state(u);
                             a.raise("AbilMorph", down ? dp.down_ability : dp.up_ability, "Start",
                                     {{"MorphFrom", down ? u.catalog_id : dp.variant},
                                      {"MorphTo", down ? dp.variant : u.catalog_id}});
-                            s.depot_finish_ms = float(down ? dp.down_ms : dp.up_ms);
+                            s.depot_finish_ms = u.depot_timer.raw() > 0 ? float(u.depot_timer.to_double() * 1000.0)
+                                                                     : float(down ? dp.down_ms : dp.up_ms);
                             s.depot_finish_down = down;
+                            s.depot_sim_timed = u.depot_timer.raw() > 0;
                         } else if (s.depot_finish_ms >= 0.0f) {
-                            s.depot_finish_ms -= dt_ms;
-                            if (s.depot_finish_ms <= 0.0f) depot_finish(dp);
+                            if (!kFinishOld && s.depot_sim_timed) {
+                                if (u.depot_timer.raw() <= 0) depot_finish(dp);
+                            } else {
+                                s.depot_finish_ms -= dt_ms;
+                                if (s.depot_finish_ms <= 0.0f) depot_finish(dp);
+                            }
                         }
                     }
                 }
-                s.lowered = u.lowered;
+                s.lowered = depot_state(u);
             }
 
             bool moving = (u.x != s.x || u.y != s.y);
@@ -1062,7 +1075,7 @@ void ActorDriver::observe(const sim::World& world, float dt_ms, bool sim_ticked)
                     s.res_depleted = depleted;
                 }
             }
-            static const bool kPowerLevel = std::getenv("SC2_NO_POWER_LEVEL") == nullptr;
+            static const bool kPowerLevel = std::getenv("OMC_NO_POWER_LEVEL") == nullptr;
             if (kPowerLevel && u.alive && !a.event_rules.empty() && u.needs_power && u.power_managed) {
                 const int down = sim::power_disabled(u) ? 1 : 0;
                 if (down != s.power_down && !(s.power_down < 0 && down == 0)) {
@@ -1081,7 +1094,8 @@ void ActorDriver::observe(const sim::World& world, float dt_ms, bool sim_ticked)
                 constexpr int kStages = 4;
                 int level = int((std::int64_t(u.resource_left) * kStages) / std::max<std::int64_t>(1, s.res_cap));
                 if (level >= kStages) level = kStages - 1;
-                if (const char* force = std::getenv("SC2_RES_LEVEL")) level = std::atoi(force);
+                static const char* const kForceLevel = std::getenv("OMC_RES_LEVEL");
+                if (kForceLevel) level = std::atoi(kForceLevel);
                 if (level != s.res_level) {
                     const std::string* subj = nullptr;
                     for (const ActorEventRule& rr : a.event_rules)
@@ -1091,7 +1105,7 @@ void ActorDriver::observe(const sim::World& world, float dt_ms, bool sim_ticked)
                         if (s.res_level >= 0) a.raise("BehaviorLevel", subject, "Stop", {{"Level", std::to_string(s.res_level)}});
                         a.raise("BehaviorLevel", subject, "Start", {{"Level", std::to_string(level)}});
                     }
-                    if (std::getenv("SC2_RES_TRACE"))
+                    if (std::getenv("OMC_RES_TRACE"))
                         std::fprintf(stderr, "res level: %s left %d cap %d level %d rules %zu subject %s\n", u.catalog_id.c_str(), int(u.resource_left),
                                      int(s.res_cap), level, a.event_rules.size(), subj ? subj->c_str() : "(none)");
                     s.res_level = level;
@@ -1108,31 +1122,34 @@ void ActorDriver::observe(const sim::World& world, float dt_ms, bool sim_ticked)
                     a.raise("Abil", a.harvest_abil, gathering_now ? "Start" : "Stop");
                     s.gathering = gathering_now;
                 }
-                const std::string mt = (morph_target && s.catalog_id == u.catalog_id) ? morph_target(u.id) : std::string();
-                if (!mt.empty() && s.morph_to.empty() && !u.catalog_id.empty()) {
-                    a.raise("AbilMorph", std::string(), "Start", {{"MorphTo", mt}, {"MorphFrom", u.catalog_id}});
-                    if (std::getenv("SC2_MORPH_TRACE")) std::fprintf(stderr, "[morph] tick %d unit %u %s start -> %s\n", world.tick(), unsigned(u.id), u.catalog_id.c_str(), mt.c_str());
+                const std::string& cid = world.morph_shown_id(u.id);
+                const std::string mt = (morph_target && s.catalog_id == cid) ? morph_target(u.id) : std::string();
+                if (!mt.empty() && s.morph_to.empty() && !cid.empty()) {
+                    a.raise("AbilMorph", std::string(), "Start", {{"MorphTo", mt}, {"MorphFrom", cid}});
+                    if (std::getenv("OMC_MORPH_TRACE")) std::fprintf(stderr, "[morph] tick %d unit %u %s start -> %s\n", world.tick(), unsigned(u.id), cid.c_str(), mt.c_str());
                     s.morph_to = mt;
-                } else if (mt.empty() && !s.morph_to.empty() && s.catalog_id == u.catalog_id) {
-                    a.raise("AbilMorph", std::string(), "Cancel", {{"MorphTo", s.morph_to}, {"MorphFrom", u.catalog_id}});
+                } else if (mt.empty() && !s.morph_to.empty() && s.catalog_id == cid) {
+                    a.raise("AbilMorph", std::string(), "Cancel", {{"MorphTo", s.morph_to}, {"MorphFrom", cid}});
                     s.morph_to.clear();
                 }
-                if (!u.catalog_id.empty() && s.catalog_id != u.catalog_id) {
+                if (!cid.empty() && s.catalog_id != cid) {
                     if (!s.catalog_id.empty()) {
                         if (s.morph_to.empty())
                             a.raise("AbilMorph", std::string(), "Start",
-                                    {{"MorphTo", u.catalog_id}, {"MorphFrom", s.catalog_id}});
+                                    {{"MorphTo", cid}, {"MorphFrom", s.catalog_id}});
                         bool reborn = false;
-                        if (std::getenv("SC2_MORPH_TRACE"))
+                        if (std::getenv("OMC_MORPH_TRACE"))
                             std::fprintf(stderr, "[morph] tick %d unit %u id %s -> %s (start raised for '%s', rules %zu, slots %zu, groups %zu)\n", world.tick(), unsigned(u.id),
-                                         s.catalog_id.c_str(), u.catalog_id.c_str(), s.morph_to.c_str(), a.event_rules.size(), a.slots.size(), a.anim_groups.size());
-                        if (unit_rules && !std::getenv("SC2_MORPH_KEEP_ACTOR")) {
-                            const std::vector<ActorEventRule>& nr = unit_rules(u.catalog_id);
+                                         s.catalog_id.c_str(), cid.c_str(), s.morph_to.c_str(), a.event_rules.size(), a.slots.size(), a.anim_groups.size());
+                        if (unit_rules && !std::getenv("OMC_MORPH_KEEP_ACTOR")) {
+                            const std::vector<ActorEventRule>& nr = unit_rules(cid);
                             for (const ActorEventRule& r : nr) {
-                                if (r.head != "AbilMorph" || r.sub != "Finish" || r.verb != "Create" || !r.args.empty()) continue;
+                                static const bool kRebornOld = std::getenv("OMC_MORPH_REBORN_OLD") != nullptr;
+                                const bool sub_ok = r.sub == "Finish" || (!kRebornOld && r.sub == "Start");
+                                if (r.head != "AbilMorph" || !sub_ok || r.verb != "Create" || !r.args.empty()) continue;
                                 bool to = false, from = false;
                                 for (const auto& f : r.filters) {
-                                    if (f.first == "MorphTo" && f.second == u.catalog_id) to = true;
+                                    if (f.first == "MorphTo" && f.second == cid) to = true;
                                     if (f.first == "MorphFrom" && f.second == s.catalog_id) from = true;
                                 }
                                 if (to && from) { reborn = true; break; }
@@ -1143,17 +1160,17 @@ void ActorDriver::observe(const sim::World& world, float dt_ms, bool sim_ticked)
                                 a.birth_clips.clear();
                                 for (int& cs : a.cached_seq) cs = -2;
                                 a.bind_event_rules(nr);
-                                a.raise("ActorCreation", u.catalog_id, std::string(),
+                                a.raise("ActorCreation", cid, std::string(),
                                         creation_ctx(a, u.player, validate_player));
-                                a.apply_birth_groups(u.catalog_id);
+                                a.apply_birth_groups(cid);
                             }
                         }
                         if (!reborn)
                             a.raise("AbilMorph", std::string(), "Finish",
-                                    {{"MorphTo", u.catalog_id}, {"MorphFrom", s.catalog_id}});
+                                    {{"MorphTo", cid}, {"MorphFrom", s.catalog_id}});
                     }
                     s.morph_to.clear();
-                    s.catalog_id = u.catalog_id;
+                    s.catalog_id = cid;
                 }
             }
 
@@ -1173,11 +1190,11 @@ void ActorDriver::observe(const sim::World& world, float dt_ms, bool sim_ticked)
                                              u.id < spawn_facing_set.size() && spawn_facing_set[u.id];
                 const double dx = immobile_placed ? 0.0 : (u.x - s.x).to_double();
                 const double dy = immobile_placed ? 0.0 : (u.y - s.y).to_double();
+                static const bool kKeepHeading = std::getenv("OMC_MINING_KEEPS_HEADING") != nullptr;
                 if (dx != 0.0 || dy != 0.0) {
                     a.facing = std::atan2(float(dy), float(dx));
                     a.facing_known = true;
-                } else if (u.mine_cd.raw() > 0 && size_t(u.gather_target) < units.size() &&
-                           !std::getenv("SC2_MINING_KEEPS_HEADING")) {
+                } else if (u.mine_cd.raw() > 0 && size_t(u.gather_target) < units.size() && !kKeepHeading) {
                     const double tx = (units[u.gather_target].x - u.x).to_double();
                     const double ty = (units[u.gather_target].y - u.y).to_double();
                     if (tx != 0.0 || ty != 0.0) {
@@ -1198,7 +1215,16 @@ void ActorDriver::observe(const sim::World& world, float dt_ms, bool sim_ticked)
             s.alive = u.alive;
             s.x = u.x; s.y = u.y; s.cooldown = u.cooldown; s.cast_count = u.cast_count;
             s.flying = u.flying;
-            s.burrowed = u.burrowed;
+            s.burrowed = burrow_state(u);
+        }
+
+        if (!kFinishOld && s.burrow_finish_ms >= 0.0f && burrow_pair && !u.catalog_id.empty()) {
+            if (s.burrow_sim_timed) {
+                if (sim_ticked && u.burrow_timer.raw() <= 0) burrow_finish();
+            } else {
+                s.burrow_finish_ms -= dt_ms;
+                if (s.burrow_finish_ms <= 0.0f) burrow_finish();
+            }
         }
 
         a.advance(dt_ms);

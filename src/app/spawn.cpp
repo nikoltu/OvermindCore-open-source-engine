@@ -1,5 +1,5 @@
 #include <cmath>
-#include "sc2/app/spawn.hpp"
+#include "omc/app/spawn.hpp"
 
 #include <cstdlib>
 
@@ -7,13 +7,13 @@
 #include <map>
 #include <vector>
 
-#include "sc2/app/ability.hpp"
-#include "sc2/data/abil_charge.hpp"
-#include "sc2/data/requirements.hpp"
-#include "sc2/data/economy.hpp"
-#include "sc2/sim/weapon.hpp"
+#include "omc/app/ability.hpp"
+#include "omc/data/abil_charge.hpp"
+#include "omc/data/requirements.hpp"
+#include "omc/data/economy.hpp"
+#include "omc/sim/weapon.hpp"
 
-namespace sc2::app {
+namespace omc::app {
 
 using sim::Fixed;
 
@@ -195,6 +195,11 @@ sim::Unit make_unit(const data::Catalog& cat, const std::string& unit_id,
         if (auto d = cat.cloak_drain(abil)) { u.cloak_drain = Fixed::from_double(*d); break; }
     }
     u.commandable = cat.unit_commandable(unit_id);
+    {
+        std::string rally = cat.unit_rally_ability(unit_id);
+        if (rally.empty()) rally = cat.unit_rally_ability(cat.liftoff_target(unit_id));
+        if (!rally.empty()) u.rally_abil_tag = behavior_id_hash(rally);
+    }
     u.train_morphs_self = cat.train_morph_unit(unit_id).has_value();
     u.fog_visibility = std::uint8_t(cat.unit_fog_visibility(unit_id));
     for (const std::string& abil : cat.array_links("CUnit", unit_id, "AbilArray")) {
@@ -324,7 +329,7 @@ sim::Unit make_unit(const data::Catalog& cat, const std::string& unit_id,
         const Fixed damage = Fixed::from_int(*dmg);
         const Fixed period = field(cat, "CWeapon", w, "Period", Fixed::from_double(0.8332));
         const Fixed range = field(cat, "CWeapon", w, "Range", Fixed::from_int(5));
-        static const bool keep_dead_zone = [] { const char* e = std::getenv("SC2_QUEEN_DEAD_ZONE"); return e && e[0] == '1'; }();
+        static const bool keep_dead_zone = [] { const char* e = std::getenv("OMC_QUEEN_DEAD_ZONE"); return e && e[0] == '1'; }();
         const Fixed min_range = (!keep_dead_zone && cat.hidden_sibling_covers_min_range(unit_id, w))
                                     ? Fixed()
                                     : field(cat, "CWeapon", w, "MinimumRange");
@@ -377,6 +382,8 @@ sim::Unit make_unit(const data::Catalog& cat, const std::string& unit_id,
             const Fixed scan = field(cat, "CWeapon", w, "MinScanRange");
             const Fixed sight_scan = u.sight - Fixed::from_double(3.5);
             u.acquire_range = scan.raw() > 0 ? scan : (sight_scan.raw() > 0 ? sight_scan : range);
+            static const bool kAcqRangeOld = std::getenv("OMC_ACQUIRE_WEAPON_RANGE_OLD") != nullptr;
+            if (!kAcqRangeOld && range > u.acquire_range) u.acquire_range = range;
             if (auto af = cat.scalar("CWeapon", w, "AcquireFilters"); af && !af->empty())
                 u.wpn_acquire_no_structure = parse_acquire_no_structure(*af);
             auto lsplash = cat.effect_persistent(cat.weapon_effect_id(w));
@@ -451,7 +458,7 @@ sim::Unit make_unit(const data::Catalog& cat, const std::string& unit_id,
             u.wpn2_period = period;
             u.wpn2_range = range;
             u.wpn2_min_range = min_range;
-            static const bool close_missile = [] { const char* e = std::getenv("SC2_QUEEN_CLOSE_MISSILE"); return e && e[0] == '1'; }();
+            static const bool close_missile = [] { const char* e = std::getenv("OMC_QUEEN_CLOSE_MISSILE"); return e && e[0] == '1'; }();
             if (!close_missile && min_range.raw() == 0 && cat.hidden_sibling_covers_min_range(unit_id, w))
                 u.wpn2_close_range = field(cat, "CWeapon", w, "MinimumRange");
             u.wpn2_target_filter = filter;
@@ -476,7 +483,8 @@ sim::Unit make_unit(const data::Catalog& cat, const std::string& unit_id,
             }
             const Fixed scan2 = field(cat, "CWeapon", w, "MinScanRange");
             const Fixed sight_scan2 = u.sight - Fixed::from_double(3.5);
-            const Fixed acq2 = scan2.raw() > 0 ? scan2 : (sight_scan2.raw() > 0 ? sight_scan2 : range);
+            Fixed acq2 = scan2.raw() > 0 ? scan2 : (sight_scan2.raw() > 0 ? sight_scan2 : range);
+            if (std::getenv("OMC_ACQUIRE_WEAPON_RANGE_OLD") == nullptr && range > acq2) acq2 = range;
             if (acq2 > u.acquire_range) u.acquire_range = acq2;
             if (auto af2 = cat.scalar("CWeapon", w, "AcquireFilters"); af2 && !af2->empty())
                 u.wpn2_acquire_no_structure = parse_acquire_no_structure(*af2);
@@ -599,9 +607,18 @@ sim::Unit make_unit(const data::Catalog& cat, const std::string& unit_id,
     for (const auto& [dx, dy] : cat.near_resources_check_offsets(unit_id))
         u.near_resources_check_offsets.emplace_back(int16_t(dx), int16_t(dy));
     u.requires_vespene = cat.structure_requires_vespene(unit_id);
-    if (const double pr = cat.power_source_radius(unit_id); pr > 0) {
-        u.power_radius = Fixed::from_double(pr);
-        u.power_reaches_higher = cat.power_source_reaches_higher(unit_id);
+    if (const data::Catalog::UnitPower pw = cat.unit_power(unit_id); pw.radius > 0 || pw.enabler_radius > 0) {
+        if (pw.radius > 0) {
+            u.power_radius = Fixed::from_double(pw.radius);
+            u.power_reaches_higher = cat.power_source_reaches_higher(unit_id);
+            u.power_level = int8_t(pw.level);
+            u.power_boost_level = int8_t(pw.boosted_level);
+            u.power_boost_min = int8_t(pw.boost_min_level);
+        }
+        if (pw.enabler_radius > 0) {
+            u.enabler_radius = Fixed::from_double(pw.enabler_radius);
+            u.enabler_level = int8_t(pw.enabler_level);
+        }
     }
     u.needs_power = cat.requires_power(unit_id);
     u.turn_rate = field_or_class_default(cat, "CUnit", unit_id, "TurningRate");
@@ -632,8 +649,8 @@ sim::Unit make_unit(const data::Catalog& cat, const std::string& unit_id,
             u.load_block_behaviors.push_back(app::behavior_id_hash(b));
     }
     u.prevent_defeat = cat.unit_flag(unit_id, "PreventDefeat");
-    if (!std::getenv("SC2_NO_FLAG_CLOAK")) u.cloaked = cat.unit_flag(unit_id, "Cloaked");
-    if (!std::getenv("SC2_NO_FLAG_CLOAK"))
+    if (!std::getenv("OMC_NO_FLAG_CLOAK")) u.cloaked = cat.unit_flag(unit_id, "Cloaked");
+    if (!std::getenv("OMC_NO_FLAG_CLOAK"))
         for (const std::string& beh : cat.array_links("CUnit", unit_id, "BehaviorArray")) {
             const std::string pe = cat.scalar("CBehavior", beh, "PeriodicEffect").value_or("");
             if (pe.empty()) continue;

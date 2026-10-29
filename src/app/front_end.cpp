@@ -1,10 +1,10 @@
 #include <cstdio>
-#include "sc2/app/front_end.hpp"
-#include "sc2/render/frame_prof.hpp"
-#include "sc2/ui/layout.hpp"
-#include "sc2/app/shell_emblem.hpp"
-#include "sc2/app/ui_canvas.hpp"
-#include "sc2/app/ui_theme.hpp"
+#include "omc/app/front_end.hpp"
+#include "omc/render/frame_prof.hpp"
+#include "omc/ui/layout.hpp"
+#include "omc/app/shell_emblem.hpp"
+#include "omc/app/ui_canvas.hpp"
+#include "omc/app/ui_theme.hpp"
 
 #include <algorithm>
 #include <cmath>
@@ -18,36 +18,38 @@
 #include <iterator>
 #include <map>
 
-#include "sc2/app/ability.hpp"
-#include "sc2/app/hud_layout.hpp"
-#include "sc2/app/map_doodads.hpp"
-#include "sc2/app/overlay_draw.hpp"
-#include "sc2/app/race_melee_setup.hpp"
-#include "sc2/app/shipping_wiring.hpp"
-#include "sc2/app/spawn.hpp"
-#include "sc2/app/shoreline_place.hpp"
-#include "sc2/app/water_heights.hpp"
-#include "sc2/app/road_place.hpp"
-#include "sc2/app/splat_place.hpp"
-#include "sc2/app/terrain_doodad_place.hpp"
-#include "sc2/app/adjust_terrain_place.hpp"
-#include "sc2/app/water_material.hpp"
-#include "sc2/casc/storage.hpp"
-#include "sc2/core/version.hpp"
-#include "sc2/data/actor_model.hpp"
-#include "sc2/data/catalog.hpp"
-#include "sc2/data/environment.hpp"
-#include "sc2/render/creep_layer.hpp"
-#include "sc2/data/economy.hpp"
-#include "sc2/data/production.hpp"
-#include "sc2/app/ui_settings.hpp"
-#include "sc2/formats/mpq.hpp"
-#include "sc2/formats/tga.hpp"
+#include "omc/app/ability.hpp"
+#include "omc/app/hud_layout.hpp"
+#include "omc/app/map_doodads.hpp"
+#include "omc/app/overlay_draw.hpp"
+#include "omc/app/race_melee_setup.hpp"
+#include "omc/app/shipping_wiring.hpp"
+#include "omc/app/spawn.hpp"
+#include "omc/app/shoreline_place.hpp"
+#include "omc/app/water_heights.hpp"
+#include "omc/app/road_place.hpp"
+#include "omc/app/splat_place.hpp"
+#include "omc/app/terrain_doodad_place.hpp"
+#include "omc/app/adjust_terrain_place.hpp"
+#include "omc/app/water_material.hpp"
+#include "omc/casc/storage.hpp"
+#include "omc/core/version.hpp"
+#include "omc/data/actor_model.hpp"
+#include "omc/data/catalog.hpp"
+#include "omc/data/environment.hpp"
+#include "omc/render/creep_layer.hpp"
+#include "omc/render/quality.hpp"
+#include "omc/render/texture_decode.hpp"
+#include "omc/data/economy.hpp"
+#include "omc/data/production.hpp"
+#include "omc/app/ui_settings.hpp"
+#include "omc/formats/mpq.hpp"
+#include "omc/formats/tga.hpp"
 
-namespace sc2::app {
+namespace omc::app {
 
 static std::uint64_t new_match_seed() {
-    if (std::getenv("SC2_FIXED_MATCH_SEED")) return 0;
+    if (std::getenv("OMC_FIXED_MATCH_SEED")) return 0;
     const std::uint64_t t = std::uint64_t(std::chrono::steady_clock::now().time_since_epoch().count()) ^
                             (std::uint64_t(std::chrono::system_clock::now().time_since_epoch().count()) << 17);
     return (t * 0x9E3779B97F4A7C15ull) | 1ull;
@@ -57,10 +59,13 @@ using sim::Fixed;
 using sim::Unit;
 
 namespace {
+const char* const kArenaLabel = "Synthetic Arena (72x72)  [built-in, no cliffs]";
+const char* const kNoArenaLabel = "No map selected";
+
 Fixed Fx(float v) { return Fixed::from_ratio(int(std::lround(double(v) * 64.0)), 64); }
 
 bool shell_v1() {
-    static const bool v1 = std::getenv("SC2_SHELL_V1") != nullptr;
+    static const bool v1 = std::getenv("OMC_SHELL_V1") != nullptr;
     return v1;
 }
 std::string& boot_screen_request() {
@@ -395,14 +400,14 @@ void band_footer(const Board& b) {
     const int mark = b.s(theme::kFooterMark);
     const int my = y0 + (b.s(theme::kFooterH) - mark) / 2;
     image_well(b, pad, my, pad + mark, my + mark, shell_emblem(true));
-    const std::string v = std::string("crafter-sc ") + sc2::kVersion;
+    const std::string v = std::string("overmindcore ") + omc::kVersion;
     text_left(b, pad + mark + b.s(8), y0, int(b.h), v, theme::kTypeSmall, theme::kAccentDeep,
               int(b.w) - pad);
 }
 
 void mark_version(const Board& b) {
     const int mark = b.s(theme::kFooterMark);
-    const std::string v = std::string("crafter-sc ") + sc2::kVersion;
+    const std::string v = std::string("overmindcore ") + omc::kVersion;
     const int tw = run_w(b, v, theme::kTypeMicro);
     const int x1 = b.rx(theme::kScreenPad);
     const int y1 = b.by(16);
@@ -418,8 +423,8 @@ void background(const Board& b, theme::Rgb inner, theme::Rgb ground) {
 
 void wordmark(const Board& b, int x, int y, theme::Type top, theme::Type bottom) {
     const int tpx = type_px(b, top);
-    text_at(b, x, y, "CRAFTER", top, theme::kTextHi);
-    text_at(b, x, y + draw::text_h_em(tpx) + b.s(2), "SC", bottom, theme::kAccentPure);
+    text_at(b, x, y, "OVERMIND", top, theme::kTextHi);
+    text_at(b, x, y + draw::text_h_em(tpx) + b.s(2), "CORE", bottom, theme::kAccentPure);
 }
 
 struct Ctl {
@@ -530,13 +535,13 @@ void draw_shell_root(const Board& b, const std::vector<Ctl>& ctls) {
                  theme::kAccentPure.g, theme::kAccentPure.b, 255);
 
     {
-        const std::string ver = "v" + std::to_string(sc2::kVersionMajor) + "." +
-                                std::to_string(sc2::kVersionMinor) + "." +
-                                std::to_string(sc2::kVersionPatch) + "." + sc2::kVersionBuild;
-        std::string stage = sc2::kVersionStage;
+        const std::string ver = "v" + std::to_string(omc::kVersionMajor) + "." +
+                                std::to_string(omc::kVersionMinor) + "." +
+                                std::to_string(omc::kVersionPatch);
+        std::string stage = omc::kVersionStage;
         for (char& ch : stage)
             if (ch >= 'a' && ch <= 'z') ch = char(ch - 'a' + 'A');
-        const std::string data_line = std::string("crafter-sc ") + sc2::kVersion;
+        const std::string data_line = std::string("overmindcore ") + omc::kVersion;
         const int padx = b.s(theme::kVersionPadX), pady = b.s(theme::kVersionPadY);
         const int wv = std::max(run_w(b, ver, theme::kTypeVersionBig),
                                 run_w(b, data_line, theme::kTypeVersionFine)) +
@@ -1012,19 +1017,25 @@ void draw_lobby(const Board& b, const std::vector<Ctl>& ctls, const LobbyInfo& i
 
 }
 
-FrontEnd::FrontEnd(data::Catalog& cat, MeleeModels& models, casc::Storage& store,
-                   const TestMap& map)
-    : cat_(cat), models_(models), store_(store), map_(map) {
-    menu_ctl_.focus = {map_.width * 0.5f, map_.height * 0.5f, 0.0f};
+FrontEnd::FrontEnd(data::Catalog& cat, MeleeModels& models, casc::Storage& store)
+    : cat_(cat), models_(models), store_(store) {
+    menu_ctl_.focus = {36.0f, 36.0f, 0.0f};
     menu_ctl_.distance = 48.0f;
     menu_ctl_.yaw = 1.5707963f;
     menu_ctl_.pitch = 1.0f;
     menu_ctl_.mirror_x = false;
-    maps_.push_back({"", "Synthetic Arena (72x72)  [built-in, no cliffs]"});
+    maps_.push_back({"", kNoArenaLabel});
+}
+
+FrontEnd::FrontEnd(data::Catalog& cat, MeleeModels& models, casc::Storage& store, const ArenaMap& arena)
+    : FrontEnd(cat, models, store) {
+    arena_ = &arena;
+    maps_[0].name = kArenaLabel;
+    menu_ctl_.focus = {arena.width * 0.5f, arena.height * 0.5f, 0.0f};
 }
 
 void FrontEnd::set_maps(std::vector<platform::MapEntry> maps) {
-    maps_.assign(1, platform::MapEntry{"", "Synthetic Arena (72x72)  [built-in, no cliffs]"});
+    maps_.assign(1, platform::MapEntry{"", arena_ ? kArenaLabel : kNoArenaLabel});
     for (auto& m : maps) maps_.push_back(std::move(m));
     sel_map_ = maps_.size() > 1 ? 1 : 0;
     thumb_cursor_ = 0;
@@ -1063,7 +1074,7 @@ const MainMenu* FrontEnd::real_menu(std::uint32_t view_w, std::uint32_t view_h) 
 
     std::string dir = menu_data_dir_;
     if (dir.empty())
-        if (const char* env = std::getenv("SC2_DATA_DIR")) dir = env;
+        if (const char* env = std::getenv("OMC_DATA_DIR")) dir = env;
     if (dir.empty()) return nullptr;
 
     const float shell_ref = float(app::theme::kDesignRefH);
@@ -1109,7 +1120,6 @@ std::vector<FrontEnd::Button> FrontEnd::menu_buttons(std::uint32_t view_w, std::
         {"VERSUS A.I.", "PlayButton"},
         {"CUSTOM GAME", "CustomButton"},
         {"REPLAYS", "ReplayButton"},
-        {"SANDBOX", "SandboxButton"},
         {"PROFILE", "ProfileButton"},
         {"OPTIONS", "menu/Options"},
         {"CREDITS", "Credits entry"},
@@ -1563,6 +1573,30 @@ void FrontEnd::apply_settings_to_match() {
     skirmish_->set_status_bar_mode(settings_.unit_status_mode());
 }
 
+float FrontEnd::default_portrait_hz() const {
+    if (portrait_full_rate_) return 0.0f;
+    const char* hz = std::getenv("OMC_PORTRAIT_HZ");
+    return hz ? float(std::atof(hz)) : 30.0f;
+}
+
+void FrontEnd::apply_performance_settings() {
+    static const std::uint32_t kCapDefault = render::portrait_texture_cap();
+    const std::vector<ShellSettings::Level>& tex = ShellSettings::portrait_texture_levels();
+    render::portrait_texture_cap() = settings_.has(ShellSettings::kPortraitTextureKey)
+                                         ? std::uint32_t(tex[std::size_t(settings_.portrait_texture_level())].value)
+                                         : kCapDefault;
+    const bool half = ShellSettings::console_texture_levels()[std::size_t(settings_.console_texture_level())].value != 0;
+    if (render::console_texture_half() != half) {
+        render::console_texture_half() = half;
+        if (skirmish_) skirmish_->refresh_console_texture();
+    }
+    render::render_quality() = settings_.scene_quality();
+    if (skirmish_)
+        skirmish_->set_portrait_hz(settings_.has(ShellSettings::kPortraitRateKey)
+                                       ? float(ShellSettings::portrait_rate_levels()[std::size_t(settings_.portrait_rate_level())].value)
+                                       : default_portrait_hz());
+}
+
 const GlueScreen* FrontEnd::glue_screen(ScreenId id, std::uint32_t view_w, std::uint32_t view_h) {
     if (id >= ScreenId::Count || !view_w || !view_h) return nullptr;
     GlueCacheEntry& e = glue_cache_[std::size_t(id)];
@@ -1790,7 +1824,7 @@ void FrontEnd::scan_replays() {
     for (const auto& entry : std::filesystem::directory_iterator(replays_dir_, ec)) {
         if (ec) break;
         if (!entry.is_regular_file(ec)) continue;
-        if (entry.path().extension().string() != ".sc2orders") continue;
+        if (entry.path().extension().string() != ".omcorders") continue;
         replays_.push_back({entry.path().string(), entry.path().stem().string()});
     }
     std::sort(replays_.begin(), replays_.end(), [](const ReplayEntry& a, const ReplayEntry& b) { return a.name > b.name; });
@@ -1806,14 +1840,14 @@ static void stamp_replay_meta(MeleeGame& g, const std::string& map_id, const std
     g.set_replay_meta(map_id, std::move(races), std::move(teams), std::move(ctls), any_start_pair);
 }
 
-static bool arena_sites(const TestMap& m, const std::vector<MeleeSlot>& slots, std::vector<const TestMap::Base*>& out) {
+static bool arena_sites(const ArenaMap& m, const std::vector<MeleeSlot>& slots, std::vector<const ArenaMap::Base*>& out) {
     out.clear();
     if (slots.size() < 2 || slots.size() > 4 || m.players.size() < 2) return false;
     if (slots.size() == 2) {
         out = {&m.players[0].main, &m.players[1].main};
         return true;
     }
-    const TestMap::Base* side_sites[2][2] = {{&m.players[0].main, &m.players[0].natural}, {&m.players[1].main, &m.players[1].natural}};
+    const ArenaMap::Base* side_sites[2][2] = {{&m.players[0].main, &m.players[0].natural}, {&m.players[1].main, &m.players[1].natural}};
     int used[2] = {0, 0};
     std::vector<std::pair<int, int>> key_side;
     for (std::size_t p = 0; p < slots.size(); ++p) {
@@ -1944,8 +1978,8 @@ std::string FrontEnd::save_game() {
     localtime_r(&now, &tmv);
 #endif
     std::strftime(stamp, sizeof stamp, "%Y%m%d-%H%M%S", &tmv);
-    std::string path = saves_dir_ + "/" + stamp + ".sc2orders";
-    for (int n = 1; std::filesystem::exists(path, ec) && n < 100; ++n) path = saves_dir_ + "/" + stamp + "-" + std::to_string(n) + ".sc2orders";
+    std::string path = saves_dir_ + "/" + stamp + ".omcorders";
+    for (int n = 1; std::filesystem::exists(path, ec) && n < 100; ++n) path = saves_dir_ + "/" + stamp + "-" + std::to_string(n) + ".omcorders";
     stamp_replay_meta(*skirmish_, match_map_path_, slots_, match_any_pair_);
     return skirmish_->write_replay(path) ? path : std::string();
 }
@@ -1956,7 +1990,7 @@ std::string FrontEnd::newest_save() const {
     if (!std::filesystem::is_directory(saves_dir_, ec)) return std::string();
     std::string best;
     for (std::filesystem::directory_iterator it(saves_dir_, ec); !ec && it != std::filesystem::directory_iterator(); it.increment(ec)) {
-        if (!it->is_regular_file(ec) || it->path().extension().string() != ".sc2orders") continue;
+        if (!it->is_regular_file(ec) || it->path().extension().string() != ".omcorders") continue;
         const std::string p = it->path().string();
         if (best.empty() || it->path().filename().string() > std::filesystem::path(best).filename().string()) best = p;
     }
@@ -2000,15 +2034,10 @@ void FrontEnd::record_match_replay() {
     localtime_r(&now, &tmv);
 #endif
     std::strftime(stamp, sizeof stamp, "%Y%m%d-%H%M%S", &tmv);
-    std::string path = replays_dir_ + "/" + stamp + ".sc2orders";
-    for (int n = 1; std::filesystem::exists(path, ec) && n < 100; ++n) path = replays_dir_ + "/" + stamp + "-" + std::to_string(n) + ".sc2orders";
+    std::string path = replays_dir_ + "/" + stamp + ".omcorders";
+    for (int n = 1; std::filesystem::exists(path, ec) && n < 100; ++n) path = replays_dir_ + "/" + stamp + "-" + std::to_string(n) + ".omcorders";
     stamp_replay_meta(*skirmish_, match_map_path_, slots_, match_any_pair_);
     if (skirmish_->write_replay(path)) last_recorded_replay_ = path;
-}
-
-void FrontEnd::start_sandbox() {
-    sandbox_ = std::make_unique<SandboxGame>(cat_, models_, store_, map_);
-    router_.replace(ScreenId::Sandbox);
 }
 
 void FrontEnd::start_skirmish() {
@@ -2112,7 +2141,7 @@ bool FrontEnd::build_real_map_phase(int phase) {
         } else if (phase == 1) {
             {
                 std::unordered_map<std::string, std::vector<std::uint8_t>> ov;
-                if (!std::getenv("SC2_NO_MAP_ASSETS")) {
+                if (!std::getenv("OMC_NO_MAP_ASSETS")) {
                     try {
                         const formats::Mpq arc = formats::Mpq::open(pending_map_bytes_);
                         for (const std::string& name : arc.list()) {
@@ -2123,10 +2152,10 @@ bool FrontEnd::build_real_map_phase(int phase) {
                         }
                     } catch (const std::exception&) {}
                 }
-                if (std::getenv("SC2_MAP_ASSETS_TRACE")) std::fprintf(stderr, "[mapassets] %zu files from the map archive\n", ov.size());
+                if (std::getenv("OMC_MAP_ASSETS_TRACE")) std::fprintf(stderr, "[mapassets] %zu files from the map archive\n", ov.size());
                 store_.set_overlay(std::move(ov));
             }
-            if (!std::getenv("SC2_NO_MAP_CAMPAIGN_UNITS")) {
+            if (!std::getenv("OMC_NO_MAP_CAMPAIGN_UNITS")) {
                 try {
                     const formats::Mpq arc = formats::Mpq::open(pending_map_bytes_);
                     const std::vector<std::uint8_t> hb = arc.read_file("DocumentHeader");
@@ -2144,7 +2173,7 @@ bool FrontEnd::build_real_map_phase(int phase) {
                         std::vector<std::string> roots(kChain + loaded_depth, kChain + depth);
                         cat_.load_missing_only(store_, roots);
                         loaded_depth = depth;
-                        if (std::getenv("SC2_PLACED_DROP_TRACE"))
+                        if (std::getenv("OMC_PLACED_DROP_TRACE"))
                             std::fprintf(stderr, "[map-campaign] dependency depth %d: %zu campaign root(s) added (missing ids only)\n", depth, roots.size());
                     }
                 } catch (const std::exception&) {
@@ -2156,7 +2185,7 @@ bool FrontEnd::build_real_map_phase(int phase) {
             models_.set_tileset(store_, real_map_->tileset);
             app::stamp_map_doodads(cat_, *real_map_);
             app::stamp_map_units(cat_, *real_map_);
-            if (!std::getenv("SC2_NO_DOODAD_MODEL_SCALE")) {
+            if (!std::getenv("OMC_NO_DOODAD_MODEL_SCALE")) {
                 std::map<std::string, std::array<float, 3>> model_scale;
                 for (formats::PlacedDoodad& d : real_map_->objects.doodads) {
                     auto it = model_scale.find(d.type);
@@ -2170,7 +2199,7 @@ bool FrontEnd::build_real_map_phase(int phase) {
             if (const std::vector<std::uint8_t>* lx = real_map_->game_data_file("LightData.xml")) data::overlay_map_light(current_env_, *lx);
             if (const std::vector<std::uint8_t>* tx = real_map_->game_data_file("TerrainData.xml")) data::overlay_map_terrain(current_env_, *tx, real_map_->tileset);
             current_env_.params["EngineZOffset"] = formats::engine_z_offset(*real_map_);
-            if (std::getenv("SC2_ENV_TRACE"))
+            if (std::getenv("OMC_ENV_TRACE"))
                 std::fprintf(stderr, "env: tileset %s -> light %s (%s) found=%d exposure=%.3f white=%.3f ambient=%.3f,%.3f,%.3f key=%d params=%zu\n",
                              real_map_->tileset.c_str(), current_env_.light_id.c_str(), current_env_.resolution.c_str(),
                              int(current_env_.found), current_env_.hdr_exposure, current_env_.hdr_white_point,
@@ -2181,7 +2210,7 @@ bool FrontEnd::build_real_map_phase(int phase) {
             app::apply_cliff_vertex_shade(real_cliffs_, *real_map_);
         } else {
             const bool vertex_ground = !real_map_->cliff.empty();
-            const bool cliff_ground = vertex_ground && !real_cliffs_.instances.empty() && !std::getenv("SC2_NO_CLIFF_GROUND");
+            const bool cliff_ground = vertex_ground && !real_cliffs_.instances.empty() && !std::getenv("OMC_NO_CLIFF_GROUND");
             const std::vector<std::uint8_t> cliff_cells = cliff_ground ? app::cliff_ground_cells(real_cliffs_, *real_map_) : std::vector<std::uint8_t>{};
             real_ground_ = vertex_ground ? formats::build_map_mesh_vertex(*real_map_, 1.0f, cliff_ground ? &cliff_cells : nullptr)
                                          : formats::build_map_mesh_stepped(*real_map_, 1.0f, 128, true);
@@ -2193,14 +2222,14 @@ bool FrontEnd::build_real_map_phase(int phase) {
             const auto water_heights = water_type_heights(store_, map_water_xml);
             real_water_ = formats::build_map_water(*real_map_, 1.0f, 0.5f, &water_heights);
             real_water_rgba_ = {1.0f, 1.0f, 1.0f, 1.0f};
-            real_roads_ = !std::getenv("SC2_ROAD_TERRAIN_SPEC")
+            real_roads_ = !std::getenv("OMC_ROAD_TERRAIN_SPEC")
                               ? build_map_roads(store_, *real_map_)
                               : build_map_roads(store_, *real_map_, float(current_env_.param("TerrainSpecularExp", 100.0)),
                                                 float(current_env_.param("TerrainHDRSpecular", 1.0) / std::max(current_env_.param("HDRSpecMultiplier", 1.0), 1e-3)));
             const double proj_spec_mult = current_env_.param("HDRSpecMultiplier", 1.0);
             append_ground_overlay(real_roads_, build_map_projectors(store_, models_, *real_map_, float(current_env_.param("TerrainSpecularExp", 100.0)),
                                                                     float(current_env_.param("TerrainHDRSpecular", 1.0) / (proj_spec_mult > 0.0 ? proj_spec_mult : 1.0))));
-            if (!std::getenv("SC2_ROAD_OVERHANG")) {
+            if (!std::getenv("OMC_ROAD_OVERHANG")) {
                 const float mw = float(real_map_->cell_width()), mh = float(real_map_->cell_height());
                 formats::Model& rm = real_roads_;
                 for (const formats::M3Region& rg : rm.regions)
@@ -2219,7 +2248,7 @@ bool FrontEnd::build_real_map_phase(int phase) {
                         if (cx < 0.0f || cy < 0.0f || cx > mw || cy > mh) rm.indices[t + 1] = rm.indices[t + 2] = rm.indices[t];
                     }
             }
-            if (std::getenv("SC2_ENV_TRACE")) {
+            if (std::getenv("OMC_ENV_TRACE")) {
                 auto zr = [](const formats::Model& m, float& lo, float& hi) {
                     lo = 1e9f; hi = -1e9f;
                     for (std::size_t v = 2; v < m.positions.size(); v += 3) { lo = std::min(lo, m.positions[v]); hi = std::max(hi, m.positions[v]); }
@@ -2278,8 +2307,13 @@ bool FrontEnd::begin_match() {
         match_any_pair_ = false;
         data::Production prod;
         prod.build(cat_);
-        std::vector<const TestMap::Base*> sites;
-        if (!arena_sites(map_, slots_, sites)) {
+        std::vector<const ArenaMap::Base*> sites;
+        if (!arena_) {
+            match_error_ = "no map selected";
+            router_.replace(ScreenId::Lobby);
+            return false;
+        }
+        if (!arena_sites(*arena_, slots_, sites)) {
             match_error_ = "the built-in arena seats 2 to 4 players (its two mains and two naturals); this setup has " +
                            std::to_string(slots_.size());
             router_.replace(ScreenId::Lobby);
@@ -2287,7 +2321,7 @@ bool FrontEnd::begin_match() {
         }
         for (std::size_t p = 0; p < slots_.size(); ++p) {
             const MeleeProtos pr = race_protos(cat_, slots_[p].race);
-            const TestMap::Base& base = *sites[p];
+            const ArenaMap::Base& base = *sites[p];
             MeleePlayerSetup ps;
             ps.team = slots_[p].team;
             ps.start = {Fx(base.town.x), Fx(base.town.y)};
@@ -2299,10 +2333,10 @@ bool FrontEnd::begin_match() {
             ps.start_extras = pr.start_extras;
             ps.mineral_field = pr.mineral;
             ps.geyser_field = pr.geyser;
-            for (const TestMap::Resource& res : base.resources) {
-                if (res.kind == TestMap::ResourceKind::Mineral)
+            for (const ArenaMap::Resource& res : base.resources) {
+                if (res.kind == ArenaMap::ResourceKind::Mineral)
                     ps.mineral_positions.push_back({Fx(res.position.x), Fx(res.position.y)});
-                else if (res.kind == TestMap::ResourceKind::Geyser)
+                else if (res.kind == ArenaMap::ResourceKind::Geyser)
                     ps.geyser_positions.push_back({Fx(res.position.x), Fx(res.position.y)});
             }
             ps.producer = pr.producer;
@@ -2313,10 +2347,10 @@ bool FrontEnd::begin_match() {
             apply_race_costs(ps, cat_, slots_[p].race, prod);
             setup.players.push_back(ps);
         }
-        ground = &map_.ground;
-        map_w = map_.width;
-        map_h = map_.height;
-        nav = &map_.nav;
+        ground = &arena_->ground;
+        map_w = arena_->width;
+        map_h = arena_->height;
+        nav = &arena_->nav;
     } else {
         for (int phase = 0; phase < 4; ++phase) {
             if (!build_real_map_phase(phase)) {
@@ -2391,7 +2425,7 @@ bool FrontEnd::begin_match() {
     skirmish_->set_build_verb(sim::BuildVerb::Committed);
     skirmish_->register_creep_masks(cat_);
     skirmish_->set_creep_diffuse(render::resolve_creep_diffuse(store_));
-    if (real_map_ && !std::getenv("SC2_CREEP_CORE_TEXTURE"))
+    if (real_map_ && !std::getenv("OMC_CREEP_CORE_TEXTURE"))
         if (auto v = cat_.scalar("CTerrain", real_map_->tileset, "CreepBaseTexture"); v && !v->empty()) {
             std::string rel = *v;
             for (char& c : rel)
@@ -2412,7 +2446,7 @@ bool FrontEnd::begin_match() {
             std::vector<float> vgrid(std::size_t(vw) * vh, 0.0f);
             for (std::uint32_t r = 0; r < vh; ++r)
                 for (std::uint32_t c = 0; c < vw; ++c) vgrid[std::size_t(r) * vw + c] = formats::vertex_ground_z(*real_map_, vth, voff, c, r);
-            if (const char* gt = std::getenv("SC2_GROUND_TRACE")) {
+            if (const char* gt = std::getenv("OMC_GROUND_TRACE")) {
                 int bx0 = 0, bx1 = 0, by0 = 0, by1 = 0;
                 if (std::sscanf(gt, "%d,%d,%d,%d", &bx0, &bx1, &by0, &by1) == 4) {
                     std::map<std::pair<int, int>, float> zs;
@@ -2447,7 +2481,7 @@ bool FrontEnd::begin_match() {
     skirmish_->setup(setup, &models_, ground, map_w, map_h, nav, placement, playable_x0,
                      playable_y0, playable_x1, playable_y1);
     render::mem_mark("match: MeleeGame::setup (world, nav, actors)");
-    if (real_map_ && real_map_->scripted_camera.found && !std::getenv("SC2_NO_MAP_CAMERA")) {
+    if (real_map_ && real_map_->scripted_camera.found && !std::getenv("OMC_NO_MAP_CAMERA")) {
         const formats::ScriptedCamera& sc = real_map_->scripted_camera;
         render::CameraControl& cc = skirmish_->camera_control();
         cc.distance = sc.distance;
@@ -2468,7 +2502,7 @@ bool FrontEnd::begin_match() {
         const std::vector<float> th = formats::tier_heights(*real_map_);
         const float z_off = formats::engine_z_offset(*real_map_);
         std::map<std::string, float> actor_scale;
-        const bool no_actor_scale = std::getenv("SC2_DOODAD_ACTOR_SCALE") == nullptr;
+        const bool no_actor_scale = std::getenv("OMC_DOODAD_ACTOR_SCALE") == nullptr;
         for (formats::PlacedDoodad& d : real_doodads_) {
             if (!no_actor_scale) {
                 auto it = actor_scale.find(d.type);
@@ -2491,7 +2525,7 @@ bool FrontEnd::begin_match() {
             if (!th.empty() && !cm.empty() && cx >= 0 && cy >= 0 && std::uint32_t(cx) < cm.width &&
                 std::uint32_t(cy) < cm.height) {
                 const std::size_t L = std::size_t(cm.levels[std::size_t(cy) * cm.width + cx]);
-                static const char* kZAuthored = std::getenv("SC2_DOODAD_Z_AUTHORED");
+                static const char* kZAuthored = std::getenv("OMC_DOODAD_Z_AUTHORED");
                 const bool z_authored = kZAuthored && d.type.compare(0, std::strlen(kZAuthored), kZAuthored) == 0;
                 if (z_authored) {
                     static int shown = 0;
@@ -2502,12 +2536,12 @@ bool FrontEnd::begin_match() {
                 d.z = 0.0f;
             }
         }
-        if (std::getenv("SC2_SHORELINE") && !std::getenv("SC2_NO_SHORELINE")) {
+        if (std::getenv("OMC_SHORELINE") && !std::getenv("OMC_NO_SHORELINE")) {
             const std::vector<std::uint8_t>* sw = real_map_->game_data_file("WaterData.xml");
-            static const float kShoreSpacing = std::getenv("SC2_SHORELINE_SPACING") ? float(std::atof(std::getenv("SC2_SHORELINE_SPACING"))) : 2.0f;
+            static const float kShoreSpacing = std::getenv("OMC_SHORELINE_SPACING") ? float(std::atof(std::getenv("OMC_SHORELINE_SPACING"))) : 2.0f;
             const auto shore = shoreline_placements(*real_map_, water_type_heights(store_, sw), store_, sw, kShoreSpacing);
             real_doodads_.insert(real_doodads_.end(), shore.begin(), shore.end());
-            if (std::getenv("SC2_SHORELINE_TRACE")) {
+            if (std::getenv("OMC_SHORELINE_TRACE")) {
                 std::fprintf(stderr, "[shoreline] %zu instances\n", shore.size());
                 for (std::size_t k = 0; k < shore.size() && k < 12; ++k)
                     std::fprintf(stderr, "[shoreline]   %s at (%.2f, %.2f, z %.2f) facing %.2f\n", shore[k].type.c_str(), double(shore[k].x), double(shore[k].y),
@@ -2516,7 +2550,7 @@ bool FrontEnd::begin_match() {
         }
         skirmish_->set_doodads(&real_doodads_);
         real_fluff_.clear();
-        if (!real_map_->fluff.empty() && !std::getenv("SC2_NO_FLUFF")) {
+        if (!real_map_->fluff.empty() && !std::getenv("OMC_NO_FLUFF")) {
             struct FluffRow { std::string model; float prob = 0.0f; bool random_rotation = false; int variations = 1; float smin = 1.0f, smax = 1.0f; };
             std::vector<std::vector<FluffRow>> rows(real_map_->tileset_textures.size());
             for (std::size_t s = 0; s < rows.size(); ++s) {
@@ -2540,7 +2574,7 @@ bool FrontEnd::begin_match() {
                     }
                     rows[s].push_back(std::move(r));
                 }
-                if (std::getenv("SC2_ENV_TRACE")) {
+                if (std::getenv("OMC_ENV_TRACE")) {
                     std::fprintf(stderr, "fluff: slot %zu '%s' found %d rows %zu\n", s, tex.c_str(), int(cat_.find("CTerrainTex", tex) != nullptr), rows[s].size());
                     for (const FluffRow& r : rows[s])
                         std::fprintf(stderr, "fluff:   row '%s' probability %.3f variations %d scale %.3f .. %.3f\n", r.model.c_str(), double(r.prob), r.variations,
@@ -2557,7 +2591,7 @@ bool FrontEnd::begin_match() {
                 const formats::LoadedMap::FluffDoodad& f = real_map_->fluff[i];
                 if (std::size_t(f.slot) >= rows.size() || rows[f.slot].empty()) continue;
                 const std::vector<FluffRow>& rs = rows[f.slot];
-                static const bool kWeights = std::getenv("SC2_FLUFF_WEIGHTS") != nullptr;
+                static const bool kWeights = std::getenv("OMC_FLUFF_WEIGHTS") != nullptr;
                 const FluffRow* row = nullptr;
                 if (kWeights) {
                     float total = 0.0f;
@@ -2584,10 +2618,10 @@ bool FrontEnd::begin_match() {
                 real_fluff_.push_back(std::move(d));
             }
         }
-        if (std::getenv("SC2_ENV_TRACE"))
+        if (std::getenv("OMC_ENV_TRACE"))
             std::fprintf(stderr, "fluff: %zu records, %zu texture slots, %zu resolved\n", real_map_->fluff.size(), real_map_->tileset_textures.size(), real_fluff_.size());
         skirmish_->set_fluff(&real_fluff_);
-        if (std::getenv("SC2_ENV_TRACE"))
+        if (std::getenv("OMC_ENV_TRACE"))
             std::fprintf(stderr, "bounds: map %u x %u cells, camera l %d b %d r %d t %d (has %d)\n", real_map_->cell_width(), real_map_->cell_height(),
                          int(real_map_->info.camera_left), int(real_map_->info.camera_bottom), int(real_map_->info.camera_right), int(real_map_->info.camera_top),
                          int(real_map_->info.has_camera_bounds));
@@ -2608,12 +2642,14 @@ bool FrontEnd::begin_match() {
     apply_shipping_wiring(*skirmish_, cat_, research_up_.get(), &setup, &races);
     render::mem_mark("match: shipping wiring");
     if (portrait_full_rate_) skirmish_->set_portrait_hz(0.0f);
+    apply_performance_settings();
     for (std::size_t p = 0; p < slots_.size(); ++p) {
         const RaceUnits u = race_units(slots_[p].race);
         skirmish_->set_spawn_models(int(p), models_.model_for(u.worker), models_.model_for(u.army),
                                     models_.model_for(u.producer));
     }
     skirmish_->set_pause_actions([this] { save_game(); }, [this] { load_pending_path_ = newest_save(); });
+    if (!shell_v1()) skirmish_->set_pause_settings_action([this] { settings_from_match_ = true; });
     if (replay_pending_) {
         skirmish_->begin_replay(replay_log_pending_);
         replay_pending_ = false;
@@ -2639,7 +2675,7 @@ bool FrontEnd::step(const render::InputState& in, float dt_ms,
     if (!boot_screen_request().empty()) {
         std::string name;
         name.swap(boot_screen_request());
-        if (!enter_screen(name)) std::fprintf(stderr, "crafter-sc: --screen %s: not a screen the client can open on\n", name.c_str());
+        if (!enter_screen(name)) std::fprintf(stderr, "overmindcore: --screen %s: not a screen the client can open on\n", name.c_str());
     }
     if (!load_pending_path_.empty()) {
         const std::string path = load_pending_path_;
@@ -2677,7 +2713,13 @@ bool FrontEnd::step(const render::InputState& in, float dt_ms,
         return true;
     }
     if ((router_.top() == ScreenId::InGame || router_.top() == ScreenId::PauseMenu) && skirmish_) {
-        if (!skirmish_->step(in, dt_ms, scene, cam)) {
+        render::InputState match_in = in;
+        if (overlay_quit_held_) {
+            if (in.quit) match_in.quit = false;
+            else overlay_quit_held_ = false;
+        }
+        settings_from_match_ = false;
+        if (!skirmish_->step(match_in, dt_ms, scene, cam)) {
             record_match_replay();
             remember_last_match();
             release_match();
@@ -2698,13 +2740,8 @@ bool FrontEnd::step(const render::InputState& in, float dt_ms,
             scene.clear();
             cam = menu_ctl_.camera();
         }
-        return true;
-    }
-    if (router_.top() == ScreenId::Sandbox && sandbox_) {
-        if (!sandbox_->step(in, dt_ms, scene, cam)) {
-            sandbox_.reset(); router_.follow("Leave sandbox"); scene.clear();
-            cam = menu_ctl_.camera();
-        }
+        if (settings_from_match_ && skirmish_ && router_.top() == ScreenId::PauseMenu && router_.follow("Options")) prev_left_ = in.left_pressed;
+        settings_from_match_ = false;
         return true;
     }
     if (router_.top() == ScreenId::Loading) {
@@ -2752,17 +2789,23 @@ bool FrontEnd::step(const render::InputState& in, float dt_ms,
     }
     {
         bool esc = false;
+        const bool over_match = settings_over_match();
         if (run_shell_screen(shell::Pass::Input, in.view_w, in.view_h, &in, nullptr, dt_ms, nullptr, &esc)) {
             fx_.tick(dt_ms, ui_.hot);
+            if (over_match) overlay_quit_held_ = in.quit;
             if (esc && !router_.cancel() && router_.top() != ScreenId::GlueRoot && router_.top() != ScreenId::Lobby) {
                 prev_left_ = in.left_pressed;
                 return false;
             }
-            if (router_.top() == ScreenId::Sandbox && !sandbox_) start_sandbox();
             prev_left_ = in.left_pressed;
             if (router_.top() == ScreenId::Boot) return false;
             scene.clear();
-            cam = menu_ctl_.camera();
+            if (over_match && skirmish_) {
+                skirmish_->emit_scene(scene);
+                cam = skirmish_->camera_control().camera();
+            } else {
+                cam = menu_ctl_.camera();
+            }
             return true;
         }
     }
@@ -2798,7 +2841,6 @@ bool FrontEnd::step(const render::InputState& in, float dt_ms,
     } else if (in.view_w && in.view_h) {
         shell_keyboard(in, in.view_w, in.view_h);
     }
-    if (router_.top() == ScreenId::Sandbox && !sandbox_) start_sandbox();
     if (router_.top() == ScreenId::Boot) { prev_left_ = in.left_pressed; return false; }
     if (router_.top() == ScreenId::Loading) { loading_frames_ = 0; load_plan_.reset(); }
     prev_left_ = in.left_pressed;
@@ -3024,8 +3066,12 @@ void FrontEnd::build_overlay_body(std::uint32_t view_w, std::uint32_t view_h,
         skirmish_->build_overlay(view_w, view_h, out);
         return;
     }
-    if (screen == ScreenId::Sandbox && sandbox_) { sandbox_->build_overlay(view_w, view_h, out); return; }
 
+    if (settings_over_match() && view_w && view_h && skirmish_) {
+        skirmish_->build_overlay(view_w, view_h, out);
+        out.resize(std::size_t(view_w) * view_h * 4, 0);
+        if (run_shell_screen(shell::Pass::Paint, view_w, view_h, nullptr, &out, 0.0f, nullptr, nullptr)) return;
+    }
     out.assign(std::size_t(view_w) * view_h * 4, 0);
     if (!view_w || !view_h) return;
     if (run_shell_screen(shell::Pass::Paint, view_w, view_h, nullptr, &out, 0.0f, nullptr, nullptr)) return;
@@ -3195,7 +3241,7 @@ void FrontEnd::build_overlay_body(std::uint32_t view_w, std::uint32_t view_h,
             };
             return theme::Rgb{ch(v[0]), ch(v[1]), ch(v[2])};
         };
-        static const bool raw_slots = std::getenv("SC2_SHELL_TEAM_SLOT_RAW") != nullptr;
+        static const bool raw_slots = std::getenv("OMC_SHELL_TEAM_SLOT_RAW") != nullptr;
         const data::TeamColor* c0 = nullptr;
         const data::TeamColor* c1 = nullptr;
         for (const data::TeamColor& t : tc) {
@@ -3263,6 +3309,10 @@ void FrontEnd::build_overlay_body(std::uint32_t view_w, std::uint32_t view_h,
 
 void FrontEnd::request_boot_screen(const std::string& name) { boot_screen_request() = name; }
 
+bool FrontEnd::settings_over_match() const {
+    return skirmish_ != nullptr && router_.top() == ScreenId::Options && router_.contains(ScreenId::PauseMenu);
+}
+
 bool FrontEnd::enter_screen(const std::string& boot_name) {
     const ScreenId id = screen_from_boot_name(boot_name);
     switch (id) {
@@ -3274,9 +3324,6 @@ bool FrontEnd::enter_screen(const std::string& boot_name) {
         case ScreenId::PauseMenu:
         case ScreenId::ReplayControls:
             return false;
-        case ScreenId::Sandbox:
-            start_sandbox();
-            return true;
         case ScreenId::Options:
         case ScreenId::Profile:
             router_.unwind_to(ScreenId::GlueRoot);
@@ -3419,7 +3466,7 @@ bool ShellCtx::team_color(int slot, theme::Rgb& out) {
         fe.team_colors_read_ = true;
         fe.team_colors_ = data::team_colors(fe.cat_);
     }
-    static const bool raw = std::getenv("SC2_SHELL_TEAM_SLOT_RAW") != nullptr;
+    static const bool raw = std::getenv("OMC_SHELL_TEAM_SLOT_RAW") != nullptr;
     const int want = raw ? slot : slot + 1;
     auto ch = [](float f) {
         const int n = int(f * 255.0f + 0.5f);
@@ -3625,8 +3672,14 @@ PortraitCatalog& ShellCtx::portraits() { return fe.portraits_; }
 bool ShellCtx::scan_portraits(int budget) { return fe.portraits_.scan(fe.cat_, fe.store_, budget); }
 
 void ShellCtx::quit() { router.follow("Esc / close client"); }
-const char* ShellCtx::version() const { return sc2::kVersion; }
+void ShellCtx::apply_settings() {
+    fe.apply_settings_to_match();
+    fe.apply_performance_settings();
+}
+bool ShellCtx::in_match() const { return fe.skirmish_ != nullptr && (router.contains(ScreenId::InGame) || router.contains(ScreenId::PauseMenu)); }
+const char* ShellCtx::version() const { return omc::kVersion; }
 bool ShellCtx::has_maps_folder_picker() const { return bool(fe.maps_folder_cb_); }
+bool ShellCtx::has_arena() const { return fe.arena_ != nullptr; }
 
 ShellCtx::GameData ShellCtx::game_data() {
     if (!fe.game_data_probed_) {

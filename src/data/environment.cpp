@@ -1,10 +1,10 @@
-#include "sc2/data/environment.hpp"
+#include "omc/data/environment.hpp"
 
 #include <cstdio>
 #include <cstdlib>
 #include <exception>
 
-namespace sc2::data {
+namespace omc::data {
 
 using core::XmlNode;
 

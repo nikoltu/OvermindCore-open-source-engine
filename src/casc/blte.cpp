@@ -1,11 +1,11 @@
-#include "sc2/casc/blte.hpp"
+#include "omc/casc/blte.hpp"
 
 #include <stdexcept>
 
-#include "sc2/core/byte_reader.hpp"
-#include "sc2/core/inflate.hpp"
+#include "omc/core/byte_reader.hpp"
+#include "omc/core/inflate.hpp"
 
-namespace sc2::casc {
+namespace omc::casc {
 
 using core::ByteReader;
 

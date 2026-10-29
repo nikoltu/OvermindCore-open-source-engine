@@ -1,4 +1,4 @@
-#include "sc2/render/texture_decode.hpp"
+#include "omc/render/texture_decode.hpp"
 
 #include <algorithm>
 #include <atomic>
@@ -7,11 +7,11 @@
 #include <cstring>
 #include <exception>
 
-#include "sc2/casc/storage.hpp"
-#include "sc2/formats/dds.hpp"
-#include "sc2/render/terrain_tex.hpp"
+#include "omc/casc/storage.hpp"
+#include "omc/formats/dds.hpp"
+#include "omc/render/terrain_tex.hpp"
 
-namespace sc2::render {
+namespace omc::render {
 
 std::vector<std::string> texture_roots_2d(const std::string& texture_root) {
     std::vector<std::string> roots = {texture_root};
@@ -57,6 +57,10 @@ static void fit_max_dim(DecodedTexture& t, std::uint32_t max_dim) {
         t.w = nw;
         t.h = nh;
     }
+}
+
+void halve_decoded(DecodedTexture& t) {
+    if (t.ok && t.w > 1 && t.h > 1) fit_max_dim(t, std::max(t.w, t.h) / 2);
 }
 
 DecodedTexture decode_texture_2d(const casc::Storage& store, const std::string& texture_root, const std::string& path, bool normal,
@@ -130,7 +134,7 @@ DecodedTexture decode_texture_env(const casc::Storage& store, const std::string&
             const bool dx10 = bytes[84] == 'D' && bytes[85] == 'X' && bytes[86] == '1' && bytes[87] == '0';
             if (dx10) break;
             if (!(caps2 & 0x200u)) {
-                if (std::getenv("SC2_NO_SPHERE_ENVIO")) break;
+                if (std::getenv("OMC_NO_SPHERE_ENVIO")) break;
                 formats::DdsInfo info;
                 std::vector<uint8_t> rgba = formats::dds_decode_rgba(bytes, info);
                 if (!rgba.empty() && info.width && info.height) {
@@ -199,7 +203,7 @@ TextureDecodePool* TextureDecodePool::existing() { return g_pool.load(); }
 
 TextureDecodePool::TextureDecodePool() {
     unsigned n = 2;
-    if (const char* e = std::getenv("SC2_TEX_DECODE_THREADS")) n = unsigned(std::max(1, std::min(8, std::atoi(e))));
+    if (const char* e = std::getenv("OMC_TEX_DECODE_THREADS")) n = unsigned(std::max(1, std::min(8, std::atoi(e))));
     for (unsigned i = 0; i < n; ++i) threads_.emplace_back([this] { worker(); });
 }
 

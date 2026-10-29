@@ -1,9 +1,9 @@
-#include "sc2/core/xml.hpp"
+#include "omc/core/xml.hpp"
 
 #include <cstdint>
 #include <stdexcept>
 
-namespace sc2::core {
+namespace omc::core {
 namespace {
 
 class Parser {

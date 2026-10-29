@@ -4,10 +4,10 @@
 #include <cstdint>
 #include <vector>
 
-#include "sc2/formats/m3.hpp"
-#include "sc2/render/mat4.hpp"
+#include "omc/formats/m3.hpp"
+#include "omc/render/mat4.hpp"
 
-namespace sc2::render {
+namespace omc::render {
 
 struct Vertex {
     float pos[3];
@@ -37,7 +37,7 @@ inline std::vector<uint32_t> resolve_indices(const formats::Model& m,
         int mat = ri < m.region_material.size() ? m.region_material[ri] : -1;
         const bool untextured_by_design = mat == formats::kUntexturedRegion;
         const bool layerless = from_m3 && mat >= 0 && std::size_t(mat) < m.materials.size() && m.materials[std::size_t(mat)].layers.empty() &&
-                               !std::getenv("SC2_DRAW_LAYERLESS");
+                               !std::getenv("OMC_DRAW_LAYERLESS");
         const bool suppress = (from_m3 && mat < 0 && !untextured_by_design) || layerless;
         if (!suppress) {
             uint32_t end = r.first_index + r.num_indices;
@@ -46,7 +46,7 @@ inline std::vector<uint32_t> resolve_indices(const formats::Model& m,
         }
         draws.push_back({start, uint32_t(out.size()) - start, untextured_by_design ? -1 : mat, false});
     }
-    static const bool first_only = std::getenv("SC2_COMPOSITE_FIRST_ONLY") != nullptr;
+    static const bool first_only = std::getenv("OMC_COMPOSITE_FIRST_ONLY") != nullptr;
     if (from_m3 && !first_only && m.region_composite.size() == m.regions.size())
         for (size_t ri = 0; ri < m.regions.size(); ++ri) {
             const int ci = m.region_composite[ri];
@@ -88,7 +88,7 @@ inline std::vector<Vertex> build_vertices(const formats::Model& m,
              x < r.first_vertex + r.num_vertices && x < m.vertex_count; ++x)
             vregion[x] = uint32_t(ri);
     }
-    static const bool kVertexColour = std::getenv("SC2_NO_VERTEX_COLOUR") == nullptr;
+    static const bool kVertexColour = std::getenv("OMC_NO_VERTEX_COLOUR") == nullptr;
     std::vector<uint8_t> region_coloured(m.regions.size(), 0);
     if (kVertexColour && (!m.material_refs.empty() || m.placement_tint) && m.vertex_colors.size() >= size_t(m.vertex_count) * 4)
         for (size_t ri = 0; ri < m.regions.size() && ri < m.region_material.size(); ++ri) {
@@ -124,7 +124,7 @@ inline std::vector<Vertex> build_vertices(const formats::Model& m,
                 for (int k = 0; k < 4; ++k) v[i].weight[k] /= wsum;
         }
         if (m.vertex_alpha_coverage && v[i].weight[3] == 0.0f && m.vertex_colors.size() >= size_t(i) * 4 + 4) {
-            static const float kAlphaGain = std::getenv("SC2_CLIFF_ALPHA_GAIN") ? float(std::atof(std::getenv("SC2_CLIFF_ALPHA_GAIN"))) : 1.0f;
+            static const float kAlphaGain = std::getenv("OMC_CLIFF_ALPHA_GAIN") ? float(std::atof(std::getenv("OMC_CLIFF_ALPHA_GAIN"))) : 1.0f;
             const float a = std::min(255.0f, float(m.vertex_colors[size_t(i) * 4 + 3]) * kAlphaGain);
             v[i].bone[3] = 0x10000u | uint32_t(a + 0.5f);
         }

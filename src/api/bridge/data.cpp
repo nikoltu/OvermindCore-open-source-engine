@@ -5,11 +5,11 @@
 
 #include "s2clientprotocol/sc2api.pb.h"
 
-#include "sc2/api/bridge.hpp"
-#include "sc2/api/truth_pack.hpp"
-#include "sc2/data/catalog.hpp"
+#include "omc/api/bridge.hpp"
+#include "omc/api/truth_pack.hpp"
+#include "omc/data/catalog.hpp"
 
-namespace sc2::api::bridge {
+namespace omc::api::bridge {
 
 bool fill_unit_type_data(Host& host, SC2APIProtocol::ResponseData& out, std::string& error) {
     const UnitTypePack pack = load_unit_type_pack(host.truth_data_dir(), host.data_build());

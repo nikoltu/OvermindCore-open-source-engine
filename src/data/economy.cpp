@@ -1,10 +1,10 @@
-#include "sc2/data/economy.hpp"
+#include "omc/data/economy.hpp"
 
 #include <algorithm>
 #include <cstdlib>
 #include <vector>
 
-namespace sc2::data {
+namespace omc::data {
 
 using sim::Fixed;
 
@@ -35,7 +35,7 @@ UnitCost unit_cost(const Catalog& cat, const std::string& unit_id) {
 
 UnitCost build_charge(const Catalog& cat, const std::string& structure, std::string builder, std::string abil) {
     UnitCost c = unit_cost(cat, structure);
-    static const bool kOld = std::getenv("SC2_ZERG_BUILD_FULL_COST") != nullptr;
+    static const bool kOld = std::getenv("OMC_ZERG_BUILD_FULL_COST") != nullptr;
     if (kOld) return c;
     if (abil.empty()) abil = cat.build_ability_of(structure);
     if (abil.empty() || !cat.ability_flag(abil, "PeonKillFinish")) return c;

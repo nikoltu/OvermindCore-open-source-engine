@@ -1,12 +1,13 @@
-#include "sc2/campaign/flow.hpp"
+#include "omc/campaign/flow.hpp"
+
+#include "omc/data/strings.hpp"
 
 #include <sstream>
 
-namespace sc2::campaign {
+namespace omc::campaign {
 
 static const char kFlowData[] = R"FLOW(
-# ===== Campaign 1 (29 edges, gate-count model, 3 branch points) =====
-campaign WOL
+campaign WOL text=UI/ExpansionLevel/WingsOfLiberty
 node TRaynor01 always
 node TRaynor02 req=TRaynor01
 node TRaynor03 req=TRaynor02
@@ -40,8 +41,7 @@ branch THanson03A THanson03B
 branch TTosh03A TTosh03B
 branch TValerian02A TValerian02B
 
-# ===== Campaign 2 (20 edges, arc-gate model, 7 arcs) =====
-campaign HOTS
+campaign HOTS text=UI/ExpansionLevel/HeartOfTheSwarm
 node ZLab1 always
 node ZLab2 req=ZLab1
 node ZLab3 req=ZLab2
@@ -70,8 +70,7 @@ arc ZHybrid3
 arc ZSpace2
 arc ZKorhal3
 
-# ===== Campaign 3 (22 edges, arc-gate model, 9 arcs) =====
-campaign LOTV
+campaign LOTV text=UI/ExpansionLevel/LegacyOfTheVoid
 node PAiur01 always
 node PAiur02 req=PAiur01
 node PAiur03 req=PAiur02
@@ -141,6 +140,9 @@ std::vector<CampaignFlow> parse_flow(const std::string& text) {
             flows.push_back(CampaignFlow{});
             cur = &flows.back();
             ls >> cur->name;
+            std::string kv;
+            while (ls >> kv)
+                if (kv.rfind("text=", 0) == 0) cur->title_key = kv.substr(5);
         } else if (tok == "node" && cur) {
             MissionNode n;
             ls >> n.id;
@@ -176,6 +178,13 @@ std::vector<CampaignFlow> parse_flow(const std::string& text) {
 
 std::vector<CampaignFlow> load_campaign_flow() {
     return parse_flow(campaign_flow_data());
+}
+
+std::string campaign_title(const std::vector<CampaignFlow>& flows, std::size_t i, const data::StringTable& text) {
+    if (i >= flows.size()) return {};
+    if (!flows[i].title_key.empty())
+        if (const std::string* s = text.find(flows[i].title_key); s && !s->empty()) return *s;
+    return "Campaign " + std::to_string(i + 1);
 }
 
 const MissionNode* CampaignFlow::find(const MissionId& id) const {

@@ -1,6 +1,6 @@
-#include "sc2/data/strings.hpp"
+#include "omc/data/strings.hpp"
 
-namespace sc2::data {
+namespace omc::data {
 
 static bool starts_with(const std::string& s, const char* prefix) {
     std::size_t i = 0;
