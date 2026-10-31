@@ -1,5 +1,6 @@
 #pragma once
 
+#include <functional>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -20,6 +21,60 @@ public:
     using Fixed = sim::Fixed;
 
     explicit CastPolicy(const data::Catalog& cat) : cat_(&cat) {}
+
+    using CooldownFold = std::function<Fixed(std::int32_t player, const std::string& abil_id, Fixed base)>;
+    void set_cooldown_fold(CooldownFold f) { cd_fold_ = std::move(f); }
+    Fixed player_cooldown(const sim::World& world, std::uint32_t caster_id, const std::string& abil_id, Fixed base) const {
+        if (!cd_fold_ || base.raw() <= 0 || caster_id >= world.units().size()) return base;
+        return cd_fold_(world.units()[caster_id].player, abil_id, base);
+    }
+    bool ability_flag(const std::string& abil_id, const std::string& flag) const {
+        const std::string key = abil_id + '\x1f' + flag;
+        if (auto it = flag_cache_.find(key); it != flag_cache_.end()) return it->second;
+        int own = -1;
+        auto scan = [&](const auto& nodes) {
+            for (const core::XmlNode& n : nodes)
+                if ((n.name == "Flags" || n.name == "FlagArray") && n.attr_or("index", "") == flag)
+                    own = n.attr_or("value", "") == "1";
+        };
+        scan(cat_->resolved("CAbil", abil_id));
+        if (own < 0)
+            if (const data::Catalog::Entry* e = cat_->find("CAbil", abil_id)) {
+                if (const std::vector<core::XmlNode>* d = cat_->tag_default_indexed_nodes(e->tag)) scan(*d);
+                if (own < 0 && e->tag.rfind("CAbilEffect", 0) == 0)
+                    if (const std::vector<core::XmlNode>* d = cat_->tag_default_indexed_nodes("CAbilEffect")) scan(*d);
+            }
+        return flag_cache_[key] = own == 1;
+    }
+
+    sim::CastCost order_cost(const sim::World& world, std::uint32_t caster_id, int32_t slot,
+                             const std::string& abil_id) const {
+        sim::CastCost c;
+        if (const sim::AbilitySpec* sp = abils_.spec(slot)) c.cooldown = player_cooldown(world, caster_id, abil_id, sp->cooldown);
+        c.wait = ability_flag(abil_id, "WaitToSpend");
+        return c;
+    }
+
+    static bool pending_cast(const sim::World& world, std::uint32_t id) {
+        if (sim::AbilitySystem::cost_at_order() || id >= world.units().size()) return false;
+        const sim::Unit& u = world.units()[id];
+        return !u.orders.empty() && u.orders.front().type == sim::OrderType::Cast && u.orders.front().pay_due;
+    }
+
+    const std::string& abil_of_effect(int32_t effect) const {
+        static const std::string kNone;
+        auto it = effect_abil_.find(effect);
+        return it == effect_abil_.end() ? kNone : it->second;
+    }
+    void refold_cooldown(sim::World& world, std::uint32_t caster_id, int32_t slot, const std::string& abil_id) {
+        if (!cd_fold_ || slot < 0 || caster_id >= world.units().size()) return;
+        const int32_t fx = abils_.effect_of(slot);
+        if (fx < 0) return;
+        const Fixed left = world.ability_cooldown_left(caster_id, fx);
+        if (left.raw() <= 0) return;
+        const Fixed folded = player_cooldown(world, caster_id, abil_id, left);
+        if (folded.raw() > 0 && folded != left) world.arm_ability_cooldown(caster_id, fx, folded);
+    }
 
     bool register_offensive(sim::World& world, const std::string& unit_id,
                             const std::string& abil_id) {
@@ -130,7 +185,8 @@ public:
         if (e.slot < 0 || e.cooldown.raw() <= 0) return 0.0f;
         const sim::Fixed left = world.ability_cooldown_left(caster_id, e.slot);
         if (left.raw() <= 0) return 0.0f;
-        const float f = float(left.to_double() / e.cooldown.to_double());
+        const sim::Fixed whole = player_cooldown(world, caster_id, abil_id, e.cooldown);
+        const float f = float(left.to_double() / (whole.raw() > 0 ? whole : e.cooldown).to_double());
         return f > 1.0f ? 1.0f : f;
     }
 
@@ -140,6 +196,7 @@ public:
         for (std::uint32_t ci = 0; ci < units.size(); ++ci) {
             const sim::Unit& u = units[ci];
             if (!u.alive || u.player != player || u.catalog_id.empty()) continue;
+            if (pending_cast(world, ci)) continue;
             for (const Entry& e : autocast_entries(world, u.catalog_id)) {
                 if (!autocast_on(ci, e.abil_id, e.autocast_default_on)) continue;
                 if (!abils_.ready(world, ci, e.slot)) continue;
@@ -157,7 +214,10 @@ public:
                         has_resume = true;
                     }
                 }
-                if (abils_.try_cast(world, ci, e.slot, tgt)) {
+                const sim::CastCost ac_cost = order_cost(world, ci, e.slot, e.abil_id);
+                if (abils_.try_cast(world, ci, e.slot, tgt, false,
+                                    sim::AbilitySystem::cost_at_order() ? nullptr : &ac_cost)) {
+                    refold_cooldown(world, ci, e.slot, e.abil_id);
                     if (has_resume) world.issue(ci, resume,  true,  false);
                     ++casts;
                     break;
@@ -173,6 +233,7 @@ public:
         for (std::uint32_t ci = 0; ci < units.size(); ++ci) {
             const sim::Unit& u = units[ci];
             if (!u.alive || u.player != player || u.catalog_id.empty()) continue;
+            if (pending_cast(world, ci)) continue;
             for (const Entry& e : entries_) {
                 if (e.unit_id != u.catalog_id) continue;
                 if (!abils_.ready(world, ci, e.slot)) continue;
@@ -206,7 +267,7 @@ public:
     }
 
     bool cast_now(sim::World& world, std::uint32_t caster_id, const std::string& abil_id,
-                  std::uint32_t target_id) {
+                  std::uint32_t target_id, bool queued = false) {
         const Entry* e = ensure_booked(world, caster_id, abil_id);
         if (!e) return false;
         if (caster_id >= world.units().size() || target_id >= world.units().size()) return false;
@@ -242,14 +303,23 @@ public:
         if (pooled && world.charge_pool_count(c.player, link, start, int32_t(ch.count_max), ticks(ch.time_start),
                                               ticks(ch.time_use)) < use)
             return false;
-        if (!abils_.try_cast(world, caster_id, e->slot, target_id)) return false;
+        if (!sim::AbilitySystem::cost_at_order()) {
+            sim::CastCost pay = order_cost(world, caster_id, e->slot, abil_id);
+            if (pooled) {
+                pay.charge = world.cast_charge_spec(link, start, int32_t(ch.count_max), ticks(ch.time_start), ticks(ch.time_use));
+                pay.charge_use = use;
+            }
+            return abils_.try_cast(world, caster_id, e->slot, target_id, queued, &pay);
+        }
+        if (!abils_.try_cast(world, caster_id, e->slot, target_id, queued)) return false;
+        refold_cooldown(world, caster_id, e->slot, abil_id);
         if (pooled)
             world.charge_pool_take(c.player, link, start, int32_t(ch.count_max), ticks(ch.time_start), ticks(ch.time_use), use);
         return true;
     }
 
     bool cast_now_point(sim::World& world, std::uint32_t caster_id, const std::string& abil_id, Fixed px,
-                        Fixed py) {
+                        Fixed py, bool queued = false) {
         const Entry* e = ensure_booked(world, caster_id, abil_id);
         if (!e) return false;
         if (caster_id >= world.units().size()) return false;
@@ -266,6 +336,8 @@ public:
             if (dx * dx + dy * dy > reach * reach) {
                 if (!walks_pt) return false;
                 walk_point = true;
+            } else if (queued && walks_pt) {
+                walk_point = true;
             }
         }
         static const bool no_pool = [] { const char* v = std::getenv("OMC_NO_CHARGE_POOL"); return v && v[0] == '1'; }();
@@ -278,10 +350,23 @@ public:
         if (pooled && world.charge_pool_count(c.player, link, start, int32_t(ch.count_max), ticks(ch.time_start),
                                               ticks(ch.time_use)) < use)
             return false;
-        if (!abils_.try_cast_point(world, caster_id, e->slot, px, py)) return false;
+        if (!sim::AbilitySystem::cost_at_order()) {
+            sim::CastCost pay = order_cost(world, caster_id, e->slot, abil_id);
+            if (pooled) {
+                pay.charge = world.cast_charge_spec(link, start, int32_t(ch.count_max), ticks(ch.time_start), ticks(ch.time_use));
+                pay.charge_use = use;
+            }
+            if (!abils_.try_cast_point(world, caster_id, e->slot, px, py, queued, &pay)) return false;
+            if (walk_point && !world.units()[caster_id].orders.empty() &&
+                world.units()[caster_id].orders.back().type == sim::OrderType::Cast)
+                world.unit(caster_id).orders.back().walk_in = true;
+            return true;
+        }
+        if (!abils_.try_cast_point(world, caster_id, e->slot, px, py, queued)) return false;
+        refold_cooldown(world, caster_id, e->slot, abil_id);
         if (walk_point && !world.units()[caster_id].orders.empty() &&
-            world.units()[caster_id].orders.front().type == sim::OrderType::Cast)
-            world.unit(caster_id).orders.front().walk_in = true;
+            world.units()[caster_id].orders.back().type == sim::OrderType::Cast)
+            world.unit(caster_id).orders.back().walk_in = true;
         if (pooled)
             world.charge_pool_take(c.player, link, start, int32_t(ch.count_max), ticks(ch.time_start), ticks(ch.time_use), use);
         return true;
@@ -368,6 +453,7 @@ private:
             auto b = make_ability(*cat_, btn.ability);
             if (!b) continue;
             Entry e = book_entry(world, unit_id, *b);
+            effect_abil_[abils_.effect_of(e.slot)] = btn.ability;
             e.support = ac.targets_allies;
             e.engage_range = Fixed::from_double(ac.range);
             e.range = e.engage_range;
@@ -445,6 +531,7 @@ private:
                 }
         }
         Entry e = book_entry(world, unit_id, *b);
+        effect_abil_[abils_.effect_of(e.slot)] = abil_id;
         e.requires_creep = b->spawn_requires_creep;
         e.requires_spawner = b->requires_spawner_target;
         const bool has_tree =
@@ -518,11 +605,14 @@ private:
     }
 
     const data::Catalog* cat_;
+    CooldownFold cd_fold_;
     sim::AbilitySystem abils_;
     std::unordered_map<std::string, Entry> ondemand_;
+    std::unordered_map<int32_t, std::string> effect_abil_;
     std::vector<Entry> entries_;
     std::unordered_map<std::string, std::vector<Entry>> autocast_cache_;
     std::unordered_map<std::string, bool> autocast_toggle_;
+    mutable std::unordered_map<std::string, bool> flag_cache_;
     static std::string toggle_key(std::uint32_t unit, const std::string& abil) {
         return std::to_string(unit) + "|" + abil;
     }

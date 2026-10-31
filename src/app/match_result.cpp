@@ -50,4 +50,13 @@ const char* MatchResult::banner(Outcome o) {
     return "";
 }
 
+std::string MatchResult::banner_text(Outcome o, const data::StringTable* strings) {
+    static const bool kOld = std::getenv("OMC_RESULT_TEXT_OLD") != nullptr;
+    const char* key = o == Outcome::Victory ? "UI/Text/Victory" : o == Outcome::Defeat ? "UI/Text/Defeat"
+                    : o == Outcome::Draw    ? "UI/Text/Tie" : nullptr;
+    if (!kOld && key && strings)
+        if (const std::string* v = strings->find(key); v && !v->empty()) return *v;
+    return banner(o);
+}
+
 }

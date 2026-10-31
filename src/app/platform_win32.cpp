@@ -1,4 +1,5 @@
 #include "omc/app/platform.hpp"
+#include "omc/core/client_identity.hpp"
 
 #ifndef NOMINMAX
 #define NOMINMAX
@@ -46,12 +47,12 @@ std::wstring widen(const std::string& s) {
 fs::path config_dir() {
     const char* appdata = std::getenv("APPDATA");
     fs::path base = appdata && *appdata ? fs::path(appdata) : fs::temp_directory_path();
-    const fs::path dir = base / "OvermindCore";
+    const fs::path dir = base / identity::kConfigFolder;
     static bool migrated = false;
     if (!migrated) {
         migrated = true;
         std::error_code ec;
-        const fs::path legacy = base / "CrafterSC";
+        const fs::path legacy = base / identity::kLegacyConfigFolder;
         if (!fs::exists(dir, ec) && fs::is_directory(legacy, ec)) fs::copy(legacy, dir, fs::copy_options::recursive, ec);
     }
     return dir;
@@ -92,7 +93,7 @@ bool set_config(const std::string& key, const std::string& value) {
     kv[key] = value;
     std::ofstream out(config_path(), std::ios::trunc);
     if (!out) return false;
-    out << "# OvermindCore config\n";
+    out << "# " << identity::kName << " config\n";
     for (const auto& [k, v] : kv) out << k << "=" << v << "\n";
     return bool(out);
 }
@@ -172,7 +173,7 @@ struct LoadingScreen::Impl {
             return 0;
         }
         if (msg == WM_ERASEBKGND) return 1;
-        return ::DefWindowProc(h, msg, wp, lp);
+        return ::DefWindowProcW(h, msg, wp, lp);
     }
 
     void paint(HDC dc) {
@@ -237,7 +238,7 @@ LoadingScreen::LoadingScreen(const std::string& title) : impl_(std::make_unique<
     WNDCLASSW wc = {};
     wc.lpfnWndProc = &Impl::proc;
     wc.hInstance = ::GetModuleHandle(nullptr);
-    wc.lpszClassName = L"OvermindCoreLoading";
+    wc.lpszClassName = identity::kLoadingWindowClass;
     wc.hCursor = ::LoadCursor(nullptr, IDC_ARROW);
     ::RegisterClassW(&wc);
 

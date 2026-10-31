@@ -1365,7 +1365,8 @@ static void material_anim(const formats::Model& m, int mi, int seq, float time_m
                 animated_layer_field(m, s, a.bright_mult_interp, a.bright_mult_flags, a.bright_mult_id, time_ms, 1, &a.bright_mult, out + 2, gl);
             else
                 out[2] = a.bright_mult;
-            if (!L.raw_record.empty() && L.word44 == 0) out[2] *= std::max(out[2] + a.midtone_offset, 0.0f);
+            static const bool kEmisSquareOld = std::getenv("OMC_EMIS_SQUARE_OLD") != nullptr;
+            if (kEmisSquareOld && !L.raw_record.empty() && L.word44 == 0) out[2] *= std::max(out[2] + a.midtone_offset, 0.0f);
             static const bool kTeamClampOld = std::getenv("OMC_EMIS_TEAM_CLAMP_AFTER_MULT") != nullptr;
             if (kTeamClampOld || mat.emis_op != 4 || kNoEmisSelect)
                 out[2] *= mat.emis_mult;
@@ -3154,6 +3155,15 @@ static float cutout_threshold(const formats::M3Material& mm) {
     return std::min(1.0f, std::max(1.0f / 255.0f, (t - add) / mul));
 }
 
+static bool material_cutout_without_team(const formats::M3Material& mm) {
+    static const bool kOld = std::getenv("OMC_CUTOUT_TEAM_OLD") != nullptr;
+    if (kOld || mm.cutout_thresh == 0 || mm.blend_mode != formats::kBlendOpaque) return false;
+    const formats::M3Layer* diff = nullptr;
+    for (const formats::M3Layer& ly : mm.layers)
+        if (ly.usage == "Diffuse") { diff = &ly; break; }
+    return diff && !diff->raw_record.empty() && diff->word44 == 0 && formats::material_alpha_mask(mm) != nullptr;
+}
+
 static int cutout_mask_channel(const formats::M3Material& mm) {
     static const bool kOld = std::getenv("OMC_CUTOUT_DIFFUSE_ALPHA") != nullptr;
     if (kOld || mm.blend_mode != formats::kBlendOpaque || mm.cutout_thresh == 0) return 0;
@@ -3897,7 +3907,7 @@ void SceneRenderer::record(VkCommandBuffer cmd, const std::vector<const SceneIns
         for (const auto& dr : mesh.draws) {
             const int m = dr.material;
             if (m >= 0 && std::size_t(m) < inst.model->materials.size() && !inst.model->vertex_alpha_coverage &&
-                formats::material_is_alpha_blended(inst.model->materials[m])) {
+                (formats::material_is_alpha_blended(inst.model->materials[m]) || material_cutout_without_team(inst.model->materials[m]))) {
                 any_masked = true;
                 break;
             }
@@ -3945,6 +3955,7 @@ void SceneRenderer::record(VkCommandBuffer cmd, const std::vector<const SceneIns
                     maskpc[0] = 2.0f;
                     maskpc[1] = float(cm);
                 }
+                if (maskpc[2] > 0.0f && material_cutout_without_team(sm)) maskpc[3] = -2.0f;
             }
             if (cutout || any_masked)
                 vkCmdPushConstants(cmd, layout_.get(),
@@ -4112,6 +4123,7 @@ void SceneRenderer::record(VkCommandBuffer cmd, const std::vector<const SceneIns
                                 if (!ly.raw_record.empty() && ly.word44 == 0) mpc[3] = -1.0f;
                                 break;
                             }
+                    if (mpc[3] == -1.0f && mpc[1] > 0.0f && material_cutout_without_team(mm)) mpc[3] = -2.0f;
                 }
             }
             const bool refractive = inst.fx.kind == FxKind::Cloak || inst.fx.kind == FxKind::Water || inst.fx.kind == FxKind::Creep;
@@ -4757,8 +4769,16 @@ void build_particles(SceneRenderer& sr, const std::vector<const SceneInstance*>&
                 ptex = sr.resolve_texture(m, pm, "Diffuse", -1);
                 if (ptex < 0) { ptex = sr.resolve_texture(m, pm, "Emissive", -1); used = "Emissive"; }
                 if (ptex < 0) { ptex = sr.resolve_texture(m, pm, "Emissive2", sr.default_white()); used = "Emissive2"; }
+                static const bool kBrightStaticOld = std::getenv("OMC_PAR_BRIGHT_STATIC_OLD") != nullptr;
+                auto layer_bright = [&](const formats::M3Layer& L) {
+                    float v = L.anim.bright_mult;
+                    if (!kBrightStaticOld && inst.seq >= 0 && L.anim.bright_mult_flags != 0)
+                        animated_layer_field(m, pseq, L.anim.bright_mult_interp, L.anim.bright_mult_flags, L.anim.bright_mult_id, ptime, 1,
+                                             &L.anim.bright_mult, &v, glayers(inst));
+                    return v;
+                };
                 for (const formats::M3Layer& L : m.materials[size_t(pm)].layers)
-                    if (L.usage == used) { pbright = L.anim.bright_mult; break; }
+                    if (L.usage == used) { pbright = layer_bright(L); break; }
                 static const bool kFlipAnySource = std::getenv("OMC_PARTICLE_FLIPBOOK_ANY_SOURCE") != nullptr;
                 if (!kFlipAnySource)
                     for (const formats::M3Layer& L : m.materials[size_t(pm)].layers)
@@ -4822,7 +4842,7 @@ void build_particles(SceneRenderer& sr, const std::vector<const SceneInstance*>&
                         if (L.usage == "Diffuse") dl = &L;
                         else if (L.usage == "Emissive") el = &L;
                     }
-                    if (dl && el && !el->image_path.empty() && dl->image_path == el->image_path) pbright += el->anim.bright_mult * (kEmisMult ? m.materials[size_t(pm)].emis_mult : 1.0f);
+                    if (dl && el && !el->image_path.empty() && dl->image_path == el->image_path) pbright += layer_bright(*el) * (kEmisMult ? m.materials[size_t(pm)].emis_mult : 1.0f);
                 } else if (kEmisMult && std::string(used) != "Diffuse") {
                     pbright *= m.materials[size_t(pm)].emis_mult;
                 }
@@ -5412,6 +5432,10 @@ void build_particles(SceneRenderer& sr, const std::vector<const SceneInstance*>&
                 if (g < 0.0f && g > -100.0f && life > 0.0f && life < 30.0f) hang_len = 0.5f * -g * life * life;
             }
             const bool hang = hang_len > 0.0f;
+            static const bool kPlanarOld = std::getenv("OMC_RIBBON_PLANAR_OLD") != nullptr;
+            std::uint32_t rtype = 0;
+            if (rb.version == 6 && rb.raw.size() >= 396) std::memcpy(&rtype, &rb.raw[392], 4);
+            const bool planar_hang = hang && !kPlanarOld && rtype == 1;
             if (!rb.has_fields || (rb.end_bone < 0 && !hang)) continue;
             if (!formats::fx_material_drawable(m, rb.material_ref_index)) continue;
             if (rb.bone >= bw.size() || (!hang && size_t(rb.end_bone) >= bw.size())) continue;
@@ -5427,11 +5451,12 @@ void build_particles(SceneRenderer& sr, const std::vector<const SceneInstance*>&
             float manim[4] = {0.0f, 0.0f, 1.0f, 1.0f};
             float ruvx[3] = {1.0f, 1.0f, 0.0f};
             float rbright = 1.0f;
+            bool rlit = false;
             if (const int rm = formats::ribbon_material(m, rb); rm >= 0) {
+                const char* used = "Diffuse";
                 if (formats::fx_material_old()) {
                     rtex = sr.resolve_texture(m, rm, "Diffuse", sr.default_white());
                 } else {
-                    const char* used = "Diffuse";
                     rtex = sr.resolve_texture(m, rm, "Diffuse", -1);
                     if (rtex < 0) { rtex = sr.resolve_texture(m, rm, "Emissive", -1); used = "Emissive"; }
                     if (rtex < 0) { rtex = sr.resolve_texture(m, rm, "Emissive2", sr.default_white()); used = "Emissive2"; }
@@ -5441,6 +5466,9 @@ void build_particles(SceneRenderer& sr, const std::vector<const SceneInstance*>&
                 }
                 rblend = m.materials[size_t(rm)].blend_mode;
                 if (rblend > formats::kBlendAlphaAdd) rblend = formats::kBlendAlphaBlend;
+                static const bool kRibUnlitOld = std::getenv("OMC_RIBBON_UNLIT_OLD") != nullptr;
+                rlit = !kRibUnlitOld && std::string(used) == "Diffuse" && (m.materials[size_t(rm)].flags & 0x10u) == 0 &&
+                       rblend != formats::kBlendAdd && rblend != formats::kBlendAlphaAdd && sr.tunables().rig.present;
                 material_anim(m, rm, inst.seq, inst.time_ms, manim, &inst.global_layers);
                 material_uv_xform(m, rm, inst.seq, inst.time_ms, ruvx, &inst.global_layers);
             }
@@ -5463,6 +5491,9 @@ void build_particles(SceneRenderer& sr, const std::vector<const SceneInstance*>&
             static const bool kV6WidthOld = std::getenv("OMC_RIBBON_V6_WIDTH_OLD") != nullptr;
             if (!kTubeHalf && rb.sides > 1 && (rb.version == 8 || (rb.version == 6 && !kV6WidthOld)))
                 for (float& w : w3) w *= 0.25f;
+            static const bool kV6QuarterOld = std::getenv("OMC_RIBBON_V6_QUARTER_OLD") != nullptr;
+            if (!kTubeHalf && !kV6QuarterOld && !kV6WidthOld && rb.sides > 1 && rb.version == 6 && !hang)
+                for (float& w : w3) w *= 0.5f;
             const Vec3 A{bw[rb.bone].m[12], bw[rb.bone].m[13], bw[rb.bone].m[14]};
             const Mat4& eb = hang ? bw[rb.bone] : bw[size_t(rb.end_bone)];
             Vec3 B{eb.m[12], eb.m[13], eb.m[14]};
@@ -5516,7 +5547,7 @@ void build_particles(SceneRenderer& sr, const std::vector<const SceneInstance*>&
                     along = Vec3{A.x * d00 + T0.x * d10 + B.x * d01 + T1.x * d11, A.y * d00 + T0.y * d10 + B.y * d01 + T1.y * d11,
                                  A.z * d00 + T0.z * d10 + B.z * d01 + T1.z * d11};
                 }
-                Vec3 side = cross(along, sub(cam.eye, P));
+                Vec3 side = planar_hang ? hang_side : cross(along, sub(cam.eye, P));
                 if (dot(side, side) < 1e-10f) side = right;
                 side = normalize(side);
                 float hw = key(w3[0], w3[1], w3[2], t);
@@ -5566,6 +5597,25 @@ void build_particles(SceneRenderer& sr, const std::vector<const SceneInstance*>&
                     tube_prev = ring;
                     continue;
                 }
+                float fshade[3] = {1.0f, 1.0f, 1.0f};
+                if (rlit) {
+                    Vec3 fn = cross(side, along);
+                    if (dot(fn, fn) > 1e-12f) {
+                        fn = normalize(fn);
+                        if (dot(fn, sub(cam.eye, P)) < 0.0f) fn = Vec3{-fn.x, -fn.y, -fn.z};
+                        const SceneRenderer::Tunables& lt = sr.tunables();
+                        const RigLight* ls[3] = {&lt.rig.key, &lt.rig.fill, &lt.rig.back};
+                        const float amul = lt.gamma_space ? lt.hdr_ambient_mult : 1.0f, dmul = lt.gamma_space ? lt.hdr_diffuse_mult : 1.0f;
+                        for (int c = 0; c < 3; ++c) fshade[c] = lt.rig.ambient[c] * amul;
+                        for (const RigLight* l : ls) {
+                            if (!l->present) continue;
+                            const float nl = std::clamp(-(fn.x * l->dir.x + fn.y * l->dir.y + fn.z * l->dir.z), 0.0f, 1.0f);
+                            for (int c = 0; c < 3; ++c) fshade[c] += l->color[c] * dmul * nl;
+                        }
+                        if (remis > 0 && k == 0)
+                            pemis_table[size_t(remis)] = {std::max(fshade[0], 1e-3f), std::max(fshade[1], 1e-3f), std::max(fshade[2], 1e-3f), 4.0f};
+                    }
+                }
                 SceneRenderer::ParticleVertex v[2];
                 for (int e = 0; e < 2; ++e) {
                     const float sgn = e == 0 ? -1.0f : 1.0f;
@@ -5576,7 +5626,7 @@ void build_particles(SceneRenderer& sr, const std::vector<const SceneInstance*>&
                     v[e].uv[0] = bu * ruv_c - bv * ruv_s + manim[0];
                     v[e].uv[1] = bu * ruv_s + bv * ruv_c + manim[1];
                     for (int ch = 0; ch < 3; ++ch)
-                        v[e].color[ch] = remis > 0 ? inst.team[size_t(ch)] : key(rb.color[0][ch], rb.color[1][ch], rb.color[2][ch], t) * manim[3] * rbright;
+                        v[e].color[ch] = remis > 0 ? inst.team[size_t(ch)] : key(rb.color[0][ch], rb.color[1][ch], rb.color[2][ch], t) * manim[3] * rbright * fshade[ch];
                     v[e].color[3] = key(rb.color[0][3], rb.color[1][3], rb.color[2][3], t);
                 }
                 if (k > 0) {

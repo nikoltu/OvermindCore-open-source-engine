@@ -34,6 +34,7 @@ enum class ScreenId {
     DataSetup,
     Starting,
     Widgets,
+    Lan,
     Count,
 };
 

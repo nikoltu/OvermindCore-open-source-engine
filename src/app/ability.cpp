@@ -1,6 +1,7 @@
 #include "omc/app/ability.hpp"
 
 #include <algorithm>
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <functional>
@@ -400,6 +401,13 @@ void apply_unit_upgrades(const data::Catalog& cat, const data::UpgradeCatalog& u
     if (!weapons.empty())
         u.acquire_range = Fixed::from_double(fold_field(up, researched, "Weapon", weapons[0], "MinScanRange",
                                                         u.acquire_range.to_double()));
+    if (u.cargo_space > 0 && !std::getenv("OMC_ABIL_UPGRADE_FOLD_OLD"))
+        for (const std::string& ab : cat.array_links("CUnit", unit_name, "AbilArray")) {
+            const data::Catalog::Entry* ae = ab.empty() ? nullptr : cat.find("CAbil", ab);
+            if (!ae || ae->tag != "CAbilTransport") continue;
+            u.cargo_space = int(std::lround(fold_field(up, researched, "Abil", ab, "TotalCargoSpace", double(u.cargo_space))));
+            break;
+        }
     static const bool rate_last_wins = std::getenv("OMC_RATE_LAST_WINS") != nullptr;
     double rate[2] = {0.0, 0.0};
     if (rate_last_wins) {
@@ -498,18 +506,20 @@ std::size_t apply_upgrade_to_live(sim::World& w, const data::Catalog& cat,
     return pushed;
 }
 
+bool fold_unit_lagging(const sim::World& w, const data::Catalog& cat, const data::UpgradeCatalog& up, sim::Unit& u) {
+    if (!u.alive || u.player < 0 || u.catalog_id.empty()) return false;
+    const std::vector<std::string>& list = w.researched(u.player);
+    if (u.upgrades_folded >= list.size()) return false;
+    const std::vector<std::string> rest(list.begin() + std::ptrdiff_t(u.upgrades_folded), list.end());
+    apply_unit_upgrades(cat, up, u.catalog_id, rest, u);
+    u.upgrades_folded = std::uint32_t(list.size());
+    return true;
+}
+
 std::size_t fold_lagging_upgrades(sim::World& w, const data::Catalog& cat, const data::UpgradeCatalog& up) {
     std::size_t folded = 0;
-    for (std::uint32_t id = 0; id < w.units().size(); ++id) {
-        sim::Unit& u = w.unit(id);
-        if (!u.alive || u.player < 0 || u.catalog_id.empty()) continue;
-        const std::vector<std::string>& list = w.researched(u.player);
-        if (u.upgrades_folded >= list.size()) continue;
-        const std::vector<std::string> rest(list.begin() + std::ptrdiff_t(u.upgrades_folded), list.end());
-        apply_unit_upgrades(cat, up, u.catalog_id, rest, u);
-        u.upgrades_folded = std::uint32_t(list.size());
-        ++folded;
-    }
+    for (std::uint32_t id = 0; id < w.units().size(); ++id)
+        if (fold_unit_lagging(w, cat, up, w.unit(id))) ++folded;
     return folded;
 }
 
@@ -1148,6 +1158,10 @@ static std::optional<AbilityBuild> make_ability_cascade(const data::Catalog& cat
     } else if (auto frac = cat.effect_energy_fraction(eff); frac && *frac > 0) {
         b.def.kind = sim::EffectKind::ModifyEnergy;
         b.def.energy_fraction = Fixed::from_double(*frac);
+        if (const auto ec = cat.effect_energy_vital_change(eff)) {
+            b.def.energy_change = Fixed::from_double(ec->energy);
+            b.def.energy_change_frac = Fixed::from_double(ec->energy_frac);
+        }
     } else if (auto heal = cat.effect_life_change(eff); heal && *heal > 0) {
         b.def.kind = sim::EffectKind::Heal;
         b.def.amount = Fixed::from_double(*heal);
@@ -2008,6 +2022,13 @@ int32_t build_effect_node(const data::Catalog& cat, const std::string& eff, Abil
         n.kind = sim::EffectKind::Damage;
         n.damage_kill = kill;
         n.death_code = sim::death_code_of(cat.scalar("CEffect", eff, "Death").value_or(""));
+        {
+            const std::string ks = cat.scalar("CEffect", eff, "Kind").value_or("");
+            n.damage_kind = ks == "Melee"    ? sim::kDamageKindMelee
+                            : ks == "Ranged" ? sim::kDamageKindRanged
+                            : ks == "Splash" ? sim::kDamageKindSplash
+                                             : sim::kDamageKindSpell;
+        }
         for (const core::XmlNode& r : cat.resolved("CEffect", eff)) {
             if (r.name == "AreaArray" && n.area_ring_count < 3) {
                 const std::string rad = r.attr_or("Radius", "");
@@ -2087,6 +2108,15 @@ int32_t build_effect_node(const data::Catalog& cat, const std::string& eff, Abil
                 bb->expire_effect = cat.scalar("CBehavior", *beh, "ExpireEffect").value_or("");
                 bb->final_effect = cat.scalar("CBehavior", *beh, "FinalEffect").value_or("");
             }
+            static const bool kStackOld = std::getenv("OMC_BEHAVIOR_STACK_OLD") != nullptr;
+            const auto* be = cat.find("CBehavior", *beh);
+            if (!kStackOld && be && be->tag.rfind("CBehaviorBuff", 0) == 0) {
+                if (auto ms = cat.scalar_num("CBehavior", *beh, "MaxStackCount")) bb->max_stack = int(*ms);
+                if (auto mc = cat.scalar_num("CBehavior", *beh, "MaxStackCountPerCaster")) bb->max_stack_caster = int(*mc);
+                for (const core::XmlNode& f : cat.resolved("CBehavior", *beh))
+                    if (f.name == "BuffFlags" && f.attr_or("index", "") == "RefreshStack")
+                        bb->refresh_stack = f.attr_or("value", "0") != "0";
+            }
         }
         if (!bb) return -1;
         sim::EffectNode n;
@@ -2121,6 +2151,8 @@ int32_t build_effect_node(const data::Catalog& cat, const std::string& eff, Abil
         n.beh_life_armor = sim::Fixed::from_double(bb->life_armor_bonus);
         n.beh_shield_armor = sim::Fixed::from_double(bb->shield_armor_bonus);
         n.beh_max_stack = bb->max_stack;
+        n.beh_max_stack_caster = bb->max_stack_caster;
+        n.beh_refresh_stack = bb->refresh_stack;
         n.beh_apply_count = std::max(1, int(cat.scalar_num("CEffect", eff, "Count").value_or(1)));
         n.beh_control_transfer = bb->control_transfer;
         n.beh_dmg_per_tick = sim::Fixed::from_double(bb->dmg_per_tick);
@@ -2272,6 +2304,9 @@ int32_t build_effect_node(const data::Catalog& cat, const std::string& eff, Abil
             sim::EffectNode n;
             n.kind = sim::EffectKind::ModifyEnergy;
             n.energy_fraction = sim::Fixed::from_double(*f);
+            const auto own = cat.effect_vital_change(eff);
+            n.vit_energy = sim::Fixed::from_double(own.energy);
+            n.vit_energy_frac = sim::Fixed::from_double(own.energy_frac);
             n.gates = parse_effect_vital_gates(cat, eff);
             b.tree.push_back(std::move(n));
             return int32_t(b.tree.size()) - 1;

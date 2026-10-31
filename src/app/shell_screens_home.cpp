@@ -3,6 +3,8 @@
 #include <cstdio>
 #include <filesystem>
 
+#include "omc/core/client_identity.hpp"
+
 namespace omc::app::shell {
 
 namespace v2 = theme::v2;
@@ -70,27 +72,24 @@ bool screen_home(Ui& ui, ShellCtx& ctx) {
         const char* trigger;
         char hotkey;
         const char* hint;
-        bool enabled;
+        const char* tag;
     };
     const Row rows[] = {
-        {L::kSkirmishSetup, "SkirmishSetupRow", "Skirmish setup", "PlayButton", 'S', "Pick the map, the races, the A.I. tier and the speed.", true},
-        {L::kReplaysAndSaves, "ReplaysRow", "Replays and saves", "ReplayButton", 'R', "Watch a recorded match or resume a saved one.", true},
-        {L::kProfile, "ProfileRow", "Profile", "ProfileButton", 'P', "Your name, race, portrait and record.", true},
-        {L::kSettings, "SettingsRow", "Settings", "menu/Options", 'O', "Gameplay, video, audio and controls.", true},
-        {L::kLanGame, "LanGameRow", "LAN game", "", 0, "", false},
-        {L::kCampaign, "CampaignRow", "Campaign", "", 0, "", false},
-        {L::kQuit, "Quit game", "Quit", "", 'Q', "Leave the client (asks first).", true},
+        {L::kSkirmishSetup, "SkirmishSetupRow", "Skirmish setup", "PlayButton", 'S', "Pick the map, the races, the A.I. tier and the speed.", ""},
+        {L::kCustomGame, "CustomGameRow", "Custom game", "CustomButton", 'C', "Any map, every start location: you, A.I., open or closed, and the match options.", ""},
+        {L::kReplaysAndSaves, "ReplaysRow", "Replays and saves", "ReplayButton", 'R', "Watch a recorded match or resume a saved one.", ""},
+        {L::kProfile, "ProfileRow", "Profile", "ProfileButton", 'P', "Your name, race, portrait and record.", ""},
+        {L::kSettings, "SettingsRow", "Settings", "menu/Options", 'O', "Gameplay, video, audio and controls.", ""},
+        {L::kLanGame, "LanGameRow", "LAN game", "LanButton", 0, "A preview of the LAN lobby. Network play arrives in version 0.4.", "SOON"},
+        {L::kCampaign, "CampaignRow", "Campaign", "CampaignSoonButton", 0, "The story campaigns come after version 1.0.", "SOON"},
+        {L::kQuit, "Quit game", "Quit", "", 'Q', "Leave the client (asks first).", ""},
     };
     for (const Row& row : rows) {
         Opts o;
         o.trigger = row.trigger;
         o.hotkey = row.hotkey;
         o.hint = row.hint;
-        o.enabled = row.enabled;
-        if (!row.enabled) {
-            o.tag = "SOON";
-            o.why_disabled = "Not in this build yet.";
-        }
+        o.tag = row.tag;
         if (!ui.button(row.id, ui.at(row.rect), row.label, ButtonKind::Menu, o)) continue;
         if (row.trigger[0]) ctx.router.follow(row.trigger);
         else ui.open_modal("quit");
@@ -171,7 +170,7 @@ bool screen_home(Ui& ui, ShellCtx& ctx) {
         ui.use_escape();
         ui.open_modal("quit");
     }
-    if (confirm(ui, "quit", "Quit OvermindCore?", "The client closes. Settings are already saved.", "Stay", "Quit") == Confirm::Yes) ctx.quit();
+    if (confirm(ui, "quit", std::string("Quit ") + identity::kName + "?", "The client closes. Settings are already saved.", "Stay", "Quit") == Confirm::Yes) ctx.quit();
     toasts(ui, ctx);
     return true;
 }

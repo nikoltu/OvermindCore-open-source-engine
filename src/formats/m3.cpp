@@ -967,6 +967,7 @@ namespace {
 uint32_t par_record_size(uint32_t version) {
     switch (version) {
         case 12: return 1316;
+        case 14: return std::getenv("OMC_PAR_V14_OLD") ? 0u : 1356u;
         case 17: return 1460;
         case 18: return 1464;
         case 19: return 1464;
@@ -1015,7 +1016,9 @@ ParFields par_fields(uint32_t v) {
     f.alpha_mid_at = add(4);
     f.rot_mid_at = add(4);
     f.hold = 0;
-    if (v >= 17) f.hold = add(16);
+    static const bool kV14Old = std::getenv("OMC_PAR_V14_OLD") != nullptr;
+    const uint32_t hold_from = kV14Old ? 17u : 14u;
+    if (v >= hold_from) f.hold = add(16);
     uint32_t sizes = add(36);
     f.rot_init = add(36) + 8;
     for (int k = 0; k < 3; ++k)
@@ -1037,8 +1040,8 @@ ParFields par_fields(uint32_t v) {
     f.cutout_size = add(36) + 8;
     f.area_radius = add(20) + 8;
     f.cutout_radius = add(20) + 8;
-    f.tail2 = o + (v >= 17 ? 12u : 0u);
-    f.flip = o + 176 + (v >= 17 ? 12u : 0u);
+    f.tail2 = o + (v >= hold_from ? 12u : 0u);
+    f.flip = o + 176 + (v >= hold_from ? 12u : 0u);
     f.flags = v == 12 ? f.flip + 480
               : (v == 17 || v == 18 || v == 19 || v == 21) ? f.flip + 484
               : (v == 22 || v == 23 || v == 24) ? f.flip + 504 : 0u;
@@ -1354,10 +1357,14 @@ std::vector<M3Particle> M3::decode_particles() const {
             if (base + rec <= data.size())
                 p.raw.assign(data.begin() + long(base), data.begin() + long(base + rec));
             static const bool kBurst = std::getenv("OMC_NO_PAR_BURST") == nullptr;
-            if (kBurst && s.version == 21 && rec >= 712 && base + 712 <= data.size()) {
-                p.burst_interp = rd16(&data[base + 700]);
-                p.burst_flags = rd16(&data[base + 702]);
-                p.burst_id = rd32(&data[base + 704]);
+            static const bool kBurstV12Old = std::getenv("OMC_PAR_BURST_V12_OLD") != nullptr;
+            static const bool kBurstVerOld = std::getenv("OMC_PAR_BURST_VER_OLD") != nullptr;
+            const uint32_t burst_at = kBurstVerOld ? (s.version == 21 ? 700u : (s.version == 12 && !kBurstV12Old) ? 684u : 0u)
+                                      : (s.version == 12 && kBurstV12Old) || f.flip < 24u ? 0u : f.flip - 24u;
+            if (kBurst && burst_at && rec >= burst_at + 12 && base + burst_at + 12 <= data.size()) {
+                p.burst_interp = rd16(&data[base + burst_at]);
+                p.burst_flags = rd16(&data[base + burst_at + 2]);
+                p.burst_id = rd32(&data[base + burst_at + 4]);
             }
             p.size_start = rf(base, f.size_start);
             p.size_end = rf(base, f.size_end);

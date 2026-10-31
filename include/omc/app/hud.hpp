@@ -27,6 +27,8 @@ struct HudMessageStyle {
     std::uint8_t r = 255, g = 255, b = 255;
     bool centred = false;
     int height_pt = 0;
+    bool shadow = true;
+    int shadow_offset = 1;
 };
 
 struct EquipmentEntry {
@@ -80,6 +82,7 @@ struct HudContent {
     int border_px = 1;
     HudMessageStyle error_style;
     HudMessageStyle warning_style;
+    HudMessageStyle transmission_style;
     float min_dot_pt = 3.0f;
 
     struct MinimapFlash {

@@ -19,6 +19,8 @@ public:
 
     const std::string* find(const std::string& key) const;
 
+    std::vector<std::string> keys_with_prefix(const std::string& prefix) const;
+
     std::size_t size() const { return map_.size(); }
     bool empty() const { return map_.empty(); }
 

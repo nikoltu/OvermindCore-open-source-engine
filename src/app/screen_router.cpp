@@ -17,8 +17,9 @@ const char* const kFlowIds[] = {
     "",
     "",
     "",
+    "",
 };
-const char* const kEngineNames[] = {"hotkeys", "profile", "portraits", "data_setup", "starting", "widgets"};
+const char* const kEngineNames[] = {"hotkeys", "profile", "portraits", "data_setup", "starting", "widgets", "lan"};
 static_assert(sizeof(kEngineNames) / sizeof(kEngineNames[0]) == std::size_t(ScreenId::Count) - std::size_t(ScreenId::Hotkeys),
               "every engine-only ScreenId needs a boot name");
 static_assert(sizeof(kFlowIds) / sizeof(kFlowIds[0]) == std::size_t(ScreenId::Count),
@@ -28,7 +29,7 @@ const char* const kNames[] = {
     "Boot", "Login", "Main Menu", "Home", "Campaign", "Difficulty", "Versus AI", "Custom Games",
     "Lobby", "Skirmish", "Options", "Load Game", "Save Replay", "Loading", "In Game",
     "Game Menu", "Game Result", "Score", "Replays", "Replay Controls", "Credits", "Hotkeys",
-    "Profile", "Portraits", "Game Data", "Starting", "Widgets",
+    "Profile", "Portraits", "Game Data", "Starting", "Widgets", "LAN Game",
 };
 static_assert(sizeof(kNames) / sizeof(kNames[0]) == std::size_t(ScreenId::Count),
               "every ScreenId needs a display name");
@@ -111,6 +112,12 @@ const FlowEdge kEdges[] = {
     {S::Starting,          "QuitButton",                                      S::Boot,           K::Replace, true,  true},
     {S::Options,           "GameDataButton",                                  S::DataSetup,      K::Push,    true,  false},
     {S::Widgets,           "BackButton",                                      S::GlueRoot,       K::Pop,     true,  true},
+    {S::Custom,            "CustomStartButton",                               S::Loading,        K::Replace, true,  false},
+    {S::GameResult,        "ChangeCustomButton",                              S::Custom,         K::Replace, true,  false},
+    {S::GlueRoot,          "CampaignSoonButton",                              S::Campaign,       K::Replace, true,  false},
+    {S::GlueRoot,          "LanButton",                                       S::Lan,            K::Replace, true,  false},
+    {S::Lan,               "BackButton",                                      S::GlueRoot,       K::Pop,     true,  true},
+    {S::ReplayBrowse,      "ResumeButton",                                    S::Loading,        K::Replace, true,  false},
 };
 
 const char* const kLayoutBoot[] = {nullptr};
@@ -189,7 +196,7 @@ const char* const* const kLayouts[] = {
     kLayoutOptions,   kLayoutLoadGame,  kLayoutSaveReplay, kLayoutLoading,     kLayoutInGame,
     kLayoutPause,     kLayoutGameResult, kLayoutScore,     kLayoutReplayBrowse, kLayoutReplayCtl,
     kLayoutCredits,   kLayoutHotkeys,   kLayoutProfile,
-    kLayoutNone,      kLayoutNone,      kLayoutNone,       kLayoutNone,
+    kLayoutNone,      kLayoutNone,      kLayoutNone,       kLayoutNone,       kLayoutNone,
 };
 static_assert(sizeof(kLayouts) / sizeof(kLayouts[0]) == std::size_t(ScreenId::Count),
               "every ScreenId needs a document row");

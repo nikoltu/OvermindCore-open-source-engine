@@ -25,6 +25,15 @@ class Storage;
 
 namespace omc::data {
 
+struct TintColorArgs {
+    std::array<float, 3> rgb = {1.0f, 1.0f, 1.0f};
+    float blend_s = 0.0f;
+    std::string mode;
+    std::string key;
+};
+
+bool parse_tint_color(const std::vector<std::string>& args, TintColorArgs& out);
+
 class Catalog {
 public:
     struct Entry {
@@ -65,6 +74,11 @@ public:
                        const std::string& mission_local_root = "");
 
     void load_missing_only(const casc::Storage& store, const std::vector<std::string>& roots);
+
+    static std::vector<std::string> dependency_data_roots(const casc::Storage& store,
+                                                          const std::vector<std::string>& dependencies);
+    std::size_t load_dependencies(const casc::Storage& store, const std::vector<std::string>& dependencies);
+    const std::vector<std::string>& dependency_roots_loaded() const { return dependency_roots_loaded_; }
 
     void load_strings_text(const std::string& text) { strings_.load_text(text); }
 
@@ -309,6 +323,49 @@ public:
             if (!e || e->tag != "CAbilRally") continue;
             for (const core::XmlNode& n : resolved("CAbil", ab))
                 if (n.name == "InfoArray" && n.attr_or("UseFilters", "").compare(0, 6, "Worker") == 0) return true;
+        }
+        return false;
+    }
+
+    bool mover_placement_bit(const std::string& mover_id, const char* slot, const char* bit) const {
+        bool on = false;
+        for (const core::XmlNode& n : resolved("CMover", mover_id)) {
+            if (n.name != "PlacementArray" || n.attr_or("index", "") != slot) continue;
+            for (const core::XmlNode& b : n.children)
+                if (b.name == "Bits" && b.attr_or("index", "") == bit) on = b.attr_or("value", "1") != "0";
+        }
+        return on;
+    }
+
+    bool unit_type_validator_rejects(const std::string& validator_id, const std::string& unit_id) const {
+        const Entry* e = find("CValidator", validator_id);
+        if (!e || e->tag != "CValidatorUnitType") return false;
+        const auto value = scalar("CValidator", validator_id, "Value");
+        const auto want = scalar("CValidator", validator_id, "Find");
+        const bool find_mode = !want || *want != "0";
+        const bool is_type = value && *value == unit_id;
+        return is_type != find_mode;
+    }
+
+    bool unit_rally_exempt(const std::string& unit_id) const {
+        auto fam = families_.find("CAbil");
+        if (fam == families_.end()) return false;
+        for (const auto& [abil_id, entry] : fam->second) {
+            if (entry.tag != "CAbilRally") continue;
+            int validated = 0, rejected = 0;
+            for (const core::XmlNode& n : resolved("CAbil", abil_id)) {
+                if (n.name != "InfoArray") continue;
+                bool has = false, rejects = false;
+                for (const core::XmlNode& c : n.children) {
+                    if (c.name != "UseValidators") continue;
+                    has = true;
+                    if (const std::string* v = c.attr("value"); v && unit_type_validator_rejects(*v, unit_id)) rejects = true;
+                }
+                if (!has) continue;
+                ++validated;
+                if (rejects) ++rejected;
+            }
+            if (validated > 0 && rejected == validated) return true;
         }
         return false;
     }
@@ -572,6 +629,7 @@ public:
         }
         return v;
     }
+    std::optional<VitalChange> effect_energy_vital_change(const std::string& effect_id) const;
 
     struct BehaviorBuff {
         double duration = 0;
@@ -604,6 +662,8 @@ public:
         std::vector<std::string> disabled_abils;
         double life_armor_bonus = 0.0, shield_armor_bonus = 0.0;
         int max_stack = 1;
+        int max_stack_caster = 0;
+        bool refresh_stack = false;
         std::string initial_effect, periodic_effect, expire_effect, final_effect;
         double food = 0.0, life_max_bonus = 0.0;
     };
@@ -750,6 +810,17 @@ public:
         int count_max = 0;
         double leash = 0;
         double build_time = 0;
+        std::string ability;
+        std::string command;
+        std::string queue_ability;
+        int queue_size = 0;
+        int queue_count = 0;
+        int minerals = 0;
+        int gas = 0;
+        bool auto_build = false;
+        bool auto_build_on = false;
+        bool show_status = false;
+        std::string activity;
     };
     std::optional<InterceptorMagSpec> interceptor_magazine_of(const std::string& unit_id) const;
 
@@ -1350,7 +1421,8 @@ public:
 
     std::vector<std::pair<int, int>> pathing_footprint_offsets(const std::string& footprint_id,
                                                               const char* layer_name = "Place",
-                                                              bool include_aux = false) const {
+                                                              bool include_aux = false,
+                                                              const std::string* only_chars = nullptr) const {
         const std::string* fp = &footprint_id;
         std::vector<std::pair<int, int>> result;
         auto has = [&](int x, int y) {
@@ -1396,7 +1468,9 @@ public:
                 for (std::size_t col = 0; col < bits.size(); ++col) {
                     const char ch = bits[col];
                     if (ch == '.' || ch == ' ' || ch == '\t' || ch == '\r' || ch == '\n') continue;
-                    if (!include_aux && aux.find(ch) != std::string::npos) continue;
+                    if (only_chars ? only_chars->find(ch) == std::string::npos
+                                   : (!include_aux && aux.find(ch) != std::string::npos))
+                        continue;
                     const int x = minx + int(col), y = footprint_row_y(miny, maxy, r);
                     if (!has(x, y)) result.emplace_back(x, y);
                 }
@@ -3024,6 +3098,7 @@ public:
         bool consumed = false;
         bool maintained = true;
         bool found = false;
+        bool range_includes_building = true;
     };
     PeonBuildMode worker_build_mode(const std::string& unit_id) const {
         PeonBuildMode m;
@@ -3043,6 +3118,7 @@ public:
                 const bool on = !(val.empty() || val == "0" || val == "false");
                 if (idx == "PeonKillFinish") m.consumed = on;
                 else if (idx == "PeonMaintained") m.maintained = on;
+                else if (idx == "RangeIncludesBuilding") m.range_includes_building = on;
             }
             break;
         }
@@ -3120,6 +3196,55 @@ public:
         auto fp = scalar("CUnit", unit_id, "PlacementFootprint");
         if (!fp || fp->empty()) return {};
         return pathing_footprint_offsets(*fp, "Check");
+    }
+
+    std::string footprint_set_chars(const std::string& footprint_id, const char* layer_name, const char* sign,
+                                    const char* flag) const {
+        std::vector<std::pair<std::string, bool>> sets;
+        auto apply = [&](const core::XmlNode& layer) {
+            if (layer.name != "Layers" || layer.attr_or("index", "") != layer_name) return;
+            for (const core::XmlNode& s : layer.children) {
+                if (s.name != "Sets") continue;
+                const std::string* si = s.attr("index");
+                const std::size_t k = si ? std::size_t(std::max(0, std::atoi(si->c_str()))) : sets.size();
+                if (k >= sets.size()) sets.resize(k + 1);
+                if (const std::string* c = s.attr("Character")) sets[k].first = *c;
+                for (const core::XmlNode& n : s.children)
+                    if (n.name == sign && n.attr_or("index", "") == flag) sets[k].second = n.attr_or("value", "1") != "0";
+            }
+        };
+        if (const std::vector<core::XmlNode>* d = tag_default_indexed_nodes("CFootprint"))
+            for (const core::XmlNode& layer : *d) apply(layer);
+        for (const core::XmlNode& layer : resolved("CFootprint", footprint_id)) apply(layer);
+        std::string chars;
+        for (const auto& [c, on] : sets)
+            if (on && !c.empty() && chars.find(c[0]) == std::string::npos) chars.push_back(c[0]);
+        return chars;
+    }
+
+    std::vector<std::pair<int, int>> creep_forbidden_offsets(const std::string& unit_id) const {
+        auto fp = scalar("CUnit", unit_id, "PlacementFootprint");
+        if (!fp || fp->empty() || !find("CFootprint", *fp)) return {};
+        const std::string chars = footprint_set_chars(*fp, "Check", "Negative", "Creep");
+        if (chars.empty()) return {};
+        return pathing_footprint_offsets(*fp, "Check", true, &chars);
+    }
+
+    std::vector<std::pair<int, int>> placement_nospawn_offsets(const std::string& unit_id) const {
+        auto fp = scalar("CUnit", unit_id, "PlacementFootprint");
+        if (!fp || fp->empty() || !find("CFootprint", *fp)) return {};
+        const std::string chars = footprint_set_chars(*fp, "Place", "Positive", "GroundNoSpawn");
+        if (chars.empty()) return {};
+        return pathing_footprint_offsets(*fp, "Place", true, &chars);
+    }
+
+    std::vector<std::pair<int, int>> placement_nobuild_offsets(const std::string& unit_id) const {
+        if (auto own = scalar("CUnit", unit_id, "Footprint"); own && !own->empty()) return {};
+        auto fp = scalar("CUnit", unit_id, "PlacementFootprint");
+        if (!fp || fp->empty() || !find("CFootprint", *fp)) return {};
+        const std::string chars = footprint_set_chars(*fp, "Place", "Positive", "NoBuild");
+        if (chars.empty()) return {};
+        return pathing_footprint_offsets(*fp, "Place", true, &chars);
     }
 
     struct UnitPower {
@@ -3798,6 +3923,7 @@ private:
     std::vector<std::string> load_skips_;
     bool add_only_ = false;
     std::set<std::string> add_only_new_;
+    std::vector<std::string> dependency_roots_loaded_;
     static std::vector<std::string> unlisted_families_;
     using IdMap = std::unordered_map<std::string, Entry>;
     std::unordered_map<std::string, IdMap> families_;

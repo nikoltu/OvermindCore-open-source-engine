@@ -13,6 +13,7 @@
 #include <utility>
 #include <vector>
 
+#include "omc/formats/document_header.hpp"
 #include "omc/formats/hard_tile.hpp"
 #include "omc/formats/map_info.hpp"
 #include "omc/formats/mpq.hpp"
@@ -82,6 +83,7 @@ struct LoadedMap {
     std::uint32_t minimap_w = 0, minimap_h = 0;
     std::vector<std::uint8_t> body_nav_block;
     std::vector<std::uint8_t> body_place_block;
+    std::vector<std::uint8_t> place_only_block;
     PlacedObjects objects;
     ScriptedCamera scripted_camera;
     MapInfoHeader info;
@@ -137,6 +139,7 @@ struct LoadedMap {
     WaterMap water;
     std::vector<HardTile> hard_tiles;
     std::vector<std::pair<std::string, std::vector<std::uint8_t>>> game_data;
+    std::vector<std::string> dependencies;
     const std::vector<std::uint8_t>* game_data_file(const std::string& leaf) const {
         for (const auto& kv : game_data)
             if (kv.first == leaf) return &kv.second;
@@ -511,6 +514,13 @@ inline LoadedMap load_map_terrain(std::vector<std::uint8_t> map_bytes) {
         } catch (const std::exception&) {
         }
     }
+    if (arc.contains("DocumentHeader")) {
+        try {
+            out.dependencies = parse_document_dependencies(arc.read_file("DocumentHeader"));
+        } catch (const std::exception&) {
+            out.dependencies.clear();
+        }
+    }
     if (arc.contains("t3HardTile")) {
         try {
             out.hard_tiles = parse_hard_tiles(arc.read_file("t3HardTile"));
@@ -612,8 +622,30 @@ inline sim::TerrainMap build_terrain_map(const LoadedMap& map) {
                 if (!body_nav || body_place) t.clear_flag(x, y, sim::kBuildable);
             } else if (ramp) {
                 t.clear_flag(x, y, sim::kBuildable);
+            } else if (const std::size_t i = std::size_t(y) * std::size_t(nav.width()) + std::size_t(x);
+                       i < map.place_only_block.size() && map.place_only_block[i]) {
+                t.clear_flag(x, y, sim::kBuildable);
             }
         }
+    const SyncHeightMap& sh = map.sync_height;
+    if (std::getenv("OMC_PLACEMENT_RAMP_SLOPE_OLD") == nullptr && !sh.empty() &&
+        sh.height_i16.size() == std::size_t(sh.width) * std::size_t(sh.height)) {
+        constexpr int kRampSlopeSpan = 48;
+        const int vw = int(sh.width), vh = int(sh.height);
+        auto vh16 = [&](int vx, int vy) { return int(sh.height_i16[std::size_t(vy) * std::size_t(vw) + std::size_t(vx)]); };
+        for (int y = 0; y < nav.height() && y + 1 < vh; ++y)
+            for (int x = 0; x < nav.width() && x + 1 < vw; ++x) {
+                if (!t.is_buildable(x, y) || nav.is_ramp_cell(x, y)) continue;
+                bool by_ramp = false;
+                for (int dy = -1; dy <= 1 && !by_ramp; ++dy)
+                    for (int dx = -1; dx <= 1 && !by_ramp; ++dx)
+                        by_ramp = nav.in_bounds(x + dx, y + dy) && nav.is_ramp_cell(x + dx, y + dy);
+                if (!by_ramp) continue;
+                const int hs[4] = {vh16(x, y), vh16(x + 1, y), vh16(x, y + 1), vh16(x + 1, y + 1)};
+                if (*std::max_element(hs, hs + 4) - *std::min_element(hs, hs + 4) > kRampSlopeSpan)
+                    t.clear_flag(x, y, sim::kBuildable);
+            }
+    }
     return t;
 }
 

@@ -7,6 +7,10 @@
 #include <string>
 #include <vector>
 
+namespace omc::casc {
+class Storage;
+}
+
 namespace omc::data {
 class StringTable;
 }
@@ -23,11 +27,12 @@ struct MissionNode {
     int32_t gate_count = 0;
     int32_t arc_gate = 0;
     bool always = false;
+    std::vector<std::string> unmodelled;
 };
 
 struct CampaignFlow {
     std::string name;
-    std::string title_key;
+    std::string title_stem;
     std::vector<MissionNode> nodes;
     std::map<MissionId, std::size_t> index;
 
@@ -49,11 +54,9 @@ struct CampaignFlow {
     std::size_t edge_count() const { return nodes.size(); }
 };
 
-std::vector<CampaignFlow> parse_flow(const std::string& text);
+CampaignFlow derive_flow(const std::string& name, const std::vector<std::string>& scripts);
 
-const std::string& campaign_flow_data();
-
-std::vector<CampaignFlow> load_campaign_flow();
+std::vector<CampaignFlow> load_campaign_flow(const casc::Storage& store);
 
 std::string campaign_title(const std::vector<CampaignFlow>& flows, std::size_t i, const data::StringTable& text);
 

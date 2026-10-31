@@ -141,10 +141,10 @@ bool screen_result(Ui& ui, ShellCtx& ctx) {
         if (ui.button("PlayAgainButton", ui.at(L::kPlayAgain), "Play again", ButtonKind::Primary, o) && !ctx.start_selected_match("PlayAgainButton"))
             ctx.fx.toast("The match could not be started.", true);
         Opts c;
-        c.trigger = "ChangeSetupButton";
+        c.trigger = ctx.custom_match() ? "ChangeCustomButton" : "ChangeSetupButton";
         c.hotkey = 'S';
-        c.hint = "Back to the skirmish setup.";
-        if (ui.button("ChangeSetupButton", ui.at(L::kChangeSetup), "Change setup", ButtonKind::Normal, c)) ctx.router.follow("ChangeSetupButton");
+        c.hint = ctx.custom_match() ? "Back to the custom game setup." : "Back to the skirmish setup.";
+        if (ui.button("ChangeSetupButton", ui.at(L::kChangeSetup), "Change setup", ButtonKind::Normal, c)) ctx.router.follow(c.trigger);
         std::error_code ec;
         if (!v.replay.empty() && std::filesystem::exists(v.replay, ec)) {
             Opts w;

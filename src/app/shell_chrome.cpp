@@ -3,6 +3,7 @@
 #include <algorithm>
 
 #include "omc/app/shell_emblem.hpp"
+#include "omc/core/client_identity.hpp"
 
 namespace omc::app::shell {
 
@@ -23,6 +24,9 @@ ScreenFn screen_fn(ScreenId id) {
         case ScreenId::ReplayBrowse: return &screen_replays;
         case ScreenId::Credits: return &screen_about;
         case ScreenId::Widgets: return &screen_widgets;
+        case ScreenId::Custom: return &screen_custom;
+        case ScreenId::Campaign: return &screen_campaign;
+        case ScreenId::Lan: return &screen_lan;
         default: return nullptr;
     }
 }
@@ -45,7 +49,7 @@ bool chrome(Ui& ui, ShellCtx& ctx, const std::string& title, unsigned flags, con
             const Rect em = ui.at(L::kEmblem);
             const IconAtlas::Icon& icon = shell_emblem(true);
             ui.picture(em, &icon);
-            ui.text(ui.at(L::kProductWordmark), "OVERMINDCORE", v2::kH2, v2::kTextHi);
+            ui.text(ui.at(L::kProductWordmark), identity::kWordmark, v2::kH2, v2::kTextHi);
         } else {
             if (flags & kChromeBack) {
                 const FlowEdge* e = ctx.router.cancel_edge();
@@ -88,7 +92,7 @@ bool chrome(Ui& ui, ShellCtx& ctx, const std::string& title, unsigned flags, con
     ui.publish_region("chrome/hint", hint);
     const Rect block = ui.at(L::kHintBar);
     const int margin = ui.px(v2::kMargin);
-    const std::string ver = std::string("overmindcore ") + ctx.version();
+    const std::string ver = std::string(identity::kSlug) + " " + ctx.version();
     const int vw = ui.text_width(ver, v2::kSmall);
     const Rect vr{block.x1 - margin - vw, hint.y0, block.x1 - margin, hint.y1};
     ui.text(vr, ver, v2::kSmall, v2::kTextMuted, Align::Right);

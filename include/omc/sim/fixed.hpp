@@ -17,9 +17,12 @@ public:
         f.raw_ = raw;
         return f;
     }
-    static constexpr Fixed from_int(int32_t v) { return from_raw(v << kShift); }
+    static constexpr Fixed from_int(int32_t v) { return from_raw(int32_t(uint32_t(v) << kShift)); }
     static constexpr Fixed from_ratio(int32_t num, int32_t den) {
-        return from_raw(int32_t((int64_t(num) << kShift) / den));
+        return from_raw(int32_t((int64_t(num) * kOne) / den));
+    }
+    static constexpr Fixed from_ratio_round(int32_t num, int32_t den) {
+        return from_raw(int32_t((int64_t(num) * kOne + den / 2) / den));
     }
     static Fixed from_double(double v) {
         return from_raw(int32_t(v * kOne + (v >= 0 ? 0.5 : -0.5)));
@@ -44,7 +47,8 @@ public:
         return from_raw(int32_t((int64_t(raw_) * o.raw_) >> kShift));
     }
     constexpr Fixed operator/(Fixed o) const {
-        return from_raw(int32_t((int64_t(raw_) << kShift) / o.raw_));
+        if (o.raw_ == 0) return from_raw(raw_ == 0 ? 0 : raw_ > 0 ? 2147483647 : -2147483647 - 1);
+        return from_raw(int32_t((int64_t(raw_) * kOne) / o.raw_));
     }
 
     constexpr bool operator==(Fixed o) const { return raw_ == o.raw_; }
@@ -55,22 +59,45 @@ public:
     constexpr bool operator>=(Fixed o) const { return raw_ >= o.raw_; }
 
     static Fixed parse(const std::string& s) {
+        constexpr int64_t kMantMax = 100000000000000;
+        constexpr int64_t kRawMax = 2147483647;
         size_t i = 0;
         bool neg = false;
         if (i < s.size() && (s[i] == '+' || s[i] == '-')) neg = (s[i++] == '-');
-        int64_t int_part = 0;
-        for (; i < s.size() && s[i] >= '0' && s[i] <= '9'; ++i)
-            int_part = int_part * 10 + (s[i] - '0');
-        int64_t raw = int_part << kShift;
+        int64_t mant = 0;
+        int scale10 = 0;
+        for (; i < s.size() && s[i] >= '0' && s[i] <= '9'; ++i) {
+            if (mant < kMantMax) mant = mant * 10 + (s[i] - '0');
+            else ++scale10;
+        }
         if (i < s.size() && s[i] == '.') {
             ++i;
-            int64_t frac = 0, scale = 1;
-            for (; i < s.size() && s[i] >= '0' && s[i] <= '9'; ++i) {
-                frac = frac * 10 + (s[i] - '0');
-                scale *= 10;
-            }
-            raw += (frac * kOne + scale / 2) / scale;
+            for (; i < s.size() && s[i] >= '0' && s[i] <= '9'; ++i)
+                if (mant < kMantMax) {
+                    mant = mant * 10 + (s[i] - '0');
+                    --scale10;
+                }
         }
+        if (i < s.size() && (s[i] == 'e' || s[i] == 'E')) {
+            ++i;
+            bool eneg = false;
+            if (i < s.size() && (s[i] == '+' || s[i] == '-')) eneg = (s[i++] == '-');
+            int e = 0;
+            for (; i < s.size() && s[i] >= '0' && s[i] <= '9'; ++i)
+                if (e < 1000) e = e * 10 + (s[i] - '0');
+            scale10 += eneg ? -e : e;
+        }
+        int64_t raw = mant * kOne;
+        if (scale10 >= 0) {
+            for (int k = 0; k < scale10 && raw <= kRawMax; ++k) raw *= 10;
+        } else if (scale10 < -18) {
+            raw = 0;
+        } else {
+            int64_t den = 1;
+            for (int k = 0; k < -scale10; ++k) den *= 10;
+            raw = raw / den + ((raw % den) * 2 >= den ? 1 : 0);
+        }
+        if (raw > kRawMax) raw = kRawMax;
         return from_raw(int32_t(neg ? -raw : raw));
     }
 

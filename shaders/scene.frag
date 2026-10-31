@@ -375,7 +375,7 @@ void main() {
         const int cc = int(floor(pc.mat.z));
         cutA = cc == 1 ? cm.a : cc == 2 ? cm.r : cc == 3 ? cm.g : cm.b;
     }
-    if (!constAlpha && !maskCover && pc.team.a <= -1.5 && pc.mat.y > -0.5 && cutA < ((pc.mat.y > 0.0 && pc.mat.y <= 0.5) ? pc.mat.y * 2.0 : 0.5)) discard;
+    if (!constAlpha && !maskCover && (pc.team.a <= -1.5 || (pc.mat.w < -1.5 && pc.mat.y > 0.0 && pc.mat.y <= 0.5)) && pc.mat.y > -0.5 && cutA < ((pc.mat.y > 0.0 && pc.mat.y <= 0.5) ? pc.mat.y * 2.0 : 0.5)) discard;
     const bool blended = pc.mat.y > 1.5 || (pc.mat.y > 0.5 && pc.mat.z > 0.5);
     const float teamMix = g.fogExtent.w > 0.0 ? clamp(pow(max(t.a, 0.0), g.fogExtent.w), 0.0, 1.0) : t.a;
     const bool blendedTeam = blended && abs(pc.team.a - 1.25) < 0.1;

@@ -88,6 +88,8 @@ namespace omc::app {
 sim::World::AddonBodyFactory addon_body_factory(const data::Catalog& cat);
 
 int card_slot_for_key(const CommandCard& card, char key);
+int card_slot_for_keys(const CommandCard& card, const std::vector<std::string>& keys);
+bool hotkey_names_match(const std::string& spec, const std::vector<std::string>& keys);
 
 struct MinimapExtent;
 struct ConsolePanel;
@@ -231,6 +233,7 @@ public:
     void set_doodads(const std::vector<formats::PlacedDoodad>* d) { doodads_ = d; }
     void set_fluff(const std::vector<formats::PlacedDoodad>* d) { fluff_ = d; }
     void set_camera_bounds_x(float left, float right) { cam_left_ = left; cam_right_ = right; }
+    void set_camera_bounds_y(float bottom) { cam_bottom_ = bottom; }
     void set_cliffs(const std::vector<render::SceneInstance>* c) { cliffs_ = c; }
 
     void set_tier_heights(std::vector<float> th) { tier_heights_ = std::move(th); }
@@ -311,6 +314,10 @@ public:
     void set_morph_start_delay(bool on) { morph_start_delay_ = on; }
     void set_morph_behaviors_sim(bool on) { morph_behaviors_sim_ = on; }
     void set_upgrade_fold_new(bool on) { upgrade_fold_new_ = on; }
+    void set_upgrade_on_create(bool on) { upgrade_on_create_ = on; }
+    void set_abil_upgrade_fold(bool on) { abil_upgrade_fold_ = on; }
+    void set_defender_range(bool on) { defender_range_ = on; }
+    double player_abil_field(std::int32_t player, const std::string& abil, const std::string& field, double base) const;
     sim::Unit research_body(const std::string& unit_id, std::int32_t player) const;
     void set_timed_burrow(bool on) { timed_burrow_ = on; }
     void set_morph_cocoon_models(bool on) { morph_cocoon_models_ = on; }
@@ -465,6 +472,10 @@ public:
         for (auto& a : ais_)
             if (a) a->set_worker_transfer(on);
     }
+    void set_ai_seal_guard(bool on) {
+        for (auto& a : ais_)
+            if (a) a->set_seal_guard(on);
+    }
     int workers_transferred() const {
         int n = 0;
         for (const auto& a : ais_)
@@ -485,6 +496,7 @@ public:
 
     bool toggle_autocast(std::uint32_t unit, const std::string& abil_id);
     bool autocast_state(std::uint32_t unit, const std::string& abil_id);
+    float card_cooldown_shown(const std::string& abil_id) const;
 
     bool human_cast(const std::string& abil_id, std::uint32_t target_id);
     int human_cast_instant(const std::string& abil_id);
@@ -492,7 +504,13 @@ public:
     void set_group_self_cast(bool on) { group_self_cast_ = on; }
     void set_group_cast_cell(bool on) { group_cast_cell_ = on; }
     void set_best_unit_pick(bool on) { best_unit_pick_ = on; }
+    void set_best_unit_target_pick(bool on) { best_unit_target_pick_ = on; }
+    void set_every_unit_target_cast(bool on) { every_unit_target_cast_ = on; }
     std::vector<std::pair<std::uint32_t, std::string>> group_cell_casters(const std::string& abil_id) const;
+    bool ability_best_unit(const std::string& abil_id) const;
+    std::vector<std::uint32_t> best_unit_target_casters(const std::string& abil_id, sim::Fixed tx, sim::Fixed ty) const;
+    std::vector<std::uint32_t> every_unit_target_casters(const std::string& abil_id) const;
+    bool human_cast_target(const std::string& abil_id, std::uint32_t target_id);
     bool human_cast_point(const std::string& abil_id, sim::Fixed px, sim::Fixed py);
     std::size_t effect_doodad_count() const { return effect_doodads_.size(); }
     const EffectActorHost& effect_actors() const { return fx_host_; }
@@ -606,6 +624,9 @@ public:
     bool human_toggle_creep(const std::string& abil_id, const std::string& command);
 
     bool human_salvage(const std::string& abil_id);
+    bool human_arm_hangar(const std::string& abil_id);
+    bool toggle_hangar_auto_build(const std::string& abil_id);
+    bool hangar_auto_build_shown(const std::string& abil_id) const;
     bool human_research(const std::string& abil_id, const std::string& index, std::uint32_t producer);
     bool human_siege_defender(std::uint32_t caster, sim::Fixed cx, sim::Fixed cy);
 
@@ -616,16 +637,32 @@ public:
     bool has_pending_ability_cast() const { return !pending_cast_abil_.empty(); }
     const std::string& pending_ability_cast() const { return pending_cast_abil_; }
     void cancel_ability_cast() { pending_cast_abil_.clear(); pending_cast_cmd_.clear(); }
-    bool cast_pending_at_target(std::uint32_t target_id) {
+    const CastPolicy* cast_policy() const { return cast_policy_.get(); }
+    static bool cast_queue_old() {
+        static const bool v = std::getenv("OMC_CAST_QUEUE_OLD") != nullptr;
+        return v;
+    }
+    bool cast_queue_now(const std::string& abil_id) const {
+        return cast_queued_ && cast_policy_ && !cast_policy_->ability_flag(abil_id, "Transient");
+    }
+    bool cast_pending_at_target(std::uint32_t target_id, bool queued = false) {
         if (pending_cast_abil_.empty()) return false;
-        const bool ok = human_cast(pending_cast_abil_, target_id);
-        if (ok) cancel_ability_cast();
+        const bool queue = queued && !cast_queue_old();
+        cast_queued_ = queue;
+        const bool ok = human_cast_target(pending_cast_abil_, target_id);
+        cast_queued_ = false;
+        if (ok && queue) cast_shift_kept_ = true;
+        else if (ok) cancel_ability_cast();
         return ok;
     }
-    bool cast_pending_at_point(sim::Fixed px, sim::Fixed py) {
+    bool cast_pending_at_point(sim::Fixed px, sim::Fixed py, bool queued = false) {
         if (pending_cast_abil_.empty()) return false;
+        const bool queue = queued && !cast_queue_old();
+        cast_queued_ = queue;
         const bool ok = human_cast_point(pending_cast_abil_, px, py);
-        if (ok) cancel_ability_cast();
+        cast_queued_ = false;
+        if (ok && queue) cast_shift_kept_ = true;
+        else if (ok) cancel_ability_cast();
         return ok;
     }
     bool is_nova_cast(std::uint32_t caster, const std::string& abil) const {
@@ -743,6 +780,17 @@ public:
         HudGroupButton::Rect pane, life_bar;
     };
     const HudUnitPane& hud_unit_pane() const { return hud_unit_pane_; }
+    struct HudHarvestLabel {
+        int resource = 0;
+        int current = 0;
+        int ideal = 0;
+        std::string prefix;
+        std::string value;
+        std::uint8_t value_rgb[3] = {0, 0, 0};
+        HudGroupButton::Rect rect;
+        bool drawn = false;
+    };
+    const std::vector<HudHarvestLabel>& hud_harvest_labels() const { return hud_harvest_labels_; }
     struct HudPortrait {
         std::string unit;
         std::string path;
@@ -1063,6 +1111,7 @@ private:
     HudUiState hud_ui_;
     std::vector<HudAlertItem> hud_alert_items_;
     HudUnitPane hud_unit_pane_;
+    std::vector<HudHarvestLabel> hud_harvest_labels_;
     std::vector<EquipmentEntry> hud_equipment_;
     HudPortrait hud_portrait_;
     int group_page_ = 0;
@@ -1261,7 +1310,7 @@ private:
 
     float map_w_ = 0, map_h_ = 0;
     float playable_x0_ = -1.0f, playable_y0_ = -1.0f, playable_x1_ = -1.0f, playable_y1_ = -1.0f;
-    float cam_left_ = 0.0f, cam_right_ = 0.0f;
+    float cam_left_ = 0.0f, cam_right_ = 0.0f, cam_bottom_ = 0.0f;
     float fps_smooth_ = 0.0f;
     sim::VisionGrid vision_;
     render::FogOverlay fog_;
@@ -1479,6 +1528,17 @@ private:
     bool morph_start_delay_ = std::getenv("OMC_MORPH_START_DELAY") != nullptr && std::string(std::getenv("OMC_MORPH_START_DELAY")) == "1";
     bool morph_behaviors_sim_ = std::getenv("OMC_MORPH_BEHAVIOR_SIM_OLD") == nullptr;
     bool upgrade_fold_new_ = false;
+    bool upgrade_on_create_ = false;
+    bool abil_upgrade_fold_ = false;
+    bool defender_range_ = false;
+    struct DefenderApproach {
+        sim::Fixed x, y, range;
+        sim::Fixed ox, oy;
+    };
+    std::map<std::uint32_t, DefenderApproach> defender_approach_;
+    void step_defender_approach();
+    void wire_cast_folds();
+    bool siege_defender_now(std::uint32_t caster, sim::Fixed cx, sim::Fixed cy);
     bool timed_burrow_ = false;
     bool ai_paused_ = false;
     bool ai_inject_ = false;
@@ -1490,6 +1550,8 @@ private:
     bool group_self_cast_ = false;
     bool group_cast_cell_ = false;
     bool best_unit_pick_ = false;
+    bool best_unit_target_pick_ = false;
+    bool every_unit_target_cast_ = false;
     bool morph_cocoon_models_ = false;
     bool zone_markers_ = false;
     bool actor_game_clock_ = false;
@@ -1524,6 +1586,9 @@ private:
     bool pause_menu_open_ = false;
     std::function<void()> on_save_, on_load_, on_settings_;
     bool prev_esc_ = false;
+    bool esc_card_ = false;
+    bool cast_queued_ = false;
+    bool cast_shift_kept_ = false;
 
 };
 

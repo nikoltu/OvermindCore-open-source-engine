@@ -114,6 +114,7 @@ void apply_shipping_wiring(MeleeGame& game, const data::Catalog& cat,
     game.set_hall_needs_builder(std::getenv("OMC_AI_HALL_BUILDER_OLD") == nullptr);
     game.set_hunt_gas(std::getenv("OMC_AI_HUNT_GAS_OLD") == nullptr);
     game.set_worker_transfer(std::getenv("OMC_AI_TRANSFER_OLD") == nullptr);
+    game.set_ai_seal_guard(std::getenv("OMC_AI_SEAL_POCKET_OLD") == nullptr);
     game.world().set_stall_unreachable(std::getenv("OMC_MOVE_UNREACHABLE_OLD") == nullptr);
     console_race_assets() = std::getenv("OMC_CONSOLE_RACE_OLD") == nullptr;
     ai::focus_skips_neutral() = std::getenv("OMC_AI_FOCUS_NEUTRAL") == nullptr;
@@ -126,6 +127,10 @@ void apply_shipping_wiring(MeleeGame& game, const data::Catalog& cat,
     game.world().set_spawn_open_spot(std::getenv("OMC_LARVA_SPAWN_OLD") == nullptr);
     game.world().set_return_dock_footprint(std::getenv("OMC_RETURN_DOCK_OLD") == nullptr);
     game.world().set_unstick_bodies(std::getenv("OMC_BODY_UNSTICK_OLD") == nullptr);
+    game.world().set_disc_slide(std::getenv("OMC_DISC_SLIDE_OLD") == nullptr);
+    game.world().set_rest_push_collide(std::getenv("OMC_REST_PUSH_COLLIDE_OLD") == nullptr);
+    game.world().set_level_guard(std::getenv("OMC_MOVE_LEVEL_GUARD_OLD") == nullptr);
+    game.world().set_sep_push_rules(std::getenv("OMC_SEP_PUSH_RULES_ON") != nullptr);
 
     if (up && setup) {
         std::vector<MeleeResearchDriver::ProtoNames> names(setup->players.size());
@@ -189,6 +194,8 @@ void apply_shipping_wiring(MeleeGame& game, const data::Catalog& cat,
     game.set_group_self_cast(std::getenv("OMC_GROUP_CAST_OLD") == nullptr);
     game.set_group_cast_cell(std::getenv("OMC_GROUP_CAST_CELL_OLD") == nullptr);
     game.set_best_unit_pick(std::getenv("OMC_BEST_UNIT_OLD") == nullptr);
+    game.set_best_unit_target_pick(std::getenv("OMC_BEST_UNIT_TARGET_OLD") == nullptr);
+    game.set_every_unit_target_cast(std::getenv("OMC_TARGET_CAST_EVERY_OLD") == nullptr);
     game.set_portrait_async(std::getenv("OMC_PORTRAIT_DECODE_SYNC") == nullptr);
     game.set_warm_foreign(std::getenv("OMC_NO_WARM_FOREIGN") == nullptr);
     game.set_card_cache(std::getenv("OMC_CARD_COMPOSE_EVERY_FRAME") == nullptr);
@@ -201,6 +208,10 @@ void apply_shipping_wiring(MeleeGame& game, const data::Catalog& cat,
     game.set_morph_swap_at_data(std::getenv("OMC_MORPH_SWAP_AT_END") == nullptr);
     game.set_morph_behaviors_sim(std::getenv("OMC_MORPH_BEHAVIOR_SIM_OLD") == nullptr);
     game.set_upgrade_fold_new(std::getenv("OMC_UPGRADE_FOLD_LIVE_ONLY") == nullptr);
+    game.set_upgrade_on_create(std::getenv("OMC_UPGRADE_ON_CREATE_OLD") == nullptr);
+    game.set_abil_upgrade_fold(std::getenv("OMC_ABIL_UPGRADE_FOLD_OLD") == nullptr);
+    game.set_defender_range(std::getenv("OMC_DEFENDER_RANGE_OLD") == nullptr);
+    game.world().set_morph_keep_behaviors(std::getenv("OMC_MORPH_BEHAVIOR_KEEP_OLD") == nullptr);
     game.set_zone_markers(std::getenv("OMC_NO_ZONE_MARKER") == nullptr);
     game.set_actor_game_clock(std::getenv("OMC_ACTOR_WALL_CLOCK") == nullptr);
     game.set_construction_child_team(std::getenv("OMC_CHILD_TEAM_TINT") != nullptr);

@@ -4,13 +4,52 @@
 #include <cstdio>
 #include <cstdlib>
 #include <functional>
+#include <iterator>
 
 #include "omc/casc/storage.hpp"
 #include "omc/data/melee_mods.hpp"
+#include "omc/formats/document_header.hpp"
 
 namespace omc::data {
 
 using core::XmlNode;
+
+bool parse_tint_color(const std::vector<std::string>& args, TintColorArgs& out) {
+    if (args.empty()) return false;
+    std::size_t i = 0;
+    std::string colour;
+    if (!args[0].empty() && args[0][0] == '{') {
+        for (; i < args.size(); ++i) {
+            if (!colour.empty()) colour += ' ';
+            colour += args[i];
+            if (args[i].find('}') != std::string::npos) break;
+        }
+        if (i >= args.size()) return false;
+        ++i;
+        colour.erase(std::remove(colour.begin(), colour.end(), '{'), colour.end());
+        colour.erase(std::remove(colour.begin(), colour.end(), '}'), colour.end());
+    } else {
+        colour = args[0];
+        i = 1;
+    }
+    int r = 255, g = 255, b = 255;
+    float hdr = 1.0f;
+    const int n = std::sscanf(colour.c_str(), "%d,%d,%d %f", &r, &g, &b, &hdr);
+    if (n < 3) return false;
+    if (n < 4 || !(hdr >= 0.0f)) hdr = 1.0f;
+    out.rgb = {float(r) / 255.0f * hdr, float(g) / 255.0f * hdr, float(b) / 255.0f * hdr};
+    if (i < args.size()) {
+        char* end = nullptr;
+        const float t = std::strtof(args[i].c_str(), &end);
+        if (end && end != args[i].c_str() && *end == '\0') {
+            out.blend_s = t > 0.0f ? t : 0.0f;
+            ++i;
+        }
+    }
+    if (i < args.size() && (args[i] == "OneShot" || args[i] == "Bounce")) out.mode = args[i++];
+    if (i < args.size() && args[i] != "{}") out.key = args[i];
+    return true;
+}
 
 std::string Catalog::family_of(const std::string& tag) {
     if (tag.rfind("CRequirement", 0) == 0) return "CRequirement";
@@ -436,6 +475,18 @@ std::optional<double> Catalog::effect_flat_energy_change(const std::string& effe
         });
 }
 
+std::optional<Catalog::VitalChange> Catalog::effect_energy_vital_change(const std::string& effect_id) const {
+    return walk_effect_first<VitalChange>(
+        effect_id, 0,
+        [this](const std::string& id, const std::string& tag, int, bool& terminal) -> std::optional<VitalChange> {
+            if (tag != "CEffectModifyUnit") return std::nullopt;
+            const VitalChange v = effect_vital_change(id);
+            if (v.energy == 0 && v.energy_frac == 0) return std::nullopt;
+            terminal = true;
+            return v;
+        });
+}
+
 std::optional<Catalog::PointDefense> Catalog::point_defense_of(const std::string& unit_id) const {
     std::function<std::optional<double>(const std::string&, int)> energy_drain =
         [&](const std::string& effect_id, int depth) -> std::optional<double> {
@@ -492,7 +543,10 @@ std::optional<Catalog::BehaviorBuff> Catalog::behavior_buff(const std::string& b
     bool any = false;
     if (auto d = scalar_num("CBehavior", behavior_id, "Duration")) { bb.duration = *d; bb.duration_authored = true; any = true; }
     if (auto ms = scalar_num("CBehavior", behavior_id, "MaxStackCount")) bb.max_stack = int(*ms);
-    if (auto p = scalar_num("CBehavior", behavior_id, "Period")) bb.dmg_period = *p;
+    if (auto mc = scalar_num("CBehavior", behavior_id, "MaxStackCountPerCaster")) bb.max_stack_caster = int(*mc);
+    for (const core::XmlNode& n : resolved("CBehavior", behavior_id))
+        if (n.name == "BuffFlags" && n.attr_or("index", "") == "RefreshStack") bb.refresh_stack = n.attr_or("value", "0") != "0";
+    if (auto p =scalar_num("CBehavior", behavior_id, "Period")) bb.dmg_period = *p;
     if (auto pe = scalar("CBehavior", behavior_id, "PeriodicEffect"); pe && !pe->empty())
         if (auto d = effect_damage_f(*pe)) { bb.dmg_per_tick = *d; any = true; }
     bb.initial_effect = scalar("CBehavior", behavior_id, "InitialEffect").value_or("");
@@ -921,6 +975,45 @@ std::optional<Catalog::InterceptorMagSpec> Catalog::interceptor_magazine_of(
     else if (const Entry* me = find("CAbil", mag))
         if (auto d = tag_default_scalar(me->tag, "Leash"); d && !d->empty()) s.leash = std::strtod(d->c_str(), nullptr);
     s.build_time = build_time;
+    s.ability = mag;
+    s.command = slot;
+    auto flag_of = [&](const auto& ns, const std::string& name, bool& on) {
+        for (const XmlNode& n : ns)
+            if (n.name == "Flags" && n.attr_or("index", "") == name) on = n.attr_or("value", "1") != "0";
+    };
+    if (const Entry* me = find("CAbil", mag)) {
+        if (const std::vector<XmlNode>* d = tag_default_indexed_nodes(me->tag)) flag_of(*d, "ShowStatus", s.show_status);
+        s.activity = tag_default_scalar(me->tag, "Activity").value_or("");
+    }
+    flag_of(nodes, "ShowStatus", s.show_status);
+    if (s.activity.empty()) s.activity = tag_default_scalar("CAbilQueueable", "Activity").value_or("");
+    if (auto a = scalar("CAbil", mag, "Activity"); a && !a->empty()) s.activity = *a;
+    for (const XmlNode& info : nodes) {
+        if (info.name != "InfoArray" || info.attr_or("index", "") != slot) continue;
+        flag_of(info.children, "AutoBuild", s.auto_build);
+        flag_of(info.children, "AutoBuildOn", s.auto_build_on);
+    }
+    if (const auto row = ability_info_row(mag, slot); row && (row->minerals > 0 || row->gas > 0)) {
+        s.minerals = row->minerals;
+        s.gas = row->gas;
+    } else {
+        for (const XmlNode& n : resolved("CUnit", escort)) {
+            if (n.name != "CostResource") continue;
+            const std::string idx = n.attr_or("index", "");
+            const int v = std::atoi(n.attr_or("value", "0").c_str());
+            if (idx == "Minerals") s.minerals = v;
+            else if (idx == "Vespene") s.gas = v;
+        }
+    }
+    for (const std::string& a : array_links("CUnit", unit_id, "AbilArray")) {
+        const Entry* qe = a.empty() ? nullptr : find("CAbil", a);
+        if (!qe || qe->tag != "CAbilQueue") continue;
+        s.queue_ability = a;
+        s.queue_size = int(scalar_num("CAbil", a, "QueueSize").value_or(0));
+        s.queue_count = int(scalar_num("CAbil", a, "QueueCount").value_or(
+            std::strtod(tag_default_scalar("CAbilQueue", "QueueCount").value_or("1").c_str(), nullptr)));
+        break;
+    }
     return s;
 }
 
@@ -1869,6 +1962,45 @@ void Catalog::load_missing_only(const casc::Storage& store, const std::vector<st
     add_only_ = false;
 }
 
+std::vector<std::string> Catalog::dependency_data_roots(const casc::Storage& store,
+                                                       const std::vector<std::string>& dependencies) {
+    std::vector<std::string> roots;
+    std::set<std::string> seen;
+    std::function<void(const std::string&)> visit = [&](const std::string& dep) {
+        const std::string key = formats::normalize_dependency_path(dep);
+        if (key.empty() || !seen.insert(key).second) return;
+        for (const char* mod : kMeleeMods)
+            if (key == std::string("mods/") + mod + ".sc2mod") return;
+        bool header = false;
+        try {
+            const std::vector<std::string> inner =
+                formats::parse_document_dependencies(store.read_by_name(key + "/DocumentHeader"));
+            header = true;
+            for (const std::string& d : inner) visit(d);
+        } catch (const std::exception&) {
+        }
+        if (!header) {
+            for (std::size_t i = 1; i < std::size(kCampaignChain); ++i)
+                if (key == kCampaignChain[i]) visit(kCampaignChain[i - 1]);
+        }
+        roots.push_back(key + "/base.sc2data");
+    };
+    for (const std::string& d : dependencies) visit(d);
+    return roots;
+}
+
+std::size_t Catalog::load_dependencies(const casc::Storage& store, const std::vector<std::string>& dependencies) {
+    std::vector<std::string> fresh;
+    for (const std::string& root : dependency_data_roots(store, dependencies))
+        if (std::find(dependency_roots_loaded_.begin(), dependency_roots_loaded_.end(), root) ==
+            dependency_roots_loaded_.end())
+            fresh.push_back(root);
+    if (fresh.empty()) return 0;
+    load_missing_only(store, fresh);
+    dependency_roots_loaded_.insert(dependency_roots_loaded_.end(), fresh.begin(), fresh.end());
+    return fresh.size();
+}
+
 void Catalog::load_campaign(const casc::Storage& store,
                             const std::vector<std::string>& campaign_roots,
                             const std::string& mission_local_root) {
@@ -2598,9 +2730,23 @@ std::optional<std::array<float, 3>> Catalog::actor_tint(const std::string& unit_
         const std::string send = n.attr_or("Send", "");
         if (terms.rfind(terms_prefix, 0) != 0 || terms.find(terms_contains) == std::string::npos) continue;
         if (send.rfind("SetTintColor ", 0) != 0) continue;
-        int r = 255, g = 255, b = 255;
-        if (std::sscanf(send.c_str() + 13, "%d,%d,%d", &r, &g, &b) != 3) continue;
-        out = std::array<float, 3>{float(r) / 255.0f, float(g) / 255.0f, float(b) / 255.0f};
+        static const bool kOld = std::getenv("OMC_TINT_HDR_OLD") != nullptr;
+        if (kOld) {
+            int r = 255, g = 255, b = 255;
+            if (std::sscanf(send.c_str() + 13, "%d,%d,%d", &r, &g, &b) != 3) continue;
+            out = std::array<float, 3>{float(r) / 255.0f, float(g) / 255.0f, float(b) / 255.0f};
+            continue;
+        }
+        std::vector<std::string> args;
+        for (std::size_t p = 13; p < send.size();) {
+            while (p < send.size() && (send[p] == ' ' || send[p] == '\t')) ++p;
+            const std::size_t s0 = p;
+            while (p < send.size() && send[p] != ' ' && send[p] != '\t') ++p;
+            if (p > s0) args.push_back(send.substr(s0, p - s0));
+        }
+        TintColorArgs t;
+        if (!parse_tint_color(args, t)) continue;
+        out = t.rgb;
     }
     return out;
 }

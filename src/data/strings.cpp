@@ -1,5 +1,7 @@
 #include "omc/data/strings.hpp"
 
+#include <algorithm>
+
 namespace omc::data {
 
 static bool starts_with(const std::string& s, const char* prefix) {
@@ -86,6 +88,14 @@ std::string StringTable::resolve(const std::string& ref, const std::string& race
 const std::string* StringTable::find(const std::string& key) const {
     auto it = map_.find(key);
     return (it != map_.end()) ? &it->second : nullptr;
+}
+
+std::vector<std::string> StringTable::keys_with_prefix(const std::string& prefix) const {
+    std::vector<std::string> out;
+    for (const auto& kv : map_)
+        if (kv.first.compare(0, prefix.size(), prefix) == 0) out.push_back(kv.first);
+    std::sort(out.begin(), out.end());
+    return out;
 }
 
 }

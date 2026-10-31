@@ -9,11 +9,26 @@ namespace omc::sim {
 
 enum class BuildStyle { TerranStructure, ProtossWarp, ZergMorph };
 
+inline bool footprint_clear_of_nobuild(const World& world, const TerrainMap& terrain, int cx0, int cy0, int fw,
+                                       int fh) {
+    for (const Unit& u : world.units()) {
+        if (!u.alive || u.nobuild_offsets.empty()) continue;
+        int ucx, ucy;
+        terrain.to_cell(u.x, u.y, ucx, ucy);
+        for (const std::pair<int16_t, int16_t>& o : u.nobuild_offsets) {
+            const int bx = ucx + o.first, by = ucy + o.second;
+            if (bx >= cx0 && bx < cx0 + fw && by >= cy0 && by < cy0 + fh) return false;
+        }
+    }
+    return true;
+}
+
 inline bool footprint_clear_of_blockers(const World& world, const TerrainMap& terrain, int cx0,
                                         int cy0, int fw, int fh,
                                         std::uint32_t builder = kNoTarget, bool gas_exempt = false,
                                         bool* saw_gas = nullptr) {
     if (saw_gas) *saw_gas = false;
+    if (!footprint_clear_of_nobuild(world, terrain, cx0, cy0, fw, fh)) return false;
     for (const Unit& u : world.units()) {
         if (!u.alive) continue;
         if (u.id == builder) continue;

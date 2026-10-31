@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.16)
-project(overmindcore VERSION 0.1.9 LANGUAGES CXX)
+project(overmindcore VERSION 0.1.10 LANGUAGES CXX)
 
 set(OVERMINDCORE_STAGE "alpha")
 set(OMC_GENERATED_DIR ${CMAKE_CURRENT_BINARY_DIR}/generated)
@@ -75,6 +75,9 @@ add_library(omc_core STATIC
   src/app/shell_screens_profile.cpp
   src/app/shell_screens_replays.cpp
   src/app/shell_screens_about.cpp
+  src/app/shell_screens_custom.cpp
+  src/app/shell_screens_campaign.cpp
+  src/app/shell_screens_lan.cpp
   src/app/shell_screens_widgets.cpp
   src/app/portrait_catalog.cpp
   src/core/inflate.cpp
@@ -108,6 +111,7 @@ add_library(omc_core STATIC
   src/data/audio.cpp
   src/data/sound_events.cpp
   src/sim/world.cpp
+  src/sim/hangar.cpp
   src/sim/vision.cpp
   src/sim/detection.cpp
   src/sim/trigger.cpp
@@ -124,6 +128,7 @@ add_library(omc_core STATIC
   src/app/install.cpp
   src/app/boot.cpp
   src/app/melee_commands.cpp
+  src/app/melee_hangar.cpp
   src/app/match_result.cpp
   src/app/replay.cpp
   src/app/replay_orders.cpp
@@ -207,7 +212,6 @@ if(Vulkan_FOUND AND Vulkan_GLSLC_EXECUTABLE)
     src/render/window.cpp
     src/render/game_window.cpp
     src/render/game_offscreen.cpp
-    src/render/overlay.cpp
     src/render/overlay_pass.cpp
     src/render/terrain_tex.cpp
     ${OMC_SHADER_HEADERS})

@@ -1147,6 +1147,20 @@ void HudRender::render_into(std::vector<std::uint8_t>& img, const HudContent& co
             return f < 0.0f ? 0.0f : f;
         };
         auto dim = [](std::uint8_t c, float f) { return std::uint8_t(float(c) * f + 0.5f); };
+        static const bool kMsgOld = std::getenv("OMC_HUD_MESSAGE_STYLE_OLD") != nullptr;
+        const bool saved_shadow_off = draw::text_shadow_off();
+        const int saved_shadow_px = draw::text_shadow_px();
+        auto use_shadow = [&](const HudMessageStyle& st) {
+            if (kMsgOld || !st.set) {
+                draw::text_shadow_off() = saved_shadow_off;
+                draw::text_shadow_px() = saved_shadow_px;
+                return;
+            }
+            draw::text_shadow_off() = !st.shadow;
+            const int sp = int(float(st.shadow_offset) * float(out_h) / app::kRefHeight + 0.5f);
+            draw::text_shadow_px() = sp > 1 ? sp : 1;
+        };
+        const bool err_styled = !kMsgOld && content.error_style.set;
         for (const HudMessageLine& m : content.messages) {
             const int tw = int(m.text.size()) * adv;
             if (authored_msgs && m.zone == MsgZone::Error) {
@@ -1163,10 +1177,13 @@ void HudRender::render_into(std::vector<std::uint8_t>& img, const HudContent& co
                     ex = err_rect.x0 + (err_rect.w() - etw) / 2;
                     if (ex < err_rect.x0) ex = err_rect.x0;
                 }
-                fill_rect(img, out_w, out_h, ex - 4, a_err_y - 2,
-                          ex + etw + 4, a_err_y + ui::kFontH * 2 + 2, 60, 12, 12, 0.65f * f);
+                if (!err_styled)
+                    fill_rect(img, out_w, out_h, ex - 4, a_err_y - 2,
+                              ex + etw + 4, a_err_y + ui::kFontH * 2 + 2, 60, 12, 12, 0.65f * f);
+                use_shadow(content.error_style);
                 draw_text(img, out_w, out_h, ex, a_err_y, m.text, 2, dim(er, f), dim(eg, f),
                           dim(eb, f), 0, 0, W, H);
+                use_shadow(HudMessageStyle{});
                 draw::set_forced_font_px(0);
                 a_err_y += ui::kFontH * 2 + 6;
                 ++err_drawn;
@@ -1174,8 +1191,10 @@ void HudRender::render_into(std::vector<std::uint8_t>& img, const HudContent& co
                 if (warn_cap > 0 && warn_drawn >= warn_cap) continue;
                 std::uint8_t r = 235, g = 225, b = 130;
                 if (m.zone == MsgZone::Transmission) { r = 150; g = 210; b = 240; }
-                if (content.warning_style.set && m.zone == MsgZone::Warning) {
-                    r = content.warning_style.r; g = content.warning_style.g; b = content.warning_style.b;
+                const HudMessageStyle& zst = (!kMsgOld && m.zone == MsgZone::Transmission) ? content.transmission_style : content.warning_style;
+                const bool zstyled = zst.set && (m.zone == MsgZone::Warning || (!kMsgOld && m.zone == MsgZone::Transmission));
+                if (zstyled) {
+                    r = zst.r; g = zst.g; b = zst.b;
                 }
                 const float f = fade_of(m, warn_fade_s);
                 const bool centre = content.warning_style.set ? content.warning_style.centred : true;
@@ -1184,8 +1203,10 @@ void HudRender::render_into(std::vector<std::uint8_t>& img, const HudContent& co
                 int x = centre ? warn_rect.x0 + (warn_rect.w() - wtw) / 2 : warn_rect.x0;
                 if (x < warn_rect.x0) x = warn_rect.x0;
                 if (a_warn_y + ui::kFontH * 2 <= warn_rect.y1) {
+                    use_shadow(zstyled ? zst : HudMessageStyle{});
                     draw_text(img, out_w, out_h, x, a_warn_y, m.text, 2, dim(r, f), dim(g, f),
                               dim(b, f), 0, 0, W, H);
+                    use_shadow(HudMessageStyle{});
                     ++warn_drawn;
                 }
                 draw::set_forced_font_px(0);
@@ -1193,9 +1214,13 @@ void HudRender::render_into(std::vector<std::uint8_t>& img, const HudContent& co
             } else if (m.zone == MsgZone::Error) {
                 int x = (W - tw) / 2;
                 if (x < kPad) x = kPad;
-                fill_rect(img, out_w, out_h, x - 4, err_y - 2, x + tw + 4,
-                          err_y + ui::kFontH * 2 + 2, 60, 12, 12, 0.65f);
-                draw_text(img, out_w, out_h, x, err_y, m.text, 2, 255, 130, 130, 0, 0, W, H);
+                if (!err_styled)
+                    fill_rect(img, out_w, out_h, x - 4, err_y - 2, x + tw + 4,
+                              err_y + ui::kFontH * 2 + 2, 60, 12, 12, 0.65f);
+                use_shadow(content.error_style);
+                draw_text(img, out_w, out_h, x, err_y, m.text, 2, err_styled ? content.error_style.r : 255,
+                          err_styled ? content.error_style.g : 130, err_styled ? content.error_style.b : 130, 0, 0, W, H);
+                use_shadow(HudMessageStyle{});
                 err_y -= ui::kFontH * 2 + 6;
             } else {
                 std::uint8_t r = 235, g = 225, b = 130;
@@ -1204,7 +1229,12 @@ void HudRender::render_into(std::vector<std::uint8_t>& img, const HudContent& co
                     g = 210;
                     b = 240;
                 }
+                const HudMessageStyle& zst = m.zone == MsgZone::Transmission ? content.transmission_style : content.warning_style;
+                const bool zstyled = !kMsgOld && zst.set && (m.zone == MsgZone::Warning || m.zone == MsgZone::Transmission);
+                if (zstyled) { r = zst.r; g = zst.g; b = zst.b; }
+                use_shadow(zstyled ? zst : HudMessageStyle{});
                 draw_text(img, out_w, out_h, kPad, ul_y, m.text, 2, r, g, b, 0, 0, W, H);
+                use_shadow(HudMessageStyle{});
                 ul_y += ui::kFontH * 2 + 4;
             }
         }

@@ -868,7 +868,19 @@ inline std::size_t append_cliff_ground(formats::Model& ground, const CliffField&
                     const float wz = M[2] * p[0] + M[6] * p[1] + M[10] * p[2] + M[14];
                     static const bool kFlatSink = std::getenv("OMC_CLIFF_APRON_FLAT_SINK") != nullptr;
                     const float sink = kFlatSink ? kSink : kSink * float(m.vertex_colors[std::size_t(vi[k]) * 4 + 3]) / 255.0f;
-                    ground.positions.insert(ground.positions.end(), {std::clamp(wx, 0.0f, W), std::clamp(wy, 0.0f, H), wz - sink});
+                    static const bool kZSinkOld = std::getenv("OMC_CLIFF_APRON_Z_SINK_OLD") != nullptr;
+                    float sd[3] = {0.0f, 0.0f, sink};
+                    const bool seam = std::fabs(p[0] - m.bounds_min[0]) < 1e-3f || std::fabs(p[0] - m.bounds_max[0]) < 1e-3f ||
+                                      std::fabs(p[1] - m.bounds_min[1]) < 1e-3f || std::fabs(p[1] - m.bounds_max[1]) < 1e-3f;
+                    if (!kZSinkOld && !seam && m.normals.size() == m.positions.size()) {
+                        const float* q = &m.normals[std::size_t(vi[k]) * 3];
+                        const float nx = M[0] * q[0] + M[4] * q[1] + M[8] * q[2];
+                        const float ny = M[1] * q[0] + M[5] * q[1] + M[9] * q[2];
+                        const float nz = M[2] * q[0] + M[6] * q[1] + M[10] * q[2];
+                        const float nl = std::sqrt(nx * nx + ny * ny + nz * nz);
+                        if (nl > 1e-6f) { sd[0] = sink * nx / nl; sd[1] = sink * ny / nl; sd[2] = sink * nz / nl; }
+                    }
+                    ground.positions.insert(ground.positions.end(), {std::clamp(wx - sd[0], 0.0f, W), std::clamp(wy - sd[1], 0.0f, H), wz - sd[2]});
                     ground.uvs.push_back(0.0f);
                     ground.uvs.push_back(0.0f);
                     if (has_normals) {

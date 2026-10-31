@@ -1,4 +1,5 @@
 #include "omc/render/window.hpp"
+#include "omc/core/client_identity.hpp"
 
 #ifndef NOMINMAX
 #define NOMINMAX
@@ -72,7 +73,7 @@ struct Mesh {
 };
 
 const wchar_t* window_class(HINSTANCE hinst) {
-    static const wchar_t* kName = L"overmindcore_render_window";
+    static const wchar_t* kName = omc::identity::kRenderWindowClass;
     static bool registered = false;
     if (!registered) {
         WNDCLASSEXW wc{};
@@ -108,7 +109,7 @@ WindowResult render_window(const std::vector<SceneInstance>& instances,
     const wchar_t* cls = window_class(hinst);
     RECT rc{0, 0, LONG(width), LONG(height)};
     AdjustWindowRect(&rc, WS_OVERLAPPEDWINDOW, FALSE);
-    HWND rawWin = CreateWindowExW(0, cls, L"OvermindCore render", WS_OVERLAPPEDWINDOW,
+    HWND rawWin = CreateWindowExW(0, cls, omc::identity::kRenderWindowTitle, WS_OVERLAPPEDWINDOW,
                                   CW_USEDEFAULT, CW_USEDEFAULT, rc.right - rc.left,
                                   rc.bottom - rc.top, nullptr, nullptr, hinst, nullptr);
     if (!rawWin) unavailable("CreateWindowEx failed");

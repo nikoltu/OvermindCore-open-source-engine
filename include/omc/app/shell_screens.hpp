@@ -73,6 +73,25 @@ struct ShellCtx {
     int lobby_rows() const;
     void lobby_row(int i, int& controller, int& race, int& difficulty, int& team) const;
     void set_lobby_row(int i, int controller, int race, int difficulty, int team);
+    void prepare_custom_lobby();
+    bool custom_match() const;
+    const std::vector<std::string>& campaign_titles();
+    struct RecordingRow {
+        std::string path, name, date, map, matchup;
+        long long ticks = 0;
+        bool readable = false, map_missing = false;
+    };
+    std::vector<RecordingRow> recordings(bool saves);
+    int selected_recording() const;
+    void select_recording(int index);
+    const std::string& replays_dir() const;
+    const std::string& saves_dir() const;
+    bool delete_recording(const std::string& path);
+    bool resume_save(const std::string& path, const char* via);
+    const std::string& about_notice() const;
+    const std::string& config_file() const;
+    bool open_folder(const std::string& path);
+    bool has_folder_opener() const;
     int map_start_count(int index);
     std::string player_name() const;
     Race player_default_race() const;
@@ -147,5 +166,12 @@ bool screen_portraits(Ui&, ShellCtx&);
 bool screen_replays(Ui&, ShellCtx&);
 bool screen_about(Ui&, ShellCtx&);
 bool screen_widgets(Ui&, ShellCtx&);
+bool screen_custom(Ui&, ShellCtx&);
+bool screen_campaign(Ui&, ShellCtx&);
+bool screen_lan(Ui&, ShellCtx&);
+
+bool map_picker(Ui& ui, ShellCtx& ctx, const std::string& key);
+void slot_rows(Ui& ui, ShellCtx& ctx, bool custom);
+std::string team_matchup(const ShellCtx& ctx);
 
 }

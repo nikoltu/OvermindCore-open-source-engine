@@ -117,6 +117,7 @@ public:
     void set_gather_needs_dropoff(bool on) { gather_needs_dropoff_ = on; }
     void set_hall_builder(bool on) { hall_builder_ = on; }
     void set_worker_transfer(bool on) { worker_transfer_ = on; }
+    void set_seal_guard(bool on) { seal_guard_ = on; }
     int workers_transferred() const { return workers_transferred_; }
     bool hunting() const { return hunting_; }
     int bases(const sim::World& w) const;
@@ -175,6 +176,7 @@ private:
     bool gather_needs_dropoff_ = false;
     bool hall_builder_ = false;
     bool worker_transfer_ = false;
+    bool seal_guard_ = false;
     int workers_transferred_ = 0;
     int last_transfer_tick_ = -1000000;
     void run_worker_transfer(sim::World& w);

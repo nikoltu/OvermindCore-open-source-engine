@@ -20,6 +20,7 @@
 #include "omc/app/replay_orders.hpp"
 #include "omc/app/melee_models.hpp"
 #include "omc/app/platform.hpp"
+#include "omc/core/client_identity.hpp"
 #include "omc/core/version.hpp"
 #include "omc/casc/storage.hpp"
 #include "omc/data/catalog.hpp"
@@ -75,7 +76,7 @@ app::InstallInfo resolve_install() {
         if (info.valid) {
             platform::set_config("install_root", picked);
         } else {
-            platform::alert("OvermindCore",
+            platform::alert(omc::identity::kName,
                             "That folder is not a valid game installation:\n" + info.message +
                                 "\n\nPick the folder that contains SC2Data.");
         }
@@ -479,7 +480,7 @@ int main(int argc, char** argv) {
         const std::vector<app::StartupStep> plan = app::plan_startup(
             {"AbilData.xml", "RequirementData.xml", "RequirementNodeData.xml", "LightData.xml",
              "TerrainData.xml", "TerrainTexData.xml"});
-        platform::LoadingScreen splash("OvermindCore");
+        platform::LoadingScreen splash(omc::identity::kName);
         for (std::size_t i = 0; i < plan.size(); ++i) {
             splash.progress(float(i) / float(plan.size()), plan[i].label);
             app::run_startup_step(plan[i], info.data_dir, store, cat, models);
@@ -503,7 +504,7 @@ int main(int argc, char** argv) {
         }
         splash.progress(1.0f, "Preparing menu");
     } catch (const std::exception& e) {
-        platform::alert("OvermindCore", std::string("Failed to load game data:\n") + e.what());
+        platform::alert(omc::identity::kName, std::string("Failed to load game data:\n") + e.what());
         return 1;
     }
 
@@ -537,6 +538,7 @@ int main(int argc, char** argv) {
     fe.set_double_click_ms(platform::double_click_ms());
     fe.set_clipboard_callback(platform::clipboard_text);
     fe.set_open_folder_callback(platform::open_folder);
+    fe.set_about(kLicenceNotice, platform::config_path());
     fe.set_maps(with_casc(!maps_dir.empty() ? platform::list_maps(maps_dir)
                                             : platform::list_maps(info.install_root)));
     fe.set_maps_folder_callback([&] {
@@ -616,7 +618,7 @@ int main(int argc, char** argv) {
             platform::attach_parent_console();
             std::fprintf(stderr, "overmindcore: --listen failed on port %d: %s\n", api_port,
                          err.c_str());
-            platform::alert("OvermindCore",
+            platform::alert(omc::identity::kName,
                             "Could not open the API port " + std::to_string(api_port) + ":\n" +
                                 err);
             return 1;
@@ -996,11 +998,11 @@ int main(int argc, char** argv) {
             app::melee_shadow_clip(cat),
             [&]() -> const render::FogField* { return fe.ground_fog(); });
         if (!r.created) {
-            platform::alert("OvermindCore", "Could not open a display window (Vulkan/WSI unavailable).");
+            platform::alert(omc::identity::kName, "Could not open a display window (Vulkan/WSI unavailable).");
             return 1;
         }
     } catch (const std::exception& e) {
-        platform::alert("OvermindCore", std::string("Renderer error:\n") + e.what());
+        platform::alert(omc::identity::kName, std::string("Renderer error:\n") + e.what());
         return 1;
     }
     return 0;

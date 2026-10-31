@@ -52,6 +52,7 @@ std::size_t apply_upgrade_to_live(sim::World& w, const data::Catalog& cat,
                                   const data::UpgradeCatalog& up, const std::string& upgrade_id,
                                   int player, std::vector<UpgradeRevert>* revert = nullptr, bool units = true);
 std::size_t fold_lagging_upgrades(sim::World& w, const data::Catalog& cat, const data::UpgradeCatalog& up);
+bool fold_unit_lagging(const sim::World& w, const data::Catalog& cat, const data::UpgradeCatalog& up, sim::Unit& u);
 
 void revert_live_upgrade(sim::World& w, std::vector<UpgradeRevert>& revert, std::size_t count);
 

@@ -146,6 +146,17 @@ struct ActorInstance {
     std::size_t unhandled_verbs = 0;
     float bus_tint[3] = {1.0f, 1.0f, 1.0f};
     bool bus_tint_set = false;
+    struct TintLayer {
+        std::string key;
+        float rgb[3] = {1.0f, 1.0f, 1.0f};
+    };
+    std::vector<TintLayer> tint_layers;
+    float tint_from[3] = {1.0f, 1.0f, 1.0f};
+    float tint_to[3] = {1.0f, 1.0f, 1.0f};
+    float tint_blend_ms = 0.0f;
+    float tint_left_ms = 0.0f;
+    void retarget_tint(float blend_ms);
+    void advance_tint(float dt_ms);
     bool host_owned = false;
     bool self_destroyed = false;
     void bracket_closed(const std::string& slot);

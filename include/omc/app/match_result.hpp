@@ -1,5 +1,8 @@
 #pragma once
 
+#include <string>
+
+#include "omc/data/strings.hpp"
 #include "omc/sim/world.hpp"
 
 namespace omc::app {
@@ -18,6 +21,7 @@ struct MatchResult {
     static bool sole_player_rule();
 
     static const char* banner(Outcome o);
+    static std::string banner_text(Outcome o, const data::StringTable* strings);
 };
 
 }

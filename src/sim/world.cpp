@@ -173,7 +173,7 @@ void World::update_destructibles() {
         if (d.id < units_.size() && units_[d.id].alive && !units_[d.id].flying &&
             !units_[d.id].lowered)
             continue;
-        for (const auto& c : d.cells) nav_.set_blocked(c.first, c.second, false);
+        for (const auto& c : d.cells) release_nav_cell(c.first, c.second);
         d.cleared = true;
     }
     destructibles_.erase(std::remove_if(destructibles_.begin(), destructibles_.end(),
@@ -323,6 +323,11 @@ namespace {
 constexpr Fixed kContactSlack = Fixed::from_raw(252);
 
 inline Fixed arrival_near(const Unit& u) { return u.radius + Fixed::from_ratio(1, 8); }
+
+inline Fixed sep_of(const Unit& u) {
+    if (u.sep_radius.raw() < 0) return Fixed();
+    return u.sep_radius.raw() > 0 ? u.sep_radius : u.radius;
+}
 
 bool move_toward(Unit& u, Fixed tx, Fixed ty, Fixed step) {
     Fixed dx = tx - u.x, dy = ty - u.y;
@@ -582,14 +587,24 @@ bool World::move_unit_toward_impl(Unit& u, Fixed gx, Fixed gy, Fixed step) {
             const bool crushable_here =
                 (u.crushes_ff && nav_.has_ff() && nav_.is_ff_cell(tcx, tcy)) ||
                 (cliff_leap_ && u.can_jump && nav_.is_cliff_cell(tcx, tcy));
-            if ((tcx != fcx || tcy != fcy) && !crushable_here && nav_.is_blocked_cell(tcx, tcy)) {
+            auto closed_step = [&](int ax, int ay, int bx, int by) {
+                if (nav_.is_blocked_cell(bx, by)) return true;
+                if (!level_guard_ || (ax == bx && ay == by)) return false;
+                if (!nav_.can_traverse(ax, ay, bx, by, u.can_jump, u.walks_cliffs)) return true;
+                if (ax != bx && ay != by) {
+                    if (nav_.is_blocked_cell(bx, ay) || !nav_.can_traverse(ax, ay, bx, ay, u.can_jump, u.walks_cliffs)) return true;
+                    if (nav_.is_blocked_cell(ax, by) || !nav_.can_traverse(ax, ay, ax, by, u.can_jump, u.walks_cliffs)) return true;
+                }
+                return false;
+            };
+            if ((tcx != fcx || tcy != fcy) && !crushable_here && closed_step(fcx, fcy, tcx, tcy)) {
                 const Fixed full_x = u.x, full_y = u.y;
                 u.x = prev_x;
                 u.y = prev_y;
                 auto free_at = [&](Fixed nx, Fixed ny) {
                     int qx = 0, qy = 0;
                     nav_.to_cell(nx, ny, qx, qy);
-                    return !nav_.is_blocked_cell(qx, qy);
+                    return !closed_step(fcx, fcy, qx, qy);
                 };
                 if (full_x.raw() != prev_x.raw() && free_at(full_x, prev_y)) {
                     u.x = full_x;
@@ -627,11 +642,51 @@ bool World::move_unit_toward_impl(Unit& u, Fixed gx, Fixed gy, Fixed step) {
                         u.x = full_x;
                     } else if (full_y.raw() != prev_y.raw() && !disc_overlaps(prev_x, full_y)) {
                         u.y = full_y;
+                    } else {
+                        if (disc_slide_) {
+                            Fixed sx = full_x, sy = full_y;
+                            const Fixed half = nav_.cell_size() / Fixed::from_int(2);
+                            const Fixed eps = Fixed::from_raw(2);
+                            for (int pass = 0; pass < 2; ++pass) {
+                                int x0 = 0, y0 = 0, x1 = 0, y1 = 0;
+                                nav_.to_cell(sx - body_r, sy - body_r, x0, y0);
+                                nav_.to_cell(sx + body_r, sy + body_r, x1, y1);
+                                for (int gy = y0; gy <= y1; ++gy)
+                                    for (int gx = x0; gx <= x1; ++gx) {
+                                        if (!nav_.is_blocked_cell(gx, gy)) continue;
+                                        if (u.crushes_ff && nav_.has_ff() && nav_.is_ff_cell(gx, gy)) continue;
+                                        if (cliff_leap_ && u.can_jump && nav_.is_cliff_cell(gx, gy)) continue;
+                                        Fixed mx, my;
+                                        nav_.cell_center(gx, gy, mx, my);
+                                        const Fixed nx = sx < mx - half ? mx - half : (sx > mx + half ? mx + half : sx);
+                                        const Fixed ny = sy < my - half ? my - half : (sy > my + half ? my + half : sy);
+                                        const Fixed dx = sx - nx, dy = sy - ny;
+                                        const Fixed d = isqrt(dx * dx + dy * dy);
+                                        if (d.raw() <= 0 || d >= body_r) continue;
+                                        const Fixed push = body_r - d + eps;
+                                        sx = sx + dx * push / d;
+                                        sy = sy + dy * push / d;
+                                    }
+                            }
+                            const Fixed ox = wp.x - prev_x, oy = wp.y - prev_y, nx = wp.x - sx, ny = wp.y - sy;
+                            int qx = 0, qy = 0;
+                            nav_.to_cell(sx, sy, qx, qy);
+                            if (!disc_overlaps(sx, sy) && !nav_.is_blocked_cell(qx, qy) && nx * nx + ny * ny < ox * ox + oy * oy) {
+                                u.x = sx;
+                                u.y = sy;
+                            } else if (!u.wall_replanned) {
+                                u.wall_replanned = true;
+                                u.path.clear();
+                                u.path_next = 0;
+                            }
+                        }
                     }
+                    if (u.x.raw() != prev_x.raw() || u.y.raw() != prev_y.raw()) u.wall_replanned = false;
                     return false;
                 }
             }
         }
+        u.wall_replanned = false;
         if (arrived) {
             ++u.path_next;
             if (u.path_next >= u.path.size()) {
@@ -655,7 +710,7 @@ static bool anchor_zone_occupied(const std::vector<Unit>& units, const Unit& u) 
         if (u.collide_flags != 0 && o.collide_flags != 0 &&
             (u.collide_flags & o.collide_flags) == 0) continue;
         const Fixed os = o.radius;
-        const Fixed zone = us + os - Fixed::from_raw(252);
+        const Fixed zone = us + os - kContactSlack;
         const Fixed ddx = o.x - u.anchor_x, ddy = o.y - u.anchor_y;
         if (ddx * ddx + ddy * ddy < zone * zone) return true;
     }
@@ -764,8 +819,8 @@ void World::apply_separation() {
             if (m.collide_flags != 0 && b.collide_flags != 0 &&
                 (m.collide_flags & b.collide_flags) == 0) continue;
             if (harvesting(m) && harvesting(b) && b.moved_this_tick) continue;
-            const Fixed ms = m.sep_radius.raw() > 0 ? m.sep_radius : m.radius;
-            const Fixed bs = b.sep_radius.raw() > 0 ? b.sep_radius : b.radius;
+            const Fixed ms = sep_of(m);
+            const Fixed bs = sep_of(b);
             const Fixed sum = ms + bs;
             const Fixed contact = m.radius + b.radius;
             if (sum.raw() <= 0) continue;
@@ -819,8 +874,19 @@ void World::apply_separation() {
             if (lat.raw() < 0) lat = Fixed() - lat;
             if (lat >= sum) continue;
             const Fixed need = sum - lat;
-            const bool m_stiff = m.allied_push_priority >= 1;
-            const bool b_stiff = b.allied_push_priority >= 1;
+            bool m_stiff = m.allied_push_priority >= 1;
+            bool b_stiff = b.allied_push_priority >= 1;
+            if (sep_push_rules_) {
+                const bool b_holds = !b.moved_this_tick && !b.orders.empty() &&
+                                     b.orders.front().type == OrderType::HoldPosition;
+                if (b_holds || m.push_priority < b.push_priority) {
+                    m_stiff = false;
+                    b_stiff = true;
+                } else if (m.push_priority > b.push_priority) {
+                    m_stiff = true;
+                    b_stiff = false;
+                }
+            }
             Fixed share_m, share_b;
             if (m_stiff == b_stiff) {
                 share_m = need / Fixed::from_int(2);
@@ -989,8 +1055,8 @@ void World::apply_separation() {
                 if (b.air_expand) continue;
                 if (a.collide_flags != 0 && b.collide_flags != 0 &&
                     (a.collide_flags & b.collide_flags) == 0) continue;
-                const Fixed as = a.sep_radius.raw() > 0 ? a.sep_radius : a.radius;
-                const Fixed bs = b.sep_radius.raw() > 0 ? b.sep_radius : b.radius;
+                const Fixed as = sep_of(a);
+                const Fixed bs = sep_of(b);
                 const Fixed sum = as + bs;
                 if (sum.raw() <= 0) continue;
                 const Fixed dx = b.x - a.x, dy = b.y - a.y;
@@ -1047,13 +1113,13 @@ void World::apply_separation() {
         sep_list.push_back(uint32_t(j));
         sep_px.push_back(r.x);
         sep_py.push_back(r.y);
-        sep_pr.push_back(r.sep_radius.raw() > 0 ? r.sep_radius : r.radius);
+        sep_pr.push_back(sep_of(r));
     }
     for (size_t i = 0; i < n; ++i) {
         Unit& m = units_[i];
         if (!m.alive || m.flying || m.burrowed || !m.moved_this_tick || m.speed.raw() == 0) continue;
         if (collision_suppressed(m)) continue;
-        const Fixed m_sr = m.sep_radius.raw() > 0 ? m.sep_radius : m.radius;
+        const Fixed m_sr = sep_of(m);
         for (size_t k = 0; k < sep_list.size(); ++k) {
             const uint32_t rl = sep_list[k];
             {
@@ -1065,18 +1131,21 @@ void World::apply_separation() {
             }
             const Unit& r = units_[rl];
             if (r.id == m.id) continue;
+            if (rest_push_collide_ && m.collide_flags != 0 && r.collide_flags != 0 &&
+                (m.collide_flags & r.collide_flags) == 0)
+                continue;
             {
                 static const bool kHeldInside = std::getenv("OMC_SEP_NO_HELD_INSIDE") == nullptr;
                 const size_t ri = rl;
                 if (kHeldInside && ri < sep_held_.size() && sep_held_[ri]) {
                     const Fixed hb_x = pass_x0[i] - r.x, hb_y = pass_y0[i] - r.y;
-                    const Fixed held_gap = (m.sep_radius.raw() > 0 ? m.sep_radius : m.radius) +
-                                           (r.sep_radius.raw() > 0 ? r.sep_radius : r.radius) - kContactSlack;
+                    const Fixed held_gap = (sep_of(m)) +
+                                           (sep_of(r)) - kContactSlack;
                     if (raw_length(hb_x, hb_y) + Fixed::from_raw(16) < held_gap) continue;
                 }
             }
-            const Fixed msr = m.sep_radius.raw() > 0 ? m.sep_radius : m.radius;
-            const Fixed rsr = r.sep_radius.raw() > 0 ? r.sep_radius : r.radius;
+            const Fixed msr = sep_of(m);
+            const Fixed rsr = sep_of(r);
             const Fixed gap = msr + rsr - kContactSlack;
             if (gap.raw() <= 0) continue;
             const Fixed dx = m.x - r.x, dy = m.y - r.y;
@@ -1125,6 +1194,18 @@ void World::apply_separation() {
             }
         }
     }
+    if (creep_.has_sources())
+        for (size_t i = 0; i < n; ++i) {
+            Unit& u = units_[i];
+            if (!u.alive || !u.mover_requires_creep || u.flying) continue;
+            if (creep_.is_creep(u.x, u.y) || !creep_.is_creep(pass_x0[i], pass_y0[i])) continue;
+            if (creep_.is_creep(u.x, pass_y0[i])) u.y = pass_y0[i];
+            else if (creep_.is_creep(pass_x0[i], u.y)) u.x = pass_x0[i];
+            else {
+                u.x = pass_x0[i];
+                u.y = pass_y0[i];
+            }
+        }
     for (Unit& u : units_) {
         u.moved_this_tick = false;
         u.pushed_this_tick = false;
@@ -1264,6 +1345,8 @@ int32_t World::add_ability(AbilityDef def) {
     n.amount = def.amount;
     n.duration = def.duration;
     n.energy_fraction = def.energy_fraction;
+    n.vit_energy = def.energy_change;
+    n.vit_energy_frac = def.energy_change_frac;
     n.radius = def.radius;
     n.period = def.period;
     n.move_speed_mult = def.move_speed_mult;
@@ -1327,19 +1410,41 @@ int32_t World::add_ability(AbilityDef def) {
 bool World::add_behavior(uint32_t id, const BehaviorInstance& b) {
     if (id >= units_.size()) return false;
     Unit& u = units_[id];
+    static const bool kStackOld = std::getenv("OMC_BEHAVIOR_STACK_OLD") != nullptr;
+    static const bool kAtkOld = std::getenv("OMC_BEHAVIOR_ATK_SPEED_OLD") != nullptr;
+    const Fixed one = Fixed::from_int(1);
+    auto atk_on = [&](const BehaviorInstance& x) { return x.atk_speed_mult.raw() > 0 && x.atk_speed_mult.raw() != one.raw(); };
+    auto replace = [&](BehaviorInstance& e) {
+        if (!kAtkOld && e.atk_speed_mult.raw() != b.atk_speed_mult.raw()) {
+            if (atk_on(e)) u.atk_speed_mult = u.atk_speed_mult / e.atk_speed_mult;
+            if (atk_on(b)) u.atk_speed_mult = u.atk_speed_mult * b.atk_speed_mult;
+        }
+        e = b;
+    };
     if (b.kind != 0) {
-        int32_t same = 0;
+        int32_t same = 0, mine = 0;
         BehaviorInstance* oldest = nullptr;
+        BehaviorInstance* oldest_mine = nullptr;
         for (BehaviorInstance& e : u.behaviors) {
             if (e.kind != b.kind || e.src != b.src) continue;
             ++same;
             if (!oldest || e.timer < oldest->timer) oldest = &e;
+            if (e.caster == b.caster) {
+                ++mine;
+                if (!oldest_mine || e.timer < oldest_mine->timer) oldest_mine = &e;
+            }
+            if (!kStackOld && b.refresh_stack && !e.permanent && e.timer < b.timer) e.timer = b.timer;
+        }
+        if (!kStackOld && oldest_mine && b.max_stack_caster > 0 && mine >= b.max_stack_caster) {
+            replace(*oldest_mine);
+            return false;
         }
         if (oldest && (b.max_stack == 1 || (b.max_stack > 1 && same >= b.max_stack))) {
-            *oldest = b;
+            replace(*oldest);
             return false;
         }
     }
+    if (!kAtkOld && atk_on(b)) u.atk_speed_mult = u.atk_speed_mult * b.atk_speed_mult;
     u.behaviors.push_back(b);
     u.supply_provides = u.supply_provides + b.food;
     u.hp_max = u.hp_max + b.life_max;
@@ -1384,12 +1489,44 @@ int32_t World::add_persistent(PersistentInstance p) {
     return int32_t(persistents_.size()) - 1;
 }
 
+bool World::cast_cost_payable(const Unit& u, const Order& o) const {
+    if (!o.pay_due) return true;
+    const CastCost& c = o.pay;
+    if (ability_cooldown_left(u.id, int32_t(o.ability)).raw() > 0) return false;
+    if (c.life.raw() > 0 && u.hp <= c.life) return false;
+    if (c.energy.raw() > 0 && u.energy < c.energy) return false;
+    if (c.charge >= 0 && std::size_t(c.charge) < cast_charges_.size()) {
+        const CastChargeSpec& ch = cast_charges_[std::size_t(c.charge)];
+        if (charge_pool_count(u.player, ch.link, ch.start, ch.max, ch.start_ticks, ch.use_ticks) <
+            std::max<int32_t>(1, c.charge_use))
+            return false;
+    }
+    return true;
+}
+
+bool World::pay_cast_cost(Unit& u, Order& o) {
+    if (!o.pay_due) return true;
+    if (!cast_cost_payable(u, o)) return false;
+    const CastCost c = o.pay;
+    o.pay_due = false;
+    if (c.life.raw() > 0) spend_life(u.id, c.life);
+    if (c.energy.raw() > 0) spend_energy(u.id, c.energy);
+    if (c.charge >= 0 && std::size_t(c.charge) < cast_charges_.size()) {
+        const CastChargeSpec ch = cast_charges_[std::size_t(c.charge)];
+        charge_pool_take(u.player, ch.link, ch.start, ch.max, ch.start_ticks, ch.use_ticks,
+                         std::max<int32_t>(1, c.charge_use));
+    }
+    if (c.cooldown.raw() > 0) arm_ability_cooldown(u.id, int32_t(o.ability), c.cooldown);
+    return true;
+}
+
 void World::step_cast(Unit& u, Fixed dt) {
     Order& o = u.orders.front();
     if (o.ability >= abilities_.size()) {
         u.orders.erase(u.orders.begin());
         return;
     }
+    const uint32_t abil_ix = o.ability;
     const AbilityDef ab = abilities_[o.ability];
     if (u.cast_prep.raw() <= 0 && (abils_disabled(u) || abil_link_disabled(u, ab.abil_tag))) {
         u.orders.erase(u.orders.begin());
@@ -1421,9 +1558,21 @@ void World::step_cast(Unit& u, Fixed dt) {
                 return;
             }
         }
+        static const bool kTargetWalkOld = std::getenv("OMC_CAST_TARGET_WALK_OLD") != nullptr;
+        if (!kTargetWalkOld && ab.range.raw() > 0 && o.target < units_.size() && o.target != u.id &&
+            units_[o.target].alive && (u.speed.raw() > 0 || (u.flying && u.speed_air.raw() > 0)) && !u.burrowed) {
+            const Unit& walk_tgt = units_[o.target];
+            const Fixed reach = ab.range + u.radius + walk_tgt.radius;
+            if (dist2(u, walk_tgt) > reach * reach) {
+                move_unit_toward(u, walk_tgt.x, walk_tgt.y, move_step(u, dt));
+                return;
+            }
+        }
+        const bool paid = pay_cast_cost(u, o);
         u.orders.erase(u.orders.begin());
-        if (ab.cooldown.raw() > 0 && ability_cooldown_left(u.id, int32_t(o.ability)).raw() <= 0)
-            arm_ability_cooldown(u.id, int32_t(o.ability), ab.cooldown);
+        if (!paid) return;
+        if (ab.cooldown.raw() > 0 && ability_cooldown_left(u.id, int32_t(abil_ix)).raw() <= 0)
+            arm_ability_cooldown(u.id, int32_t(abil_ix), cast_cooldown(u, int32_t(abil_ix), ab.cooldown));
         log_cast_start(u, ab, ctx);
         execute_effect(ab.root, ctx);
         ++u.cast_count;
@@ -1431,6 +1580,20 @@ void World::step_cast(Unit& u, Fixed dt) {
     }
 
     const uint32_t tid = o.target;
+    if (tid == kNoTarget) {
+        static const bool kPointWalkOld = std::getenv("OMC_CAST_TARGET_WALK_OLD") != nullptr;
+        if (!kPointWalkOld && o.walk_in && ab.range.raw() > 0) {
+            const Fixed reach = ab.range + u.radius;
+            const Fixed ddx = o.tx - u.x, ddy = o.ty - u.y;
+            if (ddx * ddx + ddy * ddy > reach * reach) {
+                move_unit_toward(u, o.tx, o.ty, move_step(u, dt));
+                return;
+            }
+        }
+        pay_cast_cost(u, o);
+        u.orders.erase(u.orders.begin());
+        return;
+    }
     if (tid >= units_.size() || !units_[tid].alive) {
         u.orders.erase(u.orders.begin());
         return;
@@ -1450,9 +1613,11 @@ void World::step_cast(Unit& u, Fixed dt) {
         if (u.cast_prep.raw() > 0) return;
         u.cast_prep = Fixed();
         u.cast_prep_ability = -1;
+        const bool paid = pay_cast_cost(u, o);
         u.orders.erase(u.orders.begin());
-        if (ab.cooldown.raw() > 0 && ability_cooldown_left(u.id, int32_t(o.ability)).raw() <= 0)
-            arm_ability_cooldown(u.id, int32_t(o.ability), ab.cooldown);
+        if (!paid) return;
+        if (ab.cooldown.raw() > 0 && ability_cooldown_left(u.id, int32_t(abil_ix)).raw() <= 0)
+            arm_ability_cooldown(u.id, int32_t(abil_ix), cast_cooldown(u, int32_t(abil_ix), ab.cooldown));
         execute_effect(ab.root, ctx);
         ++u.cast_count;
         return;
@@ -1465,6 +1630,10 @@ void World::step_cast(Unit& u, Fixed dt) {
         }
     }
     if (ab.prep_time.raw() > 0) {
+        if (!o.pay.wait && !pay_cast_cost(u, o)) {
+            u.orders.erase(u.orders.begin());
+            return;
+        }
         u.cast_prep = ab.prep_time;
         u.cast_prep_ability = int32_t(o.ability);
         log_cast_start(u, ab, ctx);
@@ -1472,8 +1641,10 @@ void World::step_cast(Unit& u, Fixed dt) {
         return;
     }
 
+    const bool paid = pay_cast_cost(u, o);
     u.orders.erase(u.orders.begin());
-    if (ab.cooldown.raw() > 0) arm_ability_cooldown(u.id, int32_t(o.ability), ab.cooldown);
+    if (!paid) return;
+    if (ab.cooldown.raw() > 0) arm_ability_cooldown(u.id, int32_t(abil_ix), cast_cooldown(u, int32_t(abil_ix), ab.cooldown));
     log_cast_start(u, ab, ctx);
     execute_effect(ab.root, ctx);
     ++u.cast_count;
@@ -1778,6 +1949,8 @@ void World::execute_effect(EffectRef ref, const EffectContext& ctx, int depth) {
                 PendingSpawn ps{n.spawn_proto, n.spawn_count, ctx.tx, ctx.ty,
                                 n.spawn_neutral ? -1 : ctx.origin};
                 ps.range = n.spawn_range;
+                static const bool kObstacleSpawnOld = std::getenv("OMC_FORCEFIELD_PLACE_OLD") != nullptr;
+                if (n.spawn_blocks_ground && !kObstacleSpawnOld) ps.exact_point = true;
                 if (n.spawn_exact) {
                     ps.exact_point = true;
                     ps.fx = n.initial;
@@ -1937,7 +2110,7 @@ void World::execute_effect(EffectRef ref, const EffectContext& ctx, int depth) {
                 }
                 for (const auto& h : hits)
                     apply_spell_damage(h.first, h.second, ctx.source, n.armor_reduction,
-                                       !n.damage_hidden);
+                                       !n.damage_hidden, n.damage_kind, n.death_code);
                 return;
             }
             if (n.shield_bonus.raw() > 0 && ctx.target < units_.size()) {
@@ -1957,7 +2130,7 @@ void World::execute_effect(EffectRef ref, const EffectContext& ctx, int depth) {
                 if (n.wpn_bonus_attr != 0 && ctx.target < units_.size() && (units_[ctx.target].attributes & n.wpn_bonus_attr) != 0)
                     dmg = dmg + n.wpn_bonus_amount;
                 apply_spell_damage(ctx.target, dmg, ctx.source, n.armor_reduction,
-                                   !n.damage_hidden);
+                                   !n.damage_hidden, n.damage_kind, n.death_code);
             }
             return;
         case EffectKind::UseCalldown: {
@@ -2094,6 +2267,8 @@ void World::execute_effect(EffectRef ref, const EffectContext& ctx, int depth) {
             b.src = n.behavior_tag;
             b.present_src = n.fx_beh_tag;
             b.max_stack = n.beh_max_stack;
+            b.max_stack_caster = n.beh_max_stack_caster;
+            b.refresh_stack = n.beh_refresh_stack;
             b.timer = n.duration.raw() > 0 ? n.duration : Fixed::from_raw(1);
             b.speed_mult = n.move_speed_mult;
             b.root = n.beh_root;
@@ -2185,7 +2360,8 @@ void World::execute_effect(EffectRef ref, const EffectContext& ctx, int depth) {
                 units_[ctx.target].flying = true;
                 units_[ctx.target].orders.clear();
             }
-            if (fresh && ctx.target < units_.size() && n.attack_speed_mult.raw() > 0 &&
+            static const bool kAtkOld = std::getenv("OMC_BEHAVIOR_ATK_SPEED_OLD") != nullptr;
+            if (kAtkOld && fresh && ctx.target < units_.size() && n.attack_speed_mult.raw() > 0 &&
                 n.attack_speed_mult.raw() != Fixed::from_int(1).raw())
                 units_[ctx.target].atk_speed_mult = units_[ctx.target].atk_speed_mult * n.attack_speed_mult;
             return;
@@ -2250,6 +2426,11 @@ void World::execute_effect(EffectRef ref, const EffectContext& ctx, int depth) {
                 if (bi.src == n.behavior_tag) moved.push_back(bi);
             if (moved.empty()) return;
             if (!n.transfer_copy) {
+                static const bool kAtkOld = std::getenv("OMC_BEHAVIOR_ATK_SPEED_OLD") != nullptr;
+                if (!kAtkOld)
+                    for (const BehaviorInstance& bi : moved)
+                        if (bi.atk_speed_mult.raw() > 0 && bi.atk_speed_mult.raw() != Fixed::from_int(1).raw())
+                            units_[from].atk_speed_mult = units_[from].atk_speed_mult / bi.atk_speed_mult;
                 auto& bs = units_[from].behaviors;
                 bs.erase(std::remove_if(bs.begin(), bs.end(), [&](const BehaviorInstance& bi) { return bi.src == n.behavior_tag; }), bs.end());
             }
@@ -2281,7 +2462,15 @@ void World::execute_effect(EffectRef ref, const EffectContext& ctx, int depth) {
             if (ctx.target >= units_.size()) return;
             Unit& tgt = units_[ctx.target];
             const Fixed dmg = tgt.energy * n.energy_fraction;
-            tgt.energy = Fixed();
+            static const bool kModifyEnergyOld = std::getenv("OMC_MODIFY_ENERGY_OLD") != nullptr;
+            if (kModifyEnergyOld) {
+                tgt.energy = Fixed();
+            } else {
+                Fixed e = tgt.energy + n.vit_energy + tgt.energy_max * n.vit_energy_frac;
+                if (e.raw() < 0) e = Fixed();
+                if (e > tgt.energy_max) e = tgt.energy_max;
+                tgt.energy = e;
+            }
             apply_spell_damage(ctx.target, dmg, ctx.source, n.armor_reduction);
             return;
         }
@@ -2432,13 +2621,24 @@ bool World::validator_passes(const std::vector<ValidatorOp>& ops, std::uint16_t 
 }
 
 void World::apply_spell_damage(uint32_t target, Fixed dmg, uint32_t caster, Fixed armor_reduction,
-                               bool reveals_attacker) {
+                               bool reveals_attacker, std::uint8_t damage_kind, std::uint8_t death_code) {
     if (target >= units_.size()) return;
     Unit& t = units_[target];
     if (!t.alive) return;
     note_combat(t.player);
     if (caster < units_.size()) note_combat(units_[caster].player);
     if (is_invulnerable(t)) return;
+    static const bool armor_old = std::getenv("OMC_EFFECT_DAMAGE_ARMOR_OLD") != nullptr;
+    if (!armor_old && damage_kind != kDamageKindSpell && dmg.raw() > 0) {
+        const std::uint8_t sk = hit_kind_;
+        hit_kind_ = damage_kind;
+        const std::uint8_t sd = firing_death_;
+        if (death_code != 0) firing_death_ = death_code;
+        apply_weapon_hit(target, dmg, 0, Fixed(), caster, armor_reduction, reveals_attacker);
+        firing_death_ = sd;
+        hit_kind_ = sk;
+        return;
+    }
     const Fixed vitals_before = t.hp + t.shields;
     const bool barrier_was_up = t.barrier.raw() > 0;
     (void)armor_reduction;
@@ -2470,6 +2670,7 @@ void World::apply_spell_damage(uint32_t target, Fixed dmg, uint32_t caster, Fixe
     }
     if (t.hp.raw() <= 0 && t.alive) {
         t.alive = false;
+        if (!armor_old && death_code != 0) t.death_code = death_code;
         if (caster < units_.size() && units_[caster].alive) award_kill_xp(units_[caster], t.kill_xp);
         emit_death_reveal(t, caster);
     }
@@ -2478,7 +2679,7 @@ void World::apply_spell_damage(uint32_t target, Fixed dmg, uint32_t caster, Fixe
 }
 
 void World::apply_weapon_hit(uint32_t target, Fixed base, uint32_t bonus_attr, Fixed bonus_amount,
-                             uint32_t attacker, Fixed armor_reduction) {
+                             uint32_t attacker, Fixed armor_reduction, bool reveals_attacker) {
     if (target >= units_.size()) return;
     Unit& t = units_[target];
     note_combat(t.player);
@@ -2514,7 +2715,7 @@ void World::apply_weapon_hit(uint32_t target, Fixed base, uint32_t bonus_attr, F
         if (attacker < units_.size() && units_[attacker].alive) award_kill_xp(units_[attacker], t.kill_xp);
         emit_death_reveal(t, attacker);
     }
-    record_flee_trigger(t, attacker, vitals_before);
+    record_flee_trigger(t, attacker, vitals_before, reveals_attacker);
     on_unit_damaged(t, vitals_before);
 }
 
@@ -2996,7 +3197,7 @@ int World::queued_count(uint32_t producer) const {
     int n = 0;
     for (const Pending& pd : pending_)
         if (pd.producer == producer) ++n;
-    return n;
+    return n + hangar_queued(producer);
 }
 
 bool World::cancel_train(uint32_t producer) {
@@ -3005,6 +3206,7 @@ bool World::cancel_train(uint32_t producer) {
 
 bool World::cancel_train_slot(uint32_t producer, int slot) {
     if (slot < 0) return false;
+    if (hangar_cancel_slot(producer, slot)) return true;
     int idx = -1, seen = 0;
     for (std::size_t i = 0; i < pending_.size(); ++i)
         if (pending_[i].producer == producer && seen++ == slot) { idx = int(i); break; }
@@ -3120,7 +3322,10 @@ bool World::issue_worker_build(uint32_t builder, Fixed x, Fixed y, const Unit& p
                                Fixed arrive, BuildVerb verb) {
     if (builder >= units_.size() || !units_[builder].alive) return false;
     const int32_t bp = units_[builder].player;
-    if (!creep_placement_ok(proto, x, y)) { refuse(bp, CmdError::CantBuildTooFarFromCreepSource); return false; }
+    if (!creep_placement_ok(proto, x, y)) {
+        refuse(bp, proto.requires_creep ? CmdError::CantBuildTooFarFromCreepSource : CmdError::CantBuildTooCloseToCreepSource);
+        return false;
+    }
     if (!resource_halo_ok(proto, x, y)) { refuse(bp, CmdError::CantBuildTooCloseToResources); return false; }
     if (placement_.configured()) {
         int cx = 0, cy = 0;
@@ -3200,8 +3405,13 @@ void World::step_worker_builds() {
         const Fixed dx = wb.x - b.x, dy = wb.y - b.y;
         Fixed threshold = wb.arrive;
         if (!wb.proto.requires_vespene && !wb.proto.footprint_offsets.empty()) {
+            static const bool kArriveOld = std::getenv("OMC_BUILD_ARRIVE_OLD") != nullptr;
+            static constexpr Fixed kFoundBase = Fixed::from_ratio_round(57, 100);
+            static constexpr Fixed kFoundSlope = Fixed::from_ratio_round(73, 100);
             const Fixed h = site_half_extent(wb.proto);
-            if (h.raw() > 0) threshold = Fixed::from_double(0.57) + h * Fixed::from_double(0.73);
+            if (!kArriveOld && b.build_range_to_centre && !(b.orders.empty() && h.raw() > 0)) threshold = arrival_near(b);
+            else if (kArriveOld && h.raw() > 0) threshold = Fixed::from_double(0.57) + h * Fixed::from_double(0.73);
+            else if (h.raw() > 0) threshold = kFoundBase + h * kFoundSlope;
         }
         if (dx * dx + dy * dy > threshold * threshold) {
             ++i;
@@ -3342,9 +3552,22 @@ bool World::body_overlaps_blocked(Fixed cx, Fixed cy, Fixed r) const {
     return false;
 }
 
-bool World::nearest_open_spot(Fixed& x, Fixed& y, Fixed r) const {
+bool World::ground_nospawn_at(Fixed x, Fixed y) const {
+    int cx = 0, cy = 0;
+    nav_.to_cell(x, y, cx, cy);
+    for (const Unit& s : units_) {
+        if (!s.alive || s.flying || s.nospawn_offsets.empty()) continue;
+        int ox = 0, oy = 0;
+        nav_.to_cell(s.x, s.y, ox, oy);
+        for (const std::pair<int16_t, int16_t>& o : s.nospawn_offsets)
+            if (ox + o.first == cx && oy + o.second == cy) return true;
+    }
+    return false;
+}
+
+bool World::nearest_open_spot(Fixed& x, Fixed& y, Fixed r, bool avoid_nospawn) const {
     if (!nav_.configured() || !nav_.has_blocked()) return true;
-    if (!body_overlaps_blocked(x, y, r)) return true;
+    if (!body_overlaps_blocked(x, y, r) && !(avoid_nospawn && ground_nospawn_at(x, y))) return true;
     int ocx = 0, ocy = 0;
     nav_.to_cell(x, y, ocx, ocy);
     constexpr int kRing = 12;
@@ -3359,6 +3582,7 @@ bool World::nearest_open_spot(Fixed& x, Fixed& y, Fixed r) const {
                 Fixed px, py;
                 nav_.cell_center(cx, cy, px, py);
                 if (body_overlaps_blocked(px, py, r)) continue;
+                if (avoid_nospawn && ground_nospawn_at(px, py)) continue;
                 const Fixed ex = px - x, ey = py - y, d = ex * ex + ey * ey;
                 if (!found || d < bd) {
                     found = true;
@@ -3431,8 +3655,15 @@ bool World::site_reserved(const Unit& proto, Fixed x, Fixed y, int32_t pl, uint3
 void World::evict_from_site(const Unit& structure, uint32_t builder) {
     static const double kR[6] = {0.375, 0.5, 0.5625, 0.875, 1.0, 1.375};
     static const double kD[6] = {4.07489, 4.07489, 4.1485, 4.9922, 4.4297, 5.26957};
+    static const Fixed kRf[6] = {Fixed::parse("0.375"), Fixed::parse("0.5"), Fixed::parse("0.5625"),
+                                 Fixed::parse("0.875"), Fixed::parse("1.0"), Fixed::parse("1.375")};
+    static const Fixed kDf[6] = {Fixed::parse("4.07489"), Fixed::parse("4.07489"), Fixed::parse("4.1485"),
+                                 Fixed::parse("4.9922"), Fixed::parse("4.4297"), Fixed::parse("5.26957")};
+    static const Fixed kFootRise = Fixed::parse("1.405"), kFootRun = Fixed::parse("1.5");
+    static const bool evict_double_old = std::getenv("OMC_EVICT_DOUBLE_OLD") != nullptr;
     const Fixed h = site_half_extent(structure);
     const double foot = (h.to_double() - 1.0) * (1.405 / 1.5);
+    const Fixed footf = (h - Fixed::from_int(1)) * kFootRise / kFootRun;
     const std::size_t n = units_.size();
     for (std::size_t i = 0; i < n; ++i) {
         Unit& u = units_[i];
@@ -3441,16 +3672,30 @@ void World::evict_from_site(const Unit& structure, uint32_t builder) {
         const Fixed dx = u.x - structure.x, dy = u.y - structure.y;
         const Fixed ax = dx.raw() < 0 ? Fixed() - dx : dx, ay = dy.raw() < 0 ? Fixed() - dy : dy;
         if (ax >= h || ay >= h) continue;
-        const double r = u.radius.to_double();
-        double d = kD[5];
-        if (r <= kR[0]) d = kD[0];
-        else
-            for (int k = 0; k + 1 < 6; ++k)
-                if (r <= kR[k + 1]) {
-                    d = kD[k] + (kD[k + 1] - kD[k]) * (r - kR[k]) / (kR[k + 1] - kR[k]);
-                    break;
-                }
-        const Fixed D = Fixed::from_double(d + foot) + arrival_near(u);
+        Fixed D;
+        if (evict_double_old) {
+            const double r = u.radius.to_double();
+            double d = kD[5];
+            if (r <= kR[0]) d = kD[0];
+            else
+                for (int k = 0; k + 1 < 6; ++k)
+                    if (r <= kR[k + 1]) {
+                        d = kD[k] + (kD[k + 1] - kD[k]) * (r - kR[k]) / (kR[k + 1] - kR[k]);
+                        break;
+                    }
+            D = Fixed::from_double(d + foot) + arrival_near(u);
+        } else {
+            const Fixed r = u.radius;
+            Fixed d = kDf[5];
+            if (r <= kRf[0]) d = kDf[0];
+            else
+                for (int k = 0; k + 1 < 6; ++k)
+                    if (r <= kRf[k + 1]) {
+                        d = kDf[k] + (kDf[k + 1] - kDf[k]) * (r - kRf[k]) / (kRf[k + 1] - kRf[k]);
+                        break;
+                    }
+            D = d + footf + arrival_near(u);
+        }
         const Fixed len = isqrt(dx * dx + dy * dy);
         Order mv;
         mv.type = OrderType::Move;
@@ -4046,7 +4291,7 @@ void World::step_production(Fixed dt) {
                 const Unit& pr = units_[pd.producer];
                 if (u.speed.raw() > 0) {
                     train_exit_point(pr, u.radius, u.x, u.y);
-                    if (exit_open_spot_ && !u.flying) nearest_open_spot(u.x, u.y, u.radius);
+                    if (exit_open_spot_ && !u.flying) nearest_open_spot(u.x, u.y, u.radius, u.mover_avoids_nospawn);
                     Fixed fdx = Fixed(), fdy = Fixed() - Fixed::from_int(1);
                     if (pr.has_rally) {
                         const Fixed rx = pr.rally_x - pr.x, ry = pr.rally_y - pr.y;
@@ -4110,7 +4355,8 @@ void World::step_production(Fixed dt) {
                 extra.player = units_[nid].player;
                 extra.x = units_[nid].x + Fixed::from_int(DXk[k & 7]);
                 extra.y = units_[nid].y + Fixed::from_int(DYk[k & 7]);
-                if (exit_open_spot_ && !extra.flying) nearest_open_spot(extra.x, extra.y, extra.radius);
+                if (exit_open_spot_ && !extra.flying)
+                    nearest_open_spot(extra.x, extra.y, extra.radius, extra.mover_avoids_nospawn);
                 const uint32_t enid = add_unit(extra);
                 if (rally) issue(enid, Order{OrderType::Move, rx, ry, kNoTarget}, false);
             }
@@ -4417,7 +4663,9 @@ void World::step_interceptors(Fixed dt) {
                 if (id < units_.size()) units_[id].alive = false;
             continue;
         }
-        if (c.count < c.count_max && c.build_time.raw() > 0) {
+        if (c.queue_size > 0) {
+            step_hangar(c, dt);
+        } else if (c.count < c.count_max && c.build_time.raw() > 0) {
             c.build_timer = c.build_timer - dt;
             if (c.build_timer.raw() <= 0) {
                 ++c.count;
@@ -4724,10 +4972,8 @@ void World::step() {
             }
         }
         if (crushed || ff.timer.raw() <= 0) {
-            for (const auto& c : ff.cells) {
-                nav_.set_blocked(c.first, c.second, false);
-                nav_.mark_ff(c.first, c.second, false);
-            }
+            for (const auto& c : ff.cells)
+                if (release_nav_cell(c.first, c.second)) nav_.mark_ff(c.first, c.second, false);
             force_fields_.erase(force_fields_.begin() + i);
         } else {
             ++i;
@@ -5189,7 +5435,9 @@ void World::step() {
                         if (dx * dx + dy * dy <= u.wander_range * u.wander_range) break;
                         if (tries == 7) { dx = dx * Fixed::from_ratio(7, 10); dy = dy * Fixed::from_ratio(7, 10); }
                     }
-                    issue(u.id, Order{OrderType::Move, u.wander_ox + dx, u.wander_oy + dy}, false, false);
+                    if (!u.mover_requires_creep || !creep_.has_sources() ||
+                        creep_.is_creep(u.wander_ox + dx, u.wander_oy + dy))
+                        issue(u.id, Order{OrderType::Move, u.wander_ox + dx, u.wander_oy + dy}, false, false);
                     u.wander_timer = u.wander_delay;
                 }
             }
@@ -5269,6 +5517,7 @@ void World::step() {
                     for (const Unit& r : units_) {
                         if (r.id == u.id || !r.alive || r.flying || r.burrowed || r.speed.raw() == 0) continue;
                         if (!r.orders.empty() || r.moved_this_tick || !are_allied(r.player, u.player)) continue;
+                        if (rest_push_collide_ && u.collide_flags != 0 && r.collide_flags != 0 && (u.collide_flags & r.collide_flags) == 0) continue;
                         if (!r.arrived || !(r.arrive_x == o.tx) || !(r.arrive_y == o.ty)) continue;
                         const Fixed rx = o.tx - r.x, ry = o.ty - r.y;
                         if (rx * rx + ry * ry >= my_d2) continue;
@@ -5286,6 +5535,7 @@ void World::step() {
                         for (const Unit& r : units_) {
                             if (r.id == u.id || !r.alive || r.flying || r.burrowed || r.speed.raw() == 0) continue;
                             if (!r.orders.empty() || !are_allied(r.player, u.player) || collision_suppressed(r)) continue;
+                            if (rest_push_collide_ && u.collide_flags != 0 && r.collide_flags != 0 && (u.collide_flags & r.collide_flags) == 0) continue;
                             if (r.arrived && r.arrive_x == o.tx && r.arrive_y == o.ty) continue;
                             const Fixed reach = u.radius + r.radius - kContactSlack;
                             const Fixed gx = o.tx - r.x, gy = o.ty - r.y;
@@ -5706,6 +5956,7 @@ uint64_t World::state_hash() const {
         h = mix(h, uint32_t(c.count));
         h = mix(h, uint32_t(c.count_max));
         h = mix(h, uint32_t(c.build_timer.raw()));
+        h = mix(h, uint32_t(c.queued));
         for (uint32_t id : c.wing) h = mix(h, id);
     }
     for (const Nova& n : novas_) {
@@ -5753,6 +6004,13 @@ uint64_t World::state_hash() const {
             h = mix(h, o.ability);
             h = mix(h, uint32_t(o.px.raw()));
             h = mix(h, uint32_t(o.py.raw()));
+            if (o.pay_due) {
+                h = mix(h, 0xCA57u);
+                h = mix(h, uint32_t(o.pay.energy.raw()));
+                h = mix(h, uint32_t(o.pay.life.raw()));
+                h = mix(h, uint32_t(o.pay.cooldown.raw()));
+                h = mix(h, uint32_t(o.pay.charge));
+            }
         }
         if (!u.catalog_id.empty()) h = mix(h, type_identity(u.catalog_id));
         if (u.type_id != 0) h = mix(h, uint32_t(u.type_id));
@@ -6074,9 +6332,23 @@ void World::morph_become(Unit& u, int32_t proto, bool vitals) {
     std::vector<MorphStep> keep_steps = std::move(u.morph_steps);
     std::vector<uint32_t> keep_beh_off = std::move(u.morph_beh_off);
     std::vector<BehaviorInstance> keep_perm;
+    Fixed keep_food, keep_life;
     for (const BehaviorInstance& b : u.behaviors)
-        if (b.permanent) keep_perm.push_back(b);
+        if (morph_keep_behaviors_ || b.permanent) {
+            keep_perm.push_back(b);
+            keep_food = keep_food + b.food;
+            keep_life = keep_life + b.life_max;
+        }
+    const Fixed keep_atk = u.atk_speed_mult;
+    const Fixed keep_chrono = u.chrono_timer, keep_chrono_mult = u.chrono_mult;
     u = spawn_protos_[size_t(proto)];
+    if (morph_keep_behaviors_) {
+        u.atk_speed_mult = keep_atk;
+        u.chrono_timer = keep_chrono;
+        u.chrono_mult = keep_chrono_mult;
+        u.supply_provides = u.supply_provides + keep_food;
+        if (vitals) u.hp_max = u.hp_max + keep_life;
+    }
     u.id = keep_id;
     u.player = keep_player;
     u.x = keep_x;
@@ -6116,8 +6388,10 @@ void World::morph_become(Unit& u, int32_t proto, bool vitals) {
         u.hp_max = keep_hp_max;
         u.shields = keep_shields;
         u.shields_max = keep_shields_max;
+        if (unit_refold_) unit_refold_(u);
         return;
     }
+    if (unit_refold_) unit_refold_(u);
     u.hp = keep_hp < u.hp_max ? keep_hp : u.hp_max;
     u.shields = keep_shields < u.shields_max ? keep_shields : u.shields_max;
     if (morph_vital_fraction_) {
@@ -6199,6 +6473,24 @@ bool World::cancel_morph(uint32_t id) {
         o.player = u.player;
         o.x = u.x;
         o.y = u.y;
+        if (morph_keep_behaviors_) {
+            Fixed was_food, was_life, now_food, now_life;
+            for (const BehaviorInstance& b : o.behaviors) {
+                was_food = was_food + b.food;
+                was_life = was_life + b.life_max;
+            }
+            for (const BehaviorInstance& b : u.behaviors) {
+                now_food = now_food + b.food;
+                now_life = now_life + b.life_max;
+            }
+            o.behaviors = u.behaviors;
+            o.morph_beh_off = u.morph_beh_off;
+            o.supply_provides = o.supply_provides + now_food - was_food;
+            o.hp_max = o.hp_max + now_life - was_life;
+            o.atk_speed_mult = u.atk_speed_mult;
+            o.chrono_timer = u.chrono_timer;
+            o.chrono_mult = u.chrono_mult;
+        }
         o.hp = hp_max.raw() > 0 ? Fixed::from_raw(int32_t(int64_t(hp.raw()) * o.hp_max.raw() / hp_max.raw())) : o.hp;
         o.shields = sh_max.raw() > 0 ? Fixed::from_raw(int32_t(int64_t(sh.raw()) * o.shields_max.raw() / sh_max.raw())) : o.shields;
         if (o.hp > o.hp_max) o.hp = o.hp_max;

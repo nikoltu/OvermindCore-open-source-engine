@@ -5,6 +5,8 @@
 #include "omc/app/shell_emblem.hpp"
 #include "omc/app/ui_canvas.hpp"
 #include "omc/app/ui_theme.hpp"
+#include "omc/core/client_identity.hpp"
+#include "omc/campaign/flow.hpp"
 
 #include <algorithm>
 #include <cmath>
@@ -400,14 +402,14 @@ void band_footer(const Board& b) {
     const int mark = b.s(theme::kFooterMark);
     const int my = y0 + (b.s(theme::kFooterH) - mark) / 2;
     image_well(b, pad, my, pad + mark, my + mark, shell_emblem(true));
-    const std::string v = std::string("overmindcore ") + omc::kVersion;
+    const std::string v = std::string(omc::identity::kSlug) + " " + omc::kVersion;
     text_left(b, pad + mark + b.s(8), y0, int(b.h), v, theme::kTypeSmall, theme::kAccentDeep,
               int(b.w) - pad);
 }
 
 void mark_version(const Board& b) {
     const int mark = b.s(theme::kFooterMark);
-    const std::string v = std::string("overmindcore ") + omc::kVersion;
+    const std::string v = std::string(omc::identity::kSlug) + " " + omc::kVersion;
     const int tw = run_w(b, v, theme::kTypeMicro);
     const int x1 = b.rx(theme::kScreenPad);
     const int y1 = b.by(16);
@@ -541,7 +543,7 @@ void draw_shell_root(const Board& b, const std::vector<Ctl>& ctls) {
         std::string stage = omc::kVersionStage;
         for (char& ch : stage)
             if (ch >= 'a' && ch <= 'z') ch = char(ch - 'a' + 'A');
-        const std::string data_line = std::string("overmindcore ") + omc::kVersion;
+        const std::string data_line = std::string(omc::identity::kSlug) + " " + omc::kVersion;
         const int padx = b.s(theme::kVersionPadX), pady = b.s(theme::kVersionPadY);
         const int wv = std::max(run_w(b, ver, theme::kTypeVersionBig),
                                 run_w(b, data_line, theme::kTypeVersionFine)) +
@@ -1830,6 +1832,37 @@ void FrontEnd::scan_replays() {
     std::sort(replays_.begin(), replays_.end(), [](const ReplayEntry& a, const ReplayEntry& b) { return a.name > b.name; });
 }
 
+void FrontEnd::scan_saves() {
+    saves_scanned_ = true;
+    saves_.clear();
+    if (saves_dir_.empty()) return;
+    std::error_code ec;
+    if (!std::filesystem::is_directory(saves_dir_, ec)) return;
+    for (const auto& entry : std::filesystem::directory_iterator(saves_dir_, ec)) {
+        if (ec) break;
+        if (!entry.is_regular_file(ec)) continue;
+        if (entry.path().extension().string() != ".omcorders") continue;
+        saves_.push_back({entry.path().string(), entry.path().stem().string()});
+    }
+    std::sort(saves_.begin(), saves_.end(), [](const ReplayEntry& a, const ReplayEntry& b) { return a.name > b.name; });
+}
+
+const FrontEnd::RecordingMeta& FrontEnd::recording_meta(const std::string& path) {
+    auto it = recording_meta_.find(path);
+    if (it != recording_meta_.end()) return it->second;
+    RecordingMeta m;
+    OrderLog log;
+    if (read_order_log_file(path, log)) {
+        m.ok = true;
+        m.map_id = log.map_id;
+        m.races = log.player_races;
+        m.teams = log.player_teams;
+        for (std::size_t p = 0; p < log.player_races.size(); ++p) m.controllers.push_back(log.controller_of(p));
+        m.ticks = log.total_ticks;
+    }
+    return recording_meta_.emplace(path, std::move(m)).first->second;
+}
+
 static void stamp_replay_meta(MeleeGame& g, const std::string& map_id, const std::vector<MeleeSlot>& slots, bool any_start_pair) {
     std::vector<std::int32_t> races, teams, ctls;
     for (const MeleeSlot& sl : slots) {
@@ -1929,6 +1962,23 @@ std::vector<FrontEnd::LobbySlot> FrontEnd::lobby_preset(LobbyFormat f, int rows,
         s.pick = i == 0 ? you : ai;
         s.difficulty = i == 0 ? 0 : tier;
         s.team = (f == LobbyFormat::OneVsOne || f == LobbyFormat::FreeForAll) ? -1 : (i < players / 2 ? 0 : 1);
+    }
+    return out;
+}
+
+std::vector<FrontEnd::LobbySlot> FrontEnd::custom_preset(int starts, LobbyRace you, LobbyRace ai, int tier) {
+    std::vector<LobbySlot> out(std::size_t(std::max(2, std::min(8, starts))));
+    for (std::size_t i = 0; i < out.size(); ++i) {
+        LobbySlot& s = out[i];
+        s.pick = i == 0 ? you : ai;
+        s.team = -1;
+        if (i < 2) {
+            s.controller = i == 0 ? MeleeSlot::Controller::Human : MeleeSlot::Controller::AI;
+            s.difficulty = i == 0 ? 0 : tier;
+        } else {
+            s.controller = MeleeSlot::Controller::Closed;
+            s.open = true;
+        }
     }
     return out;
 }
@@ -2095,7 +2145,7 @@ bool FrontEnd::step_load(std::uint32_t view_w, std::uint32_t view_h) {
             const int phase = int(s.kind) - int(LoadStep::Kind::MapBytes);
             if (!build_real_map_phase(phase)) {
                 load_plan_.reset();
-                router_.replace(ScreenId::Lobby);
+                router_.replace(setup_screen_);
                 return false;
             }
             ++load_plan_.warmed;
@@ -2155,7 +2205,18 @@ bool FrontEnd::build_real_map_phase(int phase) {
                 if (std::getenv("OMC_MAP_ASSETS_TRACE")) std::fprintf(stderr, "[mapassets] %zu files from the map archive\n", ov.size());
                 store_.set_overlay(std::move(ov));
             }
-            if (!std::getenv("OMC_NO_MAP_CAMPAIGN_UNITS")) {
+            if (!std::getenv("OMC_NO_MAP_CAMPAIGN_UNITS") && !std::getenv("OMC_MAP_DEPENDENCY_OLD")) {
+                try {
+                    const formats::Mpq arc = formats::Mpq::open(pending_map_bytes_);
+                    const std::vector<std::string> deps =
+                        formats::parse_document_dependencies(arc.read_file("DocumentHeader"));
+                    const std::size_t added = cat_.load_dependencies(store_, deps);
+                    if (std::getenv("OMC_PLACED_DROP_TRACE"))
+                        std::fprintf(stderr, "[map-dependency] %zu declared, %zu data root(s) added (missing ids only)\n",
+                                     deps.size(), added);
+                } catch (const std::exception&) {
+                }
+            } else if (!std::getenv("OMC_NO_MAP_CAMPAIGN_UNITS")) {
                 try {
                     const formats::Mpq arc = formats::Mpq::open(pending_map_bytes_);
                     const std::vector<std::uint8_t> hb = arc.read_file("DocumentHeader");
@@ -2310,13 +2371,13 @@ bool FrontEnd::begin_match() {
         std::vector<const ArenaMap::Base*> sites;
         if (!arena_) {
             match_error_ = "no map selected";
-            router_.replace(ScreenId::Lobby);
+            router_.replace(setup_screen_);
             return false;
         }
         if (!arena_sites(*arena_, slots_, sites)) {
             match_error_ = "the built-in arena seats 2 to 4 players (its two mains and two naturals); this setup has " +
                            std::to_string(slots_.size());
-            router_.replace(ScreenId::Lobby);
+            router_.replace(setup_screen_);
             return false;
         }
         for (std::size_t p = 0; p < slots_.size(); ++p) {
@@ -2354,7 +2415,7 @@ bool FrontEnd::begin_match() {
     } else {
         for (int phase = 0; phase < 4; ++phase) {
             if (!build_real_map_phase(phase)) {
-                router_.replace(ScreenId::Lobby);
+                router_.replace(setup_screen_);
                 return false;
             }
             static const char* const kPhase[] = {"map: phase 0 (archive, terrain)", "map: phase 1", "map: phase 2", "map: phase 3"};
@@ -2370,7 +2431,7 @@ bool FrontEnd::begin_match() {
                 setup = melee_setup_for_map(*real_map_, cat_, slots_, -1, 8, start_seed, any_pair);
             } catch (const std::exception& e) {
                 match_error_ = std::string("this map cannot seat the setup: ") + e.what();
-                router_.replace(ScreenId::Lobby);
+                router_.replace(setup_screen_);
                 return false;
             }
         }
@@ -2625,8 +2686,10 @@ bool FrontEnd::begin_match() {
             std::fprintf(stderr, "bounds: map %u x %u cells, camera l %d b %d r %d t %d (has %d)\n", real_map_->cell_width(), real_map_->cell_height(),
                          int(real_map_->info.camera_left), int(real_map_->info.camera_bottom), int(real_map_->info.camera_right), int(real_map_->info.camera_top),
                          int(real_map_->info.has_camera_bounds));
-        if (real_map_->info.has_camera_bounds)
+        if (real_map_->info.has_camera_bounds) {
             skirmish_->set_camera_bounds_x(float(real_map_->info.camera_left), float(real_map_->info.camera_right));
+            skirmish_->set_camera_bounds_y(float(real_map_->info.camera_bottom));
+        }
         skirmish_->set_cliffs(&real_cliffs_.instances);
     }
     if (!research_up_) {
@@ -2691,8 +2754,10 @@ bool FrontEnd::step(const render::InputState& in, float dt_ms,
     }
     if (router_.top() == ScreenId::ReplayBrowse) {
         if (!replays_scanned_) scan_replays();
+        if (!saves_scanned_) scan_saves();
     } else {
         replays_scanned_ = false;
+        saves_scanned_ = false;
     }
     if (router_.top() == ScreenId::ReplayControls && skirmish_) {
         if (in.quit) {
@@ -2753,6 +2818,7 @@ bool FrontEnd::step(const render::InputState& in, float dt_ms,
         }
         if (in.quit) {
             router_.cancel();
+            if (router_.top() == ScreenId::Lobby) router_.replace(setup_screen_);
             loading_frames_ = 0;
             load_plan_.reset();
         } else if (loading_frames_ < 1) {
@@ -2964,7 +3030,7 @@ void FrontEnd::draw_glue_screen(ScreenId id, std::uint32_t view_w, std::uint32_t
         const bool won = last_outcome_ == MatchResult::Outcome::Victory;
         const int ty = b.s(theme::kLoadTitleTop);
         text_box(b, 0, ty, int(view_w), ty + draw::text_h_em(type_px(b, theme::kTypeLoadTitle)),
-                 MatchResult::banner(last_outcome_), theme::kTypeLoadTitle,
+                 MatchResult::banner_text(last_outcome_, &cat_.strings()), theme::kTypeLoadTitle,
                  won ? theme::kOk : theme::kErr);
         const int sy = ty + draw::text_h_em(type_px(b, theme::kTypeLoadTitle)) + b.s(8);
         text_box(b, 0, sy, int(view_w), sy + draw::text_h_em(type_px(b, theme::kTypeBody)),
@@ -3412,7 +3478,7 @@ void ShellCtx::select_map(int index) {
     fe.sel_map_ = index;
     fe.match_error_.clear();
     settings.set_lobby_map(fe.maps_[std::size_t(index)].path);
-    if (changed && fe.lobby_format_ != FrontEnd::LobbyFormat::OneVsOne && !fe.set_lobby_format(fe.lobby_format_)) {
+    if (changed && router.top() != ScreenId::Custom && fe.lobby_format_ != FrontEnd::LobbyFormat::OneVsOne && !fe.set_lobby_format(fe.lobby_format_)) {
         fe.lobby_format_ = FrontEnd::LobbyFormat::OneVsOne;
         fe.lobby_slots_.clear();
         fx.toast(std::string("This map has ") + std::to_string(fe.map_start_count(index)) + " start locations - back to 1v1", false);
@@ -3536,12 +3602,16 @@ bool ShellCtx::start_selected_match(const char* via) {
     fe.match_seed_ = new_match_seed();
     const std::uint64_t match_seed = fe.match_seed_ ? fe.match_seed_ : MeleeGameConfig{}.seed;
     fe.match_error_.clear();
-    if (fe.lobby_format_ == FrontEnd::LobbyFormat::OneVsOne || fe.lobby_slots_.empty()) {
+    if (router.top() == ScreenId::Custom) fe.setup_screen_ = ScreenId::Custom;
+    else if (router.top() == ScreenId::Lobby || router.top() == ScreenId::GlueRoot) fe.setup_screen_ = ScreenId::Lobby;
+    const bool custom = fe.setup_screen_ == ScreenId::Custom;
+    const std::vector<FrontEnd::LobbySlot>& rows = custom ? fe.custom_slots_ : fe.lobby_slots_;
+    if ((!custom && fe.lobby_format_ == FrontEnd::LobbyFormat::OneVsOne) || rows.empty()) {
         fe.set_two_player_races(resolve_lobby_race(fe.p0_pick_, match_seed, 0), resolve_lobby_race(fe.p1_pick_, match_seed, 1));
     } else {
         std::vector<MeleeSlot> s;
-        for (std::size_t i = 0; i < fe.lobby_slots_.size(); ++i) {
-            const FrontEnd::LobbySlot& row = fe.lobby_slots_[i];
+        for (std::size_t i = 0; i < rows.size(); ++i) {
+            const FrontEnd::LobbySlot& row = rows[i];
             if (row.controller == MeleeSlot::Controller::Closed) continue;
             MeleeSlot sl;
             sl.race = resolve_lobby_race(row.pick, match_seed, int(i));
@@ -3628,23 +3698,26 @@ ShellCtx::ResultView ShellCtx::result() const {
 
 int ShellCtx::lobby_format() const { return int(fe.lobby_format_); }
 bool ShellCtx::set_lobby_format(int format) { return fe.set_lobby_format(FrontEnd::LobbyFormat(std::max(0, std::min(4, format)))); }
-int ShellCtx::lobby_rows() const { return int(fe.lobby_slots_.size()); }
+int ShellCtx::lobby_rows() const { return int(fe.edit_slots().size()); }
 int ShellCtx::map_start_count(int index) { return fe.map_start_count(index); }
 void ShellCtx::lobby_row(int i, int& controller, int& race, int& difficulty, int& team) const {
     controller = 2, race = 0, difficulty = 0, team = -1;
-    if (i < 0 || i >= int(fe.lobby_slots_.size())) return;
-    const FrontEnd::LobbySlot& s = fe.lobby_slots_[std::size_t(i)];
-    controller = int(s.controller);
+    const std::vector<FrontEnd::LobbySlot>& slots = fe.edit_slots();
+    if (i < 0 || i >= int(slots.size())) return;
+    const FrontEnd::LobbySlot& s = slots[std::size_t(i)];
+    controller = s.open && s.controller == MeleeSlot::Controller::Closed ? 3 : int(s.controller);
     race = int(s.pick);
     difficulty = s.difficulty;
     team = s.team;
 }
 void ShellCtx::set_lobby_row(int i, int controller, int race, int difficulty, int team) {
-    if (i < 0 || i >= int(fe.lobby_slots_.size())) return;
-    FrontEnd::LobbySlot& s = fe.lobby_slots_[std::size_t(i)];
+    std::vector<FrontEnd::LobbySlot>& slots = fe.edit_slots();
+    if (i < 0 || i >= int(slots.size())) return;
+    FrontEnd::LobbySlot& s = slots[std::size_t(i)];
     const MeleeSlot::Controller c = MeleeSlot::Controller(std::max(0, std::min(2, controller)));
+    s.open = controller == 3;
     if (c == MeleeSlot::Controller::Human && s.controller != MeleeSlot::Controller::Human)
-        for (FrontEnd::LobbySlot& o : fe.lobby_slots_)
+        for (FrontEnd::LobbySlot& o : slots)
             if (o.controller == MeleeSlot::Controller::Human) {
                 o.controller = MeleeSlot::Controller::AI;
                 if (o.difficulty <= 0) o.difficulty = settings.ai_difficulty();
@@ -3656,6 +3729,102 @@ void ShellCtx::set_lobby_row(int i, int controller, int race, int difficulty, in
     s.team = std::max(-1, std::min(3, team));
     fe.match_error_.clear();
 }
+void ShellCtx::prepare_custom_lobby() {
+    if (fe.sel_map_ < 0 || fe.sel_map_ >= int(fe.maps_.size())) {
+        const int first = first_real_map();
+        fe.sel_map_ = first >= 0 ? first : (fe.maps_.empty() ? -1 : 0);
+    }
+    if (fe.sel_map_ < 0) {
+        fe.custom_slots_.clear();
+        fe.custom_map_ = -1;
+        return;
+    }
+    if (fe.custom_map_ == fe.sel_map_ && !fe.custom_slots_.empty()) return;
+    fe.custom_slots_ = FrontEnd::custom_preset(fe.map_start_count(fe.sel_map_), settings.profile_race(), settings.opponent_race(), settings.ai_difficulty());
+    fe.custom_map_ = fe.sel_map_;
+}
+
+bool ShellCtx::custom_match() const { return fe.setup_screen_ == ScreenId::Custom; }
+std::vector<ShellCtx::RecordingRow> ShellCtx::recordings(bool saves) {
+    std::vector<RecordingRow> out;
+    const std::vector<FrontEnd::ReplayEntry>& files = saves ? fe.saves_ : fe.replays_;
+    for (const FrontEnd::ReplayEntry& e : files) {
+        RecordingRow r;
+        r.path = e.path;
+        r.name = e.name;
+        const std::string& t = e.name;
+        r.date = t.size() >= 13 && t[8] == '-' ? t.substr(0, 4) + "-" + t.substr(4, 2) + "-" + t.substr(6, 2) + " " + t.substr(9, 2) + ":" + t.substr(11, 2) : t;
+        const FrontEnd::RecordingMeta& m = fe.recording_meta(e.path);
+        r.readable = m.ok;
+        if (m.ok) {
+            r.ticks = m.ticks;
+            if (m.map_id.empty()) {
+                r.map = "TEST ARENA";
+                r.map_missing = fe.arena_ == nullptr;
+            } else {
+                r.map_missing = true;
+                for (const platform::MapEntry& me : fe.maps_)
+                    if (me.path == m.map_id) {
+                        r.map = me.name;
+                        r.map_missing = false;
+                    }
+                if (r.map_missing) {
+                    std::string stem = m.map_id;
+                    const std::size_t slash = stem.find_last_of("/\\");
+                    if (slash != std::string::npos) stem = stem.substr(slash + 1);
+                    const std::size_t dot = stem.find_last_of('.');
+                    if (dot != std::string::npos && dot > 0) stem = stem.substr(0, dot);
+                    r.map = stem;
+                }
+            }
+            for (std::size_t p = 0; p < m.races.size(); ++p) {
+                const int race = m.races[p];
+                const char* word = race == int(Race::Protoss) ? "Protoss" : (race == int(Race::Zerg) ? "Zerg" : "Terran");
+                r.matchup += (p ? " vs " : "") + std::string(word) + (p < m.controllers.size() && m.controllers[p] != 0 ? " A.I." : "");
+            }
+        }
+        out.push_back(std::move(r));
+    }
+    return out;
+}
+
+int ShellCtx::selected_recording() const { return fe.sel_replay_; }
+void ShellCtx::select_recording(int index) { fe.sel_replay_ = index; }
+const std::string& ShellCtx::replays_dir() const { return fe.replays_dir_; }
+const std::string& ShellCtx::saves_dir() const { return fe.saves_dir_; }
+
+bool ShellCtx::delete_recording(const std::string& path) {
+    std::error_code ec;
+    const bool gone = std::filesystem::remove(path, ec) && !ec;
+    fe.recording_meta_.erase(path);
+    fe.scan_replays();
+    fe.scan_saves();
+    return gone;
+}
+
+bool ShellCtx::resume_save(const std::string& path, const char* via) {
+    if (!router.edge_for(via)) return false;
+    return fe.load_save(path);
+}
+
+const std::string& ShellCtx::about_notice() const { return fe.about_notice_; }
+const std::string& ShellCtx::config_file() const { return fe.about_config_; }
+bool ShellCtx::open_folder(const std::string& path) { return fe.open_folder_cb_ && fe.open_folder_cb_(path); }
+bool ShellCtx::has_folder_opener() const { return bool(fe.open_folder_cb_); }
+
+const std::vector<std::string>& ShellCtx::campaign_titles() {
+    if (!fe.campaigns_read_) {
+        fe.campaigns_read_ = true;
+        try {
+            const std::vector<campaign::CampaignFlow> flows = campaign::load_campaign_flow(fe.store_);
+            for (std::size_t i = 0; i < flows.size(); ++i) fe.campaign_titles_.push_back(campaign::campaign_title(flows, i, fe.cat_.strings()));
+        } catch (const std::exception&) {
+            fe.campaign_titles_.clear();
+        }
+    }
+    return fe.campaign_titles_;
+}
+
 std::string ShellCtx::player_name() const { return settings.profile_name(); }
 
 Race ShellCtx::player_default_race() const {

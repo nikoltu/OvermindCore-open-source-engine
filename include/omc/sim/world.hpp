@@ -35,6 +35,7 @@ enum class CmdError : uint16_t {
     CantBuildTooFarFromBuildPowerSource,
     CantBuildOnThat,
     MustBuildRefineryFirst,
+    CantBuildTooCloseToCreepSource,
 };
 
 inline const char* cmd_error_key(CmdError e) {
@@ -49,6 +50,7 @@ inline const char* cmd_error_key(CmdError e) {
         case CmdError::CantBuildTooFarFromBuildPowerSource: return "e_cmdCantBuildTooFarFromBuildPowerSource";
         case CmdError::CantBuildOnThat: return "e_cmdCantBuildOnThat";
         case CmdError::MustBuildRefineryFirst: return "e_cmdMustBuildRefineryFirst";
+        case CmdError::CantBuildTooCloseToCreepSource: return "e_cmdCantBuildTooCloseToCreepSource";
         case CmdError::None: break;
     }
     return "";
@@ -136,6 +138,7 @@ struct AbilityDef {
     Fixed duration;
     Fixed range;
     Fixed energy_fraction{};
+    Fixed energy_change{}, energy_change_frac{};
     Fixed move_speed_mult = Fixed::from_int(1);
     Fixed attack_speed_mult = Fixed::from_int(1);
     bool beh_root = false;
@@ -248,6 +251,7 @@ struct EffectNode {
     HealVital heal_vital = HealVital::Life;
     Fixed shield_bonus;
     Fixed armor_reduction{Fixed::from_int(1)};
+    std::uint8_t damage_kind = kDamageKindSpell;
     bool damage_hidden = false;
     Fixed move_speed_mult{Fixed::from_int(1)}, attack_speed_mult{Fixed::from_int(1)};
     bool beh_root = false, beh_stun = false;
@@ -271,6 +275,8 @@ struct EffectNode {
     bool beh_suppress_passenger = false;
     Fixed beh_life_armor{}, beh_shield_armor{};
     std::int32_t beh_max_stack = 1, beh_apply_count = 1;
+    std::int32_t beh_max_stack_caster = 0;
+    bool beh_refresh_stack = false;
     bool beh_lift = false;
     bool beh_control_transfer = false;
     Fixed beh_dmg_per_tick, beh_dmg_period;
@@ -374,6 +380,19 @@ struct EffectContext {
     bool has_cast_point = false;
 };
 
+struct CastCost {
+    Fixed energy{}, life{}, cooldown{};
+    int32_t charge = -1;
+    int32_t charge_use = 0;
+    bool wait = false;
+};
+
+struct CastChargeSpec {
+    std::string link;
+    int32_t start = 0, max = 0;
+    int start_ticks = 0, use_ticks = 0;
+};
+
 struct Order {
     OrderType type = OrderType::Idle;
     Fixed tx{}, ty{};
@@ -384,6 +403,8 @@ struct Order {
     bool contact = false;
     bool walk_in = false;
     bool evict = false;
+    bool pay_due = false;
+    CastCost pay{};
 };
 
 struct BehaviorInstance {
@@ -416,6 +437,8 @@ struct BehaviorInstance {
     bool remove_when_firing = false;
     Fixed life_armor_bonus{}, shield_armor_bonus{};
     std::int32_t max_stack = 1;
+    std::int32_t max_stack_caster = 0;
+    bool refresh_stack = false;
     bool lift = false;
     Fixed dmg_per_tick;
     Fixed resp_amount;
@@ -607,6 +630,10 @@ struct Unit {
     std::vector<std::pair<int16_t, int16_t>> creep_check_offsets;
     std::vector<std::pair<int16_t, int16_t>> near_resources_offsets;
     std::vector<std::pair<int16_t, int16_t>> near_resources_check_offsets;
+    std::vector<std::pair<int16_t, int16_t>> nobuild_offsets;
+    std::vector<std::pair<int16_t, int16_t>> nospawn_offsets;
+    bool mover_requires_creep = false;
+    bool mover_avoids_nospawn = false;
     bool train_morphs_self = false;
     std::uint8_t fog_visibility = 0;
     bool requires_vespene = false;
@@ -645,6 +672,7 @@ struct Unit {
     bool gathers_gas = false;
     bool in_gas_structure = false;
     BuildVerb build_verb = BuildVerb::Committed;
+    bool build_range_to_centre = false;
     bool is_worker = false;
     Fixed mine_time;
     Fixed acquire_radius;
@@ -652,6 +680,7 @@ struct Unit {
     Fixed return_delay;
     Fixed return_cd;
     int gather_stall_ticks = 0;
+    bool wall_replanned = false;
     int block_ticks = 0;
     uint32_t gather_target = kNoTarget;
     uint32_t home_depot = kNoTarget;
@@ -1149,6 +1178,7 @@ public:
 
     uint32_t add_unit(Unit u) {
         u.id = uint32_t(units_.size());
+        if (unit_refold_) unit_refold_(u);
         if (u.time_life.raw() > 0 && u.time_life_max.raw() <= 0) u.time_life_max = u.time_life;
         if (u.prevent_defeat) defeat_rule_authored_ = true;
         last_progress_tick_ = tick_;
@@ -1175,6 +1205,11 @@ public:
                 c.build_time = a.build_time;
                 c.build_timer = a.build_time;
                 c.proto_idx = a.proto_idx;
+                c.queue_size = a.queue_size;
+                c.minerals = a.minerals;
+                c.gas = a.gas;
+                c.auto_build = a.auto_build && a.auto_build_on;
+                c.show_status = a.show_status;
                 carriers_.push_back(std::move(c));
             }
         }
@@ -1338,7 +1373,14 @@ public:
     }
 
     bool creep_placement_ok(const Unit& proto, Fixed x, Fixed y) const {
-        if (!proto.requires_creep) return true;
+        if (!proto.requires_creep) {
+            if (proto.creep_check_offsets.empty()) return true;
+            int fx = 0, fy = 0;
+            creep_.grid().to_cell(x, y, fx, fy);
+            for (const std::pair<int16_t, int16_t>& c : proto.creep_check_offsets)
+                if (creep_.grid().is_creep_cell(fx + c.first, fy + c.second)) return false;
+            return true;
+        }
         if (proto.creep_check_offsets.empty()) return creep_.is_creep(x, y);
         int ox = 0, oy = 0;
         creep_.grid().to_cell(x, y, ox, oy);
@@ -1384,15 +1426,15 @@ public:
         return true;
     }
 
-    void issue(uint32_t id, const Order& o, bool queued = false, bool player_order = true) {
-        if (id >= units_.size()) return;
-        if (player_order && units_[id].lift_lock.raw() > 0) return;
-        if (player_order && units_[id].burrow_timer.raw() > 0) return;
+    bool issue(uint32_t id, const Order& o, bool queued = false, bool player_order = true) {
+        if (id >= units_.size()) return false;
+        if (player_order && units_[id].lift_lock.raw() > 0) return false;
+        if (player_order && units_[id].burrow_timer.raw() > 0) return false;
         if (!in_step_ && !units_[id].commandable && !units_[id].flying &&
             is_movement_order(o.type))
-            return;
-        if (!in_step_ && uncommandable(units_[id])) return;
-        if (!in_step_ && o.type == OrderType::Cast && abils_disabled(units_[id])) return;
+            return false;
+        if (!in_step_ && uncommandable(units_[id])) return false;
+        if (!in_step_ && o.type == OrderType::Cast && abils_disabled(units_[id])) return false;
         if (order_sink_ && !in_step_) order_sink_->on_order(tick_, id, o, queued);
         detach_builder(id);
         Unit& u = units_[id];
@@ -1407,6 +1449,7 @@ public:
         if (!queued && !prep_protected) u.orders.clear();
         u.orders.push_back(o);
         if (player_order) u.ever_ordered = true;
+        return true;
     }
     void stop(uint32_t id) {
         if (id >= units_.size()) return;
@@ -1521,11 +1564,14 @@ public:
 
     void apply_spell_damage(uint32_t target, Fixed dmg, uint32_t caster,
                             Fixed armor_reduction = Fixed::from_int(1),
-                            bool reveals_attacker = true);
+                            bool reveals_attacker = true,
+                            std::uint8_t damage_kind = kDamageKindSpell,
+                            std::uint8_t death_code = 0);
 
     void apply_weapon_hit(std::uint32_t target, Fixed base, std::uint32_t bonus_attr,
                           Fixed bonus_amount, std::uint32_t attacker,
-                          Fixed armor_reduction = Fixed::from_int(1));
+                          Fixed armor_reduction = Fixed::from_int(1),
+                          bool reveals_attacker = true);
 
     void record_flee_trigger(Unit& target, std::uint32_t attacker, Fixed vitals_before,
                              bool reveals_attacker = true);
@@ -1596,8 +1642,8 @@ public:
         return int32_t(abilities_.size()) - 1;
     }
 
-    void cast(uint32_t caster, int32_t ability, uint32_t target) {
-        if (ability >= 0 && ability_cooldown_left(caster, ability).raw() > 0) return;
+    bool cast(uint32_t caster, int32_t ability, uint32_t target, bool queued = false, const CastCost* pay = nullptr) {
+        if (ability >= 0 && ability_cooldown_left(caster, ability).raw() > 0) return false;
         Order o;
         o.type = OrderType::Cast;
         o.ability = uint32_t(ability);
@@ -1609,19 +1655,40 @@ public:
             o.tx = units_[caster].x;
             o.ty = units_[caster].y;
         }
-        issue(caster, o, false);
+        if (pay) {
+            o.pay = *pay;
+            o.pay_due = true;
+        }
+        return issue(caster, o, queued);
     }
 
-    void cast(uint32_t caster, int32_t ability, Fixed tx, Fixed ty) {
-        if (ability >= 0 && ability_cooldown_left(caster, ability).raw() > 0) return;
+    bool cast(uint32_t caster, int32_t ability, Fixed tx, Fixed ty, bool queued = false, const CastCost* pay = nullptr) {
+        if (ability >= 0 && ability_cooldown_left(caster, ability).raw() > 0) return false;
         Order o;
         o.type = OrderType::Cast;
         o.ability = uint32_t(ability);
         o.target = kNoTarget;
         o.tx = tx;
         o.ty = ty;
-        issue(caster, o, false);
+        if (pay) {
+            o.pay = *pay;
+            o.pay_due = true;
+        }
+        return issue(caster, o, queued);
     }
+
+    int32_t cast_charge_spec(const std::string& link, int32_t start, int32_t max, int start_ticks, int use_ticks) {
+        for (std::size_t i = 0; i < cast_charges_.size(); ++i) {
+            const CastChargeSpec& c = cast_charges_[i];
+            if (c.link == link && c.start == start && c.max == max && c.start_ticks == start_ticks &&
+                c.use_ticks == use_ticks)
+                return int32_t(i);
+        }
+        cast_charges_.push_back(CastChargeSpec{link, start, max, start_ticks, use_ticks});
+        return int32_t(cast_charges_.size()) - 1;
+    }
+    bool cast_cost_payable(const Unit& u, const Order& o) const;
+    bool pay_cast_cost(Unit& u, Order& o);
 
     int32_t add_veterancy(VeterancyDef def);
     Fixed supply_used(int32_t p) const;
@@ -1728,7 +1795,7 @@ public:
         int32_t n = 0;
         for (const Pending& p : pending_)
             if (p.producer == producer && queue_entry(p)) ++n;
-        return n;
+        return n + hangar_queued(producer);
     }
     template <class P> static bool queue_entry(const P& p) { return p.consumed_larva == kNoTarget && p.egg == kNoTarget; }
     int pending_of_type(int32_t player, const std::string& catalog_id) const {
@@ -1757,6 +1824,7 @@ public:
             }
             out.push_back(std::move(v));
         }
+        hangar_view(producer, out);
         return out;
     }
 
@@ -1774,6 +1842,14 @@ public:
     static constexpr int32_t kAddonNone = 0, kAddonTechLab = 1, kAddonReactor = 2;
     using AddonBodyFactory = std::function<bool(const Unit& host, int32_t kind, Unit& body)>;
     void set_addon_body_factory(AddonBodyFactory f) { addon_body_factory_ = std::move(f); }
+    using UnitRefold = std::function<void(Unit& u)>;
+    void set_unit_refold(UnitRefold f) { unit_refold_ = std::move(f); }
+    void set_morph_keep_behaviors(bool on) { morph_keep_behaviors_ = on; }
+    using CastCooldownFold = std::function<Fixed(const Unit& caster, int32_t ability, Fixed base)>;
+    void set_cast_cooldown_fold(CastCooldownFold f) { cast_cd_fold_ = std::move(f); }
+    Fixed cast_cooldown(const Unit& caster, int32_t ability, Fixed base) const {
+        return cast_cd_fold_ && base.raw() > 0 ? cast_cd_fold_(caster, ability, base) : base;
+    }
     void attach_addon(uint32_t building, int32_t kind) {
         if (building >= units_.size()) return;
         units_[building].addon = kind;
@@ -1951,6 +2027,7 @@ public:
         if (id >= units_.size()) return false;
         const Unit& u = units_[id];
         if (!u.alive || !u.flying) return false;
+        if (!creep_placement_ok(u, x, y)) return false;
         return !site_blocked(u, x, y, id);
     }
     bool order_land(uint32_t id, Fixed x, Fixed y) {
@@ -2181,9 +2258,7 @@ public:
                     Fixed wx, wy;
                     nav_.cell_center(cx, cy, wx, wy);
                     const Fixed dx = wx - x, dy = wy - y;
-                    if (dx * dx + dy * dy <= r2 && nav_.in_bounds(cx, cy) &&
-                        !nav_.is_blocked_cell(cx, cy)) {
-                        nav_.block_cell(cx, cy);
+                    if (dx * dx + dy * dy <= r2 && claim_nav_cell(cx, cy, true)) {
                         nav_.mark_ff(cx, cy, true);
                         ff.cells.emplace_back(cx, cy);
                     }
@@ -2634,6 +2709,24 @@ public:
         interceptor_arm_reg_[std::move(catalog_id)] =
             InterceptorArm{proto_idx, count, count_max, leash, build_time};
     }
+    void register_interceptor_hangar(const std::string& catalog_id, int32_t queue_size, int32_t minerals,
+                                     int32_t gas, bool auto_build, bool auto_build_on, bool show_status) {
+        auto it = interceptor_arm_reg_.find(catalog_id);
+        if (it == interceptor_arm_reg_.end()) return;
+        it->second.queue_size = queue_size;
+        it->second.minerals = minerals;
+        it->second.gas = gas;
+        it->second.auto_build = auto_build;
+        it->second.auto_build_on = auto_build_on;
+        it->second.show_status = show_status;
+    }
+    bool hangar_enqueue(uint32_t carrier);
+    bool hangar_cancel_slot(uint32_t carrier, int slot);
+    int32_t hangar_queued(uint32_t carrier) const;
+    int32_t hangar_stock(uint32_t carrier) const;
+    bool hangar_auto_build(uint32_t carrier) const;
+    bool set_hangar_auto_build(uint32_t carrier, bool on);
+    void hangar_view(uint32_t carrier, std::vector<QueueSlotView>& out) const;
     void step_interceptors(Fixed dt);
     bool hosts_interceptors(uint32_t id) const {
         for (const auto& c : carriers_)
@@ -2677,6 +2770,10 @@ public:
     void set_gather_bounce(bool on) { gather_bounce_ = on; }
     void set_cargo_idle_without_dropoff(bool on) { cargo_idle_without_dropoff_ = on; }
     void set_unstick_bodies(bool on) { unstick_bodies_ = on; }
+    void set_disc_slide(bool on) { disc_slide_ = on; }
+    void set_rest_push_collide(bool on) { rest_push_collide_ = on; }
+    void set_sep_push_rules(bool on) { sep_push_rules_ = on; }
+    void set_level_guard(bool on) { level_guard_ = on; }
     bool separation_respects_nav() const { return sep_respects_nav_; }
     static bool default_gas_worker_inside();
     void set_research_queue(bool on) { research_queue_ = on; }
@@ -2802,25 +2899,61 @@ public:
     }
     void update_watchtowers();
 
+    static bool block_claims_old() {
+        static const bool kOld = std::getenv("OMC_NAV_BLOCK_CLAIMS_OLD") != nullptr;
+        return kOld;
+    }
+    std::uint16_t* nav_claim_slot(int x, int y) {
+        if (!nav_.in_bounds(x, y)) return nullptr;
+        const std::size_t n = std::size_t(nav_.width()) * std::size_t(nav_.height());
+        if (nav_claims_.size() != n) nav_claims_.assign(n, 0);
+        return &nav_claims_[std::size_t(y) * std::size_t(nav_.width()) + std::size_t(x)];
+    }
+    bool claim_nav_cell(int x, int y, bool over_ff = false) {
+        if (!nav_.in_bounds(x, y)) return false;
+        if (block_claims_old()) {
+            if (nav_.is_blocked_cell(x, y)) return false;
+            nav_.set_blocked(x, y, true);
+            return true;
+        }
+        std::uint16_t* c = nav_claim_slot(x, y);
+        if (*c == 0) {
+            if (nav_.is_blocked_cell(x, y)) return false;
+            nav_.set_blocked(x, y, true);
+        } else if (over_ff && !(nav_.has_ff() && nav_.is_ff_cell(x, y))) {
+            return false;
+        } else if (!over_ff && nav_.has_ff() && nav_.is_ff_cell(x, y)) {
+            nav_.mark_ff(x, y, false);
+        }
+        ++*c;
+        return true;
+    }
+    bool release_nav_cell(int x, int y) {
+        if (!nav_.in_bounds(x, y)) return false;
+        if (!block_claims_old()) {
+            std::uint16_t* c = nav_claim_slot(x, y);
+            if (*c > 1) {
+                --*c;
+                return false;
+            }
+            *c = 0;
+        }
+        nav_.set_blocked(x, y, false);
+        return true;
+    }
     void register_destructible(uint32_t unit_id, int cx0, int cy0, int cx1, int cy1) {
         Destructible d;
         d.id = unit_id;
         for (int y = cy0; y <= cy1; ++y)
             for (int x = cx0; x <= cx1; ++x)
-                if (nav_.in_bounds(x, y) && !nav_.is_blocked_cell(x, y)) {
-                    nav_.set_blocked(x, y, true);
-                    d.cells.emplace_back(x, y);
-                }
+                if (claim_nav_cell(x, y)) d.cells.emplace_back(x, y);
         destructibles_.push_back(std::move(d));
     }
     void register_destructible_cells(uint32_t unit_id, const std::vector<std::pair<int, int>>& cells) {
         Destructible d;
         d.id = unit_id;
         for (const auto& [x, y] : cells)
-            if (nav_.in_bounds(x, y) && !nav_.is_blocked_cell(x, y)) {
-                nav_.set_blocked(x, y, true);
-                d.cells.emplace_back(x, y);
-            }
+            if (claim_nav_cell(x, y)) d.cells.emplace_back(x, y);
         destructibles_.push_back(std::move(d));
     }
     void register_footprint_block(uint32_t id) {
@@ -2881,6 +3014,7 @@ private:
         int use_ticks = 0;
     };
     std::vector<ChargePool> charge_pools_;
+    std::vector<CastChargeSpec> cast_charges_;
     const ChargePool* find_charge_pool(int32_t player, const std::string& link) const {
         for (const ChargePool& p : charge_pools_)
             if (p.player == player && p.link == link) return &p;
@@ -2924,6 +3058,7 @@ private:
         bool cleared = false;
     };
     std::vector<Destructible> destructibles_;
+    std::vector<std::uint16_t> nav_claims_;
 
     struct Conjoined {
         std::vector<uint32_t> members;
@@ -2938,6 +3073,12 @@ private:
         int32_t count_max = 0;
         Fixed leash;
         Fixed build_time;
+        int32_t queue_size = 0;
+        int32_t minerals = 0;
+        int32_t gas = 0;
+        bool auto_build = false;
+        bool auto_build_on = false;
+        bool show_status = false;
     };
     struct Carrier {
         uint32_t carrier = kNoTarget;
@@ -2948,7 +3089,14 @@ private:
         Fixed build_timer;
         int32_t proto_idx = -1;
         std::vector<uint32_t> wing;
+        int32_t queue_size = 0;
+        int32_t queued = 0;
+        int32_t minerals = 0;
+        int32_t gas = 0;
+        bool auto_build = false;
+        bool show_status = false;
     };
+    void step_hangar(Carrier& c, Fixed dt);
     std::unordered_map<std::string, InterceptorArm> interceptor_arm_reg_;
     struct SpawnerType { int32_t proto; int32_t cap; Fixed period; int32_t hard_cap; };
     std::unordered_map<std::string, SpawnerType> spawner_type_reg_;
@@ -3012,7 +3160,8 @@ private:
     void evict_from_site(const Unit& structure, uint32_t builder);
     void train_exit_point(const Unit& producer, Fixed unit_radius, Fixed& ox, Fixed& oy) const;
     bool body_overlaps_blocked(Fixed cx, Fixed cy, Fixed r) const;
-    bool nearest_open_spot(Fixed& x, Fixed& y, Fixed r) const;
+    bool nearest_open_spot(Fixed& x, Fixed& y, Fixed r, bool avoid_nospawn = false) const;
+    bool ground_nospawn_at(Fixed x, Fixed y) const;
  private:
 
     std::vector<Unit> units_;
@@ -3103,6 +3252,10 @@ private:
     bool gather_bounce_ = false;
     bool cargo_idle_without_dropoff_ = false;
     bool unstick_bodies_ = false;
+    bool disc_slide_ = false;
+    bool rest_push_collide_ = false;
+    bool sep_push_rules_ = false;
+    bool level_guard_ = false;
     std::vector<std::uint8_t> sep_held_;
     Fixed crowd_max_radius_;
     int crowd_max_tick_ = -1;
@@ -3141,6 +3294,9 @@ private:
     int32_t last_error_player_ = -1;
     void refuse(int32_t player, CmdError e) { last_error_ = e; last_error_player_ = player; }
     AddonBodyFactory addon_body_factory_;
+    UnitRefold unit_refold_;
+    CastCooldownFold cast_cd_fold_;
+    bool morph_keep_behaviors_ = false;
     std::vector<uint32_t> pending_addon_bodies_;
     std::vector<std::vector<std::pair<Fixed, Fixed>>> spawn_offsets_;
     struct PendingHit {

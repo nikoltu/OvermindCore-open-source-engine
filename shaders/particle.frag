@@ -38,10 +38,11 @@ void main() {
     vec3 lit = teamOp ? clamp(t.a, 0.0, 1.0) * pc.emis.rgb * vColor.rgb : t.rgb * vColor.rgb;
     if (eLow > 3.5) {
         lit = mix(vColor.rgb, t.rgb, t.a);
+        if (pc.emis.r + pc.emis.g + pc.emis.b > 0.0) lit *= pc.emis.rgb;
         t.a = 1.0;
     }
     if (pc.soft.w > 0.5) lit = min(lit, vec3(1.0));
-    if (!teamOp) lit += pc.emis.rgb * vColor.rgb;
+    if (!teamOp && eLow < 3.5) lit += pc.emis.rgb * vColor.rgb;
     if (eGain > 0.5) {
         const vec4 e = texture(emissiveTex, vUV);
         vec3 ec = eLow > 1.5 ? vec3(e.a) : e.rgb;

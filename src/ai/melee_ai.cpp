@@ -17,6 +17,83 @@ using sim::Order;
 using sim::OrderType;
 using sim::Unit;
 
+static bool site_seals_pocket(const sim::World& w, const Unit& proto, Fixed x, Fixed y) {
+    const sim::NavGrid& nav = w.nav();
+    if (!nav.configured()) return false;
+    std::vector<std::pair<int, int>> fp;
+    int ocx = 0, ocy = 0;
+    nav.to_cell(x, y, ocx, ocy);
+    if (!proto.footprint_offsets.empty()) {
+        for (const auto& [dx, dy] : proto.footprint_offsets) fp.emplace_back(ocx + int(dx), ocy + int(dy));
+    } else if (proto.radius.raw() > 0) {
+        int x0 = 0, y0 = 0, x1 = 0, y1 = 0;
+        nav.to_cell(x - proto.radius, y - proto.radius, x0, y0);
+        nav.to_cell(x + proto.radius, y + proto.radius, x1, y1);
+        for (int cy = y0; cy <= y1; ++cy)
+            for (int cx = x0; cx <= x1; ++cx) fp.emplace_back(cx, cy);
+    }
+    if (fp.empty()) return false;
+    int bx0 = fp[0].first, by0 = fp[0].second, bx1 = bx0, by1 = by0;
+    for (const auto& [cx, cy] : fp) {
+        bx0 = std::min(bx0, cx);
+        by0 = std::min(by0, cy);
+        bx1 = std::max(bx1, cx);
+        by1 = std::max(by1, cy);
+    }
+    constexpr int kPad = 8;
+    const int wx0 = bx0 - kPad, wy0 = by0 - kPad, W = bx1 - bx0 + 1 + 2 * kPad, H = by1 - by0 + 1 + 2 * kPad;
+    std::vector<std::uint8_t> cell(std::size_t(W) * std::size_t(H), 0);
+    auto at = [&](int gx, int gy) -> std::uint8_t& { return cell[std::size_t(gy - wy0) * std::size_t(W) + std::size_t(gx - wx0)]; };
+    for (int gy = wy0; gy < wy0 + H; ++gy)
+        for (int gx = wx0; gx < wx0 + W; ++gx)
+            if (!nav.in_bounds(gx, gy) || nav.is_blocked_cell(gx, gy)) at(gx, gy) = 1;
+    for (const auto& [cx, cy] : fp)
+        if (cx >= wx0 && cy >= wy0 && cx < wx0 + W && cy < wy0 + H && at(cx, cy) == 0) at(cx, cy) = 2;
+    std::vector<std::pair<int, int>> ring;
+    for (const auto& [cx, cy] : fp)
+        for (int dy = -1; dy <= 1; ++dy)
+            for (int dx = -1; dx <= 1; ++dx) {
+                const int nx = cx + dx, ny = cy + dy;
+                if (at(nx, ny) == 0) ring.emplace_back(nx, ny);
+            }
+    if (ring.empty()) return false;
+    std::vector<int> label(cell.size(), -1);
+    auto flood = [&](int sx, int sy, bool through_fp, int id) {
+        bool open = false;
+        std::vector<std::pair<int, int>> stack{{sx, sy}};
+        label[std::size_t(sy - wy0) * std::size_t(W) + std::size_t(sx - wx0)] = id;
+        auto passable = [&](int gx, int gy) {
+            if (gx < wx0 || gy < wy0 || gx >= wx0 + W || gy >= wy0 + H) return false;
+            const std::uint8_t c = at(gx, gy);
+            return c == 0 || (through_fp && c == 2);
+        };
+        while (!stack.empty()) {
+            const auto [cx, cy] = stack.back();
+            stack.pop_back();
+            if (cx == wx0 || cy == wy0 || cx == wx0 + W - 1 || cy == wy0 + H - 1) open = true;
+            for (int dy = -1; dy <= 1; ++dy)
+                for (int dx = -1; dx <= 1; ++dx) {
+                    if (dx == 0 && dy == 0) continue;
+                    const int nx = cx + dx, ny = cy + dy;
+                    if (!passable(nx, ny)) continue;
+                    if (dx != 0 && dy != 0 && (!passable(cx + dx, cy) || !passable(cx, cy + dy))) continue;
+                    int& l = label[std::size_t(ny - wy0) * std::size_t(W) + std::size_t(nx - wx0)];
+                    if (l == id) continue;
+                    l = id;
+                    stack.emplace_back(nx, ny);
+                }
+        }
+        return open;
+    };
+    if (!flood(ring[0].first, ring[0].second, true, 0)) return false;
+    int next = 1;
+    for (const auto& [rx, ry] : ring) {
+        if (label[std::size_t(ry - wy0) * std::size_t(W) + std::size_t(rx - wx0)] >= 1) continue;
+        if (!flood(rx, ry, false, next++)) return true;
+    }
+    return false;
+}
+
 MeleeAI::MeleeAI(int player, MeleeConfig cfg)
     : player_(player), cfg_(std::move(cfg)) {}
 
@@ -957,6 +1034,7 @@ bool MeleeAI::place_structure(sim::World& w, const BuildItem& item) {
                     if (nav.level_cell(cx, cy) != hall_level) continue;
                 }
                 if (slot_conflict(x, y)) continue;
+                if (seal_guard_ && site_seals_pocket(w, proto, x, y)) continue;
                 if (w.issue_worker_build(builder, x, y, proto, item.minerals, item.gas, item.build_time,
                                          Fixed::from_int(2), w.unit(builder).build_verb)) {
                     site_builds_.push_back({item.proto.catalog_id, builder});

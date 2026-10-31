@@ -2,6 +2,7 @@
 #include "omc/render/quality.hpp"
 #include "omc/render/game_window.hpp"
 
+#include "omc/core/client_identity.hpp"
 #include "omc/core/version.hpp"
 
 #ifndef NOMINMAX
@@ -210,7 +211,7 @@ LRESULT CALLBACK game_wndproc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
 }
 
 const wchar_t* game_window_class(HINSTANCE hinst) {
-    static const wchar_t* kName = L"overmindcore_game_window";
+    static const wchar_t* kName = omc::identity::kGameWindowClass;
     static bool registered = false;
     if (!registered) {
         WNDCLASSEXW wc{};
@@ -243,7 +244,7 @@ WindowResult run_game_window(const GameFrameFn& frame, const casc::Storage* stor
     const wchar_t* cls = game_window_class(hinst);
     RECT rc{0, 0, LONG(width), LONG(height)};
     AdjustWindowRect(&rc, WS_OVERLAPPEDWINDOW, FALSE);
-    std::wstring wtitle(L"OvermindCore ");
+    std::wstring wtitle(omc::identity::kGameWindowTitle);
     for (const char* p = omc::kVersion; *p; ++p) wtitle.push_back(wchar_t(*p));
     HWND rawWin = CreateWindowExW(0, cls, wtitle.c_str(), WS_OVERLAPPEDWINDOW, CW_USEDEFAULT,
                                   CW_USEDEFAULT, rc.right - rc.left, rc.bottom - rc.top,

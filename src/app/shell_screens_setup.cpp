@@ -31,7 +31,9 @@ const char* race_word(LobbyRace r) {
     return r == LobbyRace::Protoss ? "Protoss" : (r == LobbyRace::Zerg ? "Zerg" : (r == LobbyRace::Random ? "Random" : "Terran"));
 }
 
-void team_rows(Ui& ui, ShellCtx& ctx) {
+}
+
+void slot_rows(Ui& ui, ShellCtx& ctx, bool custom) {
     const int rows = ctx.lobby_rows();
     const float hy = kRowsTop;
     ui.text(ui.at(kColCtl, hy, kColRace - kColCtl - 8.0f, 24.0f), "PLAYER", v2::kLabel, v2::kTextMuted);
@@ -39,6 +41,9 @@ void team_rows(Ui& ui, ShellCtx& ctx) {
     ui.text(ui.at(kColDiff, hy, kColTeam - kColDiff - 8.0f, 24.0f), "DIFFICULTY", v2::kLabel, v2::kTextMuted);
     ui.text(ui.at(kColTeam, hy, kColEnd - kColTeam, 24.0f), "TEAM", v2::kLabel, v2::kTextMuted);
     static const std::vector<std::string> kCtl = {"Human", "A.I.", "Closed"};
+    static const std::vector<std::string> kCustomCtl = {"You", "A.I.", "Open", "Closed"};
+    static const int kCustomToCtl[4] = {0, 1, 3, 2};
+    static const int kCtlToCustom[4] = {0, 1, 3, 2};
     static const std::vector<std::string> kRace = {"Terran", "Zerg", "Protoss", "Random"};
     static const std::vector<std::string> kTeam = {"-", "Team 1", "Team 2", "Team 3", "Team 4"};
     std::vector<std::string> diffs;
@@ -48,15 +53,16 @@ void team_rows(Ui& ui, ShellCtx& ctx) {
         int ctl = 2, race = 0, diff = 0, team = -1;
         ctx.lobby_row(i, ctl, race, diff, team);
         const float y = kRowsTop + kRowsHead + kRowPitch * float(i);
-        const std::string id = "setup/slot" + std::to_string(i);
-        const bool open = ctl != 2, ai = ctl == 1;
+        const std::string id = std::string(custom ? "custom/slot" : "setup/slot") + std::to_string(i);
+        const bool open = ctl == 0 || ctl == 1, ai = ctl == 1;
         theme::Rgb tc{};
         if (open && ctx.team_color(player, tc)) ui.fill(ui.at(kColChip, y + 8.0f, 12.0f, kRowH - 16.0f), tc);
         if (open) ++player;
-        int c = ctl, r = race_cell(LobbyRace(race)), d = std::max(1, diff) - 1, t = team + 1;
+        int c = custom ? kCtlToCustom[std::max(0, std::min(3, ctl))] : ctl, r = race_cell(LobbyRace(race)), d = std::max(1, diff) - 1, t = team + 1;
         Opts oc;
-        oc.hint = "Human: you. A.I.: the computer. Closed: nobody plays this start.";
-        bool changed = ui.dropdown(id + "/controller", ui.at(kColCtl, y, kColRace - kColCtl - 8.0f, kRowH), kCtl, c, oc);
+        oc.hint = custom ? "You: your seat. A.I.: the computer. Open: free for a LAN player, empty when an offline game starts. Closed: nobody plays this start."
+                         : "Human: you. A.I.: the computer. Closed: nobody plays this start.";
+        bool changed = ui.dropdown(id + "/controller", ui.at(kColCtl, y, kColRace - kColCtl - 8.0f, kRowH), custom ? kCustomCtl : kCtl, c, oc);
         Opts orc;
         orc.enabled = open;
         orc.hint = "This player's race. Random is drawn at START, from the match's own seed.";
@@ -65,12 +71,14 @@ void team_rows(Ui& ui, ShellCtx& ctx) {
         od.enabled = ai;
         od.hint = "This A.I.'s tier, Very Easy .. Elite.";
         if (ai) changed = ui.dropdown(id + "/difficulty", ui.at(kColDiff, y, kColTeam - kColDiff - 8.0f, kRowH), diffs, d, od) || changed;
-        else ui.text(ui.at(kColDiff + 16.0f, y, kColTeam - kColDiff - 24.0f, kRowH), ctl == 0 ? ctx.player_name() : std::string(), v2::kBody, v2::kTextMuted);
+        else ui.text(ui.at(kColDiff + 16.0f, y, kColTeam - kColDiff - 24.0f, kRowH), ctl == 0 ? ctx.player_name() : (ctl == 3 ? std::string("Open") : std::string()), v2::kBody,
+                     v2::kTextMuted);
         Opts ot;
         ot.enabled = open;
         ot.hint = "Players on one team are allies: shared vision, and they win together. '-' plays alone.";
         changed = ui.dropdown(id + "/team", ui.at(kColTeam, y, kColEnd - kColTeam, kRowH), kTeam, t, ot) || changed;
-        if (changed) ctx.set_lobby_row(i, c, int(kRaceCells[std::max(0, std::min(3, r))]), c == 1 ? d + 1 : 0, t - 1);
+        const int pick = custom ? kCustomToCtl[std::max(0, std::min(3, c))] : c;
+        if (changed) ctx.set_lobby_row(i, pick, int(kRaceCells[std::max(0, std::min(3, r))]), pick == 1 ? d + 1 : 0, t - 1);
     }
 }
 
@@ -79,7 +87,7 @@ std::string team_matchup(const ShellCtx& ctx) {
     for (int i = 0; i < ctx.lobby_rows(); ++i) {
         int ctl = 2, race = 0, diff = 0, team = -1;
         ctx.lobby_row(i, ctl, race, diff, team);
-        if (ctl == 2) continue;
+        if (ctl != 0 && ctl != 1) continue;
         const int key = team >= 0 ? team : -(i + 2);
         const std::string who = std::string(ctl == 0 ? "You" : "A.I.") + " (" + race_word(LobbyRace(race)) + ")";
         bool found = false;
@@ -95,30 +103,26 @@ std::string team_matchup(const ShellCtx& ctx) {
     return out.empty() ? std::string("Nobody plays - open a row") : out;
 }
 
-}
-
-bool screen_setup(Ui& ui, ShellCtx& ctx) {
-    chrome(ui, ctx, "SKIRMISH", kChromeBack | kChromePlate, "ENTER Start   ESC Back");
-    ui.fluid({FluidSpan{L::kMapListViewport.x, L::kMapListViewport.x + L::kMapListViewport.w, 48.0f / 213.0f},
-              FluidSpan{L::kRaceTerranZergProtoss.x, L::kRaceTerranZergProtoss.x + L::kRaceTerranZergProtoss.w, 165.0f / 213.0f}});
+bool map_picker(Ui& ui, ShellCtx& ctx, const std::string& key) {
+    namespace L = layout::s20_skirmish_setup;
     UiState& st = ui.state();
     const std::vector<platform::MapEntry>& maps = ctx.maps();
     if (ui.input()) ctx.warm_map_thumbs(1);
-
+    bool start_now = false;
     ui.text(ui.at(L::kLabelMap), "MAP", v2::kLabel, v2::kTextMuted);
-    std::string& search = st.str["setup/search"];
+    std::string& search = st.str[key + "/search"];
     const bool picker = ctx.has_maps_folder_picker();
     {
         Rect sr = ui.at(L::kSearch);
         if (!picker) sr.x1 = ui.at(L::kFolder).x1;
         Opts o;
         o.hint = "Type to filter the maps by name.";
-        if (ui.text_field("setup/search", sr, search, 32, "Search", o)) st.scroll_px["setup/maps"] = 0;
+        if (ui.text_field(key + "/search", sr, search, 32, "Search", o)) st.scroll_px[key + "/maps"] = 0;
         if (picker) {
             Opts f;
             f.hotkey = 'F';
             f.hint = "Point the client at a folder with your own .SC2Map files.";
-            if (ui.button("setup/folder", ui.at(L::kFolder), "Folder...", ButtonKind::Normal, f)) ctx.pick_maps_folder();
+            if (ui.button(key + "/folder", ui.at(L::kFolder), "Folder...", ButtonKind::Normal, f)) ctx.pick_maps_folder();
         }
     }
     std::vector<int> order;
@@ -137,11 +141,10 @@ bool screen_setup(Ui& ui, ShellCtx& ctx) {
         if (order[i] == selected) sel_row = int(i);
     const Rect vp = ui.at(L::kMapListViewport);
     const int pitch = ui.px(68.0f), row_h = ui.px(64.0f);
-    if (!st.num.count("setup/primed")) {
-        st.num["setup/primed"] = 1;
-        if (sel_row >= 0) st.scroll_px["setup/maps"] = std::max(0, sel_row * pitch - (vp.h() - row_h) / 2);
+    if (!st.num.count(key + "/primed")) {
+        st.num[key + "/primed"] = 1;
+        if (sel_row >= 0) st.scroll_px[key + "/maps"] = std::max(0, sel_row * pitch - (vp.h() - row_h) / 2);
     }
-    bool start_now = false;
     if (order.empty()) {
         const bool none = real_total == 0 && search.empty();
         ui.fill(vp, v2::kSurface1);
@@ -152,13 +155,13 @@ bool screen_setup(Ui& ui, ShellCtx& ctx) {
                     v2::kSmall, v2::kTextBody, Align::Centre);
             ui.text(Rect{vp.x0 + ui.px(24.0f), vp.y0 + ui.px(206.0f), vp.x1 - ui.px(24.0f), vp.y0 + ui.px(236.0f)}, "Point at a folder with .SC2Map files.", v2::kSmall,
                     v2::kTextBody, Align::Centre);
-        } else if (ui.button("setup/clear", Rect{(vp.x0 + vp.x1) / 2 - ui.px(140.0f), vp.y0 + ui.px(192.0f), (vp.x0 + vp.x1) / 2 + ui.px(140.0f), vp.y0 + ui.px(256.0f)},
+        } else if (ui.button(key + "/clear", Rect{(vp.x0 + vp.x1) / 2 - ui.px(140.0f), vp.y0 + ui.px(192.0f), (vp.x0 + vp.x1) / 2 + ui.px(140.0f), vp.y0 + ui.px(256.0f)},
                              "Clear search", ButtonKind::Normal)) {
             search.clear();
         }
     } else {
         int moved = sel_row;
-        const Ui::Range rg = ui.list("setup/maps", vp, int(order.size()), pitch, row_h, 1, moved);
+        const Ui::Range rg = ui.list(key + "/maps", vp, int(order.size()), pitch, row_h, 1, moved);
         if (moved != sel_row && moved >= 0 && moved < int(order.size())) {
             sel_row = moved;
             ctx.select_map(order[std::size_t(moved)]);
@@ -182,13 +185,23 @@ bool screen_setup(Ui& ui, ShellCtx& ctx) {
                     i == sel_row ? v2::kTextHi : v2::kTextBody);
         }
         ui.list_end();
-        ui.scrollbar("setup/maps", ui.at(L::kScrollbar));
+        ui.scrollbar(key + "/maps", ui.at(L::kScrollbar));
     }
     {
         std::string count = std::to_string(real_total) + " maps";
         if (!search.empty()) count = std::to_string(order.size()) + " of " + std::to_string(real_total + 1);
         ui.text(ui.at(L::kCount43MapsReading), count, v2::kSmall, v2::kTextMuted);
     }
+    return start_now;
+}
+
+bool screen_setup(Ui& ui, ShellCtx& ctx) {
+    chrome(ui, ctx, "SKIRMISH", kChromeBack | kChromePlate, "ENTER Start   ESC Back");
+    ui.fluid({FluidSpan{L::kMapListViewport.x, L::kMapListViewport.x + L::kMapListViewport.w, 48.0f / 213.0f},
+              FluidSpan{L::kRaceTerranZergProtoss.x, L::kRaceTerranZergProtoss.x + L::kRaceTerranZergProtoss.w, 165.0f / 213.0f}});
+    const bool start_now = map_picker(ui, ctx, "setup");
+    const std::vector<platform::MapEntry>& maps = ctx.maps();
+    const int selected = ctx.selected_map();
 
     ui.text(ui.at(L::kLabelPlayers), "PLAYERS", v2::kLabel, v2::kTextMuted);
     const int starts = ctx.map_start_count(selected);
@@ -205,7 +218,7 @@ bool screen_setup(Ui& ui, ShellCtx& ctx) {
                          true);
     }
     const bool team_mode = ctx.lobby_format() != 0 && ctx.lobby_rows() > 0;
-    if (team_mode) team_rows(ui, ctx);
+    if (team_mode) slot_rows(ui, ctx, false);
     if (!team_mode) {
         ui.panel(ui.at(L::kSlotCardYou));
         theme::Rgb tc{};

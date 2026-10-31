@@ -6,6 +6,7 @@
 #include <cstdio>
 #include <set>
 
+#include "omc/data/catalog.hpp"
 #include "omc/render/actor_rules.hpp"
 #include "omc/render/anim_select.hpp"
 #include "omc/render/audio_sink.hpp"
@@ -221,7 +222,25 @@ bool ActorInstance::timer_armed(const std::string& name) const {
     return false;
 }
 
+void ActorInstance::retarget_tint(float blend_ms) {
+    for (int k = 0; k < 3; ++k) {
+        tint_from[k] = bus_tint_set ? bus_tint[k] : 1.0f;
+        tint_to[k] = tint_layers.empty() ? 1.0f : tint_layers.back().rgb[k];
+    }
+    tint_blend_ms = blend_ms > 0.0f ? blend_ms : 0.0f;
+    tint_left_ms = tint_blend_ms;
+    advance_tint(0.0f);
+}
+
+void ActorInstance::advance_tint(float dt_ms) {
+    if (tint_left_ms > 0.0f) tint_left_ms = std::max(0.0f, tint_left_ms - dt_ms);
+    const float f = tint_blend_ms > 0.0f ? 1.0f - tint_left_ms / tint_blend_ms : 1.0f;
+    for (int k = 0; k < 3; ++k) bus_tint[k] = tint_from[k] + (tint_to[k] - tint_from[k]) * f;
+    bus_tint_set = !tint_layers.empty() || tint_left_ms > 0.0f;
+}
+
 void ActorInstance::pump(float dt_ms) {
+    if (tint_left_ms > 0.0f) advance_tint(dt_ms);
     if (event_rules.empty()) return;
 
     for (std::size_t i = 0; i < timers.size();) {
@@ -415,12 +434,39 @@ void ActorInstance::pump(float dt_ms) {
                 else
                     set_status(r.args[0], cur > 0 ? cur - 1 : 0, false);
             } else if (r.verb == "SetTintColor" && !r.args.empty() && std::getenv("OMC_NO_BUS_TINT") == nullptr) {
-                int tr = 255, tg = 255, tb = 255;
-                if (std::sscanf(r.args[0].c_str(), "%d,%d,%d", &tr, &tg, &tb) == 3) {
-                    bus_tint[0] = float(tr) / 255.0f;
-                    bus_tint[1] = float(tg) / 255.0f;
-                    bus_tint[2] = float(tb) / 255.0f;
-                    bus_tint_set = true;
+                static const bool kTintOld = std::getenv("OMC_TINT_HDR_OLD") != nullptr;
+                data::TintColorArgs ta;
+                if (kTintOld) {
+                    int tr = 255, tg = 255, tb = 255;
+                    if (std::sscanf(r.args[0].c_str(), "%d,%d,%d", &tr, &tg, &tb) == 3) {
+                        bus_tint[0] = float(tr) / 255.0f;
+                        bus_tint[1] = float(tg) / 255.0f;
+                        bus_tint[2] = float(tb) / 255.0f;
+                        bus_tint_set = true;
+                    }
+                } else if (data::parse_tint_color(r.args, ta)) {
+                    auto it = std::find_if(tint_layers.begin(), tint_layers.end(), [&](const TintLayer& l) { return l.key == ta.key; });
+                    if (it != tint_layers.end()) tint_layers.erase(it);
+                    TintLayer layer;
+                    layer.key = ta.key;
+                    for (int k = 0; k < 3; ++k) layer.rgb[k] = ta.rgb[std::size_t(k)];
+                    tint_layers.push_back(layer);
+                    retarget_tint(ta.blend_s * 1000.0f);
+                }
+            } else if (r.verb == "ClearTintColor" && std::getenv("OMC_NO_BUS_TINT") == nullptr && std::getenv("OMC_TINT_HDR_OLD") == nullptr) {
+                float blend_s = 0.0f;
+                std::string key;
+                std::size_t ai = 0;
+                if (ai < r.args.size()) {
+                    char* end = nullptr;
+                    const float t = std::strtof(r.args[ai].c_str(), &end);
+                    if (end && end != r.args[ai].c_str() && *end == '\0') { blend_s = t > 0.0f ? t : 0.0f; ++ai; }
+                }
+                if (ai < r.args.size() && r.args[ai] != "{}") key = r.args[ai];
+                auto it = std::find_if(tint_layers.begin(), tint_layers.end(), [&](const TintLayer& l) { return l.key == key; });
+                if (it != tint_layers.end()) {
+                    tint_layers.erase(it);
+                    retarget_tint(blend_s * 1000.0f);
                 }
             } else if ((r.verb == "AnimSetPaused" && !r.args.empty()) || r.verb == "AnimSetPausedAll") {
                 static const bool kPause = std::getenv("OMC_NO_ANIM_PAUSE") == nullptr;

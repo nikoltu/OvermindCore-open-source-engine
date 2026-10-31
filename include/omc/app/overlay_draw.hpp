@@ -31,6 +31,11 @@ inline bool& text_shadow_off() {
     return off;
 }
 
+inline int& text_shadow_px() {
+    static int px = 1;
+    return px;
+}
+
 inline int font_px_for(int sc) {
     const int f = forced_font_px();
     return f > 0 ? f : real_font_px(sc);
@@ -142,7 +147,7 @@ inline int text_tracked(std::vector<std::uint8_t>& b, std::uint32_t w, std::uint
                     if (!cov) continue;
                     int dx = pen + gl.bearing_x + gx;
                     int dy = baseline - gl.bearing_y + gy;
-                    if (!text_shadow_off()) put(dx + 1, dy + 1, 0, 0, 0, cov);
+                    if (!text_shadow_off()) put(dx + text_shadow_px(), dy + text_shadow_px(), 0, 0, 0, cov);
                     put(dx, dy, r, g, bl, cov);
                 }
             pen += gl.advance;

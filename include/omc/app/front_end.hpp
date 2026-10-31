@@ -79,6 +79,10 @@ public:
     const shell::UiState& shell_state() const { return ui_; }
     void set_clipboard_callback(std::function<std::string()> cb) { clipboard_cb_ = std::move(cb); }
     void set_open_folder_callback(std::function<bool(const std::string&)> cb) { open_folder_cb_ = std::move(cb); }
+    void set_about(std::string notice, std::string config_file) {
+        about_notice_ = std::move(notice);
+        about_config_ = std::move(config_file);
+    }
     int lobby_ai_difficulty() const { return settings_.ai_difficulty(); }
     GameClock::Speed lobby_speed() const { return settings_.game_speed(); }
 
@@ -88,7 +92,11 @@ public:
         MeleeSlot::Controller controller = MeleeSlot::Controller::AI;
         int difficulty = 0;
         int team = -1;
+        bool open = false;
     };
+    static std::vector<LobbySlot> custom_preset(int starts, LobbyRace you, LobbyRace ai, int tier);
+    const std::vector<LobbySlot>& custom_slots() const { return custom_slots_; }
+    ScreenId setup_screen() const { return setup_screen_; }
     static const char* lobby_format_name(LobbyFormat f);
     static int lobby_format_players(LobbyFormat f, int starts);
     static std::vector<LobbySlot> lobby_preset(LobbyFormat f, int rows, LobbyRace you, LobbyRace ai, int tier);
@@ -223,6 +231,8 @@ private:
     shell::UiState ui_;
     std::function<std::string()> clipboard_cb_;
     std::function<bool(const std::string&)> open_folder_cb_;
+    std::string about_notice_;
+    std::string about_config_;
     PortraitCatalog portraits_;
     std::map<std::string, IconAtlas::Icon> thumb_cache_;
     std::size_t thumb_cursor_ = 0;
@@ -255,6 +265,17 @@ private:
     void start_skirmish();
     std::vector<Button> replay_buttons(std::uint32_t view_w, std::uint32_t view_h) const;
     void scan_replays();
+    void scan_saves();
+    struct RecordingMeta {
+        bool ok = false;
+        std::string map_id;
+        std::vector<std::int32_t> races, controllers, teams;
+        long long ticks = 0;
+    };
+    const RecordingMeta& recording_meta(const std::string& path);
+    std::map<std::string, RecordingMeta> recording_meta_;
+    std::vector<ReplayEntry> saves_;
+    bool saves_scanned_ = false;
     void record_match_replay();
 
     std::vector<Button> play_hub_buttons(std::uint32_t view_w, std::uint32_t view_h) const;
@@ -408,6 +429,13 @@ private:
     LobbyRace p0_pick_ = LobbyRace::Terran, p1_pick_ = LobbyRace::Terran;
     std::vector<LobbySlot> lobby_slots_;
     LobbyFormat lobby_format_ = LobbyFormat::OneVsOne;
+    std::vector<LobbySlot> custom_slots_;
+    int custom_map_ = -1;
+    ScreenId setup_screen_ = ScreenId::Lobby;
+    std::vector<LobbySlot>& edit_slots() { return router_.top() == ScreenId::Custom ? custom_slots_ : lobby_slots_; }
+    const std::vector<LobbySlot>& edit_slots() const { return router_.top() == ScreenId::Custom ? custom_slots_ : lobby_slots_; }
+    std::vector<std::string> campaign_titles_;
+    bool campaigns_read_ = false;
     std::map<std::string, int> map_starts_cache_;
     std::vector<PlayerCard> last_players_;
     bool match_any_pair_ = false;

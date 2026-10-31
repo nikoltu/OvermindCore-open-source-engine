@@ -285,6 +285,10 @@ sim::Unit make_unit(const data::Catalog& cat, const std::string& unit_id,
     }
     u.load_range = Fixed::from_double(cat.transport_load_range(unit_id));
     u.build_verb = worker_build_verb(cat, unit_id);
+    {
+        const data::Catalog::PeonBuildMode pm = cat.worker_build_mode(unit_id);
+        u.build_range_to_centre = pm.found && !pm.range_includes_building;
+    }
     if (auto ox = cat.scalar("CUnit", unit_id, "AddOnOffsetX"); ox && !ox->empty()) u.addon_slot_host = true;
     u.unload_period = Fixed::from_double(cat.transport_field(unit_id, "UnloadPeriod"));
     u.unload_initial_delay = Fixed::from_double(cat.transport_field(unit_id, "InitialUnloadDelay"));
@@ -299,7 +303,8 @@ sim::Unit make_unit(const data::Catalog& cat, const std::string& unit_id,
     u.life_regen = field(cat, "CUnit", unit_id, "LifeRegenRate");
     u.life_regen_delay = field(cat, "CUnit", unit_id, "LifeRegenDelay");
     u.dual_rally = cat.unit_has_worker_rally(unit_id);
-    u.rally_exempt = unit_id == "Queen";
+    static const bool kRallyNameOld = std::getenv("OMC_RALLY_EXEMPT_NAME_OLD") != nullptr;
+    u.rally_exempt = kRallyNameOld ? unit_id == "Queen" : cat.unit_rally_exempt(unit_id);
     for (const std::string& ab : cat.array_links("CUnit", unit_id, "AbilArray")) {
         if (ab.empty()) continue;
         if (auto ms = cat.morph_spec(ab); ms && !ms->target.empty()) {
@@ -566,7 +571,18 @@ sim::Unit make_unit(const data::Catalog& cat, const std::string& unit_id,
         }
     }
     u.speed_mult_creep = field(cat, "CUnit", unit_id, "SpeedMultiplierCreep", Fixed::from_int(1));
-    if (auto mv = cat.scalar("CUnit", unit_id, "Mover"); mv && *mv == "CliffJumper") u.can_jump = true;
+    static const bool kMoverNameOld = std::getenv("OMC_MOVER_NAME_OLD") != nullptr;
+    std::optional<std::string> mover = cat.scalar("CUnit", unit_id, "Mover");
+    if (!mover && cat.find("CUnit", unit_id)) mover = cat.tag_default_scalar("CUnit", "Mover");
+    if (auto mv = mover; mv && !mv->empty()) {
+        if (kMoverNameOld) {
+            if (*mv == "CliffJumper") u.can_jump = true;
+        } else {
+            if (auto pm = cat.scalar("CMover", *mv, "PathMode"); pm && *pm == "Jumper") u.can_jump = true;
+            u.mover_requires_creep = cat.mover_placement_bit(*mv, "Require", "Creep");
+            u.mover_avoids_nospawn = cat.mover_placement_bit(*mv, "Prevent", "GroundNoSpawn");
+        }
+    }
     if (u.can_jump)
         for (const std::string& b : cat.array_links("CUnit", unit_id, "BehaviorArray")) {
             const data::Catalog::Entry* e = b.empty() ? nullptr : cat.find("CBehavior", b);
@@ -603,6 +619,17 @@ sim::Unit make_unit(const data::Catalog& cat, const std::string& unit_id,
         u.creep_check_offsets.reserve(ccs.size());
         for (const auto& [dx, dy] : ccs) u.creep_check_offsets.emplace_back(int16_t(dx), int16_t(dy));
     }
+    static const bool kCreepForbidOld = std::getenv("OMC_CREEP_FORBID_OLD") != nullptr;
+    if (!u.requires_creep && !kCreepForbidOld)
+        for (const auto& [dx, dy] : cat.creep_forbidden_offsets(unit_id))
+            u.creep_check_offsets.emplace_back(int16_t(dx), int16_t(dy));
+    if (!std::getenv("OMC_MOVER_NAME_OLD"))
+        for (const auto& [dx, dy] : cat.placement_nospawn_offsets(unit_id))
+            u.nospawn_offsets.emplace_back(int16_t(dx), int16_t(dy));
+    static const bool kNoBuildOld = std::getenv("OMC_FORCEFIELD_PLACE_OLD") != nullptr;
+    if (!kNoBuildOld)
+        for (const auto& [dx, dy] : cat.placement_nobuild_offsets(unit_id))
+            u.nobuild_offsets.emplace_back(int16_t(dx), int16_t(dy));
     for (const auto& [dx, dy] : cat.near_resources_offsets(unit_id)) u.near_resources_offsets.emplace_back(int16_t(dx), int16_t(dy));
     for (const auto& [dx, dy] : cat.near_resources_check_offsets(unit_id))
         u.near_resources_check_offsets.emplace_back(int16_t(dx), int16_t(dy));
@@ -630,6 +657,8 @@ sim::Unit make_unit(const data::Catalog& cat, const std::string& unit_id,
         if (auto d = cat.tag_default_scalar("CUnit", "SeparationRadius"); d && !d->empty())
             sep_default = Fixed::parse(*d);
         u.sep_radius = field(cat, "CUnit", unit_id, "SeparationRadius", sep_default);
+        static const bool kSepZeroOld = std::getenv("OMC_SEP_RADIUS_ZERO_OLD") != nullptr;
+        if (!kSepZeroOld && u.sep_radius.raw() == 0) u.sep_radius = Fixed::from_raw(-1);
     }
     u.inner_radius = field(cat, "CUnit", unit_id, "InnerRadius", u.radius);
     u.push_priority = int32_t(field(cat, "CUnit", unit_id, "PushPriority", Fixed::from_int(10)).round());

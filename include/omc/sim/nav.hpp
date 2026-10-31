@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <cstdlib>
 #include <limits>
 #include <queue>
 #include <vector>
@@ -319,7 +320,7 @@ inline void find_path(const NavGrid& g, int sx, int sy, int gx, int gy,
                       std::vector<NavCell>& out, bool can_jump = false, bool crush_ff = false,
                       bool can_walk_cliffs = false, const Fixed* goal_point_x = nullptr,
                       const Fixed* goal_point_y = nullptr, Fixed radius = Fixed(), int leap_cells = 1,
-                      bool nearest_fallback = false) {
+                      bool nearest_fallback = false, std::vector<uint8_t>* reached = nullptr) {
     out.clear();
     if (!g.in_bounds(sx, sy) || !g.in_bounds(gx, gy)) return;
     int64_t goal_px = 0, goal_py = 0;
@@ -371,20 +372,36 @@ inline void find_path(const NavGrid& g, int sx, int sy, int gx, int gy,
                 const int64_t ddx = nx - sx, ddy = ny - sy;
                 cands.push_back(Cand{nx, ny, qx * qx + qy * qy, ddx * ddx + ddy * ddy});
             }
-        if (cands.empty()) return;
-        std::stable_sort(cands.begin(), cands.end(), [](const Cand& a, const Cand& b) {
-            return a.dg != b.dg ? a.dg < b.dg : a.ds < b.ds;
-        });
-        constexpr std::size_t kMaxCandidates = 8;
-        for (std::size_t c = 0; c < cands.size() && c < kMaxCandidates; ++c) {
-            find_path(g, sx, sy, cands[c].x, cands[c].y, out, can_jump, crush_ff, can_walk_cliffs, nullptr, nullptr, radius,
-                      leap_cells, false);
-            if (!out.empty()) return;
+        static const bool kFarGoalOld = std::getenv("OMC_NAV_FAR_GOAL_OLD") != nullptr;
+        if (cands.empty() && (kFarGoalOld || !nearest_fallback)) return;
+        if (!cands.empty()) {
+            std::stable_sort(cands.begin(), cands.end(), [](const Cand& a, const Cand& b) {
+                return a.dg != b.dg ? a.dg < b.dg : a.ds < b.ds;
+            });
+            constexpr std::size_t kMaxCandidates = 8;
+            if (kFarGoalOld) {
+                for (std::size_t c = 0; c < cands.size() && c < kMaxCandidates; ++c) {
+                    find_path(g, sx, sy, cands[c].x, cands[c].y, out, can_jump, crush_ff, can_walk_cliffs, nullptr,
+                              nullptr, radius, leap_cells, false);
+                    if (!out.empty()) return;
+                }
+            } else {
+                std::vector<uint8_t> reach;
+                find_path(g, sx, sy, cands[0].x, cands[0].y, out, can_jump, crush_ff, can_walk_cliffs, nullptr, nullptr,
+                          radius, leap_cells, false, &reach);
+                if (!out.empty()) return;
+                for (std::size_t c = 1; c < cands.size() && c < kMaxCandidates && !reach.empty(); ++c) {
+                    if (!reach[std::size_t(cands[c].y) * std::size_t(g.width()) + std::size_t(cands[c].x)]) continue;
+                    find_path(g, sx, sy, cands[c].x, cands[c].y, out, can_jump, crush_ff, can_walk_cliffs, nullptr,
+                              nullptr, radius, leap_cells, false);
+                    if (!out.empty()) return;
+                }
+            }
+            if (nearest_fallback)
+                find_path(g, sx, sy, cands[0].x, cands[0].y, out, can_jump, crush_ff, can_walk_cliffs, nullptr, nullptr,
+                          radius, leap_cells, true);
+            return;
         }
-        if (nearest_fallback)
-            find_path(g, sx, sy, cands[0].x, cands[0].y, out, can_jump, crush_ff, can_walk_cliffs, nullptr, nullptr,
-                      radius, leap_cells, true);
-        return;
     }
 
     const int W = g.width();
@@ -519,6 +536,7 @@ inline void find_path(const NavGrid& g, int sx, int sy, int gx, int gy,
 
     int end = goal;
     if (!found) {
+        if (reached) reached->swap(closed);
         if (!nearest_fallback || best_idx < 0) return;
         end = best_idx;
     }
