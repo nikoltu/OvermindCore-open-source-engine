@@ -193,6 +193,7 @@ struct AbilityDef {
     std::uint32_t abil_tag = 0;
     std::uint32_t redirect_tag = 0;
     std::uint8_t redirect_order = 0xFF;
+    Fixed passenger_life_cost{};
 };
 
 enum : std::uint8_t {
@@ -734,6 +735,7 @@ struct Unit {
     std::uint8_t windup_slot = 0;
     Fixed wpn_range_slop{Fixed::from_int(-1)}, wpn2_range_slop{Fixed::from_int(-1)};
     std::uint32_t wpn_tag = 0, wpn2_tag = 0;
+    Fixed windup_bs;
     Fixed windup_reach;
     Fixed windup_ps;
     Fixed windup_ar{Fixed::from_int(1)};
@@ -987,6 +989,82 @@ struct Unit {
     int bounce_count = 0;
     Fixed bounce_range;
     Fixed bounce_amount[kMaxBounce] = {};
+
+    struct WeaponArea {
+        Fixed splash_inner, splash_mid, splash_outer;
+        Fixed no_splash_radius;
+        Fixed splash_inner_frac = Fixed::from_int(1);
+        Fixed splash_mid_frac = Fixed::from_ratio(1, 2);
+        Fixed splash_outer_frac = Fixed::from_ratio(1, 4);
+        std::uint8_t splash_affiliation = 8 | 16;
+        std::uint8_t splash_planes = 1 | 2;
+        bool splash_excludes_structure = false;
+        bool splash_offset_by_radius = false;
+        int splash_line_count = 0;
+        Fixed splash_line_first, splash_line_step, splash_line_radius;
+        bool splash_line_from_source = false;
+        Fixed arc_radius[2];
+        Fixed arc_cos[2];
+        Fixed arc_frac[2];
+        int bounce_count = 0;
+        Fixed bounce_range;
+        Fixed bounce_amount[kMaxBounce] = {};
+    };
+    WeaponArea wpn2_area;
+    WeaponArea first_area() const {
+        WeaponArea a;
+        a.splash_inner = splash_inner;
+        a.splash_mid = splash_mid;
+        a.splash_outer = splash_outer;
+        a.no_splash_radius = no_splash_radius;
+        a.splash_inner_frac = splash_inner_frac;
+        a.splash_mid_frac = splash_mid_frac;
+        a.splash_outer_frac = splash_outer_frac;
+        a.splash_affiliation = splash_affiliation;
+        a.splash_planes = splash_planes;
+        a.splash_excludes_structure = splash_excludes_structure;
+        a.splash_offset_by_radius = splash_offset_by_radius;
+        a.splash_line_count = splash_line_count;
+        a.splash_line_first = splash_line_first;
+        a.splash_line_step = splash_line_step;
+        a.splash_line_radius = splash_line_radius;
+        a.splash_line_from_source = splash_line_from_source;
+        for (int k = 0; k < 2; ++k) {
+            a.arc_radius[k] = arc_radius[k];
+            a.arc_cos[k] = arc_cos[k];
+            a.arc_frac[k] = arc_frac[k];
+        }
+        a.bounce_count = bounce_count;
+        a.bounce_range = bounce_range;
+        for (int k = 0; k < kMaxBounce; ++k) a.bounce_amount[k] = bounce_amount[k];
+        return a;
+    }
+    void set_first_area(const WeaponArea& a) {
+        splash_inner = a.splash_inner;
+        splash_mid = a.splash_mid;
+        splash_outer = a.splash_outer;
+        no_splash_radius = a.no_splash_radius;
+        splash_inner_frac = a.splash_inner_frac;
+        splash_mid_frac = a.splash_mid_frac;
+        splash_outer_frac = a.splash_outer_frac;
+        splash_affiliation = a.splash_affiliation;
+        splash_planes = a.splash_planes;
+        splash_excludes_structure = a.splash_excludes_structure;
+        splash_offset_by_radius = a.splash_offset_by_radius;
+        splash_line_count = a.splash_line_count;
+        splash_line_first = a.splash_line_first;
+        splash_line_step = a.splash_line_step;
+        splash_line_radius = a.splash_line_radius;
+        splash_line_from_source = a.splash_line_from_source;
+        for (int k = 0; k < 2; ++k) {
+            arc_radius[k] = a.arc_radius[k];
+            arc_cos[k] = a.arc_cos[k];
+            arc_frac[k] = a.arc_frac[k];
+        }
+        bounce_count = a.bounce_count;
+        bounce_range = a.bounce_range;
+        for (int k = 0; k < kMaxBounce; ++k) bounce_amount[k] = a.bounce_amount[k];
+    }
 
     Fixed point_defense_radius;
     int point_defense_max = 0;
@@ -1413,6 +1491,19 @@ public:
     void clear_last_error() { last_error_ = CmdError::None; last_error_player_ = -1; }
     void report_error(int32_t player, CmdError e) { refuse(player, e); }
 
+    bool splash_hits(const Unit& attacker, const Unit::WeaponArea& area, const Unit& victim) const {
+        std::uint8_t rel = 0;
+        if (victim.id == attacker.id) rel = 1;
+        else if (victim.player == attacker.player) rel = 2;
+        else if (victim.player < 0) rel = 16;
+        else if (are_allied(victim.player, attacker.player)) rel = 4;
+        else rel = 8;
+        if ((area.splash_affiliation & rel) == 0) return false;
+        if ((area.splash_planes & (victim.flying ? 2 : 1)) == 0) return false;
+        if (area.splash_excludes_structure && (victim.attributes & kAttrStructure)) return false;
+        return true;
+    }
+
     bool splash_hits(const Unit& attacker, const Unit& victim) const {
         std::uint8_t rel = 0;
         if (victim.id == attacker.id) rel = 1;
@@ -1442,6 +1533,8 @@ public:
             const Fixed elapsed = u.windup_total - u.windup_timer;
             if (u.windup_total.raw() <= 0 || elapsed < Fixed::from_double(0.0893)) cancel_windup(u);
         }
+        if (!queued && player_order && o.type == OrderType::Move && !backswing_origin_old())
+            u.backswing_timer = Fixed();
         const bool prep_protected =
             !queued && player_order && u.cast_prep.raw() > 0 && cast_prep_uninterruptible(u);
         if (!queued && player_order && u.cast_prep.raw() > 0 && !cast_prep_uninterruptible(u))
@@ -1459,6 +1552,11 @@ public:
         detach_builder(id);
         cancel_windup(units_[id]);
         units_[id].orders.clear();
+    }
+
+    static bool backswing_origin_old() {
+        static const bool kOld = std::getenv("OMC_BACKSWING_ORIGIN_OLD") != nullptr;
+        return kOld;
     }
 
     bool cast_prep_uninterruptible(const Unit& u) const {
@@ -2029,6 +2127,9 @@ public:
         if (!u.alive || !u.flying) return false;
         if (!creep_placement_ok(u, x, y)) return false;
         return !site_blocked(u, x, y, id);
+    }
+    bool morph_site_ok(const Unit& proto, Fixed x, Fixed y, uint32_t body) const {
+        return creep_placement_ok(proto, x, y) && !site_blocked(proto, x, y, body);
     }
     bool order_land(uint32_t id, Fixed x, Fixed y) {
         if (!can_land(id, x, y)) return false;
@@ -2774,6 +2875,9 @@ public:
     void set_rest_push_collide(bool on) { rest_push_collide_ = on; }
     void set_sep_push_rules(bool on) { sep_push_rules_ = on; }
     void set_level_guard(bool on) { level_guard_ = on; }
+    void set_closed_step_replan(bool on) { closed_step_replan_ = on; }
+    void set_gather_even(bool on) { gather_even_ = on; }
+    void set_builder_orphan_cancel(bool on) { builder_orphan_cancel_ = on; }
     bool separation_respects_nav() const { return sep_respects_nav_; }
     static bool default_gas_worker_inside();
     void set_research_queue(bool on) { research_queue_ = on; }
@@ -3256,6 +3360,9 @@ private:
     bool rest_push_collide_ = false;
     bool sep_push_rules_ = false;
     bool level_guard_ = false;
+    bool closed_step_replan_ = false;
+    bool gather_even_ = false;
+    bool builder_orphan_cancel_ = false;
     std::vector<std::uint8_t> sep_held_;
     Fixed crowd_max_radius_;
     int crowd_max_tick_ = -1;

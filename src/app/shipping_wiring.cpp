@@ -130,6 +130,9 @@ void apply_shipping_wiring(MeleeGame& game, const data::Catalog& cat,
     game.world().set_disc_slide(std::getenv("OMC_DISC_SLIDE_OLD") == nullptr);
     game.world().set_rest_push_collide(std::getenv("OMC_REST_PUSH_COLLIDE_OLD") == nullptr);
     game.world().set_level_guard(std::getenv("OMC_MOVE_LEVEL_GUARD_OLD") == nullptr);
+    game.world().set_closed_step_replan(std::getenv("OMC_CLOSED_STEP_REPLAN_OLD") == nullptr);
+    game.world().set_gather_even(std::getenv("OMC_GATHER_EVEN_OLD") == nullptr);
+    game.world().set_builder_orphan_cancel(std::getenv("OMC_BUILDER_ORPHAN_OLD") == nullptr);
     game.world().set_sep_push_rules(std::getenv("OMC_SEP_PUSH_RULES_ON") != nullptr);
 
     if (up && setup) {

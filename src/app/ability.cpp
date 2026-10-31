@@ -128,6 +128,17 @@ std::uint8_t ability_target_excluded_rel(const data::Catalog& cat, const std::st
 AbilTargetMode ability_target_mode(const data::Catalog& cat, const std::string& abil_id) {
     if (const auto* e = cat.find("CAbil", abil_id); e && e->tag == "CAbilEffectInstant")
         return AbilTargetMode::Instant;
+    static const bool kTargetModeOld = std::getenv("OMC_ABIL_TARGET_MODE_OLD") != nullptr;
+    if (!kTargetModeOld) {
+        const auto* tagged = cat.find("CAbil", abil_id);
+        if (tagged && tagged->tag == "CAbilRedirectInstant") return AbilTargetMode::Instant;
+        if (tagged && tagged->tag == "CAbilEffectTarget") {
+            const std::string loc = cat.scalar("CEffect", cat.cabil_effect_link(abil_id), "TargetLocationType").value_or("");
+            if (loc == "Point" || loc == "UnitOrPoint") return AbilTargetMode::Point;
+            if (loc == "Unit") return AbilTargetMode::Unit;
+            if (!cat.scalar("CAbil", abil_id, "CursorEffect").value_or("").empty()) return AbilTargetMode::Point;
+        }
+    }
     auto b = make_ability(cat, abil_id);
     if (!b) return AbilTargetMode::Unit;
     const bool has_tree =
@@ -2161,7 +2172,8 @@ int32_t build_effect_node(const data::Catalog& cat, const std::string& eff, Abil
         n.behavior_tag = behavior_id_hash(*beh);
         n.gates = parse_effect_vital_gates(cat, eff);
         if (!bb->initial_effect.empty()) n.initial = build_effect_rec(cat, bb->initial_effect, b, depth + 1);
-        if (!bb->periodic_effect.empty() && bb->dmg_per_tick <= 0.0 && bb->dmg_period > 0.0) {
+        static const bool kPeriodicOld = std::getenv("OMC_PERIODIC_TICK_OLD") != nullptr;
+        if (!bb->periodic_effect.empty() && (!kPeriodicOld || bb->dmg_per_tick <= 0.0) && bb->dmg_period > 0.0) {
             n.periodic = build_effect_rec(cat, bb->periodic_effect, b, depth + 1);
             n.period = sim::Fixed::from_double(bb->dmg_period);
         }
@@ -2437,7 +2449,12 @@ int32_t build_effect(const data::Catalog& cat, const std::string& effect_id, Abi
 
 int32_t register_ability(sim::World& world, const AbilityBuild& b) {
     const int32_t n = int32_t(b.tree.size());
-    if (b.tree.empty() || b.tree_root < 0 || b.tree_root >= n) return world.add_ability(b.def);
+    static const bool kPassengerCostOld = std::getenv("OMC_ABIL_TARGET_MODE_OLD") != nullptr;
+    if (b.tree.empty() || b.tree_root < 0 || b.tree_root >= n) {
+        sim::AbilityDef flat = b.def;
+        if (!kPassengerCostOld) flat.passenger_life_cost = b.life_cost;
+        return world.add_ability(flat);
+    }
 
     std::vector<int32_t> remap(b.tree.size(), -1);
     auto to_global = [&](sim::EffectRef& e) {
@@ -2455,6 +2472,7 @@ int32_t register_ability(sim::World& world, const AbilityBuild& b) {
         remap[i] = world.add_effect(std::move(node));
     }
     sim::AbilityDef def = b.def;
+    if (!kPassengerCostOld) def.passenger_life_cost = b.life_cost;
     to_global(def.cancel_effect_prep);
     return world.add_ability_with_root(def, remap[b.tree_root]);
 }

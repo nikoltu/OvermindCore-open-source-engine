@@ -281,6 +281,7 @@ void MeleeAI::run_worker_transfer(sim::World& w) {
     last_transfer_tick_ = w.tick();
     const std::vector<uint32_t> halls = own_halls(w, false);
     if (halls.size() < 2) return;
+    static const bool kHallSurplusOld = std::getenv("OMC_AI_TRANSFER_HALL_SURPLUS_OLD") != nullptr;
     const Fixed r2 = Fixed::from_int(10) * Fixed::from_int(10);
     const std::size_t H = halls.size();
     std::vector<int> ideal(H, 0), patches(H, 0), assigned(H, 0);
@@ -316,7 +317,10 @@ void MeleeAI::run_worker_transfer(sim::World& w) {
                 for (std::size_t d = 0; d < H; ++d) {
                     if (d == s || patches[d] <= 0) continue;
                     const int room = cap(d) - assigned[d];
-                    if (tier == 1 && assigned[s] - ideal[s] <= assigned[d] - ideal[d] + 1) continue;
+                    if (tier == 1 && kHallSurplusOld && assigned[s] - ideal[s] <= assigned[d] - ideal[d] + 1) continue;
+                    if (tier == 1 && !kHallSurplusOld && patches[s] > 0 &&
+                        (assigned[s] - ideal[s]) * patches[d] <= (assigned[d] + 1 - ideal[d]) * patches[s])
+                        continue;
                     if (room > best_room) { best_room = room; best = d; }
                 }
                 if (best == H) break;

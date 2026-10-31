@@ -175,6 +175,72 @@ static uint32_t read_collide(const data::Catalog& cat, const std::string& unit_i
     return flags;
 }
 
+static sim::Unit::WeaponArea read_weapon_area(const data::Catalog& cat, const std::string& w) {
+    sim::Unit::WeaponArea out;
+    auto lsplash = cat.effect_persistent(cat.weapon_effect_id(w));
+    auto arcs = cat.weapon_arc_splash(w);
+    if (lsplash && lsplash->line_count >= 2 && lsplash->radius > 0) {
+        out.splash_line_count = lsplash->line_count;
+        out.splash_line_radius = Fixed::from_double(lsplash->radius);
+        out.splash_line_from_source = lsplash->line_from_source;
+        if (lsplash->line_from_source) {
+            const double a = std::fabs(lsplash->line_first), b = std::fabs(lsplash->line_last);
+            out.splash_line_first = Fixed::from_double(std::min(a, b));
+            out.splash_line_step = Fixed::from_double(std::fabs(lsplash->line_step));
+        } else {
+            out.splash_line_first = Fixed::from_double(lsplash->line_first);
+            out.splash_line_step = Fixed::from_double(lsplash->line_step);
+        }
+    } else if (!arcs.empty()) {
+        constexpr double kPi = 3.14159265358979323846;
+        data::Catalog::ArcSplash src[2] = {};
+        int band = 0;
+        for (const data::Catalog::ArcSplash& a : arcs) {
+            if (band >= 2) break;
+            bool dup = false;
+            for (int b = 0; b < band; ++b)
+                if (src[b].arc_deg == a.arc_deg && src[b].radius == a.radius && src[b].frac == a.frac)
+                    dup = true;
+            if (dup) continue;
+            src[band] = a;
+            out.arc_radius[band] = Fixed::from_double(a.radius);
+            out.arc_cos[band] = Fixed::from_double(std::cos(a.arc_deg * 0.5 * kPi / 180.0));
+            out.arc_frac[band] = Fixed::from_double(a.frac);
+            ++band;
+        }
+        if (std::getenv("OMC_CLEAVE_BANDS_OLD") == nullptr) {
+            const data::Catalog::SplashFilters sf = cat.weapon_splash_filters(w);
+            out.splash_affiliation = sf.affiliation;
+            out.splash_planes = sf.planes;
+            out.splash_excludes_structure = sf.excludes_structure;
+        }
+    } else if (auto rings = cat.weapon_splash(w); rings.size() >= 1) {
+        const data::Catalog::SplashFilters sf = cat.weapon_splash_filters(w);
+        out.splash_affiliation = sf.affiliation;
+        out.splash_planes = sf.planes;
+        out.splash_excludes_structure = sf.excludes_structure;
+        out.splash_offset_by_radius = sf.offset_by_radius;
+        std::sort(rings.begin(), rings.end(), [](const auto& a, const auto& b) { return a.first < b.first; });
+        const auto& lo = rings.front();
+        const auto& hi = rings.back();
+        const auto& mid = rings[rings.size() / 2];
+        out.splash_inner = Fixed::from_double(lo.first);
+        out.splash_outer = Fixed::from_double(hi.first);
+        out.splash_mid = Fixed::from_double(mid.first);
+        out.splash_inner_frac = Fixed::from_double(lo.second);
+        out.splash_mid_frac = Fixed::from_double(mid.second);
+        out.splash_outer_frac = Fixed::from_double(hi.second);
+    }
+    if (auto thr = cat.weapon_radius_split_no_splash(w)) out.no_splash_radius = Fixed::from_double(*thr);
+    if (auto bs = cat.weapon_bounce(w); bs && !bs->amounts.empty()) {
+        const int nb = std::min<int>(int(bs->amounts.size()), sim::Unit::kMaxBounce);
+        out.bounce_count = nb;
+        out.bounce_range = Fixed::from_double(bs->range);
+        for (int k = 0; k < nb; ++k) out.bounce_amount[k] = Fixed::from_double(bs->amounts[k]);
+    }
+    return out;
+}
+
 sim::Unit make_unit(const data::Catalog& cat, const std::string& unit_id,
                     int player, Fixed x, Fixed y) {
     sim::Unit u;
@@ -391,64 +457,9 @@ sim::Unit make_unit(const data::Catalog& cat, const std::string& unit_id,
             if (!kAcqRangeOld && range > u.acquire_range) u.acquire_range = range;
             if (auto af = cat.scalar("CWeapon", w, "AcquireFilters"); af && !af->empty())
                 u.wpn_acquire_no_structure = parse_acquire_no_structure(*af);
-            auto lsplash = cat.effect_persistent(cat.weapon_effect_id(w));
-            auto arcs = cat.weapon_arc_splash(w);
-            if (lsplash && lsplash->line_count >= 2 && lsplash->radius > 0) {
-                u.splash_line_count = lsplash->line_count;
-                u.splash_line_radius = Fixed::from_double(lsplash->radius);
-                u.splash_line_from_source = lsplash->line_from_source;
-                if (lsplash->line_from_source) {
-                    const double a = std::fabs(lsplash->line_first), b = std::fabs(lsplash->line_last);
-                    u.splash_line_first = Fixed::from_double(std::min(a, b));
-                    u.splash_line_step = Fixed::from_double(std::fabs(lsplash->line_step));
-                } else {
-                    u.splash_line_first = Fixed::from_double(lsplash->line_first);
-                    u.splash_line_step = Fixed::from_double(lsplash->line_step);
-                }
-            } else if (!arcs.empty()) {
-                constexpr double kPi = 3.14159265358979323846;
-                data::Catalog::ArcSplash src[2] = {};
-                int band = 0;
-                for (const data::Catalog::ArcSplash& a : arcs) {
-                    if (band >= 2) break;
-                    bool dup = false;
-                    for (int b = 0; b < band; ++b)
-                        if (src[b].arc_deg == a.arc_deg && src[b].radius == a.radius && src[b].frac == a.frac)
-                            dup = true;
-                    if (dup) continue;
-                    src[band] = a;
-                    u.arc_radius[band] = Fixed::from_double(a.radius);
-                    u.arc_cos[band] = Fixed::from_double(std::cos(a.arc_deg * 0.5 * kPi / 180.0));
-                    u.arc_frac[band] = Fixed::from_double(a.frac);
-                    ++band;
-                }
-            } else if (auto rings = cat.weapon_splash(w); rings.size() >= 1) {
-                const data::Catalog::SplashFilters sf = cat.weapon_splash_filters(w);
-                u.splash_affiliation = sf.affiliation;
-                u.splash_planes = sf.planes;
-                u.splash_excludes_structure = sf.excludes_structure;
-                u.splash_offset_by_radius = sf.offset_by_radius;
-                std::sort(rings.begin(), rings.end(),
-                          [](const auto& a, const auto& b) { return a.first < b.first; });
-                const auto& lo = rings.front();
-                const auto& hi = rings.back();
-                const auto& mid = rings[rings.size() / 2];
-                u.splash_inner = Fixed::from_double(lo.first);
-                u.splash_outer = Fixed::from_double(hi.first);
-                u.splash_mid = Fixed::from_double(mid.first);
-                u.splash_inner_frac = Fixed::from_double(lo.second);
-                u.splash_mid_frac = Fixed::from_double(mid.second);
-                u.splash_outer_frac = Fixed::from_double(hi.second);
-            }
-            if (auto thr = cat.weapon_radius_split_no_splash(w))
-                u.no_splash_radius = Fixed::from_double(*thr);
-            if (auto bs = cat.weapon_bounce(w); bs && !bs->amounts.empty()) {
-                const int nb = std::min<int>(int(bs->amounts.size()), sim::Unit::kMaxBounce);
-                u.bounce_count = nb;
-                u.bounce_range = Fixed::from_double(bs->range);
-                for (int k = 0; k < nb; ++k) u.bounce_amount[k] = Fixed::from_double(bs->amounts[k]);
-            }
+            u.set_first_area(read_weapon_area(cat, w));
         } else {
+            u.wpn2_area = read_weapon_area(cat, w);
             u.wpn2_id = w;
             {
                 const auto dmg_id = cat.weapon_damage_effect_id(w);

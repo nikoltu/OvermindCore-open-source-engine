@@ -116,6 +116,8 @@ void draw_shaded_row(std::vector<uint8_t>& buf, uint32_t w, uint32_t h, int left
     const int inner_w = width - 4, ix = left + 2;
     const int fill_w = int(std::lround(frac * double(inner_w)));
     const int trail_w = trail > frac ? int(std::lround((trail > 1.0 ? 1.0 : trail) * double(inner_w))) : fill_w;
+    static const bool kPartialCellOld = std::getenv("OMC_STATUS_PARTIAL_CELL_OLD") != nullptr;
+    const bool cell_mix = !kPartialCellOld && segments > 1;
     auto shade = [](const Color& c, double k) {
         auto ch = [&](uint8_t v) { const double x = double(v) * k; return uint8_t(x > 255.0 ? 255.0 : x); };
         return Color{ch(c.r), ch(c.g), ch(c.b), 255};
@@ -125,6 +127,20 @@ void draw_shaded_row(std::vector<uint8_t>& buf, uint32_t w, uint32_t h, int left
         fill_rect(buf, w, h, ix, y, ix + fill_w, y + 1, shade(fill, kShade[r]));
         fill_rect(buf, w, h, ix + fill_w, y, ix + trail_w, y + 1, shade(reduction, kShade[r]));
         fill_rect(buf, w, h, ix + trail_w, y, ix + inner_w, y + 1, shade(empty, kShade[r]));
+        if (cell_mix) {
+            const double covered = frac * double(segments);
+            const int cell = std::min(segments, int(std::floor(covered)));
+            const int x0 = ix + int(std::lround(double(inner_w) * double(cell) / double(segments)));
+            fill_rect(buf, w, h, ix, y, x0, y + 1, shade(fill, kShade[r]));
+            fill_rect(buf, w, h, x0, y, ix + inner_w, y + 1, shade(empty, kShade[r]));
+            const double k = covered - double(cell);
+            if (cell < segments && k > 0.0) {
+                const int x1 = ix + int(std::lround(double(inner_w) * double(cell + 1) / double(segments)));
+                auto mix = [&](uint8_t a, uint8_t b) { return uint8_t(std::lround(double(a) + (double(b) - double(a)) * k)); };
+                const Color m{mix(empty.r, fill.r), mix(empty.g, fill.g), mix(empty.b, fill.b), 255};
+                fill_rect(buf, w, h, x0, y, x1, y + 1, shade(m, kShade[r]));
+            }
+        }
     }
     for (int s = 1; s < segments; ++s) {
         const int x = ix + int(std::lround(double(inner_w) * double(s) / double(segments)));
@@ -160,10 +176,15 @@ void UnitOverlay::render_status_into(std::vector<uint8_t>& rgba, int& dirty_y0, 
     using Mode = StatusBarOptions::Mode;
 
     constexpr Color kLifeBand[4] = {{208, 34, 0, 255}, {229, 129, 0, 255}, {229, 221, 0, 255}, {22, 229, 0, 255}};
-    constexpr Color kShield{0, 0, 255, 255};
-    constexpr Color kEnergy{150, 40, 220, 255};
-    constexpr Color kProgress{0, 200, 200, 255};
-    constexpr Color kDuration{120, 120, 120, 255};
+    static const bool kColoursOld = std::getenv("OMC_STATUS_COLOURS_OLD") != nullptr;
+    static const bool kTrailOld = std::getenv("OMC_STATUS_TRAIL_OLD") != nullptr;
+    static const bool kBandsOld = std::getenv("OMC_STATUS_LEGACY_BANDS_OLD") != nullptr;
+    const Color kShield = kColoursOld ? Color{0, 0, 255, 255} : Color{54, 56, 190, 255};
+    const Color kEnergy = kColoursOld ? Color{150, 40, 220, 255} : Color{136, 79, 195, 255};
+    const Color kProgress = kColoursOld ? Color{0, 200, 200, 255} : Color{45, 141, 165, 255};
+    const Color kDuration = kColoursOld ? Color{120, 120, 120, 255} : Color{114, 116, 136, 255};
+    const Color kDurationEmpty = kColoursOld ? Color{40, 40, 40, 255} : Color{37, 39, 52, 255};
+    const Color kSeat = kColoursOld ? Color{255, 255, 255, 255} : Color{223, 223, 224, 255};
     constexpr Color kTeamOwn{0, 255, 0, 255};
     constexpr Color kTeamAlly{11, 105, 1, 255};
     constexpr Color kTeamEnemy{150, 15, 50, 255};
@@ -225,6 +246,7 @@ void UnitOverlay::render_status_into(std::vector<uint8_t>& rgba, int& dirty_y0, 
                 auto ch = [&](double v, double k) { const double x = 0.478 * v + 0.356 * l + k; return uint8_t(x < 0.0 ? 0.0 : (x > 255.0 ? 255.0 : x)); };
                 return Color{ch(c.r, 3.0), ch(c.g, 5.0), ch(c.b, 25.0), 255};
             };
+            auto screen = [&](const Color& c) { return kColoursOld ? treated(c) : c; };
             constexpr Color kScreenLife[4] = {{141, 63, 71, 255}, {160, 115, 76, 255}, {147, 145, 73, 255}, {64, 165, 76, 255}};
             constexpr Color kScreenEmpty{70, 72, 92, 255};
             struct Row { double frac; Color fill; Color empty; int segs; double trail; };
@@ -238,7 +260,7 @@ void UnitOverlay::render_status_into(std::vector<uint8_t>& rgba, int& dirty_y0, 
             if (vitals) {
                 if (row_shield) {
                     const double st = (o.shield_trail && u.id < o.shield_trail->size()) ? double((*o.shield_trail)[u.id]) : -1.0;
-                    rows[n++] = Row{u.shields.to_double() / u.shields_max.to_double(), treated(kShield), kScreenEmpty, segs, st};
+                    rows[n++] = Row{u.shields.to_double() / u.shields_max.to_double(), screen(kShield), kScreenEmpty, segs, kTrailOld ? st : -1.0};
                 }
                 const double lf = u.hp.to_double() / u.hp_max.to_double();
                 int band = int(std::floor((lf < 0.0 ? 0.0 : (lf > 1.0 ? 1.0 : lf)) * 7.0)) / 2;
@@ -248,14 +270,14 @@ void UnitOverlay::render_status_into(std::vector<uint8_t>& rgba, int& dirty_y0, 
                     life = treated(u.player == o.viewer_player ? kTeamOwn
                                    : (o.viewer_player >= 0 && w.are_allied(u.player, o.viewer_player)) ? kTeamAlly : kTeamEnemy);
                 const double lt = (o.life_trail && u.id < o.life_trail->size()) ? double((*o.life_trail)[u.id]) : -1.0;
-                if (row_life) rows[n++] = Row{lf, life, kScreenEmpty, segs, lt};
-                if (row_energy) rows[n++] = Row{u.energy.to_double() / u.energy_max.to_double(), treated(kEnergy), kScreenEmpty, segs, -1.0};
+                if (row_life) rows[n++] = Row{lf, life, kScreenEmpty, segs, kTrailOld ? lt : -1.0};
+                if (row_energy) rows[n++] = Row{u.energy.to_double() / u.energy_max.to_double(), screen(kEnergy), kScreenEmpty, segs, -1.0};
                 if (u.constructing) rows[n++] = Row{u.build_progress.to_double(), Color{45, 141, 165, 255}, kScreenEmpty, 1, -1.0};
                 if (u.time_life.raw() > 0 && u.time_life_max.raw() > 0)
-                    rows[n++] = Row{u.time_life.to_double() / u.time_life_max.to_double(), treated(kDuration), treated(Color{40, 40, 40, 255}), 1, -1.0};
+                    rows[n++] = Row{u.time_life.to_double() / u.time_life_max.to_double(), screen(kDuration), screen(kDurationEmpty), 1, -1.0};
             }
             if (cargo)
-                rows[n++] = Row{double(w.cargo_used(u.id)) / double(u.cargo_space), treated(Color{255, 255, 255, 255}), Color{53, 49, 46, 255},
+                rows[n++] = Row{double(w.cargo_used(u.id)) / double(u.cargo_space), screen(kSeat), Color{53, 49, 46, 255},
                                 int(u.cargo_space), -1.0};
             for (int i = 0; i < n; ++i)
                 draw_shaded_row(rgba, view_w, view_h, left, last_top - 9 * (n - 1 - i), row_w, rows[i].frac, rows[i].fill, rows[i].empty,
@@ -267,7 +289,7 @@ void UnitOverlay::render_status_into(std::vector<uint8_t>& rgba, int& dirty_y0, 
             }
             if (salvaging)
                 draw_shaded_row(rgba, view_w, view_h, left, last_top + 8, row_w, u.salvage_timer.to_double() / u.salvage_total.to_double(),
-                                treated(kDuration), treated(Color{40, 40, 40, 255}), 1, -1.0, Color{0, 0, 0, 255});
+                                screen(kDuration), screen(kDurationEmpty), 1, -1.0, Color{0, 0, 0, 255});
             continue;
         }
         if (o.own_rows && u.player == o.viewer_player && !u.constructing) {
@@ -330,17 +352,18 @@ void UnitOverlay::render_status_into(std::vector<uint8_t>& rgba, int& dirty_y0, 
         if (has_shield) {
             const double sf = u.shields.to_double() / u.shields_max.to_double();
             const double st = (o.shield_trail && u.id < o.shield_trail->size()) ? double((*o.shield_trail)[u.id]) : -1.0;
-            draw_status_row(rgba, view_w, view_h, left, top, sf, kShield, segments_of(u.shields_max), st);
+            draw_status_row(rgba, view_w, view_h, left, top, sf, kShield, segments_of(u.shields_max), kTrailOld ? st : -1.0);
         }
         const double lf = u.hp.to_double() / u.hp_max.to_double();
-        Color life = kLifeBand[lf >= 0.75 ? 3 : lf >= 0.5 ? 2 : lf >= 0.25 ? 1 : 0];
+        const int legacy_band = std::min(3, int(std::floor((lf < 0.0 ? 0.0 : (lf > 1.0 ? 1.0 : lf)) * 7.0)) / 2);
+        Color life = kLifeBand[kBandsOld ? (lf >= 0.75 ? 3 : lf >= 0.5 ? 2 : lf >= 0.25 ? 1 : 0) : legacy_band];
         if (o.team_colored) {
             life = u.player == o.viewer_player ? kTeamOwn
                  : (o.viewer_player >= 0 && w.are_allied(u.player, o.viewer_player)) ? kTeamAlly
                  : kTeamEnemy;
         }
         const double lt = (o.life_trail && u.id < o.life_trail->size()) ? double((*o.life_trail)[u.id]) : -1.0;
-        draw_status_row(rgba, view_w, view_h, left, life_top, lf, life, segments_of(u.hp_max), lt);
+        draw_status_row(rgba, view_w, view_h, left, life_top, lf, life, segments_of(u.hp_max), kTrailOld ? lt : -1.0);
         int next_top = life_top + (kStatusBarHeight - 1);
         if (has_energy) {
             const double ef = u.energy.to_double() / u.energy_max.to_double();

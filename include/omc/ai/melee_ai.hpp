@@ -120,6 +120,13 @@ public:
     void set_seal_guard(bool on) { seal_guard_ = on; }
     int workers_transferred() const { return workers_transferred_; }
     bool hunting() const { return hunting_; }
+    bool hunt_point_near(sim::Fixed x, sim::Fixed y) const {
+        for (const HuntPoint& p : hunt_points_) {
+            const sim::Fixed dx = p.x - x, dy = p.y - y;
+            if (dx * dx + dy * dy <= sim::Fixed::from_int(1)) return true;
+        }
+        return false;
+    }
     int bases(const sim::World& w) const;
     bool is_inject_queen(uint32_t id) const;
     int pending_cap(const sim::World& w) const;

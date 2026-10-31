@@ -11,7 +11,7 @@
 
 <p align="center">
   <img src="https://img.shields.io/badge/status-alpha-orange" alt="Status: alpha">
-  <img src="https://img.shields.io/badge/version-v0.1.10--alpha-blue" alt="Version v0.1.10-alpha">
+  <img src="https://img.shields.io/badge/version-v0.1.11--alpha-blue" alt="Version v0.1.11-alpha">
   <img src="https://img.shields.io/badge/platform-Windows-0078D6?logo=windows&logoColor=white" alt="Platform: Windows">
   <img src="https://img.shields.io/badge/melee%20vs%20AI-playable%20end%20to%20end-brightgreen" alt="Melee vs AI: playable end to end">
   <img src="https://img.shields.io/badge/license-GPL--3.0--or--later-blue" alt="License: GPL-3.0-or-later">

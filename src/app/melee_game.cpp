@@ -1217,7 +1217,7 @@ std::uint32_t MeleeGame::selected_liberator_ag() const {
 std::vector<std::uint32_t> MeleeGame::selected_merge_templar() const {
     std::vector<std::uint32_t> out;
     if (cfg_.human_player < 0 || !cat_) return out;
-    for (std::uint32_t id : selection_) {
+    for (std::uint32_t id : card_full_selection_ ? *card_full_selection_ : selection_) {
         if (id >= world_.units().size()) continue;
         const sim::Unit& u = world_.units()[id];
         if (!u.alive || u.player != cfg_.human_player || u.constructing) continue;
@@ -2407,6 +2407,12 @@ bool MeleeGame::human_cancel_morph(const std::string& morph_abil) {
     bool any = false;
     for (std::uint32_t id : selection_) {
         if (id >= world_.units().size() || world_.unit(id).player != cfg_.human_player) continue;
+        if (const auto rw = root_walks_.find(id); rw != root_walks_.end() && rw->second.abil == morph_abil) {
+            root_walks_.erase(rw);
+            world_.stop(id);
+            any = true;
+            continue;
+        }
         const auto it = morph_abil_.find(id);
         if (it == morph_abil_.end() || it->second != morph_abil || !world_.is_morphing(id)) continue;
         if (!world_.cancel_morph(id)) continue;
@@ -2865,6 +2871,28 @@ CommandCard MeleeGame::compose_command_card(std::vector<BuildCardEntry>& builds,
                                             std::vector<AbilityCardEntry>& abils,
                                             std::vector<TrainCardEntry>& trains,
                                             std::vector<SubmenuCardEntry>& submenus) {
+    static const bool kActiveSubgroupOld = std::getenv("OMC_CARD_ACTIVE_SUBGROUP_OLD") != nullptr;
+    if (!kActiveSubgroupOld && sel_groups_.subgroups.size() > 1) {
+        const std::size_t a = sel_groups_.active < sel_groups_.subgroups.size() ? sel_groups_.active : 0;
+        std::vector<std::uint32_t> members;
+        for (std::uint32_t id : sel_groups_.subgroups[a].units)
+            if (std::find(selection_.begin(), selection_.end(), id) != selection_.end()) members.push_back(id);
+        if (!members.empty() && members.size() != selection_.size()) {
+            selection_.swap(members);
+            card_full_selection_ = &members;
+            const CommandCard active_card = compose_subgroup_card(builds, abils, trains, submenus);
+            card_full_selection_ = nullptr;
+            selection_.swap(members);
+            return active_card;
+        }
+    }
+    return compose_subgroup_card(builds, abils, trains, submenus);
+}
+
+CommandCard MeleeGame::compose_subgroup_card(std::vector<BuildCardEntry>& builds,
+                                             std::vector<AbilityCardEntry>& abils,
+                                             std::vector<TrainCardEntry>& trains,
+                                             std::vector<SubmenuCardEntry>& submenus) {
     if (card_page_ != 0 && !lead_authors_card_page(card_page_)) card_page_ = 0;
     CommandCard card =
         card_page_ == 0 ? build_melee_command_card(command_context()) : CommandCard{};
@@ -2893,7 +2921,7 @@ CommandCard MeleeGame::compose_command_card(std::vector<BuildCardEntry>& builds,
     } else if (card_page_ == 0 && !std::getenv("OMC_IDLE_CANCEL_CELL")) {
         bool morphing = false;
         for (std::uint32_t id : selection_)
-            if (id < world_.units().size() && world_.is_morphing(id)) morphing = true;
+            if ((id < world_.units().size() && world_.is_morphing(id)) || root_walks_.count(id)) morphing = true;
         static const bool kNoChannelCancel = std::getenv("OMC_NO_CHANNEL_CANCEL") != nullptr;
         if (!kNoChannelCancel)
             for (std::uint32_t id : selection_)
@@ -5324,7 +5352,8 @@ void MeleeGame::handle_commands(const render::InputState& in, float aspect) {
         hot_slot = card_slot_for_keys(command_card_layout().card, keys);
     }
 
-    if (!selection_.empty() && hot_slot < 0) {
+    static const bool kFixedOrderKeysOld = std::getenv("OMC_FIXED_ORDER_KEYS_OLD") != nullptr;
+    if (kFixedOrderKeysOld && !selection_.empty() && hot_slot < 0) {
         bool ordered = false;
         if (in.key_hold && !prev_keys_.hold) {
             for (std::uint32_t id : selection_)
@@ -5415,6 +5444,15 @@ void MeleeGame::handle_commands(const render::InputState& in, float aspect) {
             set_placement_ghost(world_.unit(pending_land_unit_).catalog_id, wx, wy, ok);
         }
     }
+    if (pending_root_ && cat_) {
+        sim::Fixed wx, wy;
+        const std::uint32_t rid = human_lead_caster();
+        const auto rms = cat_->morph_spec(pending_root_abil_);
+        if (rid != sim::kNoTarget && rms && !over_bar && ctrl.ground_point(world_, ScreenPoint{in.mouse_x, in.mouse_y}, wx, wy)) {
+            const bool ok = root_site(pending_root_abil_, rid, wx, wy);
+            set_placement_ghost(rms->target, wx, wy, ok);
+        }
+    }
     if (has_pending_ability_cast()) {
         sim::Fixed cwx, cwy;
         const bool cpt = !over_bar && !over_minimap && ctrl.ground_point(world_, ScreenPoint{in.mouse_x, in.mouse_y}, cwx, cwy);
@@ -5456,11 +5494,19 @@ void MeleeGame::handle_commands(const render::InputState& in, float aspect) {
         }
     }
     if (over_minimap && map_w_ > 0.0f && map_h_ > 0.0f) {
+        static const bool kMinimapCastOld = std::getenv("OMC_MINIMAP_CAST_OLD") != nullptr;
+        if (in.right_pressed && !kMinimapCastOld && modal_armed()) {
+            float wx, wy; minimap_world(wx, wy);
+            camctl_.focus = {wx, wy, ground_z_at(wx, wy)};
+            user_scrolled_ = true;
+            return;
+        }
         if (in.left_pressed) {
             float wx, wy; minimap_world(wx, wy);
-            const bool spent = consume_modal_target(
-                sim::Fixed::from_ratio(int(std::lround(double(wx) * 4096.0)), 4096),
-                sim::Fixed::from_ratio(int(std::lround(double(wy) * 4096.0)), 4096), in.shift);
+            const sim::Fixed mfx = sim::Fixed::from_ratio(int(std::lround(double(wx) * 4096.0)), 4096);
+            const sim::Fixed mfy = sim::Fixed::from_ratio(int(std::lround(double(wy) * 4096.0)), 4096);
+            const bool spent = (!kMinimapCastOld && minimap_place_armed(mfx, mfy, in.shift)) ||
+                               consume_modal_target(mfx, mfy, in.shift);
             if (!spent) {
                 camctl_.focus = {wx, wy, ground_z_at(wx, wy)};
                 user_scrolled_ = true;
@@ -5655,6 +5701,22 @@ void MeleeGame::handle_commands(const render::InputState& in, float aspect) {
                         }
                         break;
                     }
+                    if (card.slots[i].is_cancel && cat_ && !std::getenv("OMC_ROOT_PLACEMENT_OLD")) {
+                        std::vector<std::string> rooting;
+                        for (std::uint32_t id : selection_) {
+                            const auto ma = morph_abil_.find(id);
+                            if (ma == morph_abil_.end() || !world_.is_morphing(id)) continue;
+                            const data::Catalog::Entry* me = cat_->find("CAbil", ma->second);
+                            if (me && me->tag == "CAbilMorphPlacement") rooting.push_back(ma->second);
+                        }
+                        bool cancelled = false;
+                        for (const std::string& abil : rooting) cancelled = human_cancel_morph(abil) || cancelled;
+                        if (cancelled) {
+                            cancel_ability_cast();
+                            pending_attack_ = pending_patrol_ = pending_move_ = false;
+                            break;
+                        }
+                    }
                     bool routed = false;
                     for (const AbilityCardEntry& ab : card_abils)
                         if (ab.slot == i) {
@@ -5684,6 +5746,12 @@ void MeleeGame::handle_commands(const render::InputState& in, float aspect) {
                                 } else if (ab.command == "Cancel" && human_cancel_morph(ab.ability)) {
                                 } else if (ab.command == "Cancel" && !std::getenv("OMC_EFFECT_CANCEL_IDLE_OLD") &&
                                            human_cancel_effect(ab.ability)) {
+                                } else if (const data::Catalog::Entry* rp = cat_->find("CAbil", ab.ability);
+                                           rp && rp->tag == "CAbilMorphPlacement" &&
+                                           !std::getenv("OMC_ROOT_PLACEMENT_OLD")) {
+                                    pending_attack_ = pending_patrol_ = pending_move_ = false;
+                                    pending_root_ = true;
+                                    pending_root_abil_ = ab.ability;
                                 } else if (const auto ms = cat_->morph_spec(ab.ability);
                                            ms && !ms->target.empty()) {
                                     human_morph_selection(ab.ability);
@@ -5928,6 +5996,10 @@ void MeleeGame::handle_commands(const render::InputState& in, float aspect) {
                 }
             }
             pending_refinery_ = false;
+        } else if (pending_root_) {
+            dragging_ = false;
+            sim::Fixed wx, wy;
+            if (ctrl.ground_point(world_, ScreenPoint{in.mouse_x, in.mouse_y}, wx, wy)) root_order(wx, wy);
         } else if (pending_defender_) {
             dragging_ = false;
             sim::Fixed wx, wy;
@@ -6168,6 +6240,9 @@ void MeleeGame::handle_commands(const render::InputState& in, float aspect) {
         if (!marquee && clicked_nothing && selection_.empty() && !empty_clears_old) set_selection(prev_selection);
     }
 
+    static const bool kRightCancelOld = std::getenv("OMC_RIGHT_CANCEL_OLD") != nullptr;
+    const bool right_cancelled = in.right_pressed && !kRightCancelOld && !over_bar && modal_armed();
+    if (right_cancelled) clear_armed_modals();
     if (in.right_pressed && pending_build_) pending_build_ = false;
     if (in.right_pressed && pending_warp_) {
         pending_warp_ = false;
@@ -6179,7 +6254,7 @@ void MeleeGame::handle_commands(const render::InputState& in, float aspect) {
     const bool selection_owned = std::any_of(selection_.begin(), selection_.end(), [&](std::uint32_t id) {
         return id < world_.units().size() && world_.unit(id).player == cfg_.human_player;
     });
-    if (in.right_pressed && !pending_build_ && !pending_refinery_ && selection_owned && !over_bar) {
+    if (in.right_pressed && !right_cancelled && !pending_build_ && !pending_refinery_ && selection_owned && !over_bar) {
         std::uint32_t node = sim::kNoTarget;
         std::uint32_t raw_node = sim::kNoTarget;
         sim::Fixed gx, gy;
@@ -8354,8 +8429,157 @@ void MeleeGame::set_spawn_models(int player, const formats::Model* worker,
     if (producer) spawn_producer_model_[p] = producer;
 }
 
+bool MeleeGame::modal_armed() const {
+    return has_pending_ability_cast() || pending_warp_ || pending_build_ || pending_refinery_ || pending_land_ ||
+           pending_unload_ || pending_defender_ || pending_root_ || pending_attack_ || pending_patrol_ || pending_move_;
+}
+
+void MeleeGame::clear_armed_modals() {
+    cancel_ability_cast();
+    pending_warp_ = false;
+    pending_warp_gate_ = sim::kNoTarget;
+    pending_warp_unit_.clear();
+    pending_build_ = pending_refinery_ = false;
+    pending_land_ = false;
+    pending_land_unit_ = sim::kNoTarget;
+    pending_land_addon_.clear();
+    pending_unload_ = false;
+    pending_unload_unit_ = sim::kNoTarget;
+    pending_defender_ = false;
+    pending_liberator_ = sim::kNoTarget;
+    pending_root_ = false;
+    pending_root_abil_.clear();
+    pending_attack_ = pending_patrol_ = pending_move_ = false;
+}
+
+bool MeleeGame::minimap_place_armed(sim::Fixed wx, sim::Fixed wy, bool queued) {
+    if (has_pending_ability_cast()) {
+        if (pending_cast_mode_ == AbilTargetMode::Point) {
+            const std::uint32_t caster = human_lead_caster();
+            if (caster != sim::kNoTarget && is_nova_cast(caster, pending_cast_abil_)) {
+                if (world_.launch_nova(caster, wx, wy)) cancel_ability_cast();
+            } else if (cast_pending_at_point(wx, wy, queued)) {
+                cue_confirm_point(float(wx.to_double()), float(wy.to_double()), false);
+            }
+        }
+        return true;
+    }
+    if (pending_land_) {
+        if (pending_land_unit_ < world_.units().size() && world_.unit(pending_land_unit_).alive &&
+            world_.unit(pending_land_unit_).flying) {
+            land_site(pending_land_unit_, wx, wy);
+            const bool ordered = !pending_land_addon_.empty()
+                                     ? human_land_addon(pending_land_unit_, wx, wy, pending_land_addon_)
+                                     : world_.order_land(pending_land_unit_, wx, wy);
+            if (ordered) {
+                pending_land_ = false;
+                pending_land_unit_ = sim::kNoTarget;
+                pending_land_addon_.clear();
+            }
+        }
+        return true;
+    }
+    if (pending_unload_) {
+        if (pending_unload_unit_ < world_.units().size() && world_.unit(pending_unload_unit_).alive) {
+            const bool mobile = world_.unit(pending_unload_unit_).speed.raw() > 0;
+            if (mobile) world_.issue(pending_unload_unit_, sim::Order{sim::OrderType::Move, wx, wy, sim::kNoTarget});
+            world_.issue(pending_unload_unit_, sim::Order{sim::OrderType::Unload, wx, wy, sim::kNoTarget}, mobile);
+        }
+        pending_unload_ = false;
+        pending_unload_unit_ = sim::kNoTarget;
+        return true;
+    }
+    if (pending_defender_) {
+        human_siege_defender(pending_liberator_, wx, wy);
+        pending_defender_ = false;
+        pending_liberator_ = sim::kNoTarget;
+        return true;
+    }
+    if (pending_root_) {
+        root_order(wx, wy);
+        return true;
+    }
+    return false;
+}
+
+bool MeleeGame::root_site(const std::string& abil, std::uint32_t id, sim::Fixed& x, sim::Fixed& y) const {
+    if (!cat_ || id >= world_.units().size()) return false;
+    const auto ms = cat_->morph_spec(abil);
+    if (!ms || ms->target.empty()) return false;
+    double fx = 0.5, fy = 0.5;
+    if (cat_->unit_placement_grid_phase(ms->target, fx, fy)) {
+        auto snap = [](sim::Fixed v, double phase) {
+            return sim::Fixed::from_double(std::floor(v.to_double() - phase + 0.5) + phase);
+        };
+        x = snap(x, fx);
+        y = snap(y, fy);
+    }
+    if (x.to_double() < 0.0 || y.to_double() < 0.0 || x.to_double() > double(map_w_) || y.to_double() > double(map_h_))
+        return false;
+    sim::Unit proto = make_unit(*cat_, ms->target, cfg_.human_player);
+    proto.speed = sim::Fixed();
+    return world_.morph_site_ok(proto, x, y, id);
+}
+
+bool MeleeGame::root_order(sim::Fixed wx, sim::Fixed wy) {
+    std::uint32_t best = sim::kNoTarget;
+    double best_d = 0.0;
+    for (std::uint32_t id : selection_) {
+        if (root_walks_.count(id) || !morph_command_allowed(id, pending_root_abil_)) continue;
+        const sim::Unit& u = world_.unit(id);
+        const double dx = u.x.to_double() - wx.to_double(), dy = u.y.to_double() - wy.to_double();
+        const double d = dx * dx + dy * dy;
+        if (best == sim::kNoTarget || d < best_d) {
+            best = id;
+            best_d = d;
+        }
+    }
+    if (best == sim::kNoTarget || !root_site(pending_root_abil_, best, wx, wy)) return false;
+    world_.issue(best, sim::Order{sim::OrderType::Move, wx, wy, sim::kNoTarget});
+    root_walks_[best] = RootWalk{pending_root_abil_, wx, wy};
+    pending_root_ = false;
+    pending_root_abil_.clear();
+    return true;
+}
+
+void MeleeGame::step_root_walks() {
+    for (auto it = root_walks_.begin(); it != root_walks_.end();) {
+        const std::uint32_t id = it->first;
+        const RootWalk walk = it->second;
+        if (id >= world_.units().size() || !world_.unit(id).alive || world_.is_morphing(id)) {
+            it = root_walks_.erase(it);
+            continue;
+        }
+        const sim::Unit& u = world_.unit(id);
+        const bool walking = !u.orders.empty() && u.orders.front().type == sim::OrderType::Move &&
+                             u.orders.front().tx == walk.x && u.orders.front().ty == walk.y;
+        if (!u.orders.empty() && !walking) {
+            it = root_walks_.erase(it);
+            continue;
+        }
+        const double dx = u.x.to_double() - walk.x.to_double(), dy = u.y.to_double() - walk.y.to_double();
+        const double d2 = dx * dx + dy * dy;
+        if (d2 <= 0.01 || (!walking && d2 <= 1.0)) {
+            sim::Fixed sx = walk.x, sy = walk.y;
+            if (root_site(walk.abil, id, sx, sy)) {
+                world_.stop(id);
+                world_.teleport_unit(id, sx, sy);
+                human_morph(id, walk.abil);
+            }
+            it = root_walks_.erase(it);
+            continue;
+        }
+        if (!walking) {
+            it = root_walks_.erase(it);
+            continue;
+        }
+        ++it;
+    }
+}
+
 bool MeleeGame::cancel_pending_modal() {
     if (has_pending_ability_cast()) { cancel_ability_cast(); return true; }
+    if (pending_root_) { pending_root_ = false; pending_root_abil_.clear(); return true; }
     if (hud_ui_.minimap.ping_armed) { hud_ui_.minimap.ping_armed = false; return true; }
     if (pending_warp_) {
         pending_warp_ = false;
@@ -8917,6 +9141,7 @@ bool MeleeGame::step(const render::InputState& in, float dt_ms,
                 cast_policy_->run_autocast(world_, cfg_.human_player);
         }
         if (!replay_drive_) run_morph_autocast();
+        if (!root_walks_.empty()) step_root_walks();
     }
     step_lap.lap("st.sim");
 

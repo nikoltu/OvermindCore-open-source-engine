@@ -482,6 +482,11 @@ public:
             if (a) n += a->workers_transferred();
         return n;
     }
+    bool ai_hunt_point_near(sim::Fixed x, sim::Fixed y) const {
+        for (const auto& a : ais_)
+            if (a && a->hunt_point_near(x, y)) return true;
+        return false;
+    }
     void set_hall_needs_builder(bool on) {
         hall_needs_builder_ = on;
         for (auto& a : ais_)
@@ -1481,6 +1486,21 @@ private:
     std::string pending_land_addon_;
     bool pending_unload_ = false;
     std::uint32_t pending_unload_unit_ = sim::kNoTarget;
+    bool pending_root_ = false;
+    std::string pending_root_abil_;
+    struct RootWalk {
+        std::string abil;
+        sim::Fixed x, y;
+    };
+    std::map<std::uint32_t, RootWalk> root_walks_;
+    bool modal_armed() const;
+    void clear_armed_modals();
+    bool minimap_place_armed(sim::Fixed wx, sim::Fixed wy, bool queued);
+    bool root_site(const std::string& abil, std::uint32_t id, sim::Fixed& x, sim::Fixed& y) const;
+    bool root_order(sim::Fixed wx, sim::Fixed wy);
+    void step_root_walks();
+    CommandCard compose_subgroup_card(std::vector<BuildCardEntry>& builds, std::vector<AbilityCardEntry>& abils,
+                                      std::vector<TrainCardEntry>& trains, std::vector<SubmenuCardEntry>& submenus);
     bool pending_build_ = false;
     std::uint32_t build_caster_ = sim::kNoTarget;
     bool pending_refinery_ = false;
@@ -1589,6 +1609,7 @@ private:
     bool esc_card_ = false;
     bool cast_queued_ = false;
     bool cast_shift_kept_ = false;
+    const std::vector<std::uint32_t>* card_full_selection_ = nullptr;
 
 };
 

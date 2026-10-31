@@ -96,6 +96,24 @@ inline bool in_line_splash(Fixed ax, Fixed ay, Fixed tx, Fixed ty, Fixed first, 
     return false;
 }
 
+inline bool in_cleave(Fixed ax, Fixed ay, Fixed tx, Fixed ty, Fixed attacker_radius, Fixed radius, Fixed cos_half,
+                      Fixed victim_radius, Fixed px, Fixed py) {
+    if (radius.raw() <= 0) return false;
+    const Fixed bx = tx - ax, by = ty - ay;
+    const Fixed blen = isqrt(bx * bx + by * by);
+    if (blen.raw() <= 0) return false;
+    const Fixed dx = bx / blen, dy = by / blen;
+    const Fixed cx = ax + dx * attacker_radius, cy = ay + dy * attacker_radius;
+    const Fixed ex = px - cx, ey = py - cy;
+    const Fixed reach = radius + victim_radius;
+    const Fixed d2 = ex * ex + ey * ey;
+    if (d2 > reach * reach) return false;
+    const Fixed elen = isqrt(d2);
+    if (elen.raw() <= 0) return true;
+    const Fixed dot = dx * (ex / elen) + dy * (ey / elen);
+    return dot >= cos_half;
+}
+
 inline bool in_arc(Fixed ax, Fixed ay, Fixed tx, Fixed ty, Fixed radius, Fixed cos_half, Fixed px, Fixed py) {
     if (radius.raw() <= 0) return false;
     const Fixed ex = px - tx, ey = py - ty;

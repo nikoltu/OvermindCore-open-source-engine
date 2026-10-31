@@ -498,6 +498,12 @@ private:
         const std::string key = unit_id + '\x1f' + abil_id;
         auto it = ondemand_.find(key);
         if (it != ondemand_.end()) return &it->second;
+        static const bool kRedirectBookOld = std::getenv("OMC_ABIL_TARGET_MODE_OLD") != nullptr;
+        if (const data::Catalog::Entry* re = cat_->find("CAbil", abil_id);
+            !kRedirectBookOld && re && re->tag == "CAbilRedirectInstant") {
+            const std::string handed = cat_->scalar("CAbil", abil_id, "Abil").value_or("");
+            if (!handed.empty() && cat_->find("CAbil", handed)) ensure_booked(world, caster_id, handed);
+        }
         auto b = make_ability(*cat_, abil_id);
         if (!b) return nullptr;
         if ((b->def.kind == sim::EffectKind::CreateUnit || b->def.kind == sim::EffectKind::PhaseShift) &&
