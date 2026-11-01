@@ -1,5 +1,6 @@
 #pragma once
 
+#include "omc/core/env_once.hpp"
 #include <algorithm>
 #include <cmath>
 #include <cstddef>
@@ -267,7 +268,7 @@ inline CliffField place_cliffs(casc::Storage& store, const formats::LoadedMap& m
         float base_z = tier_top(mn);
         float shear[3] = {0.0f, 0.0f, 0.0f};
         bool on_pure = false;
-        if (!std::getenv("OMC_CLIFF_TIER_BASE")) {
+        if (!OMC_ENV_ONCE("OMC_CLIFF_TIER_BASE")) {
             on_pure = !sculpt_of_level.empty();
             if (on_pure) base_z = pure_top(mn);
             const float off = formats::engine_z_offset(map);
@@ -298,7 +299,7 @@ inline CliffField place_cliffs(casc::Storage& store, const formats::LoadedMap& m
                 }
             const float block_lowest = lowest;
             float wide_lowest = lowest;
-            if (cnt && n == 3 && !std::getenv("OMC_CLIFF_BASE_BLOCK_ONLY"))
+            if (cnt && n == 3 && !OMC_ENV_ONCE("OMC_CLIFF_BASE_BLOCK_ONLY"))
                 for (int j = -2; j <= 2; ++j)
                     for (int i = -2; i <= 2; ++i) {
                         const int vx = int(std::lround(wx)) + i, vy = int(std::lround(wy)) + j;
@@ -314,7 +315,7 @@ inline CliffField place_cliffs(casc::Storage& store, const formats::LoadedMap& m
                         wide_lowest = std::min(wide_lowest, formats::vertex_ground_z(map, tier_z, off, std::uint32_t(vx), std::uint32_t(vy)) - delta);
                     }
             static const float kDrop = std::getenv("OMC_CLIFF_BASE_DROP") ? float(std::atof(std::getenv("OMC_CLIFF_BASE_DROP"))) : 3.25f;
-            if (std::getenv("OMC_CLIFF_PIECE_DUMP") && block_lowest - wide_lowest > 0.5f)
+            if (OMC_ENV_ONCE("OMC_CLIFF_PIECE_DUMP") && block_lowest - wide_lowest > 0.5f)
                 std::fprintf(stderr, "[base] %s at %.1f %.1f mn %d block %.2f wide %.2f table %.2f\n", code.c_str(), double(wx), double(wy), mn, double(block_lowest), double(wide_lowest), double(base_z));
             if (abs_code && code.find('A') != std::string::npos && block_lowest - wide_lowest <= kDrop) lowest = wide_lowest;
             if (cnt) {
@@ -349,7 +350,7 @@ inline CliffField place_cliffs(casc::Storage& store, const formats::LoadedMap& m
         int mn = t[0], mx = t[0];
         for (int k = 1; k < 4; ++k) { mn = t[k] < mn ? t[k] : mn; mx = t[k] > mx ? t[k] : mx; }
         int shift = mx > 3 ? mx - 3 : 0;
-        if (mn - shift < 0 || std::getenv("OMC_CLIFF_RELATIVE_CODES")) shift = mn;
+        if (mn - shift < 0 || OMC_ENV_ONCE("OMC_CLIFF_RELATIVE_CODES")) shift = mn;
         code.clear();
         for (int k = 0; k < 4; ++k) code += char('A' + (t[(k + best_r) & 3] - shift));
         return best_r;

@@ -1,5 +1,6 @@
 #pragma once
 
+#include "omc/core/env_once.hpp"
 #include <algorithm>
 #include <array>
 #include <cmath>
@@ -652,6 +653,8 @@ public:
         bool disable_production = false, disable_spawner = false;
         bool disable_morph = false, disable_transport = false;
         double weapon_range_bonus = 0.0;
+        double ranged_weapon_range_bonus = 0.0;
+        bool no_detect = false;
         double move_speed_max = -1.0;
         double decel_mult = 1.0;
         double accel_mult = 1.0;
@@ -666,6 +669,8 @@ public:
         bool refresh_stack = false;
         std::string initial_effect, periodic_effect, expire_effect, final_effect;
         double food = 0.0, life_max_bonus = 0.0;
+        bool no_life_regen = false, no_shield_regen = false, no_energy_regen = false;
+        double weapon_scan_bonus = 0.0;
     };
     std::optional<BehaviorBuff> behavior_buff(const std::string& behavior_id) const;
 
@@ -683,6 +688,7 @@ public:
         std::uint8_t kinds = 15;
         bool present = false;
         std::string handled;
+        bool fatal = false;
     };
     DamageResponse behavior_damage_response(const std::string& behavior_id) const;
 
@@ -1950,7 +1956,7 @@ public:
         for (const std::string& w : array_links("CUnit", unit_id, "WeaponArray"))
             if (!w.empty() && !weapon_hidden(w) && (include_disabled || !weapon_disabled(w)))
                 out.push_back(w);
-        if (out.empty() && !std::getenv("OMC_HIDDEN_ONLY_WEAPON_OFF"))
+        if (out.empty() && !OMC_ENV_ONCE("OMC_HIDDEN_ONLY_WEAPON_OFF"))
             for (const std::string& w : array_links("CUnit", unit_id, "WeaponArray"))
                 if (!w.empty() && weapon_hidden(w) && (include_disabled || !weapon_disabled(w)))
                     out.push_back(w);

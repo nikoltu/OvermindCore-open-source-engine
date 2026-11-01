@@ -1,3 +1,4 @@
+#include "omc/core/env_once.hpp"
 #include <cstring>
 #include "omc/render/frame_prof.hpp"
 #include "omc/app/hud_render.hpp"
@@ -791,7 +792,7 @@ void HudRender::render_into(std::vector<std::uint8_t>& img, const HudContent& co
     } else {
         fill_rect(img, out_w, out_h, mm.x0, mm.y0, mm.x1, mm.y1, 8, 10, 14, 0.92f);
     }
-    if (!(console && console->authored) || std::getenv("OMC_MINIMAP_BOX"))
+    if (!(console && console->authored) || OMC_ENV_ONCE("OMC_MINIMAP_BOX"))
         stroke_rect(img, out_w, out_h, mm.x0, mm.y0, mm.x1, mm.y1, 70, 90, 120, 0.9f);
     if (content.minimap_creep && content.creep_alpha > 0.0f && content.creep_w > 0 && content.creep_h > 0 &&
         content.creep_cell > 0.0f && content.minimap_creep->size() >= std::size_t(content.creep_w) * std::size_t(content.creep_h) &&

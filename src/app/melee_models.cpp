@@ -1,3 +1,4 @@
+#include "omc/core/env_once.hpp"
 #include "omc/app/melee_models.hpp"
 
 #include <cstring>
@@ -214,7 +215,7 @@ UnitModelSource unit_model_source(const casc::Storage& store, const data::Catalo
     std::optional<std::string> am = cat.scalar("CActorUnit", token, "Model");
     out.model_id = (!am || am->empty() || am->find("##unitName##") != std::string::npos) ? token : *am;
     out.path = data::resolve_unit_model(cat, token);
-    if (out.path && !std::getenv("OMC_NO_UNIT_FAMILY_PATH") && cat.scalar("CModel", out.model_id, "VariationCount")) {
+    if (out.path && !OMC_ENV_ONCE("OMC_NO_UNIT_FAMILY_PATH") && cat.scalar("CModel", out.model_id, "VariationCount")) {
         const std::string& rel = *out.path;
         const std::size_t dot = rel.rfind(".m3");
         const bool numbered = dot != std::string::npos && dot >= 3 && rel[dot - 3] == '_' &&
@@ -224,7 +225,7 @@ UnitModelSource unit_model_source(const casc::Storage& store, const data::Catalo
             if (asset_ships(store, fam, story)) out.path = fam;
         }
     }
-    if (std::getenv("OMC_NO_OPTION_MODELSWAP") || !cat.find("CActorUnit", token)) return out;
+    if (OMC_ENV_ONCE("OMC_NO_OPTION_MODELSWAP") || !cat.find("CActorUnit", token)) return out;
     for (const core::XmlNode& n : cat.resolved("CActorUnit", token)) {
         if (n.name != "On") continue;
         const std::string terms = n.attr_or("Terms", ""), send = n.attr_or("Send", "");
@@ -276,7 +277,7 @@ data::Catalog& MeleeModels::catalog(casc::Storage& store) {
 data::Catalog& MeleeModels::unit_catalog(casc::Storage& store, const std::string& token, bool& story) {
     story = false;
     data::Catalog& cat = catalog(store);
-    if (token.empty() || std::getenv("OMC_NO_STORY_MODELS") || cat.find("CActorUnit", data::unit_actor_id(cat, token))) return cat;
+    if (token.empty() || OMC_ENV_ONCE("OMC_NO_STORY_MODELS") || cat.find("CActorUnit", data::unit_actor_id(cat, token))) return cat;
     if (!story_ready_) {
         story_ready_ = true;
         story_catalog_ = std::make_unique<data::Catalog>();

@@ -1,3 +1,4 @@
+#include "omc/core/env_once.hpp"
 #include <algorithm>
 #include "omc/data/catalog.hpp"
 
@@ -547,8 +548,11 @@ std::optional<Catalog::BehaviorBuff> Catalog::behavior_buff(const std::string& b
     for (const core::XmlNode& n : resolved("CBehavior", behavior_id))
         if (n.name == "BuffFlags" && n.attr_or("index", "") == "RefreshStack") bb.refresh_stack = n.attr_or("value", "0") != "0";
     if (auto p =scalar_num("CBehavior", behavior_id, "Period")) bb.dmg_period = *p;
-    if (auto pe = scalar("CBehavior", behavior_id, "PeriodicEffect"); pe && !pe->empty())
+    static const bool kBlindBuffOld = std::getenv("OMC_BLIND_EFFECTS_OLD") != nullptr;
+    if (auto pe = scalar("CBehavior", behavior_id, "PeriodicEffect"); pe && !pe->empty()) {
         if (auto d = effect_damage_f(*pe)) { bb.dmg_per_tick = *d; any = true; }
+        if (!kBlindBuffOld && bb.dmg_period > 0.0) any = true;
+    }
     bb.initial_effect = scalar("CBehavior", behavior_id, "InitialEffect").value_or("");
     bb.periodic_effect = scalar("CBehavior", behavior_id, "PeriodicEffect").value_or("");
     bb.expire_effect = scalar("CBehavior", behavior_id, "ExpireEffect").value_or("");
@@ -587,8 +591,17 @@ std::optional<Catalog::BehaviorBuff> Catalog::behavior_buff(const std::string& b
             if (g.name == "MoveSpeedMaximum")
                 if (const std::string v2 = g.attr_or("value", ""); !v2.empty())
                     bb.move_speed_max = std::strtod(v2.c_str(), nullptr);
-        if (const std::string* v = n.attr("WeaponRange"); v && !v->empty())
-            bb.weapon_range_bonus += std::strtod(v->c_str(), nullptr);
+        static const bool kBlindOld = std::getenv("OMC_BLIND_EFFECTS_OLD") != nullptr;
+        if (const std::string* v = n.attr("WeaponRange"); v && !v->empty()) {
+            if (kBlindOld) bb.weapon_range_bonus += std::strtod(v->c_str(), nullptr);
+            else bb.weapon_range_bonus = std::strtod(v->c_str(), nullptr);
+        }
+        if (const std::string* v = n.attr("WeaponScanBonus"); v && !v->empty())
+            bb.weapon_scan_bonus = std::strtod(v->c_str(), nullptr);
+        if (const std::string* v = n.attr("RangedWeaponRange"); v && !v->empty())
+            bb.ranged_weapon_range_bonus = std::strtod(v->c_str(), nullptr);
+        if (const std::string* v = n.attr("DetectArc"); v && !v->empty() && std::strtod(v->c_str(), nullptr) == 0.0)
+            bb.no_detect = true;
         for (const core::XmlNode& g : n.children)
             if (g.name == "WeaponRange")
                 if (const std::string v2 = g.attr_or("value", ""); !v2.empty())
@@ -635,6 +648,9 @@ std::optional<Catalog::BehaviorBuff> Catalog::behavior_buff(const std::string& b
                 if (idx == "SuppressPassenger" && on) bb.suppress_passenger = true;
                 if (idx == "Benign" && on) bb.benign = true;
                 if (idx == "Passive" && on) bb.passive = true;
+                if (idx == "SuppressLifeRegen" && on) bb.no_life_regen = true;
+                if (idx == "SuppressShieldsRegen" && on) bb.no_shield_regen = true;
+                if (idx == "SuppressEnergyRegen" && on) bb.no_energy_regen = true;
             }
         for (const core::XmlNode& g : n.children)
             if (g.name == "ModifyFlags" && g.attr_or("value", "") == "1") {
@@ -773,6 +789,7 @@ Catalog::DamageResponse Catalog::behavior_damage_response(const std::string& beh
         if (auto v = field(n, "ModifyMinimumDamage")) r.minimum = *v;
         if (auto v = field(n, "ModifyAmount")) r.modify_amount = *v;
         if (const std::string* h = n.attr("Handled"); h && !h->empty()) r.handled = *h;
+        if (auto v = field(n, "Fatal")) r.fatal = *v != 0.0;
         for (const core::XmlNode& cost : n.children) {
             if (cost.name != "Cost") continue;
             for (const core::XmlNode& cd : cost.children) {
@@ -2492,7 +2509,7 @@ std::vector<Catalog::ActorRule> Catalog::actor_rules(const std::string& actor_id
         }
         for (const std::string& mid : mids) {
             std::vector<NodeSlot> mrows = resolve_node_slots("CActorEventMacro", mid, "On");
-            if (std::getenv("OMC_MACRO_TRACE"))
+            if (OMC_ENV_ONCE("OMC_MACRO_TRACE"))
                 std::fprintf(stderr, "[macro] %s: %s -> %zu rows\n", actor_id.c_str(), mid.c_str(), mrows.size());
             for (NodeSlot& mo : mrows) on_slots.push_back(std::move(mo));
         }

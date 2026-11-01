@@ -1,5 +1,6 @@
 #pragma once
 
+#include <algorithm>
 #include <functional>
 #include <string>
 #include <unordered_map>
@@ -7,6 +8,7 @@
 
 #include "omc/app/ability.hpp"
 #include "omc/app/spawn.hpp"
+#include "omc/core/env_once.hpp"
 #include "omc/data/abil_charge.hpp"
 #include "omc/data/catalog.hpp"
 #include "omc/data/economy.hpp"
@@ -24,6 +26,8 @@ public:
 
     using CooldownFold = std::function<Fixed(std::int32_t player, const std::string& abil_id, Fixed base)>;
     void set_cooldown_fold(CooldownFold f) { cd_fold_ = std::move(f); }
+    using ButtonGate = std::function<bool(std::uint32_t caster, const std::string& requirement)>;
+    void set_button_gate(ButtonGate f) { button_gate_ = std::move(f); }
     Fixed player_cooldown(const sim::World& world, std::uint32_t caster_id, const std::string& abil_id, Fixed base) const {
         if (!cd_fold_ || base.raw() <= 0 || caster_id >= world.units().size()) return base;
         return cd_fold_(world.units()[caster_id].player, abil_id, base);
@@ -196,14 +200,18 @@ public:
         for (std::uint32_t ci = 0; ci < units.size(); ++ci) {
             const sim::Unit& u = units[ci];
             if (!u.alive || u.player != player || u.catalog_id.empty()) continue;
+            if (u.loaded && !OMC_ENV_ONCE("OMC_AUTOCAST_LOADED_OLD")) continue;
             if (pending_cast(world, ci)) continue;
             for (const Entry& e : autocast_entries(world, u.catalog_id)) {
                 if (!autocast_on(ci, e.abil_id, e.autocast_default_on)) continue;
                 if (!abils_.ready(world, ci, e.slot)) continue;
                 if (!autocast_caster_ok(u, e)) continue;
-                const std::uint32_t tgt = e.support ? wounded_ally(world, u, e.engage_range, e.heal_vital)
+                const std::uint32_t tgt = e.support ? wounded_ally(world, u, e.engage_range, e.heal_vital,
+                                                                   OMC_ENV_ONCE("OMC_AUTOCAST_ALLY_OLD") ? nullptr : &e)
                                                     : best_target(world, u, e);
                 if (tgt == sim::kNoTarget) continue;
+                if (!button_allows(ci, e)) continue;
+                const std::uint32_t order_tgt = e.instant_self ? ci : tgt;
                 static const bool kResumeOld = std::getenv("OMC_AUTOCAST_RESUME_OLD") != nullptr;
                 sim::Order resume;
                 bool has_resume = false;
@@ -215,7 +223,7 @@ public:
                     }
                 }
                 const sim::CastCost ac_cost = order_cost(world, ci, e.slot, e.abil_id);
-                if (abils_.try_cast(world, ci, e.slot, tgt, false,
+                if (abils_.try_cast(world, ci, e.slot, order_tgt, false,
                                     sim::AbilitySystem::cost_at_order() ? nullptr : &ac_cost)) {
                     refold_cooldown(world, ci, e.slot, e.abil_id);
                     if (has_resume) world.issue(ci, resume,  true,  false);
@@ -274,6 +282,7 @@ public:
         const sim::Unit& c = world.units()[caster_id];
         const sim::Unit& t = world.units()[target_id];
         if (!c.alive || !t.alive) return false;
+        if (!button_allows(caster_id, *e)) return false;
         if (e->rel_authored) {
             std::uint8_t rel = sim::kAffilEnemy;
             if (caster_id == target_id) rel = sim::kAffilSelf;
@@ -287,11 +296,14 @@ public:
             return false;
         }
         if (e->requires_ground && t.flying) return false;
+        if (e->requires_air && !t.flying) return false;
         if (e->requires_spawner && t.spawner_proto < 0) return false;
         const Fixed dx = t.x - c.x, dy = t.y - c.y;
         const Fixed reach = e->range + c.radius + t.radius;
         static const bool kRangeOld = std::getenv("OMC_CAST_RANGE_REFUSE_OLD") != nullptr;
-        const bool walks = !kRangeOld && (c.speed.raw() > 0 || (c.flying && c.speed_air.raw() > 0)) && !c.burrowed;
+        static const bool kBurrowCastOld = std::getenv("OMC_BURROW_CAST_OLD") != nullptr;
+        const bool walks = !kRangeOld && (c.burrowed ? !kBurrowCastOld && c.can_burrow_move
+                                                     : c.speed.raw() > 0 || (c.flying && c.speed_air.raw() > 0));
         if (!walks && dx * dx + dy * dy > reach * reach) return false;
         static const bool no_pool = [] { const char* v = std::getenv("OMC_NO_CHARGE_POOL"); return v && v[0] == '1'; }();
         const data::ChargeSpec ch = no_pool ? data::ChargeSpec{} : data::ability_cost_charge(*cat_, abil_id);
@@ -325,6 +337,7 @@ public:
         if (caster_id >= world.units().size()) return false;
         const sim::Unit& c = world.units()[caster_id];
         if (!c.alive) return false;
+        if (!button_allows(caster_id, *e)) return false;
         bool walk_point = false;
         if (e->requires_creep) {
             if (!world.creep().is_creep(px, py)) return false;
@@ -332,7 +345,9 @@ public:
             const Fixed dx = px - c.x, dy = py - c.y;
             const Fixed reach = e->range + c.radius;
             static const bool kRangeOldPt = std::getenv("OMC_CAST_RANGE_REFUSE_OLD") != nullptr;
-            const bool walks_pt = !kRangeOldPt && (c.speed.raw() > 0 || (c.flying && c.speed_air.raw() > 0)) && !c.burrowed;
+            static const bool kBurrowCastOldPt = std::getenv("OMC_BURROW_CAST_OLD") != nullptr;
+            const bool walks_pt = !kRangeOldPt && (c.burrowed ? !kBurrowCastOldPt && c.can_burrow_move
+                                                              : c.speed.raw() > 0 || (c.flying && c.speed_air.raw() > 0));
             if (dx * dx + dy * dy > reach * reach) {
                 if (!walks_pt) return false;
                 walk_point = true;
@@ -395,12 +410,22 @@ private:
         std::vector<std::uint32_t> autocast_not_behaviors;
         bool requires_creep = false;
         bool requires_ground = false;
+        bool requires_air = false;
         bool rel_authored = false;
         std::uint8_t exc_rel = 0;
         std::string calldown_unit;
         int32_t calldown_count = 1;
         bool requires_spawner = false;
+        std::string button_req;
+        bool instant_self = false;
+        std::vector<sim::ValidatorOp> autocast_ops;
+        std::vector<std::uint16_t> autocast_roots;
+        AutoCastFilter autocast_filter;
     };
+
+    bool button_allows(std::uint32_t caster, const Entry& e) const {
+        return e.button_req.empty() || !button_gate_ || button_gate_(caster, e.button_req);
+    }
 
     static bool autocast_caster_ok(const sim::Unit& u, const Entry& e) {
         for (const sim::VitalGate& g : e.autocast_caster_gates)
@@ -421,8 +446,21 @@ private:
         return false;
     }
 
+    static bool autocast_filter_ok(const sim::World& world, const sim::Unit& caster, const sim::Unit& o, const AutoCastFilter& f) {
+        if ((o.attributes & f.req_attr) != f.req_attr || (o.attributes & f.exc_attr) != 0) return false;
+        const std::uint8_t plane = o.flying ? 2 : 1;
+        if ((f.req_plane != 0 && (f.req_plane & plane) == 0) || (f.exc_plane & plane) != 0) return false;
+        if (f.exc_constructing && o.constructing) return false;
+        if (f.exc_invulnerable && world.is_invulnerable(o)) return false;
+        if (f.visible && !world.are_allied(o.player, caster.player)) {
+            if ((o.burrowed || o.cloaked_effective()) && !world.revealed_to(caster.player, o.id)) return false;
+            if (!world.visible_to(caster.player, o)) return false;
+        }
+        return true;
+    }
+
     static std::uint32_t wounded_ally(const sim::World& world, const sim::Unit& caster, Fixed range,
-                                      sim::HealVital vital = sim::HealVital::Life) {
+                                      sim::HealVital vital = sim::HealVital::Life, const Entry* e = nullptr) {
         std::uint32_t best = sim::kNoTarget;
         Fixed best_d2;
         for (const sim::Unit& o : world.units()) {
@@ -435,10 +473,17 @@ private:
             const Fixed reach = range + caster.radius + o.radius;
             const Fixed d2 = dx * dx + dy * dy;
             if (d2 > reach * reach) continue;
-            if (best == sim::kNoTarget || d2 < best_d2) {
-                best = o.id;
-                best_d2 = d2;
+            if (best != sim::kNoTarget && d2 >= best_d2) continue;
+            if (e) {
+                if ((o.attributes & e->req_attr) != e->req_attr || (o.attributes & e->exc_attr) != 0) continue;
+                if (!autocast_filter_ok(world, caster, o, e->autocast_filter)) continue;
+                bool passes = true;
+                for (const std::uint16_t r : e->autocast_roots)
+                    if (!world.validators_pass(e->autocast_ops, r, caster.id, o.id)) { passes = false; break; }
+                if (!passes) continue;
             }
+            best = o.id;
+            best_d2 = d2;
         }
         return best;
     }
@@ -447,17 +492,37 @@ private:
         auto it = autocast_cache_.find(unit_id);
         if (it != autocast_cache_.end()) return it->second;
         std::vector<Entry> out;
-        for (const data::Catalog::AbilityCardButton& btn : cat_->unit_ability_card_buttons(unit_id)) {
-            const auto ac = cat_->ability_autocast(btn.ability);
+        std::vector<std::string> abils;
+        for (const data::Catalog::AbilityCardButton& btn : cat_->unit_ability_card_buttons(unit_id)) abils.push_back(btn.ability);
+        static const bool kCardOnlyOld = std::getenv("OMC_REGEN_SUPPRESS_OLD") != nullptr;
+        if (!kCardOnlyOld)
+            for (const std::string& a : cat_->array_links("CUnit", unit_id, "AbilArray"))
+                if (std::find(abils.begin(), abils.end(), a) == abils.end()) abils.push_back(a);
+        static const bool kLockOnOld = std::getenv("OMC_LOCK_ON_OLD") != nullptr;
+        for (const std::string& abil : abils) {
+            const auto ac = cat_->ability_autocast(abil);
             if (!ac.offered || ac.range <= 0.0) continue;
-            auto b = make_ability(*cat_, btn.ability);
+            auto b = make_ability(*cat_, abil);
             if (!b) continue;
             Entry e = book_entry(world, unit_id, *b);
-            effect_abil_[abils_.effect_of(e.slot)] = btn.ability;
+            effect_abil_[abils_.effect_of(e.slot)] = abil;
+            if (!kLockOnOld) {
+                compile_autocast_validators(*cat_, abil, e.autocast_ops, e.autocast_roots);
+                e.button_req = cat_->button_requirement(abil, "Execute");
+            }
+            e.autocast_filter = parse_autocast_filter(*cat_, abil);
+            if (OMC_ENV_ONCE("OMC_AUTOCAST_VISIBLE_OLD")) e.autocast_filter.visible = false;
+            if (OMC_ENV_ONCE("OMC_AUTOCAST_ALLY_OLD")) {
+                const bool vis = e.autocast_filter.visible;
+                e.autocast_filter = AutoCastFilter{};
+                e.autocast_filter.visible = vis;
+            }
             e.support = ac.targets_allies;
             e.engage_range = Fixed::from_double(ac.range);
             e.range = e.engage_range;
-            e.abil_id = btn.ability;
+            e.abil_id = abil;
+            if (const data::Catalog::Entry* ae = cat_->find("CAbil", abil); !kCardOnlyOld && ae && ae->tag == "CAbilEffectInstant")
+                e.instant_self = true;
             e.autocast_default_on = ac.on_by_default;
             e.autocast_caster_gates = b->autocast_caster_gates;
             e.autocast_not_behaviors = b->autocast_not_behaviors;
@@ -485,6 +550,7 @@ private:
         e.exc_attr = b.exc_attr_mask;
         e.req_energy = b.require_energy;
         e.requires_ground = b.requires_ground;
+        e.requires_air = b.requires_air;
         e.cooldown = b.cooldown;
         if (!b.tree.empty() && b.tree_root >= 0 && b.tree_root < int32_t(b.tree.size()))
             e.heal_vital = b.tree[b.tree_root].heal_vital;
@@ -538,6 +604,8 @@ private:
         }
         Entry e = book_entry(world, unit_id, *b);
         effect_abil_[abils_.effect_of(e.slot)] = abil_id;
+        static const bool kButtonOld = std::getenv("OMC_LOCK_ON_OLD") != nullptr;
+        if (!kButtonOld) e.button_req = cat_->button_requirement(abil_id, "Execute");
         e.requires_creep = b->spawn_requires_creep;
         e.requires_spawner = b->requires_spawner_target;
         const bool has_tree =
@@ -602,15 +670,20 @@ private:
             const Fixed d2 = dx * dx + dy * dy;
             const Fixed reach = e.range + caster.radius + o.radius;
             if (d2 > reach * reach) continue;
-            if (best == sim::kNoTarget || d2 < best_d2) {
-                best = o.id;
-                best_d2 = d2;
-            }
+            if (best != sim::kNoTarget && d2 >= best_d2) continue;
+            bool passes = true;
+            for (const std::uint16_t r : e.autocast_roots)
+                if (!world.validators_pass(e.autocast_ops, r, caster.id, o.id)) { passes = false; break; }
+            if (!passes) continue;
+            if (!autocast_filter_ok(world, caster, o, e.autocast_filter)) continue;
+            best = o.id;
+            best_d2 = d2;
         }
         return best;
     }
 
     const data::Catalog* cat_;
+    ButtonGate button_gate_;
     CooldownFold cd_fold_;
     sim::AbilitySystem abils_;
     std::unordered_map<std::string, Entry> ondemand_;

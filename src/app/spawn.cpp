@@ -1,3 +1,4 @@
+#include "omc/core/env_once.hpp"
 #include <cmath>
 #include "omc/app/spawn.hpp"
 
@@ -418,6 +419,8 @@ sim::Unit make_unit(const data::Catalog& cat, const std::string& unit_id,
                 u.wpn_death = sim::death_code_of(cat.scalar("CEffect", dmg_id ? *dmg_id : cat.weapon_effect_id(w), "Death").value_or(""));
             }
             u.wpn_damage = damage;
+            for (const core::XmlNode& opt : cat.resolved("CWeapon", w))
+                if (opt.name == "Options" && opt.attr_or("index", "") == "Melee") u.wpn_melee = opt.attr_or("value", "1") != "0";
             u.wpn_tag = app::behavior_id_hash(w);
             u.wpn_period = period;
             u.wpn_range = range;
@@ -470,6 +473,8 @@ sim::Unit make_unit(const data::Catalog& cat, const std::string& unit_id,
                 u.wpn2_death = sim::death_code_of(cat.scalar("CEffect", dmg_id ? *dmg_id : cat.weapon_effect_id(w), "Death").value_or(""));
             }
             u.wpn2_damage = damage;
+            for (const core::XmlNode& opt : cat.resolved("CWeapon", w))
+                if (opt.name == "Options" && opt.attr_or("index", "") == "Melee") u.wpn2_melee = opt.attr_or("value", "1") != "0";
             u.wpn2_tag = app::behavior_id_hash(w);
             u.wpn2_period = period;
             u.wpn2_range = range;
@@ -634,7 +639,7 @@ sim::Unit make_unit(const data::Catalog& cat, const std::string& unit_id,
     if (!u.requires_creep && !kCreepForbidOld)
         for (const auto& [dx, dy] : cat.creep_forbidden_offsets(unit_id))
             u.creep_check_offsets.emplace_back(int16_t(dx), int16_t(dy));
-    if (!std::getenv("OMC_MOVER_NAME_OLD"))
+    if (!OMC_ENV_ONCE("OMC_MOVER_NAME_OLD"))
         for (const auto& [dx, dy] : cat.placement_nospawn_offsets(unit_id))
             u.nospawn_offsets.emplace_back(int16_t(dx), int16_t(dy));
     static const bool kNoBuildOld = std::getenv("OMC_FORCEFIELD_PLACE_OLD") != nullptr;
@@ -689,8 +694,8 @@ sim::Unit make_unit(const data::Catalog& cat, const std::string& unit_id,
             u.load_block_behaviors.push_back(app::behavior_id_hash(b));
     }
     u.prevent_defeat = cat.unit_flag(unit_id, "PreventDefeat");
-    if (!std::getenv("OMC_NO_FLAG_CLOAK")) u.cloaked = cat.unit_flag(unit_id, "Cloaked");
-    if (!std::getenv("OMC_NO_FLAG_CLOAK"))
+    if (!OMC_ENV_ONCE("OMC_NO_FLAG_CLOAK")) u.cloaked = cat.unit_flag(unit_id, "Cloaked");
+    if (!OMC_ENV_ONCE("OMC_NO_FLAG_CLOAK"))
         for (const std::string& beh : cat.array_links("CUnit", unit_id, "BehaviorArray")) {
             const std::string pe = cat.scalar("CBehavior", beh, "PeriodicEffect").value_or("");
             if (pe.empty()) continue;

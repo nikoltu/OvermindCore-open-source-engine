@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.16)
-project(overmindcore VERSION 0.1.11 LANGUAGES CXX)
+project(overmindcore VERSION 0.1.12 LANGUAGES CXX)
 
 set(OVERMINDCORE_STAGE "alpha")
 set(OMC_GENERATED_DIR ${CMAKE_CURRENT_BINARY_DIR}/generated)

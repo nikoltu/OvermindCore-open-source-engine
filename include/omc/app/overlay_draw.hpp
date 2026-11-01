@@ -163,7 +163,9 @@ inline int text_tracked(std::vector<std::uint8_t>& b, std::uint32_t w, std::uint
                 if (ui::font_pixel(s[k], col, row))
                     for (int dy = 0; dy < sc; ++dy)
                         for (int dx = 0; dx < sc; ++dx) {
-                            put(pen + col * sc + dx + sc, y + row * sc + dy + sc, 0, 0, 0, 255);
+                            static const bool kBitmapShadowOld = std::getenv("OMC_BITMAP_SHADOW_OLD") != nullptr;
+                            if (kBitmapShadowOld || !text_shadow_off())
+                                put(pen + col * sc + dx + sc, y + row * sc + dy + sc, 0, 0, 0, 255);
                             put(pen + col * sc + dx, y + row * sc + dy, r, g, bl, 255);
                         }
         pen += (ui::kFontW + 1) * sc;

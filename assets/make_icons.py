@@ -2,14 +2,31 @@ import os
 import struct
 import sys
 
-from PIL import Image
+from PIL import Image, ImageDraw
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ICO_SIZES = [16, 24, 32, 48, 64, 128, 256]
+TILE_BOX = (95, 660, 403, 968)
+TILE_RADIUS = 30
 
 
 def scaled(src, size):
     return src.resize((size, size), Image.LANCZOS)
+
+
+def cut_tile(sheet):
+    tile = sheet.convert("RGB").crop(TILE_BOX).convert("RGBA")
+    w, h = tile.size
+    mask = Image.new("L", (w * 4, h * 4), 0)
+    ImageDraw.Draw(mask).rounded_rectangle((0, 0, w * 4 - 1, h * 4 - 1), TILE_RADIUS * 4, fill=255)
+    tile.putalpha(mask.resize((w, h), Image.LANCZOS))
+    return tile
+
+
+def opaque(img):
+    base = Image.new("RGBA", img.size, (0, 0, 0, 255))
+    base.alpha_composite(img)
+    return base
 
 
 def write_dds(path, img):
@@ -25,12 +42,13 @@ def write_dds(path, img):
 
 
 def main():
-    src_path = sys.argv[1] if len(sys.argv) > 1 else os.path.join(HERE, "icon.jpg")
+    src_path = sys.argv[1] if len(sys.argv) > 1 else os.path.join(HERE, "icons2.jpg")
     out = sys.argv[2] if len(sys.argv) > 2 else HERE
-    src = Image.open(src_path).convert("RGBA")
-    write_dds(os.path.join(out, "emblem.dds"), scaled(src, 384))
-    write_dds(os.path.join(out, "emblem_sm.dds"), scaled(src, 160))
-    src.save(os.path.join(out, "overmindcore.ico"), format="ICO", sizes=[(s, s) for s in ICO_SIZES])
+    src = cut_tile(Image.open(src_path))
+    write_dds(os.path.join(out, "emblem.dds"), opaque(scaled(src, 384)))
+    write_dds(os.path.join(out, "emblem_sm.dds"), opaque(scaled(src, 160)))
+    scaled(src, 160).save(os.path.join(out, "readme_icon.png"))
+    scaled(src, 256).save(os.path.join(out, "overmindcore.ico"), format="ICO", sizes=[(s, s) for s in ICO_SIZES])
 
 
 if __name__ == "__main__":

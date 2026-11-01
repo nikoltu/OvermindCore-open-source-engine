@@ -11,7 +11,7 @@ OvermindCore ships no game content. Game data, text, models, textures, sounds, f
 | MinGW-w64 runtime and winpthreads | statically linked (MSYS2 UCRT64 toolchain) | C runtime and threads | MinGW-w64 runtime licence, MIT, BSD-style |
 | GCC runtime (libgcc, libstdc++) | statically linked | C++ runtime | GPL-3.0 with the GCC Runtime Library Exception 3.1 |
 | 5x7 bitmap font | `include/omc/ui/font.hpp` | Fallback glyphs for the layout rasteriser | Original work of this project (added 2026-07-28 in commit f90c09c, drawn for this repository; no external source) under GPL-3.0-or-later |
-| OvermindCore artwork | `assets/icon.jpg` (source), `assets/emblem.dds`, `assets/emblem_sm.dds`, `assets/overmindcore.ico` | Client emblem and application icon; the derived files are converted from the source by `assets/make_icons.py` | Original artwork made for this project by its owner, under GPL-3.0-or-later |
+| OvermindCore artwork | `assets/icons2.jpg` (source sheet), `assets/emblem.dds`, `assets/emblem_sm.dds`, `assets/overmindcore.ico` | Client emblem and application icon; the derived files are converted from the source by `assets/make_icons.py` | Original artwork made for this project by its owner, under GPL-3.0-or-later |
 
 ## s2client-proto
 ```text

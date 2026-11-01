@@ -2,10 +2,15 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <cstdlib>
 #include <cstring>
+#include <filesystem>
+#include <fstream>
 #include <memory>
+#include <random>
 #include <stdexcept>
+#include <system_error>
 
 namespace omc::casc {
 namespace {
@@ -783,6 +788,123 @@ void fc_step(const std::vector<std::uint8_t>& b, std::size_t& p, std::string& s)
     s.append(reinterpret_cast<const char*>(b.data() + p), take);
     p += take;
 }
+}
+
+namespace {
+constexpr char kCacheMagic[8] = {'O', 'M', 'C', 'M', 'N', 'D', 'X', '1'};
+
+std::uint64_t cache_sum(const std::uint8_t* p, std::size_t n) {
+    std::uint64_t h = 1469598103934665603ull;
+    const std::size_t words = n / 8;
+    for (std::size_t i = 0; i < words; ++i) {
+        std::uint64_t w;
+        std::memcpy(&w, p + i * 8, 8);
+        h = (h ^ w) * 1099511628211ull;
+    }
+    for (std::size_t i = words * 8; i < n; ++i) h = (h ^ p[i]) * 1099511628211ull;
+    return h;
+}
+
+template <class T>
+void cache_put(std::vector<std::uint8_t>& out, const std::vector<T>& v) {
+    const std::uint64_t n = v.size();
+    const std::size_t at = out.size();
+    out.resize(at + 8 + n * sizeof(T));
+    std::memcpy(out.data() + at, &n, 8);
+    if (n) std::memcpy(out.data() + at + 8, v.data(), n * sizeof(T));
+}
+
+template <class T>
+bool cache_get(const std::vector<std::uint8_t>& in, std::size_t& at, std::size_t end, std::vector<T>& v) {
+    std::uint64_t n = 0;
+    if (end - at < 8) return false;
+    std::memcpy(&n, in.data() + at, 8);
+    at += 8;
+    if (n > (end - at) / sizeof(T)) return false;
+    v.resize(std::size_t(n));
+    if (n) std::memcpy(static_cast<void*>(v.data()), in.data() + at, std::size_t(n) * sizeof(T));
+    at += std::size_t(n) * sizeof(T);
+    return true;
+}
+}
+
+bool Mndx::save_cache(const std::string& path, const std::string& key) const {
+    if (!fc_count_) return false;
+    std::vector<std::uint8_t> out(kCacheMagic, kCacheMagic + 8);
+    const std::vector<char> key_bytes(key.begin(), key.end());
+    cache_put(out, key_bytes);
+    const std::vector<std::uint64_t> count{std::uint64_t(fc_count_)};
+    cache_put(out, count);
+    cache_put(out, fc_);
+    cache_put(out, restart_);
+    cache_put(out, first_ck_);
+    cache_put(out, by_hash_);
+    cache_put(out, resolve_ck_);
+    const std::uint64_t sum = cache_sum(out.data(), out.size());
+    const std::size_t at = out.size();
+    out.resize(at + 8);
+    std::memcpy(out.data() + at, &sum, 8);
+    static std::atomic<std::uint32_t> serial{0};
+    const std::string tmp = path + "." + std::to_string(std::random_device{}()) + "." + std::to_string(serial.fetch_add(1)) + ".tmp";
+    std::error_code ec;
+    std::filesystem::create_directories(std::filesystem::path(path).parent_path(), ec);
+    {
+        std::ofstream f(tmp, std::ios::binary);
+        if (!f) return false;
+        f.write(reinterpret_cast<const char*>(out.data()), std::streamsize(out.size()));
+        if (!f) {
+            f.close();
+            std::filesystem::remove(tmp, ec);
+            return false;
+        }
+    }
+    std::filesystem::rename(tmp, path, ec);
+    if (ec) {
+        std::error_code ignored;
+        std::filesystem::remove(tmp, ignored);
+        return false;
+    }
+    return true;
+}
+
+bool Mndx::load_cache(const std::string& path, const std::string& key) {
+    std::ifstream f(path, std::ios::binary | std::ios::ate);
+    if (!f) return false;
+    const std::streamoff size = f.tellg();
+    if (size < 8 + 8) return false;
+    std::vector<std::uint8_t> in{};
+    in.resize(std::size_t(size));
+    f.seekg(0);
+    f.read(reinterpret_cast<char*>(in.data()), size);
+    if (!f) return false;
+    const std::size_t end = in.size() - 8;
+    if (std::memcmp(in.data(), kCacheMagic, 8) != 0) return false;
+    std::uint64_t sum = 0;
+    std::memcpy(&sum, in.data() + end, 8);
+    if (sum != cache_sum(in.data(), end)) return false;
+    std::size_t at = 8;
+    std::vector<char> key_bytes;
+    std::vector<std::uint64_t> count;
+    std::vector<std::uint8_t> fc;
+    std::vector<std::uint32_t> restart;
+    std::vector<std::pair<std::uint32_t, CKey>> first_ck;
+    std::vector<std::pair<std::uint64_t, std::uint32_t>> by_hash;
+    std::vector<CKey> resolve_ck;
+    if (!cache_get(in, at, end, key_bytes) || std::string(key_bytes.begin(), key_bytes.end()) != key) return false;
+    if (!cache_get(in, at, end, count) || count.size() != 1 || !count[0]) return false;
+    if (!cache_get(in, at, end, fc) || !cache_get(in, at, end, restart) || !cache_get(in, at, end, first_ck) ||
+        !cache_get(in, at, end, by_hash) || !cache_get(in, at, end, resolve_ck))
+        return false;
+    if (at != end || by_hash.size() != count[0] || resolve_ck.size() != count[0]) return false;
+    entries_.clear();
+    by_path_.clear();
+    fc_ = std::move(fc);
+    restart_ = std::move(restart);
+    first_ck_ = std::move(first_ck);
+    by_hash_ = std::move(by_hash);
+    resolve_ck_ = std::move(resolve_ck);
+    fc_count_ = std::size_t(count[0]);
+    return true;
 }
 
 std::string Mndx::name(std::size_t i) const {

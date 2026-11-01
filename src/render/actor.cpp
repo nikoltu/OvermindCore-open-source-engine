@@ -1,3 +1,4 @@
+#include "omc/core/env_once.hpp"
 #include <algorithm>
 #include <cstdlib>
 #include "omc/render/actor.hpp"
@@ -156,10 +157,10 @@ void ActorInstance::bind_event_rules(std::vector<ActorEventRule> rules) {
 }
 
 int ActorInstance::apply_birth_groups(const std::string& unit_id) {
-    if (unit_id.empty() || std::getenv("OMC_NO_BIRTH_GROUPS")) return 0;
+    if (unit_id.empty() || OMC_ENV_ONCE("OMC_NO_BIRTH_GROUPS")) return 0;
     int n = 0;
     static const bool kBirthForever = std::getenv("OMC_NO_BIRTH_FOREVER_CLIPS") == nullptr;
-    if (const char* bt = std::getenv("OMC_BIRTH_TRACE"); bt && unit_id == bt) {
+    if (const char* bt = OMC_ENV_ONCE("OMC_BIRTH_TRACE"); bt && unit_id == bt) {
         std::fprintf(stderr, "[birth] %s: %zu rules bound\n", unit_id.c_str(), event_rules.size());
         for (const ActorEventRule& r : event_rules)
             if (r.head.find("Birth") != std::string::npos || r.verb == "AnimPlay") {
@@ -284,7 +285,7 @@ void ActorInstance::pump(float dt_ms) {
             }
             ++done;
             ++rules_fired;
-            if (std::getenv("OMC_BUS_TRACE")) {
+            if (OMC_ENV_ONCE("OMC_BUS_TRACE")) {
                 std::fprintf(stderr, "[bus] %s.%s.%s -> %s", ev.head.c_str(), ev.subject.c_str(), ev.sub.c_str(), r.verb.c_str());
                 for (const std::string& a : r.args) std::fprintf(stderr, " %s", a.c_str());
                 std::fprintf(stderr, " | slots before:");
@@ -433,7 +434,7 @@ void ActorInstance::pump(float dt_ms) {
                     set_status(r.args[0], cur + 1, false);
                 else
                     set_status(r.args[0], cur > 0 ? cur - 1 : 0, false);
-            } else if (r.verb == "SetTintColor" && !r.args.empty() && std::getenv("OMC_NO_BUS_TINT") == nullptr) {
+            } else if (r.verb == "SetTintColor" && !r.args.empty() && OMC_ENV_ONCE("OMC_NO_BUS_TINT") == nullptr) {
                 static const bool kTintOld = std::getenv("OMC_TINT_HDR_OLD") != nullptr;
                 data::TintColorArgs ta;
                 if (kTintOld) {
@@ -453,7 +454,7 @@ void ActorInstance::pump(float dt_ms) {
                     tint_layers.push_back(layer);
                     retarget_tint(ta.blend_s * 1000.0f);
                 }
-            } else if (r.verb == "ClearTintColor" && std::getenv("OMC_NO_BUS_TINT") == nullptr && std::getenv("OMC_TINT_HDR_OLD") == nullptr) {
+            } else if (r.verb == "ClearTintColor" && OMC_ENV_ONCE("OMC_NO_BUS_TINT") == nullptr && OMC_ENV_ONCE("OMC_TINT_HDR_OLD") == nullptr) {
                 float blend_s = 0.0f;
                 std::string key;
                 std::size_t ai = 0;
@@ -482,7 +483,7 @@ void ActorInstance::pump(float dt_ms) {
                     if (on && it == paused_names.end()) paused_names.push_back(r.args[0]);
                     if (!on && it != paused_names.end()) paused_names.erase(it);
                 }
-            } else if (r.verb == "Signal" && !r.args.empty() && std::getenv("OMC_NO_ACTOR_SIGNAL") == nullptr) {
+            } else if (r.verb == "Signal" && !r.args.empty() && OMC_ENV_ONCE("OMC_NO_ACTOR_SIGNAL") == nullptr) {
                 raise("Signal", "Self", r.args[0]);
             } else if (r.verb == "Create" && !r.args.empty()) {
                 if (!has_child(r.args[0])) {
@@ -958,6 +959,21 @@ void ActorDriver::observe(const sim::World& world, float dt_ms, bool sim_ticked)
         };
         ActorInstance& a = actors[i];
 
+        if (s.known && !u.alive && !s.alive) {
+            constexpr float kParkAfterMs = 10000.0f;
+            s.dead_ms += dt_ms;
+            if (s.dead_ms >= kParkAfterMs && a.queued.empty() && a.timers.empty() && a.tint_left_ms <= 0.0f && a.last_events.empty() &&
+                u.x == s.x && u.y == s.y && u.constructing == s.constructing && s.burrow_finish_ms < 0.0f && s.depot_finish_ms < 0.0f) {
+                s.parked_ms += dt_ms;
+                continue;
+            }
+        }
+        if (s.parked_ms > 0.0f) {
+            a.advance(s.parked_ms);
+            s.parked_ms = 0.0f;
+            s.dead_ms = 0.0f;
+        }
+
         if (!s.known) {
             a.model = (u.id < models.size() && models[u.id]) ? models[u.id] : default_model;
             a.rules = (u.id < rules.size() && rules[u.id]) ? rules[u.id] : default_rules;
@@ -1151,7 +1167,7 @@ void ActorDriver::observe(const sim::World& world, float dt_ms, bool sim_ticked)
                         if (s.res_level >= 0) a.raise("BehaviorLevel", subject, "Stop", {{"Level", std::to_string(s.res_level)}});
                         a.raise("BehaviorLevel", subject, "Start", {{"Level", std::to_string(level)}});
                     }
-                    if (std::getenv("OMC_RES_TRACE"))
+                    if (OMC_ENV_ONCE("OMC_RES_TRACE"))
                         std::fprintf(stderr, "res level: %s left %d cap %d level %d rules %zu subject %s\n", u.catalog_id.c_str(), int(u.resource_left),
                                      int(s.res_cap), level, a.event_rules.size(), subj ? subj->c_str() : "(none)");
                     s.res_level = level;
@@ -1172,7 +1188,7 @@ void ActorDriver::observe(const sim::World& world, float dt_ms, bool sim_ticked)
                 const std::string mt = (morph_target && s.catalog_id == cid) ? morph_target(u.id) : std::string();
                 if (!mt.empty() && s.morph_to.empty() && !cid.empty()) {
                     a.raise("AbilMorph", std::string(), "Start", {{"MorphTo", mt}, {"MorphFrom", cid}});
-                    if (std::getenv("OMC_MORPH_TRACE")) std::fprintf(stderr, "[morph] tick %d unit %u %s start -> %s\n", world.tick(), unsigned(u.id), cid.c_str(), mt.c_str());
+                    if (OMC_ENV_ONCE("OMC_MORPH_TRACE")) std::fprintf(stderr, "[morph] tick %d unit %u %s start -> %s\n", world.tick(), unsigned(u.id), cid.c_str(), mt.c_str());
                     s.morph_to = mt;
                 } else if (mt.empty() && !s.morph_to.empty() && s.catalog_id == cid) {
                     a.raise("AbilMorph", std::string(), "Cancel", {{"MorphTo", s.morph_to}, {"MorphFrom", cid}});
@@ -1184,10 +1200,10 @@ void ActorDriver::observe(const sim::World& world, float dt_ms, bool sim_ticked)
                             a.raise("AbilMorph", std::string(), "Start",
                                     {{"MorphTo", cid}, {"MorphFrom", s.catalog_id}});
                         bool reborn = false;
-                        if (std::getenv("OMC_MORPH_TRACE"))
+                        if (OMC_ENV_ONCE("OMC_MORPH_TRACE"))
                             std::fprintf(stderr, "[morph] tick %d unit %u id %s -> %s (start raised for '%s', rules %zu, slots %zu, groups %zu)\n", world.tick(), unsigned(u.id),
                                          s.catalog_id.c_str(), cid.c_str(), s.morph_to.c_str(), a.event_rules.size(), a.slots.size(), a.anim_groups.size());
-                        if (unit_rules && !std::getenv("OMC_MORPH_KEEP_ACTOR")) {
+                        if (unit_rules && !OMC_ENV_ONCE("OMC_MORPH_KEEP_ACTOR")) {
                             const std::vector<ActorEventRule>& nr = unit_rules(cid);
                             for (const ActorEventRule& r : nr) {
                                 static const bool kRebornOld = std::getenv("OMC_MORPH_REBORN_OLD") != nullptr;

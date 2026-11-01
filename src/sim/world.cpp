@@ -1,6 +1,7 @@
 #include "omc/sim/world.hpp"
 
 #include <algorithm>
+#include <cmath>
 #include <cstdlib>
 
 #include "omc/sim/transport.hpp"
@@ -236,6 +237,7 @@ uint32_t World::acquire_target(const Unit& u, Fixed max_range) const {
     Fixed best_key;
     int32_t best_pri = 0;
     int32_t best_in_range = 0;
+    static const bool kScanBonusOld = std::getenv("OMC_LOCK_ON_OLD") != nullptr;
     const bool sort_on = target_sort_ && u.target_sort != kTargetSortDefault;
     auto sort_key = [&](const Unit& o) -> Fixed {
         if (!sort_on) return Fixed();
@@ -243,10 +245,16 @@ uint32_t World::acquire_target(const Unit& u, Fixed max_range) const {
             return o.hp_max.raw() > 0 ? o.hp / o.hp_max : Fixed::from_int(1);
         return Fixed();
     };
+    for (const BehaviorInstance& b : u.behaviors)
+        if (!kScanBonusOld && b.scan_bonus.raw() != 0 && (b.permanent || b.timer.raw() > 0)) max_range = max_range + b.scan_bonus;
     const bool bounded = max_range.raw() > 0;
     if (u.wpn_damage.raw() <= 0 && u.wpn2_damage.raw() <= 0 && !u.has_burrowed_wpn && !hosts_interceptors(u.id))
         return kNoTarget;
-    for (const Unit& o : units_) {
+    const bool w1_ready = !weapon_disabled(u, u.wpn_tag) && (u.wpn_damage.raw() > 0 || u.has_burrowed_wpn || hosts_interceptors(u.id));
+    const bool w2_ready = !weapon_disabled(u, u.wpn2_tag) && u.wpn2_damage.raw() > 0;
+    const size_t scan_n = in_step_ ? scan_ids_.size() : units_.size();
+    for (size_t scan_k = 0; scan_k < scan_n; ++scan_k) {
+        const Unit& o = units_[in_step_ ? scan_ids_[scan_k] : scan_k];
         if (!o.alive || are_allied(o.player, u.player)) continue;
         if (o.resource_left > 0) continue;
         if (acquire_skips_neutral_ && is_neutral(o.player)) continue;
@@ -254,11 +262,8 @@ uint32_t World::acquire_target(const Unit& u, Fixed max_range) const {
         if (untargetable(o)) continue;
         if (benign(o)) continue;
         const uint32_t plane_bit = o.flying ? 2u : 1u;
-        const bool w1_live = !weapon_disabled(u, u.wpn_tag);
-        const bool w2_live = !weapon_disabled(u, u.wpn2_tag);
-        const bool w1 = w1_live && (u.wpn_damage.raw() > 0 || u.has_burrowed_wpn || hosts_interceptors(u.id)) &&
-                        (u.wpn_target_filter & plane_bit) != 0;
-        const bool w2 = w2_live && u.wpn2_damage.raw() > 0 && (u.wpn2_target_filter & plane_bit) != 0;
+        const bool w1 = w1_ready && (u.wpn_target_filter & plane_bit) != 0;
+        const bool w2 = w2_ready && (u.wpn2_target_filter & plane_bit) != 0;
         if (!w1 && !w2) continue;
         if (u.zone_radius.raw() > 0) {
             if (o.flying) continue;
@@ -356,6 +361,11 @@ bool World::harvest_brake(bool drop) {
 }
 
 Fixed World::move_step(Unit& u, Fixed dt, Fixed brake_dist) {
+    static const bool kBurrowCastOld = std::getenv("OMC_BURROW_CAST_OLD") != nullptr;
+    if (!kBurrowCastOld && u.burrowed) {
+        if (!u.can_burrow_move) return Fixed();
+        if (u.burrow_speed.raw() > 0) return u.burrow_speed * dt;
+    }
     Fixed speed = (u.flying && u.speed_air.raw() > 0) ? u.speed_air : u.speed;
     if (creep_.is_creep(u.x, u.y)) speed = speed * u.speed_mult_creep;
     if (!u.behaviors.empty()) speed = speed * behavior_speed_mult(u);
@@ -1398,6 +1408,9 @@ int32_t World::add_ability(AbilityDef def) {
     n.beh_wpn_bonus_amount = def.beh_wpn_bonus_amount;
     n.beh_suppress_collision = def.beh_suppress_collision;
     n.beh_suppress_passenger = def.beh_suppress_passenger;
+    n.beh_no_life_regen = def.beh_no_life_regen;
+    n.beh_no_shield_regen = def.beh_no_shield_regen;
+    n.beh_no_energy_regen = def.beh_no_energy_regen;
     n.beh_benign = def.beh_benign;
     n.beh_passive = def.beh_passive;
     n.beh_life_armor = def.beh_life_armor;
@@ -1437,12 +1450,16 @@ bool World::add_behavior(uint32_t id, const BehaviorInstance& b) {
     static const bool kAtkOld = std::getenv("OMC_BEHAVIOR_ATK_SPEED_OLD") != nullptr;
     const Fixed one = Fixed::from_int(1);
     auto atk_on = [&](const BehaviorInstance& x) { return x.atk_speed_mult.raw() > 0 && x.atk_speed_mult.raw() != one.raw(); };
+    static const bool kBlindOld = std::getenv("OMC_BLIND_EFFECTS_OLD") != nullptr;
     auto replace = [&](BehaviorInstance& e) {
         if (!kAtkOld && e.atk_speed_mult.raw() != b.atk_speed_mult.raw()) {
             if (atk_on(e)) u.atk_speed_mult = u.atk_speed_mult / e.atk_speed_mult;
             if (atk_on(b)) u.atk_speed_mult = u.atk_speed_mult * b.atk_speed_mult;
         }
+        const Fixed tick_left = e.fx_timer;
+        const bool keep_tick = !kBlindOld && e.fx_periodic != kNoEffect && e.fx_period.raw() == b.fx_period.raw();
         e = b;
+        if (keep_tick) e.fx_timer = tick_left;
     };
     if (b.kind != 0) {
         int32_t same = 0, mine = 0;
@@ -1497,12 +1514,52 @@ bool World::behavior_rooted(const Unit& u) {
     return false;
 }
 
+bool World::regen_off(const Unit& u, bool BehaviorInstance::*flag) {
+    static const bool kOld = std::getenv("OMC_REGEN_SUPPRESS_OLD") != nullptr;
+    if (kOld) return false;
+    for (const BehaviorInstance& b : u.behaviors)
+        if (b.*flag && (b.permanent || b.timer.raw() > 0)) return true;
+    return false;
+}
+
+void World::step_turret_aims() {
+    for (std::size_t i = 0; i < turret_aims_.size();) {
+        TurretAim& a = turret_aims_[i];
+        if (a.unit >= units_.size() || a.target >= units_.size() || !units_[a.unit].alive || !units_[a.target].alive) {
+            turret_aims_.erase(turret_aims_.begin() + long(i));
+            continue;
+        }
+        if (a.done) {
+            advance_turret(units_[a.unit], units_[a.target].x, units_[a.target].y, Fixed());
+            ++i;
+            continue;
+        }
+        if (!advance_turret(units_[a.unit], units_[a.target].x, units_[a.target].y, Fixed::from_ratio(1, 64))) {
+            ++i;
+            continue;
+        }
+        a.done = true;
+        const EffectRef complete = a.complete;
+        const std::size_t before = i;
+        EffectContext ctx = a.ctx;
+        ctx.tx = units_[a.target].x;
+        ctx.ty = units_[a.target].y;
+        execute_effect(complete, ctx);
+        i = before + 1;
+    }
+}
+
 int32_t World::add_persistent(PersistentInstance p) {
     const bool defer_for_validators = !p.pval_roots.empty();
     if (presentation_log_ && p.present_tag != 0) {
         const bool has_src = p.source < units_.size();
         p.present_id = log_presentation(p.present_tag, false, 0, p.source, p.target, has_src ? units_[p.source].x : p.x,
                                         has_src ? units_[p.source].y : p.y, p.x, p.y, p.owner);
+    }
+    if (persist_step_depth_ > 0 && persistents_.size() == persistents_.capacity()) {
+        persist_overflow_.emplace_back(std::move(p), apply_persistent_now_ && !defer_for_validators);
+        apply_persistent_now_ = false;
+        return int32_t(persistents_.size() + persist_overflow_.size()) - 1;
     }
     persistents_.push_back(p);
     if (apply_persistent_now_) {
@@ -1527,8 +1584,33 @@ bool World::cast_cost_payable(const Unit& u, const Order& o) const {
     return true;
 }
 
+bool World::effect_would_pass(EffectRef ref, const EffectContext& ctx, int depth) const {
+    if (depth > kMaxEffectDepth || ref < 0 || ref >= EffectRef(effects_.size())) return true;
+    const EffectNode& n = effects_[ref];
+    for (const std::uint16_t r : n.validator_roots)
+        if (!validator_passes(n.validators, r, ctx)) return false;
+    if (n.kind != EffectKind::Switch) return true;
+    const size_t ncase = n.switch_case_roots.size();
+    for (size_t i = 0; i < ncase && i < n.children.size(); ++i)
+        if (validator_passes(n.switch_ops, n.switch_case_roots[i], ctx, false))
+            return effect_would_pass(n.children[i], ctx, depth + 1);
+    return n.children.size() > ncase ? effect_would_pass(n.children[ncase], ctx, depth + 1) : true;
+}
+
 bool World::pay_cast_cost(Unit& u, Order& o) {
     if (!o.pay_due) return true;
+    static const bool kBlindPreflightOld = std::getenv("OMC_BLIND_EFFECTS_OLD") != nullptr;
+    if (!kBlindPreflightOld && o.ability < abilities_.size() && o.target < units_.size()) {
+        EffectContext pc;
+        pc.source = u.id;
+        pc.target = o.target;
+        pc.origin = u.player;
+        pc.sx = u.x;
+        pc.sy = u.y;
+        pc.tx = units_[o.target].x;
+        pc.ty = units_[o.target].y;
+        if (!effect_would_pass(abilities_[o.ability].root, pc, 0)) return false;
+    }
     if (!cast_cost_payable(u, o)) return false;
     const CastCost c = o.pay;
     o.pay_due = false;
@@ -1583,7 +1665,9 @@ void World::step_cast(Unit& u, Fixed dt) {
         }
         static const bool kTargetWalkOld = std::getenv("OMC_CAST_TARGET_WALK_OLD") != nullptr;
         if (!kTargetWalkOld && ab.range.raw() > 0 && o.target < units_.size() && o.target != u.id &&
-            units_[o.target].alive && (u.speed.raw() > 0 || (u.flying && u.speed_air.raw() > 0)) && !u.burrowed) {
+            units_[o.target].alive &&
+            (u.burrowed ? std::getenv("OMC_BURROW_CAST_OLD") == nullptr && u.can_burrow_move
+                        : u.speed.raw() > 0 || (u.flying && u.speed_air.raw() > 0))) {
             const Unit& walk_tgt = units_[o.target];
             const Fixed reach = ab.range + u.radius + walk_tgt.radius;
             if (dist2(u, walk_tgt) > reach * reach) {
@@ -1683,6 +1767,11 @@ bool World::teleport_unit(uint32_t id, Fixed tx, Fixed ty) {
     u.y = ty;
     u.path.clear();
     u.path_next = 0;
+    static const bool kGuardOld = std::getenv("OMC_TELEPORT_GUARD_OLD") != nullptr;
+    if (jump2.raw() > 0 && !kGuardOld) {
+        u.guarding = false;
+        u.guard_set = false;
+    }
     if (jump2.raw() > 0) {
         for (Unit& a : units_) {
             if (!a.alive || a.target != id) continue;
@@ -1736,10 +1825,32 @@ void World::log_cast_start(const Unit& u, const AbilityDef& ab, const EffectCont
     presentation_events_.back().abil = true;
 }
 
-void World::execute_effect(EffectRef ref, const EffectContext& ctx, int depth) {
+void World::execute_effect(EffectRef ref, const EffectContext& ctx_in, int depth) {
     if (depth > kMaxEffectDepth) return;
     if (ref < 0 || ref >= EffectRef(effects_.size())) return;
     const EffectNode& n = effects_[ref];
+    EffectContext framed;
+    if (n.frame_saved) {
+        framed = ctx_in;
+        framed.frames[1] = framed.frames[0];
+        framed.frames[0].tag = n.frame_tag;
+        framed.frames[0].unit = ctx_in.target;
+        framed.frames[0].x = ctx_in.tx;
+        framed.frames[0].y = ctx_in.ty;
+        framed.frames[0].caster = ctx_in.source;
+    }
+    if (n.ctx_frame != 0) {
+        if (!n.frame_saved) framed = ctx_in;
+        for (const EffectFrame& fr : ctx_in.frames)
+            if (fr.tag == n.ctx_frame) {
+                framed.target = n.ctx_frame_caster ? fr.caster : fr.unit;
+                if (framed.target < units_.size()) {
+                    framed.tx = units_[framed.target].x;
+                    framed.ty = units_[framed.target].y;
+                }
+            }
+    }
+    const EffectContext& ctx = (n.frame_saved || n.ctx_frame != 0) ? framed : ctx_in;
     if (n.kind == EffectKind::ApplyBehavior && n.beh_on_caster && ctx.target != ctx.source) {
         EffectContext self = ctx;
         self.target = ctx.source;
@@ -1785,8 +1896,10 @@ void World::execute_effect(EffectRef ref, const EffectContext& ctx, int depth) {
             const int32_t caster_team = ctx.origin >= 0 ? team_of(ctx.origin) : -1;
             const bool skip_structures = n.search_exclude_structure;
             std::vector<uint32_t> ids;
+            static const bool kBlindOld = std::getenv("OMC_BLIND_EFFECTS_OLD") != nullptr;
             for (const Unit& u : units_) {
                 if (!u.alive) continue;
+                if (!kBlindOld && u.loaded) continue;
                 if (skip_structures && (u.attributes & kAttrStructure)) continue;
                 if (n.search_exclude_target && u.id == ctx.target) continue;
                 if ((u.attributes & n.search_req_attr) != n.search_req_attr) continue;
@@ -1823,6 +1936,34 @@ void World::execute_effect(EffectRef ref, const EffectContext& ctx, int depth) {
             }
             return;
         }
+        case EffectKind::ModifyPlayer: {
+            const int32_t pl = ctx.source < units_.size() ? units_[ctx.source].player : ctx.origin;
+            if (pl < 0) return;
+            player(pl).minerals += n.res_minerals;
+            player(pl).gas += n.res_gas;
+            return;
+        }
+        case EffectKind::RandomPointInCircle: {
+            if (n.children.empty()) return;
+            const double r = n.circle_radius.to_double();
+            const double ang = double(rng_.below(4096)) / 4096.0 * 6.283185307179586;
+            const double rho = n.circle_edge ? r : r * std::sqrt(double(rng_.below(4096)) / 4096.0);
+            EffectContext cc = ctx;
+            cc.target = kNoTarget;
+            cc.tx = ctx.tx + Fixed::from_double(rho * std::cos(ang));
+            cc.ty = ctx.ty + Fixed::from_double(rho * std::sin(ang));
+            execute_effect(n.children[0], cc, depth + 1);
+            return;
+        }
+        case EffectKind::EnumTransport: {
+            if (n.children.empty()) return;
+            for (uint32_t id : passengers(ctx.target)) {
+                EffectContext cc = ctx;
+                cc.target = id;
+                execute_effect(n.children[0], cc, depth + 1);
+            }
+            return;
+        }
         case EffectKind::Switch: {
             const size_t ncase = n.switch_case_roots.size();
             for (size_t i = 0; i < ncase && i < n.children.size(); ++i)
@@ -1836,6 +1977,32 @@ void World::execute_effect(EffectRef ref, const EffectContext& ctx, int depth) {
         case EffectKind::IssueOrder: {
             const uint32_t who = n.beh_on_caster ? ctx.source : ctx.target;
             if (who >= units_.size() || !units_[who].alive) return;
+            if (!n.issue_morph.empty()) {
+                if (order_morph_ && !order_morph_(who, n.issue_morph)) ++order_morph_failures_;
+                return;
+            }
+            if (n.issue_effect != kNoEffect) {
+                EffectContext oc = ctx;
+                oc.source = who;
+                oc.holder = kNoTarget;
+                oc.sx = units_[who].x;
+                oc.sy = units_[who].y;
+                oc.target = kNoTarget;
+                for (const EffectFrame& fr : ctx.frames)
+                    if (fr.tag != 0 && fr.tag == n.issue_frame) {
+                        oc.target = fr.unit;
+                        oc.tx = fr.x;
+                        oc.ty = fr.y;
+                    }
+                if (oc.target < units_.size() && units_[oc.target].alive) {
+                    oc.tx = units_[oc.target].x;
+                    oc.ty = units_[oc.target].y;
+                }
+                const Fixed dx = oc.tx - oc.sx, dy = oc.ty - oc.sy;
+                if (n.issue_range.raw() > 0 && dx * dx + dy * dy > n.issue_range * n.issue_range) return;
+                execute_effect(n.issue_effect, oc, depth + 1);
+                return;
+            }
             if (n.issue_order == kIssueOrderStop) { stop(who); return; }
             Order o{};
             o.type = OrderType(n.issue_order);
@@ -1896,6 +2063,12 @@ void World::execute_effect(EffectRef ref, const EffectContext& ctx, int depth) {
             const Fixed dx = ix - lx, dy = iy - ly, dz = n.missile_impact_z - n.missile_launch_z;
             const Fixed dist = isqrt(dx * dx + dy * dy + dz * dz);
             Fixed flight = n.missile_speed.raw() > 0 ? dist / n.missile_speed : Fixed();
+            if (n.missile_accel.raw() > 0 && n.missile_speed.raw() > 0) {
+                const double a = n.missile_accel.to_double(), v = n.missile_speed.to_double(), d = dist.to_double();
+                const double v0 = std::min(n.missile_start_speed.to_double(), v);
+                const double ramp = (v - v0) / a, ramp_d = v0 * ramp + 0.5 * a * ramp * ramp;
+                flight = Fixed::from_double(d <= ramp_d ? (std::sqrt(v0 * v0 + 2.0 * a * d) - v0) / a : ramp + (d - ramp_d) / v);
+            }
             if (flight.raw() <= 0 && n.missile_never_instant) flight = Fixed::from_raw(1);
             if (flight.raw() <= 0) {
                 execute_effect(n.impact, ictx, depth + 1);
@@ -1903,6 +2076,7 @@ void World::execute_effect(EffectRef ref, const EffectContext& ctx, int depth) {
             }
             PendingEffect pe;
             pe.impact = n.impact;
+            pe.interrupt = n.missile_interrupt;
             pe.ctx = ictx;
             pe.remaining = flight;
             pe.home = n.missile_impact_loc == 2 && ctx.target < units_.size();
@@ -1926,6 +2100,8 @@ void World::execute_effect(EffectRef ref, const EffectContext& ctx, int depth) {
             p.owner = ctx.origin;
             p.source = ctx.source;
             p.target = ctx.target;
+            p.frames[0] = ctx.frames[0];
+            p.frames[1] = ctx.frames[1];
             p.channeled = n.persist_channeled;
             if (!n.periodic_validator_roots.empty()) {
                 p.pval = n.validators;
@@ -1934,6 +2110,10 @@ void World::execute_effect(EffectRef ref, const EffectContext& ctx, int depth) {
             p.allies = n.persist_allies;
             p.affiliation = n.persist_affiliation;
             p.excludes_structure = n.persist_excludes_structure;
+            if (n.persist_caster_point && ctx.source < units_.size()) {
+                p.x = units_[ctx.source].x;
+                p.y = units_[ctx.source].y;
+            }
             if (n.persist_follow_source && ctx.source < units_.size()) {
                 p.follow = ctx.source;
                 p.x = units_[ctx.source].x;
@@ -1945,12 +2125,18 @@ void World::execute_effect(EffectRef ref, const EffectContext& ctx, int depth) {
                 p.y = units_[ctx.target].y;
             }
             p.periodic = n.periodic;
+            p.periodic_seq = n.periodic_seq;
+            p.period_seq = n.period_seq;
             p.expire = n.expire;
             p.final_effect = n.final_effect;
             p.expire_delay = n.persist_expire_delay;
             p.src = n.persist_src;
             p.present_tag = n.persist_src != 0 ? n.persist_src : n.fx_tag;
-            if (n.persist_initial_delay.raw() > 0) {
+            if (n.persist_wait_first) {
+                p.timer = n.period;
+                p.count = n.period_count;
+                apply_persistent_now_ = false;
+            } else if (n.persist_initial_delay.raw() > 0) {
                 p.timer = n.persist_initial_delay;
                 p.count = n.period_count;
                 p.initial_deferred = n.initial;
@@ -1981,9 +2167,12 @@ void World::execute_effect(EffectRef ref, const EffectContext& ctx, int depth) {
                     ps.cast_x = ctx.cast_x;
                     ps.cast_y = ctx.cast_y;
                     ps.has_cast_point = ctx.has_cast_point;
-                    if (n.area_at_source && ctx.source < units_.size()) {
-                        ps.x = units_[ctx.source].x;
-                        ps.y = units_[ctx.source].y;
+                    ps.frame0 = ctx.frames[0];
+                    ps.frame1 = ctx.frames[1];
+                    const uint32_t at = n.area_at_holder && ctx.holder < units_.size() ? ctx.holder : ctx.source;
+                    if (n.area_at_source && at < units_.size()) {
+                        ps.x = units_[at].x;
+                        ps.y = units_[at].y;
                     }
                 }
                 if (n.spawn_snap_resource) {
@@ -2325,6 +2514,13 @@ void World::execute_effect(EffectRef ref, const EffectContext& ctx, int depth) {
             }
             b.suppress_collision = n.beh_suppress_collision;
             b.suppress_passenger = n.beh_suppress_passenger;
+            b.no_life_regen = n.beh_no_life_regen;
+            b.no_shield_regen = n.beh_no_shield_regen;
+            b.no_energy_regen = n.beh_no_energy_regen;
+            b.scan_bonus = n.beh_scan_bonus;
+            b.resp_fatal = n.beh_resp_fatal;
+            b.rv_frames[0] = ctx.frames[0];
+            b.rv_frames[1] = ctx.frames[1];
             b.benign = n.beh_benign;
             b.passive = n.beh_passive;
             if (!n.beh_remove_roots.empty()) {
@@ -2356,8 +2552,16 @@ void World::execute_effect(EffectRef ref, const EffectContext& ctx, int depth) {
             if (n.beh_permanent) b.permanent = true;
             b.fx_period = n.period;
             b.fx_timer = n.period;
-            b.fx_caster = ctx.source;
+            b.fx_caster = n.beh_self_caster ? ctx.target : ctx.source;
             b.fx_origin = ctx.origin;
+            b.ranged_range = n.beh_ranged_range;
+            b.no_detect = n.beh_no_detect;
+            b.update_disabled = n.beh_update_disabled;
+            b.fx_frame_tag = n.frame_saved ? n.frame_tag : 0;
+            if (!n.beh_disable_roots.empty()) {
+                b.dis_ops = n.beh_disable_ops;
+                b.dis_roots = n.beh_disable_roots;
+            }
             if (n.beh_control_transfer && ctx.target < units_.size() && ctx.source < units_.size()) {
                 Unit& ctgt = units_[ctx.target];
                 int32_t orig = ctgt.player;
@@ -2442,7 +2646,9 @@ void World::execute_effect(EffectRef ref, const EffectContext& ctx, int depth) {
             return;
         }
         case EffectKind::TransferBehavior: {
-            const uint32_t from = n.transfer_from_caster ? ctx.source : ctx.target;
+            uint32_t from = n.transfer_from_caster ? ctx.source : ctx.target;
+            for (const EffectFrame& fr : ctx.frames)
+                if (n.transfer_from_frame != 0 && fr.tag == n.transfer_from_frame) from = fr.unit;
             const uint32_t to = n.transfer_to_caster ? ctx.source : ctx.target;
             if (from >= units_.size() || to >= units_.size() || from == to) return;
             std::vector<BehaviorInstance> moved;
@@ -2480,6 +2686,21 @@ void World::execute_effect(EffectRef ref, const EffectContext& ctx, int depth) {
             }
             left = n.remove_count > 0 ? n.remove_count : INT32_MAX;
             bs.erase(std::remove_if(bs.begin(), bs.end(), take), bs.end());
+            return;
+        }
+        case EffectKind::ModifyTurret: {
+            if (ctx.source >= units_.size()) return;
+            for (std::size_t i = 0; i < turret_aims_.size();) {
+                if (turret_aims_[i].unit == ctx.source) turret_aims_.erase(turret_aims_.begin() + long(i));
+                else ++i;
+            }
+            if (n.turret_clear || ctx.target >= units_.size()) return;
+            TurretAim a;
+            a.unit = ctx.source;
+            a.target = ctx.target;
+            a.complete = n.impact;
+            a.ctx = ctx;
+            turret_aims_.push_back(a);
             return;
         }
         case EffectKind::ModifyEnergy: {
@@ -2569,10 +2790,20 @@ bool World::validator_passes(const std::vector<ValidatorOp>& ops, std::uint16_t 
         r = compare_token(v.area_cmp, Fixed::from_int(n), Fixed::from_int(v.area_count)) &&
             compare_token(v.cmp, Fixed::from_int(n), Fixed::from_int(v.count_value));
     } else {
-        const std::uint32_t who = v.on_caster ? ctx.source : ctx.target;
+        std::uint32_t who = v.on_source && ctx.holder < units_.size() ? ctx.holder : v.on_caster ? ctx.source : ctx.target;
+        if (v.frame_tag != 0)
+            for (const EffectFrame& fr : ctx.frames)
+                if (fr.tag == v.frame_tag) who = fr.unit;
         if (who >= units_.size()) return no_unit_passes;
         const Unit& u = units_[who];
         switch (v.kind) {
+            case ValidatorOp::OrderCount: {
+                std::int32_t held = 0;
+                for (const Order& o : u.orders)
+                    if (o.ability < abilities_.size() && abilities_[o.ability].abil_tag == v.abil_tag) ++held;
+                r = compare_token(v.cmp, Fixed::from_int(held), Fixed::from_int(v.count_value));
+                break;
+            }
             case ValidatorOp::Vital: r = vital_gate_passes(v.vital, u); break;
             case ValidatorOp::UnitType: r = u.catalog_id == v.unit_type; break;
             case ValidatorOp::NoBehavior:
@@ -2590,6 +2821,8 @@ bool World::validator_passes(const std::vector<ValidatorOp>& ops, std::uint16_t 
                 if (v.field == 0) have = Fixed::from_int(cargo_used(u.id));
                 else if (v.field == 1) have = Fixed::from_int(u.resource_left);
                 else if (v.field == 2) have = u.radius;
+                else if (v.field == 4) have = u.flying ? Fixed::from_int(1) : Fixed();
+                else if (v.field == 5) have = (u.wpn_damage.raw() > 0 || u.wpn2_damage.raw() > 0 || u.has_burrowed_wpn || hosts_interceptors(u.id)) ? Fixed::from_int(1) : Fixed();
                 else {
                     for (std::size_t s = 0; s < abilities_.size(); ++s)
                         if (abilities_[s].abil_tag == v.abil_tag) {
@@ -2627,6 +2860,16 @@ bool World::validator_passes(const std::vector<ValidatorOp>& ops, std::uint16_t 
                 break;
             }
             case ValidatorOp::Filters: {
+                if (v.exc_dead && !u.alive) { r = false; break; }
+                if (v.exc_stunned && behavior_stunned(u)) { r = false; break; }
+                if (v.exc_hidden && u.loaded) { r = false; break; }
+                if (v.exc_warping && u.warp_forming && u.constructing) { r = false; break; }
+                if (v.req_cloaked && !u.cloaked_effective()) { r = false; break; }
+                if (v.req_buried && !u.burrowed) { r = false; break; }
+                if (v.req_visible) {
+                    const int32_t viewer = ctx.origin >= 0 ? ctx.origin : (ctx.source < units_.size() ? units_[ctx.source].player : -1);
+                    if (viewer >= 0 && u.cloaked_effective() && !detected_by(viewer, u)) { r = false; break; }
+                }
                 const std::uint8_t plane = u.flying ? 2 : 1;
                 std::uint8_t rel = 8;
                 if (u.id == ctx.source) rel = 1;
@@ -3103,6 +3346,10 @@ void World::step_effect_missiles(Fixed dt) {
             p.ctx.tx = units_[p.ctx.target].x;
             p.ctx.ty = units_[p.ctx.target].y;
         }
+        if (p.home && p.interrupt != kNoEffect && p.ctx.target < units_.size() && !units_[p.ctx.target].alive) {
+            execute_effect(p.interrupt, p.ctx);
+            continue;
+        }
         execute_effect(p.impact, p.ctx);
     }
 }
@@ -3258,6 +3505,8 @@ bool World::cancel_train_slot(uint32_t producer, int slot) {
         if (pd.egg < units_.size()) units_[pd.egg].alive = false;
     } else if (pd.consumed_larva < units_.size() && !units_[pd.consumed_larva].alive) {
         units_[pd.consumed_larva].alive = true;
+        const auto at = std::lower_bound(scan_ids_.begin(), scan_ids_.end(), uint32_t(pd.consumed_larva));
+        if (at == scan_ids_.end() || *at != pd.consumed_larva) scan_ids_.insert(at, uint32_t(pd.consumed_larva));
     }
     if (train_sink_) train_sink_->on_train_cancel(tick_, pd.producer, pd.egg, pd.proto.catalog_id);
     pending_.erase(pending_.begin() + idx);
@@ -3984,6 +4233,8 @@ void World::step_bunker_fire(Fixed dt) {
                 if (p.cooldown.raw() < 0) p.cooldown = Fixed();
                 continue;
             }
+            const Fixed blind = weapon_range_bonus(p) + (p.wpn_melee ? Fixed() : ranged_range_bonus(p));
+            if (blind.raw() < 0 && p.wpn_range + blind <= Fixed()) continue;
             const Fixed reach = p.wpn_range + bonus;
             uint32_t best = kNoTarget;
             Fixed best_d2;
@@ -4005,8 +4256,9 @@ void World::step_bunker_fire(Fixed dt) {
 }
 
 void World::step_persistents(Fixed dt, size_t only) {
+    ++persist_step_depth_;
     for (size_t i = (only == kAllPersistents ? 0 : only); i < persistents_.size();) {
-        persistents_.reserve(persistents_.size() + 16);
+        if (persist_step_depth_ == 1) persistents_.reserve(persistents_.size() + 16);
         PersistentInstance& p = persistents_[i];
         if (p.count <= 0 && p.initial_deferred < 0) {
             if (!p.expire_done && (p.expire >= 0 || p.final_effect >= 0)) {
@@ -4018,6 +4270,8 @@ void World::step_persistents(Fixed dt, size_t only) {
                 }
                 p.expire_done = true;
                 EffectContext ectx;
+                ectx.frames[0] = p.frames[0];
+                ectx.frames[1] = p.frames[1];
                 ectx.source = p.source;
                 ectx.target = p.target;
                 ectx.cast_x = p.x;
@@ -4042,11 +4296,19 @@ void World::step_persistents(Fixed dt, size_t only) {
         }
         p.timer = p.timer - dt;
         if (p.timer.raw() <= 0) {
-            p.timer = p.timer + p.period;
+            if (!p.period_seq.empty()) {
+                const std::size_t nk = std::min(std::size_t(p.applied) + 1, p.period_seq.size() - 1);
+                p.timer = p.timer + p.period_seq[nk];
+            } else {
+                p.timer = p.timer + p.period;
+            }
+            if (!p.periodic_seq.empty()) p.periodic = p.periodic_seq[std::min(std::size_t(p.applied), p.periodic_seq.size() - 1)];
             if (p.initial_deferred >= 0) {
                 const EffectRef ini = p.initial_deferred;
                 p.initial_deferred = kNoEffect;
                 EffectContext ectx;
+                ectx.frames[0] = p.frames[0];
+                ectx.frames[1] = p.frames[1];
                 ectx.source = p.source;
                 ectx.target = p.target;
                 ectx.cast_x = p.x;
@@ -4064,7 +4326,9 @@ void World::step_persistents(Fixed dt, size_t only) {
                     p.count = 0;
                     if (p.final_effect >= 0) {
                         EffectContext ectx;
-                        ectx.source = p.source;
+                        ectx.frames[0] = p.frames[0];
+                ectx.frames[1] = p.frames[1];
+                ectx.source = p.source;
                 ectx.target = p.target;
                 ectx.cast_x = p.x;
                 ectx.cast_y = p.y;
@@ -4089,6 +4353,11 @@ void World::step_persistents(Fixed dt, size_t only) {
                 vctx.origin = p.owner;
                 vctx.sx = vctx.tx = p.x;
                 vctx.sy = vctx.ty = p.y;
+                static const bool kLockOnOld = std::getenv("OMC_LOCK_ON_OLD") != nullptr;
+                if (!kLockOnOld && p.source < units_.size()) {
+                    vctx.sx = units_[p.source].x;
+                    vctx.sy = units_[p.source].y;
+                }
                 bool ok = true;
                 for (const std::uint16_t r : p.pval_roots)
                     if (!validator_passes(p.pval, r, vctx)) { ok = false; break; }
@@ -4168,6 +4437,8 @@ void World::step_persistents(Fixed dt, size_t only) {
                 (p.expire >= 0 || p.final_effect >= 0)) {
                 p.expire_done = true;
                 EffectContext ectx;
+                ectx.frames[0] = p.frames[0];
+                ectx.frames[1] = p.frames[1];
                 ectx.source = p.source;
                 ectx.target = p.target;
                 ectx.cast_x = p.x;
@@ -4183,6 +4454,14 @@ void World::step_persistents(Fixed dt, size_t only) {
         }
         if (only != kAllPersistents) break;
         ++i;
+    }
+    if (--persist_step_depth_ == 0 && !persist_overflow_.empty()) {
+        std::vector<std::pair<PersistentInstance, bool>> late;
+        late.swap(persist_overflow_);
+        for (std::pair<PersistentInstance, bool>& e : late) {
+            persistents_.push_back(std::move(e.first));
+            if (e.second) step_persistents(Fixed(), persistents_.size() - 1);
+        }
     }
 }
 
@@ -4989,7 +5268,11 @@ void World::step() {
         presentation_delayed_.erase(presentation_delayed_.begin() + long(k));
     }
     in_step_ = true;
-    for (Unit& u : units_) u.loco_moved = Fixed();
+    scan_ids_.clear();
+    for (Unit& u : units_) {
+        u.loco_moved = Fixed();
+        if (u.alive) scan_ids_.push_back(u.id);
+    }
     update_conjoined();
     return_dead_carry();
     update_destructibles();
@@ -5066,6 +5349,7 @@ void World::step() {
     step_point_defense(dt);
     step_projectiles(dt);
     step_effect_missiles(dt);
+    step_turret_aims();
     step_interceptors(dt);
     step_nova(dt);
     update_watchtowers();
@@ -5090,7 +5374,7 @@ void World::step() {
                 regen_held = true;
             }
         }
-        if (!regen_held && regen.raw() > 0 && u.hp.raw() > 0 && u.hp < u.hp_max) {
+        if (!regen_held && regen.raw() > 0 && u.hp.raw() > 0 && u.hp < u.hp_max && !regen_off(u, &BehaviorInstance::no_life_regen)) {
             u.hp = u.hp + regen * dt;
             if (u.hp > u.hp_max) u.hp = u.hp_max;
         }
@@ -5100,7 +5384,7 @@ void World::step() {
             if (total < u.shield_last_total) u.shield_since_hit = Fixed();
             if (u.shield_since_hit < u.shield_regen_delay) {
                 u.shield_since_hit = u.shield_since_hit + dt;
-            } else if (u.shields < u.shields_max) {
+            } else if (u.shields < u.shields_max && !regen_off(u, &BehaviorInstance::no_shield_regen)) {
                 u.shields = u.shields + u.shield_regen_rate * dt;
                 if (u.shields > u.shields_max) u.shields = u.shields_max;
             }
@@ -5240,6 +5524,15 @@ void World::step() {
 
         if (u.loaded) continue;
         if (u.burrowed) {
+            static const bool kBurrowCastOld = std::getenv("OMC_BURROW_CAST_OLD") != nullptr;
+            if (!kBurrowCastOld && !u.can_burrow_attack && u.energy_max.raw() > 0 && u.energy < u.energy_max && !regen_off(u, &BehaviorInstance::no_energy_regen)) {
+                u.energy = u.energy + u.energy_regen * dt;
+                if (u.energy > u.energy_max) u.energy = u.energy_max;
+            }
+            if (!kBurrowCastOld && !u.orders.empty() && u.orders.front().type == OrderType::Cast) {
+                step_cast(u, dt);
+                continue;
+            }
             if (u.can_burrow_move && !u.orders.empty() && u.orders.front().type == OrderType::Move &&
                 !behavior_rooted(u)) {
                 const Order o = u.orders.front();
@@ -5271,7 +5564,7 @@ void World::step() {
             }
         }
 
-        if (u.energy_max.raw() > 0 && u.energy < u.energy_max) {
+        if (u.energy_max.raw() > 0 && u.energy < u.energy_max && !regen_off(u, &BehaviorInstance::no_energy_regen)) {
             u.energy = u.energy + u.energy_regen * dt;
             if (u.energy > u.energy_max) u.energy = u.energy_max;
         }
@@ -5308,7 +5601,19 @@ void World::step() {
 
         if (!u.behaviors.empty()) {
             for (BehaviorInstance& b : u.behaviors) {
-                if (!b.permanent) b.timer = b.timer - dt;
+                if (!b.dis_roots.empty()) {
+                    EffectContext dctx;
+                    dctx.source = b.fx_caster;
+                    dctx.target = u.id;
+                    dctx.holder = u.id;
+                    dctx.origin = b.fx_origin;
+                    dctx.sx = dctx.tx = u.x;
+                    dctx.sy = dctx.ty = u.y;
+                    b.disabled = false;
+                    for (const std::uint16_t r : b.dis_roots)
+                        if (!validator_passes(b.dis_ops, r, dctx)) b.disabled = true;
+                }
+                if (!b.permanent && !(b.disabled && !b.update_disabled)) b.timer = b.timer - dt;
                 if (b.ctrl_orig_owner != -2) {
                     if (b.ctrl_caster >= units_.size() || !units_[b.ctrl_caster].alive) b.timer = Fixed();
                     if (b.timer.raw() <= 0 && u.alive) u.player = b.ctrl_orig_owner;
@@ -5329,11 +5634,13 @@ void World::step() {
                 }
                 static const bool kPeriodicOld = std::getenv("OMC_PERIODIC_TICK_OLD") != nullptr;
                 const bool expiry_tick = !kPeriodicOld && !b.permanent && b.ctrl_orig_owner == -2;
-                if (b.fx_periodic != kNoEffect && b.fx_period.raw() > 0 && u.alive && (b.timer.raw() > 0 || expiry_tick)) {
+                static const bool kBlindTickOld = std::getenv("OMC_BLIND_EFFECTS_OLD") != nullptr;
+                if (!b.disabled && b.fx_periodic != kNoEffect && b.fx_period.raw() > 0 && u.alive &&
+                    (b.timer.raw() > 0 || expiry_tick || (b.permanent && !kBlindTickOld))) {
                     b.fx_timer = b.fx_timer - dt;
                     if (b.fx_timer.raw() <= 0) {
                         b.fx_timer = b.fx_timer + b.fx_period;
-                        behavior_fx_.push_back({b.fx_periodic, u.id, b.fx_caster, b.fx_origin, b.fx_px, b.fx_py, b.fx_has_point});
+                        behavior_fx_.push_back({b.fx_periodic, u.id, b.fx_caster, b.fx_origin, b.fx_px, b.fx_py, b.fx_has_point, b.fx_frame_tag, false});
                     }
                 }
                 if (!b.rv_roots.empty() && (b.permanent || b.timer.raw() > 0)) {
@@ -5343,6 +5650,8 @@ void World::step() {
                     rctx.origin = b.fx_origin;
                     rctx.sx = rctx.tx = u.x;
                     rctx.sy = rctx.ty = u.y;
+                    rctx.frames[0] = b.rv_frames[0];
+                    rctx.frames[1] = b.rv_frames[1];
                     for (const std::uint16_t r : b.rv_roots)
                         if (!validator_passes(b.rv_ops, r, rctx)) {
                             b.timer = Fixed();
@@ -5785,7 +6094,8 @@ void World::step() {
                 w_slot = 1;
             }
             const bool can_hit_plane = w1_cov || w2_cov;
-            Fixed eff_rng = w_rng + w_rng_bonus;
+            const bool w_melee = w_slot == 1 ? u.wpn2_melee : u.wpn_melee;
+            Fixed eff_rng = w_rng + w_rng_bonus + (w_melee ? Fixed() : ranged_range_bonus(u));
             if (eff_rng.raw() < 0) eff_rng = Fixed();
             Fixed reach = eff_rng + u.radius + tgt.radius;
             const Fixed d2 = dist2(u, tgt);
@@ -5857,14 +6167,29 @@ void World::step() {
     }
     step_bunker_fire(dt);
 
+    static const bool kBlindOld = std::getenv("OMC_BLIND_EFFECTS_OLD") != nullptr;
+    if (!kBlindOld)
+        for (Unit& dead : units_) {
+            if (dead.alive || dead.death_finals_fired || dead.behaviors.empty()) continue;
+            dead.death_finals_fired = true;
+            for (const BehaviorInstance& bi : dead.behaviors)
+                if (bi.permanent || bi.timer.raw() > 0) queue_behavior_final(dead, bi);
+        }
     for (int round = 0; round < 8 && !behavior_fx_.empty(); ++round) {
         std::vector<BehaviorFx> fx;
         fx.swap(behavior_fx_);
         for (const BehaviorFx& f : fx) {
-            if (f.holder >= units_.size() || !units_[f.holder].alive) continue;
+            if (f.holder >= units_.size() || (!units_[f.holder].alive && !f.holder_dead)) continue;
             EffectContext c;
             c.source = f.caster;
             c.target = f.holder;
+            c.holder = f.holder;
+            if (f.frame_tag != 0) {
+                c.frames[0].tag = f.frame_tag;
+                c.frames[0].unit = f.holder;
+                c.frames[0].x = units_[f.holder].x;
+                c.frames[0].y = units_[f.holder].y;
+            }
             c.origin = f.origin;
             c.sx = c.tx = units_[f.holder].x;
             c.sy = c.ty = units_[f.holder].y;
@@ -5879,7 +6204,7 @@ void World::step() {
         static const int DY[8] = {0, 1, 1, 1, 0, -1, -1, -1};
         std::vector<PendingSpawn> spawn_batch;
         spawn_batch.swap(pending_spawns_);
-        struct SpawnFx { EffectRef fx; uint32_t source, unit; int32_t origin; Fixed cx, cy; bool has_point; };
+        struct SpawnFx { EffectRef fx; uint32_t source, unit; int32_t origin; Fixed cx, cy; bool has_point; EffectFrame f0, f1; };
         std::vector<SpawnFx> spawn_fx;
         for (const PendingSpawn& ps : spawn_batch) {
             if (ps.proto < 0 || size_t(ps.proto) >= spawn_protos_.size()) continue;
@@ -5934,7 +6259,7 @@ void World::step() {
                 const uint32_t sid = add_unit(s);
                 if (ps.gather_node != kNoTarget) issue(sid, Order{OrderType::Gather});
                 if (ps.fx != kNoEffect)
-                    spawn_fx.push_back({ps.fx, ps.fx_source, sid, ps.owner, ps.cast_x, ps.cast_y, ps.has_cast_point});
+                    spawn_fx.push_back({ps.fx, ps.fx_source, sid, ps.owner, ps.cast_x, ps.cast_y, ps.has_cast_point, ps.frame0, ps.frame1});
                 if (is_shade && ps.phase_link < units_.size()) {
                     units_[ps.phase_link].phase_shade = sid;
                     issue(sid, Order{OrderType::Move, ps.move_x, ps.move_y});
@@ -5946,6 +6271,8 @@ void World::step() {
             EffectContext c;
             c.source = f.source;
             c.target = f.unit;
+            c.frames[0] = f.f0;
+            c.frames[1] = f.f1;
             c.origin = f.source < units_.size() ? units_[f.source].player : f.origin;
             c.tx = units_[f.unit].x;
             c.ty = units_[f.unit].y;
@@ -6185,6 +6512,8 @@ uint64_t World::state_hash() const {
         }
         if (u.backswing_timer.raw() > 0) h = mix(h, uint32_t(u.backswing_timer.raw()));
         if (turret_aim_ && u.turret_set) h = mix(h, uint32_t(u.turret_facing.raw()));
+        for (const BehaviorInstance& b : u.behaviors)
+            if (b.scan_bonus.raw() != 0) h = mix(h, uint32_t(b.scan_bonus.raw()));
         if (u.constructing) {
             h = mix(h, uint32_t(u.build_progress.raw()));
             h = mix(h, uint32_t(u.build_time.raw()));

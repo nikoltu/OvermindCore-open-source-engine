@@ -104,6 +104,10 @@ enum class EffectKind {
     WeaponCooldown,
     LaunchMissile,
     RedirectPassengers,
+    EnumTransport,
+    ModifyPlayer,
+    RandomPointInCircle,
+    ModifyTurret,
 };
 
 inline constexpr std::uint16_t kCastBehaviorKind = 0xCA5;
@@ -194,6 +198,7 @@ struct AbilityDef {
     std::uint32_t redirect_tag = 0;
     std::uint8_t redirect_order = 0xFF;
     Fixed passenger_life_cost{};
+    bool beh_no_life_regen = false, beh_no_shield_regen = false, beh_no_energy_regen = false;
 };
 
 enum : std::uint8_t {
@@ -215,7 +220,8 @@ struct VitalGate {
 
 struct ValidatorOp {
     enum Kind : std::uint8_t { And, Or, Vital, Filters, UnitType, NoBehavior, OrderQueue, CompareRange, BehaviorCount, PlayerRequirement,
-                               Compare, Mover, ConstFalse, Pathable, EnumArea } kind = And;
+                               Compare, Mover, ConstFalse, Pathable, EnumArea, OrderCount } kind = And;
+    bool on_source = false;
     Fixed area_radius;
     std::int32_t area_count = 1;
     std::uint8_t area_cmp = 5;
@@ -241,6 +247,9 @@ struct ValidatorOp {
     Fixed value;
     std::uint32_t abil_tag = 0;
     bool want_fly = false;
+    std::uint32_t frame_tag = 0;
+    bool exc_dead = false, exc_stunned = false, exc_hidden = false, exc_warping = false;
+    bool req_cloaked = false, req_buried = false, req_visible = false;
 };
 
 enum class HealVital : uint8_t { Life, Shields };
@@ -321,11 +330,32 @@ struct EffectNode {
     bool issue_queued = false;
     bool cancel_active = true, cancel_queued = false;
     bool transfer_from_caster = false, transfer_to_caster = false, transfer_copy = false;
+    std::uint32_t transfer_from_frame = 0;
+    std::uint32_t frame_tag = 0;
+    bool frame_saved = false;
+    EffectRef issue_effect = kNoEffect;
+    std::uint32_t issue_frame = 0;
+    Fixed issue_range;
+    std::uint32_t ctx_frame = 0;
+    bool ctx_frame_caster = false;
+    std::string issue_morph{};
+    int32_t res_minerals = 0, res_gas = 0;
+    Fixed circle_radius{};
+    bool circle_edge = false;
+    EffectRef missile_interrupt = kNoEffect;
+    bool area_at_holder = false;
+    bool beh_self_caster = false;
+    bool beh_update_disabled = false;
+    bool beh_no_detect = false;
+    Fixed beh_ranged_range;
+    std::vector<ValidatorOp> beh_disable_ops;
+    std::vector<std::uint16_t> beh_disable_roots;
     Fixed vit_life, vit_life_frac, vit_shields, vit_shields_frac, vit_energy, vit_energy_frac;
     std::uint32_t cd_abil_tag = 0;
     std::uint8_t cd_op = 0;
     Fixed cd_time;
     Fixed missile_speed;
+    Fixed missile_accel{};
     Fixed missile_launch_z, missile_impact_z;
     std::uint8_t missile_launch_loc = 0, missile_impact_loc = 2;
     Fixed persist_expire_delay;
@@ -362,11 +392,29 @@ struct EffectNode {
     std::uint32_t fx_tag = 0;
     std::uint32_t fx_beh_tag = 0;
     std::vector<std::pair<std::uint32_t, Fixed>> fx_spawn_tags{};
+    bool beh_no_life_regen = false, beh_no_shield_regen = false, beh_no_energy_regen = false;
+    Fixed beh_scan_bonus{};
+    bool beh_resp_fatal = false;
+    bool turret_clear = false;
+    bool persist_wait_first = false;
+    bool persist_caster_point = false;
+    Fixed missile_start_speed{};
+    std::vector<EffectRef> periodic_seq{};
+    std::vector<Fixed> period_seq{};
+};
+
+struct EffectFrame {
+    std::uint32_t tag = 0;
+    std::uint32_t unit = kNoTarget;
+    Fixed x, y;
+    std::uint32_t caster = kNoTarget;
 };
 
 struct EffectContext {
     uint32_t source = kNoTarget;
     uint32_t target = kNoTarget;
+    uint32_t holder = kNoTarget;
+    EffectFrame frames[2];
     Fixed sx, sy;
     Fixed tx, ty;
     int32_t origin = -1;
@@ -458,10 +506,21 @@ struct BehaviorInstance {
     bool fx_has_point = false;
     std::vector<ValidatorOp> rv_ops;
     std::vector<std::uint16_t> rv_roots;
+    std::vector<ValidatorOp> dis_ops;
+    std::vector<std::uint16_t> dis_roots;
+    bool update_disabled = false;
+    bool disabled = false;
+    bool no_detect = false;
+    Fixed ranged_range;
+    std::uint32_t fx_frame_tag = 0;
     Fixed fx_period{}, fx_timer{};
     std::uint32_t fx_caster = kNoTarget;
     int32_t fx_origin = -1;
     Fixed food, life_max;
+    bool no_life_regen = false, no_shield_regen = false, no_energy_regen = false;
+    Fixed scan_bonus{};
+    bool resp_fatal = false;
+    EffectFrame rv_frames[2];
 };
 
 struct PersistentInstance {
@@ -492,9 +551,13 @@ struct PersistentInstance {
     bool channeled = false;
     std::vector<ValidatorOp> pval;
     std::vector<std::uint16_t> pval_roots;
+    EffectFrame frames[2];
+    std::vector<EffectRef> periodic_seq{};
+    std::vector<Fixed> period_seq{};
 };
 
 struct PendingEffect {
+    EffectRef interrupt = kNoEffect;
     EffectRef impact = kNoEffect;
     EffectContext ctx;
     Fixed remaining;
@@ -735,6 +798,8 @@ struct Unit {
     std::uint8_t windup_slot = 0;
     Fixed wpn_range_slop{Fixed::from_int(-1)}, wpn2_range_slop{Fixed::from_int(-1)};
     std::uint32_t wpn_tag = 0, wpn2_tag = 0;
+    bool wpn_melee = false, wpn2_melee = false;
+    bool death_finals_fired = false;
     Fixed windup_bs;
     Fixed windup_reach;
     Fixed windup_ps;
@@ -1291,6 +1356,7 @@ public:
                 carriers_.push_back(std::move(c));
             }
         }
+        scan_ids_.push_back(u.id);
         units_.push_back(u);
         if (u.creep_radius > 0) {
             const int period = u.creep_grow_period > 0 ? u.creep_grow_period : 1;
@@ -1320,6 +1386,21 @@ public:
     }
     bool validator_passes(const std::vector<ValidatorOp>& ops, std::uint16_t i, const EffectContext& ctx,
                           bool no_unit_passes = true) const;
+    bool validators_pass(const std::vector<ValidatorOp>& ops, std::uint16_t root, std::uint32_t source, std::uint32_t target) const {
+        EffectContext c;
+        c.source = source;
+        c.target = target;
+        if (source < units_.size()) {
+            c.origin = units_[source].player;
+            c.sx = units_[source].x;
+            c.sy = units_[source].y;
+        }
+        if (target < units_.size()) {
+            c.tx = units_[target].x;
+            c.ty = units_[target].y;
+        }
+        return validator_passes(ops, root, c);
+    }
     static Fixed behavior_armor(const Unit& u, bool shield) {
         Fixed a;
         for (const BehaviorInstance& b : u.behaviors) a = a + (shield ? b.shield_armor_bonus : b.life_armor_bonus);
@@ -1387,6 +1468,17 @@ public:
         for (const BehaviorInstance& b : u.behaviors)
             if (b.permanent || b.timer.raw() > 0) a = a + b.weapon_range;
         return a;
+    }
+    Fixed ranged_range_bonus(const Unit& u) const {
+        Fixed a;
+        for (const BehaviorInstance& b : u.behaviors)
+            if ((b.permanent || b.timer.raw() > 0) && !b.disabled) a = a + b.ranged_range;
+        return a;
+    }
+    static bool detection_suppressed(const Unit& u) {
+        for (const BehaviorInstance& b : u.behaviors)
+            if (b.no_detect && (b.permanent || b.timer.raw() > 0)) return true;
+        return false;
     }
     bool production_disabled(const Unit& u) const {
         for (const BehaviorInstance& b : u.behaviors)
@@ -1787,6 +1879,7 @@ public:
     }
     bool cast_cost_payable(const Unit& u, const Order& o) const;
     bool pay_cast_cost(Unit& u, Order& o);
+    bool effect_would_pass(EffectRef ref, const EffectContext& ctx, int depth) const;
 
     int32_t add_veterancy(VeterancyDef def);
     Fixed supply_used(int32_t p) const;
@@ -1931,6 +2024,9 @@ public:
     bool cancel_worker_build(uint32_t builder, int32_t mineral_cost, int32_t gas_cost);
 
     void set_tech_requirement(std::string unit_id, std::vector<std::string> prereqs);
+    using OrderMorph = std::function<bool(uint32_t unit, const std::string& morph_abil)>;
+    void set_order_morph(OrderMorph f) { order_morph_ = std::move(f); }
+    int order_morph_failures() const { return order_morph_failures_; }
     using TrainGate = std::function<bool(uint32_t producer, const std::string& unit_id, bool at_site)>;
     void set_train_gate(TrainGate gate) { train_gate_ = std::move(gate); }
     using RequirementGate = std::function<bool(int32_t player, const std::string& req_id)>;
@@ -3269,6 +3365,7 @@ private:
  private:
 
     std::vector<Unit> units_;
+    std::vector<uint32_t> scan_ids_;
     std::vector<Player> players_;
     std::vector<Fixed> supply_ceiling_;
     std::vector<Pending> pending_;
@@ -3342,7 +3439,7 @@ private:
                           uint32_t phase_link = kNoTarget; Fixed move_x{}, move_y{};
                           uint32_t gather_node = kNoTarget, depot = kNoTarget;
                           bool exact_point = false; EffectRef fx = kNoEffect; uint32_t fx_source = kNoTarget;
-                          Fixed cast_x{}, cast_y{}; bool has_cast_point = false; };
+                          Fixed cast_x{}, cast_y{}; bool has_cast_point = false; EffectFrame frame0{}, frame1{}; };
     std::vector<PendingSpawn> pending_spawns_;
     std::vector<Fixed> sep_budget_, sep_allowance_, sep_x0_, sep_y0_;
     std::vector<Fixed> sep_in_x_, sep_in_y_;
@@ -3377,12 +3474,14 @@ private:
         int32_t origin;
         Fixed px{}, py{};
         bool has_point = false;
+        std::uint32_t frame_tag = 0;
+        bool holder_dead = false;
     };
     std::vector<BehaviorFx> behavior_fx_;
     void on_unit_damaged(const Unit& u, Fixed vitals_before) {
         if (u.hp + u.shields >= vitals_before) return;
         for (const BehaviorInstance& b : u.behaviors)
-            if (b.fx_resp_handled != kNoEffect && (b.permanent || b.timer.raw() > 0))
+            if (b.fx_resp_handled != kNoEffect && (b.permanent || b.timer.raw() > 0) && (!b.resp_fatal || u.hp.raw() <= 0))
                 behavior_fx_.push_back({b.fx_resp_handled, u.id, b.fx_caster, b.fx_origin, b.fx_px, b.fx_py, b.fx_has_point});
     }
     static void behavior_stats_end(Unit& u, BehaviorInstance& b) {
@@ -3395,7 +3494,7 @@ private:
     }
     void queue_behavior_final(const Unit& u, const BehaviorInstance& b) {
         if (b.fx_final != kNoEffect)
-            behavior_fx_.push_back({b.fx_final, u.id, b.fx_caster, b.fx_origin, b.fx_px, b.fx_py, b.fx_has_point});
+            behavior_fx_.push_back({b.fx_final, u.id, b.fx_caster, b.fx_origin, b.fx_px, b.fx_py, b.fx_has_point, b.fx_frame_tag, !u.alive});
     }
     CmdError last_error_ = CmdError::None;
     int32_t last_error_player_ = -1;
@@ -3422,6 +3521,16 @@ private:
     };
     std::vector<PendingHit> pending_hits_;
     std::vector<PendingEffect> pending_effects_;
+    struct TurretAim {
+        std::uint32_t unit = kNoTarget;
+        std::uint32_t target = kNoTarget;
+        EffectRef complete = kNoEffect;
+        EffectContext ctx;
+        bool done = false;
+    };
+    std::vector<TurretAim> turret_aims_;
+    void step_turret_aims();
+    static bool regen_off(const Unit& u, bool BehaviorInstance::*flag);
     std::vector<VeterancyDef> vet_defs_;
     std::vector<AbilityDef> abilities_;
     std::vector<EffectNode> effects_;
@@ -3464,6 +3573,8 @@ private:
     NavGrid nav_;
     TerrainMap placement_;
     Rng rng_;
+    OrderMorph order_morph_;
+    int order_morph_failures_ = 0;
     uint64_t seed_ = 1;
     int tick_ = 0;
     OrderSink* order_sink_ = nullptr;
@@ -3502,7 +3613,7 @@ private:
     uint32_t acquire_target(const Unit& u, Fixed max_range = Fixed()) const;
     bool detected_by(int32_t player, const Unit& target) const {
         for (const Unit& d : units_) {
-            if (!d.alive || d.detect_range.raw() <= 0 || !are_allied(d.player, player)) continue;
+            if (!d.alive || d.detect_range.raw() <= 0 || !are_allied(d.player, player) || detection_suppressed(d)) continue;
             if (power_disabled(d)) continue;
             const Fixed dx = d.x - target.x, dy = d.y - target.y;
             if (dx * dx + dy * dy <= d.detect_range * d.detect_range) return true;
@@ -3548,6 +3659,8 @@ private:
     static constexpr std::size_t kAllPersistents = std::size_t(-1);
     void step_persistents(Fixed dt, std::size_t only = kAllPersistents);
     bool apply_persistent_now_ = false;
+    int persist_step_depth_ = 0;
+    std::vector<std::pair<PersistentInstance, bool>> persist_overflow_;
     void step_healers(Fixed dt);
     void step_charge();
     void step_bunker_fire(Fixed dt);

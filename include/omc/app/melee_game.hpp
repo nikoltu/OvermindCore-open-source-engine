@@ -1,5 +1,6 @@
 #pragma once
 
+#include "omc/core/env_once.hpp"
 #include <cstdint>
 #include <cstdlib>
 #include <map>
@@ -348,7 +349,7 @@ public:
                          std::int32_t player) const {
         Control c(mvp, view_w, view_h, player);
         c.set_ground_height(&ground_height_);
-        if (!std::getenv("OMC_PICK_EXTENT_OLD")) c.set_pick_volumes(&pick_volumes_);
+        if (!OMC_ENV_ONCE("OMC_PICK_EXTENT_OLD")) c.set_pick_volumes(&pick_volumes_);
         if (select_rules_672_) {
             Control::BoxRules br;
             br.on = true;

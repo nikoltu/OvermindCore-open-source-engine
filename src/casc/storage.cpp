@@ -1,8 +1,10 @@
+#include "omc/core/env_once.hpp"
 #include "omc/casc/storage.hpp"
 
 #include <algorithm>
 #include <cctype>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
@@ -73,10 +75,18 @@ void Storage::open(const std::string& data_dir, const std::string& install_root)
     }
 
     if (has_encoding_ && !root_ckey_hex_.empty()) {
+        const char* cache_dir = std::getenv("OMC_CASC_CACHE_DIR");
+        const bool cacheable = cache_dir && cache_dir[0] && !casc_index_maps_old() && !std::getenv("OMC_CASC_NAMES_PLAIN");
+        const std::string cache_file = cacheable ? std::string(cache_dir) + "/mndx_" + root_ckey_hex_ + ".bin" : std::string();
+        if (cacheable && mndx_.load_cache(cache_file, root_ckey_hex_)) {
+            has_mndx_ = true;
+            return;
+        }
         auto root_blob = read_root();
         if (root_blob.size() >= 4 && std::memcmp(root_blob.data(), "MNDX", 4) == 0) {
             mndx_.parse(root_blob);
             has_mndx_ = true;
+            if (cacheable) mndx_.save_cache(cache_file, root_ckey_hex_);
         }
     }
 }
@@ -217,7 +227,7 @@ std::vector<uint8_t> Storage::read_by_name(const std::string& path) const {
             if (std::getenv("OMC_MAP_ASSETS_TRACE")) std::fprintf(stderr, "[mapassets] read %s from the map\n", path.c_str());
             return *ov;
         }
-        if (std::getenv("OMC_MAP_ASSETS_TRACE") && to_lower(path).find(".m3") != std::string::npos)
+        if (OMC_ENV_ONCE("OMC_MAP_ASSETS_TRACE") && to_lower(path).find(".m3") != std::string::npos)
             std::fprintf(stderr, "[mapassets] read %s from the stores\n", path.c_str());
         if (!has_mndx_) throw std::runtime_error("storage: MNDX names not loaded");
         const CKey* ck = mndx_.resolve(path);

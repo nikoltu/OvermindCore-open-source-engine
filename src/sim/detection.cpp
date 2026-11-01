@@ -35,7 +35,7 @@ void DetectionGrid::compute(const World& world, int32_t player, Fixed detect_rad
     const Fixed half = Fixed::from_raw(cell_.raw() / 2);
 
     for (const Unit& u : world.units()) {
-        if (!u.alive || u.player != player || !u.detector) continue;
+        if (!u.alive || u.player != player || !u.detector || World::detection_suppressed(u)) continue;
 
         const Fixed dr = u.detect_range.raw() > 0 ? u.detect_range : detect_radius;
         const int64_t r2 = int64_t(dr.raw()) * int64_t(dr.raw());

@@ -1,3 +1,4 @@
+#include "omc/core/env_once.hpp"
 #include "omc/app/ability.hpp"
 
 #include <algorithm>
@@ -62,6 +63,7 @@ static void parse_ability_filters(const data::Catalog& cat, const std::string& a
         if (t == "HasEnergy") b.require_energy = true;
         else if (t == "CanHaveEnergy") b.require_energy_pool = std::getenv("OMC_NO_CAN_HAVE_ENERGY") == nullptr;
         else if (t == "Ground") b.requires_ground = true;
+        else if (t == "Air") b.requires_air = std::getenv("OMC_BLIND_EFFECTS_OLD") == nullptr;
         else b.req_attr_mask |= filter_attr_bit(t);
     });
     each(exc, [&](const std::string& t) { b.exc_attr_mask |= filter_attr_bit(t); });
@@ -133,7 +135,17 @@ AbilTargetMode ability_target_mode(const data::Catalog& cat, const std::string& 
         const auto* tagged = cat.find("CAbil", abil_id);
         if (tagged && tagged->tag == "CAbilRedirectInstant") return AbilTargetMode::Instant;
         if (tagged && tagged->tag == "CAbilEffectTarget") {
-            const std::string loc = cat.scalar("CEffect", cat.cabil_effect_link(abil_id), "TargetLocationType").value_or("");
+            static const bool kBlindModeOld = std::getenv("OMC_BLIND_EFFECTS_OLD") != nullptr;
+            const std::string root = cat.cabil_effect_link(abil_id);
+            if (!kBlindModeOld && cat.effect_subclass(root).empty()) return AbilTargetMode::Instant;
+            std::string loc = cat.scalar("CEffect", root, "TargetLocationType").value_or("");
+            if (!kBlindModeOld && loc.empty() && cat.effect_subclass(root) == "CreatePersistent")
+                loc = cat.scalar("CEffect", cat.scalar("CEffect", root, "PeriodicEffectArray").value_or(""), "TargetLocationType").value_or("");
+            if (!kBlindModeOld && loc.empty() && !cat.scalar("CAbil", abil_id, "CursorEffect").value_or("").empty())
+                for (const core::XmlNode& f : cat.resolved("CEffect", root))
+                    if (f.name == "ValidatorArray")
+                        if (const auto* ve = cat.find("CValidator", f.attr_or("value", "")); ve && ve->tag == "CValidatorUnitType")
+                            return AbilTargetMode::Unit;
             if (loc == "Point" || loc == "UnitOrPoint") return AbilTargetMode::Point;
             if (loc == "Unit") return AbilTargetMode::Unit;
             if (!cat.scalar("CAbil", abil_id, "CursorEffect").value_or("").empty()) return AbilTargetMode::Point;
@@ -373,7 +385,7 @@ void apply_unit_upgrades(const data::Catalog& cat, const data::UpgradeCatalog& u
 
     u.speed        = Fixed::from_double(fold_field(up, researched, "Unit", unit_name, "Speed",
                                                    u.speed.to_double()));
-    if (!std::getenv("OMC_UPGRADE_NO_ACCEL_FOLD"))
+    if (!OMC_ENV_ONCE("OMC_UPGRADE_NO_ACCEL_FOLD"))
         u.accel = Fixed::from_double(fold_field(up, researched, "Unit", unit_name, "Acceleration",
                                                 u.accel.to_double()));
     u.shield_armor = Fixed::from_double(fold_field(up, researched, "Unit", unit_name, "ShieldArmor",
@@ -1201,6 +1213,9 @@ static std::optional<AbilityBuild> make_ability_cascade(const data::Catalog& cat
         buff_attr_bonus(*bb, b.def.beh_wpn_bonus_attr, b.def.beh_wpn_bonus_amount);
         b.def.beh_suppress_collision = bb->suppress_collision;
         b.def.beh_suppress_passenger = bb->suppress_passenger;
+        b.def.beh_no_life_regen = bb->no_life_regen;
+        b.def.beh_no_shield_regen = bb->no_shield_regen;
+        b.def.beh_no_energy_regen = bb->no_energy_regen;
         b.def.beh_speed_cap = bb->move_speed_max >= 0.0 ? sim::Fixed::from_double(bb->move_speed_max)
                                                         : sim::Fixed::from_int(-1);
         b.def.beh_disable_spawner = bb->disable_spawner;
@@ -1304,10 +1319,11 @@ void unread_modification(const data::Catalog& cat, const std::string& beh, std::
                          std::vector<std::string>& tolerated) {
     static const char* const kAttrs[] = {"MoveSpeedMultiplier", "DecelerationMultiplier", "MoveSpeedMaximum",
                                          "WeaponRange", "AttackSpeedMultiplier", "LifeArmorBonus", "ShieldArmorBonus",
-                                         "Food"};
+                                         "Food", "WeaponScanBonus"};
     static const char* const kState[] = {"Stun", "SuppressAttack", "Invulnerable", "Uncommandable", "Untargetable",
                                          "SuppressCloak", "SuppressCollision", "SuppressPassenger", "Benign", "Passive",
-                                         "NoDraw", "Unselectable", "IsKiting", "Summoned"};
+                                         "NoDraw", "Unselectable", "IsKiting", "Summoned", "SuppressLifeRegen",
+                                         "SuppressShieldsRegen", "SuppressEnergyRegen", "Stasis", "Unstoppable"};
     static const char* const kAbilClass[] = {"CAbilAttack", "CAbilMove", "CAbilTrain", "CAbilQueue", "CAbilWarpTrain",
                                              "CAbilMorph", "CAbilMorphPlacement", "CAbilTransport"};
     auto in = [](const std::string& v, const char* const* list, std::size_t count) {
@@ -1315,20 +1331,40 @@ void unread_modification(const data::Catalog& cat, const std::string& beh, std::
             if (v == list[i]) return true;
         return false;
     };
+    static const bool kBlindOld = std::getenv("OMC_BLIND_EFFECTS_OLD") != nullptr;
+    static const char* const kAttrsNew[] = {"RangedWeaponRange", "DetectArc", "RadarArc"};
+    const std::size_t n_attrs = sizeof(kAttrs) / sizeof(kAttrs[0]) - (OMC_ENV_ONCE("OMC_LOCK_ON_OLD") ? 1 : 0);
+    const std::size_t n_state = sizeof(kState) / sizeof(kState[0]) - (OMC_ENV_ONCE("OMC_REGEN_SUPPRESS_OLD") ? 5 : 0);
     for (const core::XmlNode& m : cat.resolved("CBehavior", beh)) {
         if (m.name != "Modification") continue;
         for (const auto& a : m.attrs)
-            if (!in(a.first, kAttrs, sizeof(kAttrs) / sizeof(kAttrs[0]))) out.push_back("Modification." + a.first);
+            if (!in(a.first, kAttrs, n_attrs) &&
+                (kBlindOld || !in(a.first, kAttrsNew, sizeof(kAttrsNew) / sizeof(kAttrsNew[0]))))
+                out.push_back("Modification." + a.first);
         for (const core::XmlNode& g : m.children) {
             const std::string idx = g.attr_or("index", ""), val = g.attr_or("value", "");
-            if (in(g.name, kAttrs, sizeof(kAttrs) / sizeof(kAttrs[0])) || g.name == "RateMultiplierArray" ||
+            if (in(g.name, kAttrs, n_attrs) || g.name == "RateMultiplierArray" ||
                 g.name == "WeaponDisableArray" || g.name == "AbilLinkDisableArray")
                 continue;
             if (g.name == "VitalMaxArray" && idx == "Life") continue;
+            static const bool kWeaponRowOld = std::getenv("OMC_LOCK_ON_OLD") != nullptr;
+            if (!kWeaponRowOld && g.name == "WeaponArray") {
+                bool removed = false;
+                for (const core::XmlNode& mm : cat.resolved("CBehavior", beh))
+                    if (mm.name == "Modification")
+                        for (const core::XmlNode& w : mm.children)
+                            if (w.name == "WeaponArray" && w.attr_or("removed", "") == "1") removed = true;
+                if (removed) continue;
+            }
             if (g.name == "StateFlags") {
-                if (val == "0" || in(idx, kState, sizeof(kState) / sizeof(kState[0]))) continue;
+                if (val == "0" || in(idx, kState, n_state)) continue;
+                if (!kBlindOld && idx == "SuppressCombat") {
+                    tolerated.push_back("Modification.StateFlags[SuppressCombat]");
+                    continue;
+                }
             } else if (g.name == "ModifyFlags") {
                 if (val == "0" || idx == "DisableAbils" || idx == "SuppressMoving" || idx == "SuppressTurning") continue;
+                if (!kBlindOld && (idx == "EnableAttack" || idx == "EnableMove")) continue;
             } else if (g.name == "AbilClassDisableArray") {
                 if (val == "0" || in(idx, kAbilClass, sizeof(kAbilClass) / sizeof(kAbilClass[0]))) continue;
             } else if (g.name == "BehaviorLinkDisableArray") {
@@ -1354,17 +1390,48 @@ static int compare_code(const std::string& cmp) {
 }
 
 bool g_full_validators = false;
+bool g_autocast_validators = false;
 std::vector<std::string>* g_full_tolerated = nullptr;
+int compile_validator(const data::Catalog& cat, const std::string& vid, std::vector<sim::ValidatorOp>& ops,
+                      int depth, bool inverted, bool strict = false);
 
 int compile_validator(const data::Catalog& cat, const std::string& vid, std::vector<sim::ValidatorOp>& ops,
-                      int depth, bool inverted, bool strict = false) {
+                      int depth, bool inverted, bool strict) {
     if (vid.empty() || depth > 8) return -1;
     const data::Catalog::Entry* ve = cat.find("CValidator", vid);
     if (!ve) return -1;
     sim::ValidatorOp op;
     op.negate = cat.scalar("CValidator", vid, "Negate").value_or("0") == "1";
     op.on_caster = which_unit(cat, "CValidator", vid).on_caster();
+    static const bool kBlindOld = std::getenv("OMC_BLIND_EFFECTS_OLD") != nullptr;
+    if (!kBlindOld && which_unit(cat, "CValidator", vid).value == "Source") op.on_source = true;
     const std::string& tag = ve->tag;
+    if (!kBlindOld && tag == "CValidatorUnitCompareOrderCount") {
+        const std::string link = cat.scalar("CValidator", vid, "AbilLink").value_or("");
+        const int code = compare_code(validator_field(cat, vid, tag, "Compare", "EQ"));
+        if (link.empty() || code < 0) return -1;
+        op.kind = sim::ValidatorOp::OrderCount;
+        op.abil_tag = behavior_id_hash(link);
+        op.cmp = std::uint8_t(code);
+        op.count_value = std::atoi(validator_field(cat, vid, tag, "Value", "0").c_str());
+        ops.push_back(std::move(op));
+        return int(ops.size()) - 1;
+    }
+    if (!kBlindOld && tag == "CValidatorUnitOrderQueue") {
+        const std::string link = cat.scalar("CValidator", vid, "AbilLink").value_or("");
+        std::string low = link;
+        for (char& c : low)
+            if (c >= 'A' && c <= 'Z') c = char(c - 'A' + 'a');
+        if (!link.empty() && low != "attack" && low != "move" && low != "patrol" && low != "gather" && low != "harvest" && low != "stop") {
+            const bool find = cat.scalar("CValidator", vid, "Find").value_or("1") != "0";
+            op.kind = sim::ValidatorOp::OrderCount;
+            op.abil_tag = behavior_id_hash(link);
+            op.cmp = std::uint8_t(find ? 4 : 0);
+            op.count_value = 0;
+            ops.push_back(std::move(op));
+            return int(ops.size()) - 1;
+        }
+    }
     if (tag == "CValidatorCombine") {
         op.kind = validator_field(cat, vid, tag, "Type", "Or") == "And" ? sim::ValidatorOp::And
                                                                          : sim::ValidatorOp::Or;
@@ -1392,7 +1459,10 @@ int compile_validator(const data::Catalog& cat, const std::string& vid, std::vec
         const std::string val = validator_field(cat, vid, tag, "Value", "0");
         const bool none = (cmp == "EQ" && val == "0") || (cmp == "LT" && val == "1") || (cmp == "LE" && val == "0");
         if (beh.empty()) return -1;
-        if (none && !strict && inverted == op.negate) {
+        if (g_autocast_validators && none && beh == "PowerUserWarpable") {
+            op.kind = sim::ValidatorOp::Filters;
+            op.exc_warping = true;
+        } else if (none && !strict && inverted == op.negate) {
             op.kind = sim::ValidatorOp::NoBehavior;
             op.behavior = behavior_id_hash(beh);
         } else {
@@ -1461,8 +1531,10 @@ int compile_validator(const data::Catalog& cat, const std::string& vid, std::vec
         } else if (tag == "CValidatorUnitCompareResourceContents") {
             op.field = 1;
         } else if (tag == "CValidatorUnitCompareField") {
-            if (cat.scalar("CValidator", vid, "Field").value_or("") != "Radius") return -1;
-            op.field = 2;
+            const std::string fld = cat.scalar("CValidator", vid, "Field").value_or("");
+            if (fld == "Height" && !kBlindOld) op.field = 4;
+            else if (fld != "Radius") return -1;
+            else op.field = 2;
         } else {
             const std::string abil = cat.scalar("CValidator", vid, "Ability").value_or("");
             if (abil.empty()) return -1;
@@ -1558,10 +1630,49 @@ int compile_validator(const data::Catalog& cat, const std::string& vid, std::vec
             if (k < 0) return -1;
             op.kids.push_back(std::uint16_t(k));
         }
+    } else if (tag == "CValidatorCondition" && g_full_validators) {
+        static const bool kLockOnOld = std::getenv("OMC_LOCK_ON_OLD") != nullptr;
+        if (kLockOnOld) return -1;
+        std::vector<std::uint16_t> rows;
+        for (const core::XmlNode& n : cat.resolved("CValidator", vid)) {
+            if (n.name != "IfArray") continue;
+            const int t = compile_validator(cat, n.attr_or("Test", ""), ops, depth + 1, false, strict);
+            const int ret = compile_validator(cat, n.attr_or("Return", ""), ops, depth + 1, false, strict);
+            if (t < 0 || ret < 0) return -1;
+            if (ops[std::size_t(ret)].kind == sim::ValidatorOp::Filters &&
+                cat.scalar("CValidator", n.attr_or("Return", ""), "Filters").value_or("").rfind("Visible", 0) == 0)
+                ops[std::size_t(ret)].req_visible = true;
+            sim::ValidatorOp no;
+            no.kind = sim::ValidatorOp::Or;
+            no.negate = true;
+            no.kids.push_back(std::uint16_t(t));
+            ops.push_back(no);
+            const int nt = int(ops.size()) - 1;
+            sim::ValidatorOp either;
+            either.kind = sim::ValidatorOp::Or;
+            either.kids.push_back(std::uint16_t(nt));
+            either.kids.push_back(std::uint16_t(ret));
+            ops.push_back(either);
+            rows.push_back(std::uint16_t(ops.size() - 1));
+        }
+        if (rows.empty()) return -1;
+        op.kind = sim::ValidatorOp::And;
+        op.kids = rows;
+    } else if (g_autocast_validators && tag == "CValidatorUnitAbil") {
+        op.kind = sim::ValidatorOp::Compare;
+        op.field = 5;
+        op.cmp = std::uint8_t(compare_code("GE"));
+        op.value = sim::Fixed::from_int(1);
+        if (cat.scalar("CValidator", vid, "Find").value_or("1") == "0") op.negate = !op.negate;
     } else if (tag == "CValidatorLocationPathable") {
         op.kind = sim::ValidatorOp::Pathable;
     } else if (tag == "CValidatorUnitFilters") {
         op.kind = sim::ValidatorOp::Filters;
+        static const bool kLockOnOld = std::getenv("OMC_LOCK_ON_OLD") != nullptr;
+        if (!kLockOnOld)
+            for (const core::XmlNode& wu : cat.resolved("CValidator", vid))
+                if (wu.name == "WhichUnit")
+                    if (const std::string* fx = wu.attr("Effect"); fx && !fx->empty()) op.frame_tag = behavior_id_hash(*fx);
         const std::string f = cat.scalar("CValidator", vid, "Filters").value_or("");
         const std::size_t semi = f.find(';');
         const std::string req = f.substr(0, semi), exc = semi == std::string::npos ? "" : f.substr(semi + 1);
@@ -1583,6 +1694,8 @@ int compile_validator(const data::Catalog& cat, const std::string& vid, std::vec
         each(req, [&](const std::string& t) {
             if (g_full_validators && t == "-") return;
             if (g_full_validators && t == "Visible") return;
+            if (g_full_validators && !kLockOnOld && t == "Cloaked") { op.req_cloaked = true; modelled = true; return; }
+            if (g_full_validators && !kLockOnOld && t == "Buried") { op.req_buried = true; modelled = true; return; }
             if (g_full_validators && (t == "Missile" || t == "Dead" || t == "Hidden" || t == "Item")) { never = true; return; }
             if (t == "Ground") { op.req_plane |= 1; modelled = true; }
             else if (t == "Air") { op.req_plane |= 2; modelled = true; }
@@ -1590,6 +1703,9 @@ int compile_validator(const data::Catalog& cat, const std::string& vid, std::vec
             else whole = false;
         });
         each(exc, [&](const std::string& t) {
+            if (op.frame_tag != 0 && t == "Dead") { op.exc_dead = true; modelled = true; return; }
+            if (!kLockOnOld && t == "Stunned") { op.exc_stunned = true; modelled = true; return; }
+            if (g_autocast_validators && t == "Hidden") { op.exc_hidden = true; modelled = true; return; }
             if (g_full_validators && (t == "-" || inert(t))) return;
             const std::uint8_t rel = t == "Self" ? 1 : t == "Player" ? 2 : t == "Ally" ? 4 : t == "Enemy" ? 8
                                    : t == "Neutral" ? 16 : 0;
@@ -1648,6 +1764,7 @@ int32_t build_effect_rec(const data::Catalog& cat, const std::string& eff, Abili
     if (idx >= 0) attach_validators(cat, eff, b.tree[std::size_t(idx)], b.full_tree ? &b.unbuilt : nullptr);
     if (idx >= 0 && !eff.empty()) {
         sim::EffectNode& tn = b.tree[std::size_t(idx)];
+        if (tn.frame_tag == 0) tn.frame_tag = behavior_id_hash(eff);
         if (tn.fx_tag == 0 &&
             (!cat.actors_on("Effect", eff, "Start").empty() || !cat.actors_on("Effect", eff, "Stop").empty()))
             tn.fx_tag = behavior_id_hash(eff);
@@ -1660,8 +1777,23 @@ int32_t build_effect_rec(const data::Catalog& cat, const std::string& eff, Abili
         for (const core::XmlNode& f : cat.resolved("CEffect", eff))
             if (f.name == "WhichUnit" || f.name == "ImpactUnit" || f.name == "LaunchUnit" || f.name == "WhichLocation" ||
                 f.name == "ImpactLocation" || f.name == "LaunchLocation" || f.name == "TargetLocation")
-                if (const std::string* fx = f.attr("Effect"); fx && !fx->empty())
+                if (const std::string* fx = f.attr("Effect"); fx && !fx->empty()) {
+                    static const bool kBlindOld = std::getenv("OMC_BLIND_EFFECTS_OLD") != nullptr;
+                    if (!kBlindOld && f.name == "LaunchUnit" && cat.effect_subclass(eff) == "TransferBehavior") continue;
+                    const std::string fv = f.attr_or("Value", "");
+                    const std::string fsub = cat.effect_subclass(eff);
+                    if (!kBlindOld && (f.name == "WhichUnit" || f.name == "ImpactUnit" || f.name == "ImpactLocation") &&
+                        (fsub == "ApplyBehavior" || fsub == "Damage" || fsub == "ModifyUnit") &&
+                        (fv.empty() || fv == "TargetUnit" || fv == "Caster")) {
+                        sim::EffectNode& fn = b.tree[std::size_t(idx)];
+                        fn.ctx_frame = behavior_id_hash(*fx);
+                        fn.ctx_frame_caster = fv == "Caster";
+                        fn.beh_on_caster = false;
+                        b.frame_refs.push_back(fn.ctx_frame);
+                        continue;
+                    }
                     b.unbuilt.push_back("Frame " + f.name + " Effect=" + *fx + " on " + eff);
+                }
     if (const char* t = std::getenv("OMC_ABIL_TRACE"); t && *t && *t != '0')
         std::fprintf(stderr, "[abil] %*s%s (%s) -> %s\n", depth * 2, "", eff.c_str(),
                      cat.effect_subclass(eff).c_str(), idx >= 0 ? "built" : "REFUSED");
@@ -1687,9 +1819,40 @@ int32_t build_effect_node(const data::Catalog& cat, const std::string& eff, Abil
         n.spawn_neutral = effect_cap_value(cat, eff, "SpawnOwner") == "Neutral";
         n.area_at_source = names_caster_location(effect_cap_value(cat, eff, "WhichLocation"));
         n.spawn_exact = true;
+        static const bool kBlindOld = std::getenv("OMC_BLIND_EFFECTS_OLD") != nullptr;
+        if (!kBlindOld) n.area_at_holder = effect_cap_value(cat, eff, "WhichLocation").rfind("Source", 0) == 0;
         if (const std::string se = cat.scalar("CEffect", eff, "SpawnEffect").value_or(""); !se.empty()) {
             n.initial = build_effect_rec(cat, se, b, depth + 1);
             if (n.initial < 0) return -1;
+        }
+        if (!kBlindOld) {
+            std::vector<int32_t> own;
+            for (const std::string& ub : cat.array_links("CUnit", unit, "BehaviorArray")) {
+                const auto ubb = ub.empty() ? std::nullopt : cat.behavior_buff(ub);
+                if (!ubb || ubb->final_effect.empty()) continue;
+                sim::EffectNode k;
+                k.kind = sim::EffectKind::ApplyBehavior;
+                k.behavior_tag = behavior_id_hash(ub);
+                k.duration = sim::Fixed::from_double(ubb->duration);
+                k.beh_self_caster = true;
+                k.final_effect = build_effect_rec(cat, ubb->final_effect, b, depth + 1);
+                if (k.final_effect < 0) return -1;
+                for (const std::string& vid : cat.array_links("CBehavior", ub, "DisableValidatorArray")) {
+                    const int r = compile_validator(cat, vid, k.beh_disable_ops, 0, false);
+                    if (r < 0) return -1;
+                    k.beh_disable_roots.push_back(std::uint16_t(r));
+                }
+                b.tree.push_back(std::move(k));
+                own.push_back(int32_t(b.tree.size()) - 1);
+            }
+            if (!own.empty()) {
+                if (n.initial >= 0) own.insert(own.begin(), n.initial);
+                sim::EffectNode both;
+                both.kind = sim::EffectKind::Set;
+                both.children = own;
+                b.tree.push_back(std::move(both));
+                n.initial = int32_t(b.tree.size()) - 1;
+            }
         }
         for (const core::XmlNode& f : cat.resolved("CEffect", eff))
             if (f.name == "CreateFlags" && f.attr_or("value", "1") != "0") {
@@ -1705,6 +1868,7 @@ int32_t build_effect_node(const data::Catalog& cat, const std::string& eff, Abil
     if (sub == "LaunchMissile") {
         const std::string impact = cat.scalar("CEffect", eff, "ImpactEffect").value_or("");
         int32_t child = -1;
+        sim::EffectRef missile_interrupt = sim::kNoEffect;
         if (!impact.empty()) {
             child = build_effect_rec(cat, impact, b, depth + 1);
             if (child < 0) return -1;
@@ -1723,16 +1887,32 @@ int32_t build_effect_node(const data::Catalog& cat, const std::string& eff, Abil
                     child = int32_t(b.tree.size()) - 1;
                 }
             }
+            static const bool kBlindOld = std::getenv("OMC_BLIND_EFFECTS_OLD") != nullptr;
             for (const char* fld : {"LaunchEffect", "InterruptEffect"})
-                if (const std::string v = cat.scalar("CEffect", eff, fld).value_or(""); !v.empty())
+                if (const std::string v = cat.scalar("CEffect", eff, fld).value_or(""); !v.empty()) {
+                    if (!kBlindOld && std::string(fld) == "InterruptEffect") {
+                        missile_interrupt = build_effect_rec(cat, v, b, depth + 1);
+                        if (missile_interrupt < 0) return -1;
+                        continue;
+                    }
                     b.unbuilt.push_back(std::string(fld) + " " + v + " on " + eff);
+                }
         }
-        const std::optional<double> speed = cat.effect_missile_speed(eff);
+        std::optional<double> speed = cat.effect_missile_speed(eff);
+        double ammo_accel = 0.0;
+        static const bool kBlindMoverOld = std::getenv("OMC_BLIND_EFFECTS_OLD") != nullptr;
+        if (!kBlindMoverOld && b.full_tree)
+            if (const auto movers = cat.effect_missile_movers(eff); !movers.empty()) ammo_accel = movers.front().accel;
         if (!speed || *speed <= 0.0) return child;
         sim::EffectNode n;
         n.kind = sim::EffectKind::LaunchMissile;
         n.impact = child;
+        n.missile_interrupt = missile_interrupt;
         n.missile_speed = sim::Fixed::from_double(*speed);
+        n.missile_accel = sim::Fixed::from_double(ammo_accel);
+        static const bool kStartSpeedOld = std::getenv("OMC_LOCK_ON_OLD") != nullptr;
+        if (!kStartSpeedOld && ammo_accel > 0.0)
+            n.missile_start_speed = sim::Fixed::from_double(cat.effect_missile_movers(eff).front().speed);
         auto loc = [&](const char* fld, std::uint8_t def) {
             std::uint8_t out = def;
             for (const core::XmlNode& x : cat.resolved("CEffect", eff)) {
@@ -1840,21 +2020,52 @@ int32_t build_effect_node(const data::Catalog& cat, const std::string& eff, Abil
         };
         if (!edge("InitialEffect", n.initial) || !edge("ExpireEffect", n.expire) || !edge("FinalEffect", n.final_effect))
             return -1;
-        if (!per && n.initial < 0 && n.expire < 0 && n.final_effect < 0 && !(b.full_tree && n.periodic >= 0))
-            return -1;
+        if (!per && n.initial < 0 && n.expire < 0 && n.final_effect < 0 && !(b.full_tree && n.periodic >= 0)) {
+            static const bool kRevealOld = std::getenv("OMC_REGEN_SUPPRESS_OLD") != nullptr;
+            if (kRevealOld || !b.full_tree || !cat.scalar_num("CEffect", eff, "RevealRadius")) return -1;
+            b.tolerated.push_back("RevealRadius on " + eff);
+            sim::EffectNode nn;
+            nn.kind = sim::EffectKind::Set;
+            b.tree.push_back(std::move(nn));
+            return int32_t(b.tree.size()) - 1;
+        }
         n.persist_channeled = cat.effect_flag_set(eff, "Channeled");
+        static const bool kLockOnOld = std::getenv("OMC_LOCK_ON_OLD") != nullptr;
+        n.persist_wait_first = !kLockOnOld && b.full_tree && !per && n.initial < 0 && n.periodic >= 0 && n.period.raw() > 0 &&
+                               n.period_count > 0 && !n.periodic_validator_roots.empty();
         if (b.full_tree) {
             const std::string where = effect_cap_value(cat, eff, "WhichLocation");
             if (where == "TargetUnit") n.persist_follow_target = true;
             else if (where == "CasterUnit" || where == "SourceUnit") n.persist_follow_source = true;
+            else if (where == "CasterPoint" && !std::getenv("OMC_REGEN_SUPPRESS_OLD")) n.persist_caster_point = true;
             else if (!where.empty() && where != "TargetPoint" && where != "TargetUnitOrPoint")
                 b.unbuilt.push_back("WhichLocation " + where + " on " + eff);
             std::string first;
+            bool varies = false;
             for (const std::string& pe : cat.array_links("CEffect", eff, "PeriodicEffectArray")) {
                 if (pe.empty()) continue;
                 if (first.empty()) first = pe;
-                else if (pe != first) { b.unbuilt.push_back("PeriodicEffectArray varies on " + eff); break; }
+                else if (pe != first) { varies = true; break; }
             }
+            static const bool kRegenOld = std::getenv("OMC_REGEN_SUPPRESS_OLD") != nullptr;
+            if (varies && kRegenOld) b.unbuilt.push_back("PeriodicEffectArray varies on " + eff);
+            if (varies && !kRegenOld) {
+                for (const std::string& pe : cat.array_links("CEffect", eff, "PeriodicEffectArray")) {
+                    const int32_t k = build_effect_rec(cat, pe, b, depth + 1);
+                    if (k < 0) return -1;
+                    n.periodic_seq.push_back(k);
+                }
+                for (const std::string& pp : cat.array_links("CEffect", eff, "PeriodicPeriodArray"))
+                    n.period_seq.push_back(sim::Fixed::from_double(std::strtod(pp.c_str(), nullptr)));
+                if (n.periodic_seq.empty() || n.period_seq.empty()) return -1;
+                n.periodic = n.periodic_seq.front();
+                n.period = n.period_seq.front();
+                n.persist_wait_first = true;
+            }
+            static const bool kBlindCpOld = std::getenv("OMC_BLIND_EFFECTS_OLD") != nullptr;
+            if (!kBlindCpOld && n.period_count <= 0 && cat.effect_flag_set(eff, "PersistUntilDestroyed") &&
+                (!n.periodic_validator_roots.empty() || n.persist_follow_target))
+                n.period_count = 1 << 28;
             if (n.periodic >= 0 && n.period_count <= 0) b.unbuilt.push_back("PeriodCount absent on " + eff);
             if (!cat.array_links("CEffect", eff, "PeriodicOffsetArray").empty())
                 b.unbuilt.push_back("PeriodicOffsetArray on " + eff);
@@ -1888,12 +2099,26 @@ int32_t build_effect_node(const data::Catalog& cat, const std::string& eff, Abil
         std::vector<sim::ValidatorOp> case_ops;
         std::vector<std::uint16_t> case_roots;
         int32_t uncond = -1;
+        struct CaseRow { std::string effect, validator; };
+        std::vector<CaseRow> case_rows;
+        static const bool kCaseOld = std::getenv("OMC_LOCK_ON_OLD") != nullptr;
         for (const core::XmlNode& node : cat.resolved("CEffect", eff)) {
             if (node.name != "CaseArray") continue;
-            const std::string* cef = node.attr("Effect");
-            if (!cef || cef->empty()) continue;
-            const std::string* vid = node.attr("Validator");
-            if (!vid || vid->empty()) {
+            const std::string ix = node.attr_or("index", "");
+            if (!kCaseOld && !ix.empty()) {
+                const std::size_t at = std::size_t(std::strtoul(ix.c_str(), nullptr, 10));
+                if (case_rows.size() <= at) case_rows.resize(at + 1);
+                if (const std::string* v = node.attr("Effect")) case_rows[at].effect = *v;
+                if (const std::string* v = node.attr("Validator")) case_rows[at].validator = *v;
+            } else {
+                case_rows.push_back({node.attr_or("Effect", ""), node.attr_or("Validator", "")});
+            }
+        }
+        for (const CaseRow& row : case_rows) {
+            if (row.effect.empty()) continue;
+            const std::string* cef = &row.effect;
+            const std::string* vid = &row.validator;
+            if (vid->empty()) {
                 uncond = build_effect_rec(cat, *cef, b, depth + 1);
                 if (uncond < 0) return -1;
                 break;
@@ -1945,8 +2170,90 @@ int32_t build_effect_node(const data::Catalog& cat, const std::string& eff, Abil
         b.tree.push_back(std::move(n));
         return int32_t(b.tree.size()) - 1;
     }
+    if (sub == "ModifyPlayer") {
+        static const bool kBlindOld = std::getenv("OMC_BLIND_EFFECTS_OLD") != nullptr;
+        if (kBlindOld || !b.full_tree) return -1;
+        sim::EffectNode n;
+        n.kind = sim::EffectKind::ModifyPlayer;
+        for (const core::XmlNode& f : cat.resolved("CEffect", eff)) {
+            if (f.name == "Resources") {
+                const std::string ix = f.attr_or("index", "");
+                const int v = std::atoi(f.attr_or("value", "0").c_str());
+                if (ix == "Minerals") n.res_minerals = v;
+                else if (ix == "Vespene") n.res_gas = v;
+                else if (v != 0) b.unbuilt.push_back("Resources " + ix + " on " + eff);
+            } else if (f.name == "Upgrades") {
+                b.unbuilt.push_back("Upgrades on " + eff);
+            }
+        }
+        b.tree.push_back(std::move(n));
+        return int32_t(b.tree.size()) - 1;
+    }
+    if (sub == "RandomPointInCircle") {
+        static const bool kBlindOld = std::getenv("OMC_BLIND_EFFECTS_OLD") != nullptr;
+        if (kBlindOld || !b.full_tree) return -1;
+        const int32_t child = build_effect_rec(cat, cat.scalar("CEffect", eff, "Effect").value_or(""), b, depth + 1);
+        if (child < 0) return -1;
+        sim::EffectNode n;
+        n.kind = sim::EffectKind::RandomPointInCircle;
+        n.children = {child};
+        n.circle_radius = sim::Fixed::from_double(cat.scalar_num("CEffect", eff, "Radius").value_or(0));
+        n.circle_edge = cat.scalar_num("CEffect", eff, "RestrictToCircumference").value_or(0) != 0;
+        b.tree.push_back(std::move(n));
+        return int32_t(b.tree.size()) - 1;
+    }
+    if (sub == "EnumTransport") {
+        static const bool kBlindOld = std::getenv("OMC_BLIND_EFFECTS_OLD") != nullptr;
+        if (kBlindOld) return -1;
+        const std::string each = cat.scalar("CEffect", eff, "Effect").value_or("");
+        const int32_t child = build_effect_rec(cat, each, b, depth + 1);
+        if (child < 0) return -1;
+        sim::EffectNode n;
+        n.kind = sim::EffectKind::EnumTransport;
+        n.children = {child};
+        b.tree.push_back(std::move(n));
+        return int32_t(b.tree.size()) - 1;
+    }
     if (sub == "IssueOrder") {
         const std::string abil = cat.scalar("CEffect", eff, "Abil").value_or("");
+        static const bool kBlindOrderOld = std::getenv("OMC_BLIND_EFFECTS_OLD") != nullptr;
+        if (const data::Catalog::Entry* ae = abil.empty() ? nullptr : cat.find("CAbil", abil);
+            !kBlindOrderOld && b.full_tree && ae && ae->tag.rfind("CAbilEffect", 0) == 0) {
+            const std::string ordered = cat.cabil_effect_link(abil);
+            const int32_t body = build_effect_rec(cat, ordered, b, depth + 1);
+            if (body < 0) return -1;
+            sim::EffectNode n;
+            n.kind = sim::EffectKind::IssueOrder;
+            n.issue_effect = body;
+            n.beh_on_caster = which_unit(cat, "CEffect", eff).on_caster();
+            n.issue_range = sim::Fixed::from_double(cat.scalar_num("CAbil", abil, "Range").value_or(0));
+            for (const core::XmlNode& f : cat.resolved("CEffect", eff))
+                if (f.name == "Target")
+                    if (const std::string* fx = f.attr("Effect"); fx && !fx->empty()) {
+                        n.issue_frame = behavior_id_hash(*fx);
+                        b.frame_refs.push_back(n.issue_frame);
+                    }
+            b.tree.push_back(std::move(n));
+            return int32_t(b.tree.size()) - 1;
+        }
+        if (const data::Catalog::Entry* ae = abil.empty() ? nullptr : cat.find("CAbil", abil);
+            !kBlindOrderOld && b.full_tree && ae && ae->tag == "CAbilMorph") {
+            sim::EffectNode n;
+            n.kind = sim::EffectKind::IssueOrder;
+            n.issue_morph = abil;
+            n.beh_on_caster = which_unit(cat, "CEffect", eff).on_caster();
+            b.tree.push_back(std::move(n));
+            return int32_t(b.tree.size()) - 1;
+        }
+        static const bool kHaltOld = std::getenv("OMC_REGEN_SUPPRESS_OLD") != nullptr;
+        if (const data::Catalog::Entry* ae = abil.empty() ? nullptr : cat.find("CAbil", abil);
+            !kHaltOld && b.full_tree && ae && ae->tag == "CAbilBuild") {
+            b.tolerated.push_back("IssueOrder " + abil + " on " + eff);
+            sim::EffectNode n;
+            n.kind = sim::EffectKind::Set;
+            b.tree.push_back(std::move(n));
+            return int32_t(b.tree.size()) - 1;
+        }
         std::string low = abil;
         for (char& c : low)
             if (c >= 'A' && c <= 'Z') c = char(c - 'A' + 'a');
@@ -2021,7 +2328,8 @@ int32_t build_effect_node(const data::Catalog& cat, const std::string& eff, Abil
             }
         const bool has_frac = frac_cur[0] != 0 || frac_cur[1] != 0 || frac_cur[2] != 0;
         if (!d && sb <= 0.0 && !kill && !has_frac && !unread_payload) {
-            if (cat.effect_flag_set(eff, "Notification")) {
+            static const bool kBlindDummyOld = std::getenv("OMC_BLIND_EFFECTS_OLD") != nullptr;
+            if (cat.effect_flag_set(eff, "Notification") || (!kBlindDummyOld && b.full_tree)) {
                 sim::EffectNode nn;
                 nn.kind = sim::EffectKind::Set;
                 b.tree.push_back(std::move(nn));
@@ -2100,6 +2408,8 @@ int32_t build_effect_node(const data::Catalog& cat, const std::string& eff, Abil
     }
     if (sub == "ApplyBehavior") {
         auto beh = cat.effect_apply_behavior(eff);
+        static const bool kBlindDefaultOld = std::getenv("OMC_BLIND_EFFECTS_OLD") != nullptr;
+        if (!beh && !kBlindDefaultOld && b.full_tree && cat.find("CBehavior", eff)) beh = eff;
         if (!beh) {
             bool names_behavior = false;
             for (const core::XmlNode& f : cat.resolved("CEffect", eff))
@@ -2152,6 +2462,10 @@ int32_t build_effect_node(const data::Catalog& cat, const std::string& eff, Abil
         buff_attr_bonus(*bb, n.beh_wpn_bonus_attr, n.beh_wpn_bonus_amount);
         n.beh_suppress_collision = bb->suppress_collision;
         n.beh_suppress_passenger = bb->suppress_passenger;
+        n.beh_no_life_regen = bb->no_life_regen;
+        n.beh_no_shield_regen = bb->no_shield_regen;
+        n.beh_no_energy_regen = bb->no_energy_regen;
+        n.beh_scan_bonus = sim::Fixed::from_double(bb->weapon_scan_bonus);
         n.beh_speed_cap = bb->move_speed_max >= 0.0 ? sim::Fixed::from_double(bb->move_speed_max)
                                                     : sim::Fixed::from_int(-1);
         n.beh_disable_spawner = bb->disable_spawner;
@@ -2161,6 +2475,18 @@ int32_t build_effect_node(const data::Catalog& cat, const std::string& eff, Abil
         n.beh_passive = bb->passive;
         n.beh_life_armor = sim::Fixed::from_double(bb->life_armor_bonus);
         n.beh_shield_armor = sim::Fixed::from_double(bb->shield_armor_bonus);
+        n.beh_ranged_range = sim::Fixed::from_double(bb->ranged_weapon_range_bonus);
+        n.beh_no_detect = bb->no_detect;
+        for (const std::string& vid : cat.array_links("CBehavior", *beh, "DisableValidatorArray")) {
+            static const bool kBlindOld = std::getenv("OMC_BLIND_EFFECTS_OLD") != nullptr;
+            if (kBlindOld) break;
+            const int r = compile_validator(cat, vid, n.beh_disable_ops, 0, false);
+            if (r >= 0) n.beh_disable_roots.push_back(std::uint16_t(r));
+            else if (b.full_tree) b.unbuilt.push_back("Behavior " + *beh + " DisableValidator " + vid);
+        }
+        for (const core::XmlNode& f : cat.resolved("CBehavior", *beh))
+            if (f.name == "BuffFlags" && f.attr_or("index", "") == "UpdateDurationWhileDisabled")
+                n.beh_update_disabled = f.attr_or("value", "1") != "0";
         n.beh_max_stack = bb->max_stack;
         n.beh_max_stack_caster = bb->max_stack_caster;
         n.beh_refresh_stack = bb->refresh_stack;
@@ -2181,6 +2507,7 @@ int32_t build_effect_node(const data::Catalog& cat, const std::string& eff, Abil
         if (!bb->expire_effect.empty()) n.expire = build_effect_rec(cat, bb->expire_effect, b, depth + 1);
         if (const data::Catalog::DamageResponse dr = cat.behavior_damage_response(*beh); !dr.handled.empty())
             n.resp_handled = build_effect_rec(cat, dr.handled, b, depth + 1);
+        n.beh_resp_fatal = cat.behavior_damage_response(*beh).fatal;
         n.beh_permanent = !bb->duration_authored && !cat.effect_apply_duration(eff).has_value();
         if (b.full_tree) {
             bool own_duration = false;
@@ -2209,6 +2536,8 @@ int32_t build_effect_node(const data::Catalog& cat, const std::string& eff, Abil
             const int r = compile_validator(cat, vid, n.beh_remove_ops, 0, false);
             if (r >= 0) n.beh_remove_roots.push_back(std::uint16_t(r));
         }
+        for (const sim::ValidatorOp& rop : n.beh_remove_ops)
+            if (rop.frame_tag != 0) b.frame_refs.push_back(rop.frame_tag);
         if (which_unit(cat, "CEffect", eff).on_caster()) n.beh_on_caster = true;
         b.tree.push_back(std::move(n));
         return int32_t(b.tree.size()) - 1;
@@ -2297,6 +2626,12 @@ int32_t build_effect_node(const data::Catalog& cat, const std::string& eff, Abil
         n.transfer_from_caster = is_caster(ref("LaunchUnit"));
         n.transfer_to_caster = is_caster(ref("ImpactUnit"));
         n.transfer_copy = cat.scalar("CEffect", eff, "Copy").value_or("0") == "1";
+        for (const core::XmlNode& f : cat.resolved("CEffect", eff))
+            if (f.name == "LaunchUnit")
+                if (const std::string* fx = f.attr("Effect"); fx && !fx->empty()) {
+                    n.transfer_from_frame = behavior_id_hash(*fx);
+                    b.frame_refs.push_back(n.transfer_from_frame);
+                }
         b.tree.push_back(std::move(n));
         return int32_t(b.tree.size()) - 1;
     }
@@ -2377,6 +2712,23 @@ int32_t build_effect_node(const data::Catalog& cat, const std::string& eff, Abil
             b.tree.push_back(std::move(n));
             return int32_t(b.tree.size()) - 1;
         }
+        {
+            static const bool kLockOnOld = std::getenv("OMC_LOCK_ON_OLD") != nullptr;
+            for (const core::XmlNode& f : cat.resolved("CEffect", eff)) {
+                if (kLockOnOld || !b.full_tree || f.name != "ModifyTurret") continue;
+                sim::EffectNode n;
+                n.kind = sim::EffectKind::ModifyTurret;
+                n.beh_on_caster = true;
+                n.turret_clear = f.attr_or("Action", "") == "ClearTarget";
+                if (const std::string aim = f.attr_or("AimCompleteEffect", ""); !aim.empty()) {
+                    const int32_t k = build_effect_rec(cat, aim, b, depth + 1);
+                    if (k < 0) return -1;
+                    n.impact = k;
+                }
+                b.tree.push_back(std::move(n));
+                return int32_t(b.tree.size()) - 1;
+            }
+        }
         for (const core::XmlNode& f : cat.resolved("CEffect", eff)) {
             if (f.name != "Weapon" || f.attr_or("CooldownOperation", "") != "Set") continue;
             sim::EffectNode n;
@@ -2435,6 +2787,20 @@ int32_t build_effect_node(const data::Catalog& cat, const std::string& eff, Abil
                 return int32_t(b.tree.size()) - 1;
             }
         }
+        {
+            static const bool kBlindOld = std::getenv("OMC_BLIND_EFFECTS_OLD") != nullptr;
+            bool payload = false;
+            for (const core::XmlNode& f : cat.resolved("CEffect", eff))
+                if (f.name == "VitalArray" || f.name == "Cost" || f.name == "Weapon" || f.name == "ModifyFlags" ||
+                    f.name == "SalvageFactor" || f.name == "Charge" || f.name == "Cooldown" || f.name == "XPGain")
+                    payload = true;
+            if (!kBlindOld && b.full_tree && !payload) {
+                sim::EffectNode nn;
+                nn.kind = sim::EffectKind::Set;
+                b.tree.push_back(std::move(nn));
+                return int32_t(b.tree.size()) - 1;
+            }
+        }
         return -1;
     }
     return -1;
@@ -2469,6 +2835,9 @@ int32_t register_ability(sim::World& world, const AbilityBuild& b) {
         to_global(node.impact);
         to_global(node.final_effect);
         to_global(node.resp_handled);
+        to_global(node.issue_effect);
+        to_global(node.missile_interrupt);
+        for (sim::EffectRef& c : node.periodic_seq) to_global(c);
         remap[i] = world.add_effect(std::move(node));
     }
     sim::AbilityDef def = b.def;
@@ -2552,10 +2921,27 @@ static bool build_generic_tree(const data::Catalog& cat, const std::string& abil
     g_full_validators = true;
     g_full_tolerated = &t.tolerated;
     const int32_t built = build_effect(cat, eff, t);
+    static const bool kPrepOld = std::getenv("OMC_LOCK_ON_OLD") != nullptr;
+    if (built >= 0 && !kPrepOld)
+        if (const std::string prep = cat.scalar("CAbil", abil_id, "PrepEffect").value_or(""); !prep.empty()) {
+            const std::size_t gaps = t.unbuilt.size();
+            const int32_t pk = build_effect_rec(cat, prep, t, 0);
+            if (pk >= 0 && t.unbuilt.size() == gaps) {
+                sim::EffectNode both;
+                both.kind = sim::EffectKind::Set;
+                both.children = {pk, built};
+                t.tree.push_back(std::move(both));
+                t.tree_root = int32_t(t.tree.size()) - 1;
+            } else {
+                t.unbuilt.resize(gaps);
+            }
+        }
     g_full_validators = false;
     g_full_tolerated = nullptr;
     if (built < 0) return false;
     if (!t.unbuilt.empty()) return false;
+    for (sim::EffectNode& fn : t.tree)
+        if (std::find(t.frame_refs.begin(), t.frame_refs.end(), fn.frame_tag) != t.frame_refs.end()) fn.frame_saved = true;
     const data::Catalog::Entry* ae = cat.find("CAbil", abil_id);
     const bool instant = ae && ae->tag == "CAbilEffectInstant";
     if (flat && !tree_adds(t, *flat, instant)) return false;
@@ -2570,6 +2956,49 @@ std::vector<std::string> effect_tree_gaps(const data::Catalog& cat, const std::s
     AbilityBuild t;
     build_generic_tree(cat, abil_id, eff, flat, t);
     return t.unbuilt;
+}
+
+void compile_autocast_validators(const data::Catalog& cat, const std::string& abil_id, std::vector<sim::ValidatorOp>& ops,
+                                 std::vector<std::uint16_t>& roots) {
+    const bool full = !OMC_ENV_ONCE("OMC_AUTOCAST_LOADED_OLD");
+    g_full_validators = full;
+    g_autocast_validators = full;
+    for (const std::string& vid : cat.array_links("CAbil", abil_id, "AutoCastValidatorArray")) {
+        const int r = compile_validator(cat, vid, ops, 0, false);
+        if (r >= 0) roots.push_back(std::uint16_t(r));
+    }
+    g_full_validators = false;
+    g_autocast_validators = false;
+}
+
+AutoCastFilter parse_autocast_filter(const data::Catalog& cat, const std::string& abil_id) {
+    AutoCastFilter f;
+    const std::string s = cat.scalar("CAbil", abil_id, "AutoCastFilters").value_or("");
+    const std::size_t semi = s.find(';');
+    const std::string req = s.substr(0, semi), exc = semi == std::string::npos ? "" : s.substr(semi + 1);
+    auto each = [](const std::string& list, auto&& fn) {
+        std::size_t b = 0;
+        while (b < list.size()) {
+            std::size_t c = list.find(',', b);
+            if (c == std::string::npos) c = list.size();
+            if (c > b) fn(list.substr(b, c - b));
+            b = c + 1;
+        }
+    };
+    each(req, [&](const std::string& t) {
+        if (t == "Visible") f.visible = true;
+        else if (t == "Ground") f.req_plane |= 1;
+        else if (t == "Air") f.req_plane |= 2;
+        else f.req_attr |= filter_attr_bit(t);
+    });
+    each(exc, [&](const std::string& t) {
+        if (t == "UnderConstruction") f.exc_constructing = true;
+        else if (t == "Invulnerable") f.exc_invulnerable = true;
+        else if (t == "Ground") f.exc_plane |= 1;
+        else if (t == "Air") f.exc_plane |= 2;
+        else f.exc_attr |= filter_attr_bit(t);
+    });
+    return f;
 }
 
 std::optional<AbilityBuild> make_ability(const data::Catalog& cat, const std::string& abil_id) {

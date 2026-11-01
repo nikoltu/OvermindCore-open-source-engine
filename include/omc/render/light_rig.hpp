@@ -1,4 +1,5 @@
 #pragma once
+#include "omc/core/env_once.hpp"
 #include <cstdlib>
 
 #include <algorithm>
@@ -36,7 +37,7 @@ inline LightRig rig_from_env(const data::EnvLight& env) {
             d.spec[i] = float(s.spec_color[i] * s.spec_multiplier);
         }
     };
-    if (!std::getenv("OMC_NO_KEY")) one(env.key, r.key);
+    if (!OMC_ENV_ONCE("OMC_NO_KEY")) one(env.key, r.key);
     one(env.fill, r.fill);
     one(env.back, r.back);
     if (env.has_ambient)

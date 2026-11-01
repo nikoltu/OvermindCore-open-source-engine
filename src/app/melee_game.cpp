@@ -1,3 +1,4 @@
+#include "omc/core/env_once.hpp"
 #include "omc/render/frame_prof.hpp"
 #include "omc/app/melee_game.hpp"
 #include "omc/app/ui_hotkeys.hpp"
@@ -1454,6 +1455,16 @@ void MeleeGame::setup(const MeleeSetup& setup, MeleeModels* models,
             world_.register_conjoined_group(std::move(members));
         }
     }
+    world_.set_order_morph([this](std::uint32_t unit, const std::string& abil) {
+        if (OMC_ENV_ONCE("OMC_EFFECT_MORPH_OLD")) return human_morph(unit, abil);
+        if (unit >= world_.units().size() || world_.units()[unit].player < 0) return false;
+        const std::int32_t was = morph_as_player_;
+        morph_as_player_ = world_.units()[unit].player;
+        const bool ok = human_morph(unit, abil);
+        morph_as_player_ = was;
+        if (!ok) std::fprintf(stderr, "effect morph %s refused for unit %u\n", abil.c_str(), unit);
+        return ok;
+    });
     world_.set_separation(true);
     world_.set_acceleration(true);
     world_.set_turn_limit(true);
@@ -4114,6 +4125,11 @@ double MeleeGame::player_abil_field(std::int32_t player, const std::string& abil
 
 void MeleeGame::wire_cast_folds() {
     if (!cast_policy_) return;
+    cast_policy_->set_button_gate([this](std::uint32_t caster, const std::string& req) {
+        if (!cat_ || caster >= world_.units().size()) return true;
+        const data::TechState st = tech_state_of(world_.units()[caster].player, caster);
+        return data::eval_requirement(*cat_, req, "Use", st) && !data::requirement_hidden(*cat_, req, st);
+    });
     cast_policy_->set_cooldown_fold([this](std::int32_t player, const std::string& abil, sim::Fixed base) {
         const double b = base.to_double();
         double v = player_abil_field(player, abil, "Cost[0].Cooldown.TimeUse", b);
@@ -4434,7 +4450,7 @@ void MeleeGame::update_camera(const render::InputState& in, float dt_s) {
     if (o != 0.0f) camctl_.orbit(o * cfg_.orbit_speed * dt_s);
     if (in.middle_down && (in.mouse_dx != 0.0f || in.mouse_dy != 0.0f))
         camctl_.pan(-in.mouse_dx * cfg_.pan_mouse, in.mouse_dy * cfg_.pan_mouse);
-    if (cam_right_ > cam_left_ && !std::getenv("OMC_NO_CAMERA_MARGIN")) {
+    if (cam_right_ > cam_left_ && !OMC_ENV_ONCE("OMC_NO_CAMERA_MARGIN")) {
         static const float kMargin = std::getenv("OMC_CAMERA_MARGIN") ? float(std::atof(std::getenv("OMC_CAMERA_MARGIN"))) : 12.0f;
         const float lo = cam_left_ + kMargin, hi = cam_right_ - kMargin;
         if (hi > lo) camctl_.focus.x = std::clamp(camctl_.focus.x, lo, hi);
@@ -4457,7 +4473,7 @@ void MeleeGame::update_camera(const render::InputState& in, float dt_s) {
                 }
             camctl_.focus.z = sum / float(n);
         }
-        if (const char* cf = std::getenv("OMC_CAM_FOCUS")) {
+        if (const char* cf = OMC_ENV_ONCE("OMC_CAM_FOCUS")) {
             const float gz = ground_z_at(camctl_.focus.x, camctl_.focus.y);
             if (cf[0] == 't') {
                 static float last_x = -1.0f, last_y = -1.0f;
@@ -5111,7 +5127,7 @@ void MeleeGame::spawn_corpse(const sim::Unit& u) {
     if (!model && u.id < driver_.actors.size()) model = driver_.actors[u.id].model;
     int seq = model ? render::select_sequence(*model, props, u.id) : -1;
     if (model && seq < 0 && props != std::vector<std::string>{"Death"}) seq = render::select_sequence(*model, {"Death"}, u.id);
-    if (std::getenv("OMC_CORPSE_TRACE"))
+    if (OMC_ENV_ONCE("OMC_CORPSE_TRACE"))
         std::fprintf(stderr, "[corpse] tick %d at (%.1f, %.1f) %s death '%s' -> %s model (%u verts, %zu emitters), clip %d '%s'\n", world_.tick(), u.x.to_double(), u.y.to_double(), u.catalog_id.c_str(), sim::death_name_of(u.death_code),
                      model ? (own_model ? "its own" : "the death row's") : "NO", model ? model->vertex_count : 0u, model ? model->particles.size() : std::size_t(0), seq,
                      model && seq >= 0 && std::size_t(seq) < model->sequences.size() ? model->sequences[std::size_t(seq)].name.c_str() : "-");
@@ -6629,11 +6645,11 @@ void MeleeGame::emit_scene(std::vector<render::SceneInstance>& scene) {
     ++pick_frame_;
     const data::Catalog::SelectionLook sel_look = cat_ ? cat_->selection_look()
                                                        : data::Catalog::SelectionLook{};
-    const bool env_sel_line_003 = std::getenv("OMC_SELECTION_LINE_003") != nullptr;
-    const bool env_sel_width_ratio = std::getenv("OMC_SELECTION_WIDTH_RATIO") != nullptr;
-    const bool env_sel_rim_uniform = std::getenv("OMC_SELECTION_RIM_UNIFORM") != nullptr;
-    const bool env_sel_band_flat = std::getenv("OMC_SELECTION_BAND_FLAT") != nullptr;
-    const bool env_sel_band_radial = std::getenv("OMC_SELECTION_BAND_RADIAL") != nullptr;
+    const bool env_sel_line_003 = OMC_ENV_ONCE("OMC_SELECTION_LINE_003") != nullptr;
+    const bool env_sel_width_ratio = OMC_ENV_ONCE("OMC_SELECTION_WIDTH_RATIO") != nullptr;
+    const bool env_sel_rim_uniform = OMC_ENV_ONCE("OMC_SELECTION_RIM_UNIFORM") != nullptr;
+    const bool env_sel_band_flat = OMC_ENV_ONCE("OMC_SELECTION_BAND_FLAT") != nullptr;
+    const bool env_sel_band_radial = OMC_ENV_ONCE("OMC_SELECTION_BAND_RADIAL") != nullptr;
     const bool pass_tags = render::gpu_prof_switch() || render::render_quality().shadows == render::ShadowQuality::Units;
     auto tag_pass = [&scene, pass_tags](std::size_t from, render::PassGroup g) {
         if (!pass_tags) return scene.size();
@@ -6701,7 +6717,7 @@ void MeleeGame::emit_scene(std::vector<render::SceneInstance>& scene) {
             }
             w.model = &water_fx_model_;
             static const bool kCaustics = std::getenv("OMC_NO_WATER_CAUSTICS") == nullptr;
-            if (kCaustics && std::getenv("OMC_WATER_CAUSTICS_TRACE")) {
+            if (kCaustics && OMC_ENV_ONCE("OMC_WATER_CAUSTICS_TRACE")) {
                 static bool once = false;
                 if (!once) {
                     once = true;
@@ -6728,7 +6744,7 @@ void MeleeGame::emit_scene(std::vector<render::SceneInstance>& scene) {
                 w.model = &water_caustics_models_[frame];
                 w.fx.emis_uv[0] = water_look_.caustics_tiling;
                 w.fx.emis_uv[1] = water_look_.caustics_falloff;
-                w.fx.emis_uv[2] = std::getenv("OMC_WATER_CAUSTICS_SRGB") ? 0.0f : 1.0f;
+                w.fx.emis_uv[2] = OMC_ENV_ONCE("OMC_WATER_CAUSTICS_SRGB") ? 0.0f : 1.0f;
             }
             static const bool shadow_always = std::getenv("OMC_WATER_SHADOW_ALWAYS") != nullptr;
             w.team = {(water_look_.receive_shadows || shadow_always) ? 1.0f : 0.0f, 0.0f, 0.0f, -1.0f};
@@ -6930,7 +6946,7 @@ void MeleeGame::emit_scene(std::vector<render::SceneInstance>& scene) {
                 c.fx.team_emissive[2] = 0.45f;
                 c.fx.team_emissive[3] = kCreepModelLambert ? 0.0f : 0.25f;
                 static const bool kCreepNoiseRim = std::getenv("OMC_CREEP_NOISE_RIM") != nullptr;
-                c.fx.p1[1] = (kCreepNoiseRim || std::getenv("OMC_CREEP_UV_PER_CELL")) ? 0.0f : 1.0f;
+                c.fx.p1[1] = (kCreepNoiseRim || OMC_ENV_ONCE("OMC_CREEP_UV_PER_CELL")) ? 0.0f : 1.0f;
                 c.fx.p1[2] = 0.2f;
                 c.fx.p1[3] = 0.0f;
                 c.coverage = &creep_coverage_;
@@ -8170,7 +8186,7 @@ void MeleeGame::emit_scene(std::vector<render::SceneInstance>& scene) {
             const sim::Unit& shooter = world_.units()[sv.attacker];
             const std::string& wid = sv.slot == 1 ? shooter.wpn2_id : shooter.wpn_id;
             const formats::Model* mm = models_->missile_model(*ui_store_, wid);
-            if (std::getenv("OMC_SHOT_TRACE")) {
+            if (OMC_ENV_ONCE("OMC_SHOT_TRACE")) {
                 static std::set<std::string> told;
                 if (told.insert(shooter.catalog_id + "/" + wid).second)
                     std::fprintf(stderr, "[shot] %s weapon '%s' slot %d in flight -> %s\n", shooter.catalog_id.c_str(), wid.c_str(), int(sv.slot), mm ? "a missile model" : "NO MODEL");
@@ -8306,10 +8322,10 @@ void MeleeGame::emit_scene(std::vector<render::SceneInstance>& scene) {
     }
     const std::size_t doodads_from = tag_pass(fluff_from, render::PassGroup::Foliage);
     if (doodads_ && models_ && ui_store_) {
-        const char* const env_doodad_var = std::getenv("OMC_DOODAD_VAR");
-        const char* const env_doodad_skip = std::getenv("OMC_DOODAD_SKIP");
-        const char* const env_doodad_xform = std::getenv("OMC_DOODAD_XFORM");
-        const char* const env_doodad_seq = std::getenv("OMC_DOODAD_SEQ");
+        const char* const env_doodad_var = OMC_ENV_ONCE("OMC_DOODAD_VAR");
+        const char* const env_doodad_skip = OMC_ENV_ONCE("OMC_DOODAD_SKIP");
+        const char* const env_doodad_xform = OMC_ENV_ONCE("OMC_DOODAD_XFORM");
+        const char* const env_doodad_seq = OMC_ENV_ONCE("OMC_DOODAD_SEQ");
         static const bool kDoodadClock = std::getenv("OMC_DOODAD_FROZEN") == nullptr;
         static const bool kDoodadTakes = std::getenv("OMC_DOODAD_NO_VARIATIONS") == nullptr;
         const bool reuse = !env_doodad_var && !env_doodad_skip && !env_doodad_xform && !env_doodad_seq;
@@ -9085,7 +9101,7 @@ bool MeleeGame::step(const render::InputState& in, float dt_ms,
             OMC_PROF_SCOPE("st.world");
             world_.step();
         }
-        if (const char* lt = std::getenv("OMC_LIFE_TRACE")) {
+        if (const char* lt = OMC_ENV_ONCE("OMC_LIFE_TRACE")) {
             static std::map<std::uint32_t, double> last;
             for (const sim::Unit& lu : world_.units()) {
                 if (!lu.alive || lu.catalog_id != lt) continue;
@@ -9137,9 +9153,13 @@ bool MeleeGame::step(const render::InputState& in, float dt_ms,
             tick_counter_ = 0;
             for (size_t p = 0; p < ais_.size(); ++p)
                 if ((cfg_.human_player < 0 || int(p) != cfg_.human_player) && own_period(p) == 0) drive_ai(p);
-            if (cast_policy_ && cfg_.human_player >= 0)
+            static const bool kScanOld = std::getenv("OMC_LOCK_ON_OLD") != nullptr;
+            if (kScanOld && cast_policy_ && cfg_.human_player >= 0)
                 cast_policy_->run_autocast(world_, cfg_.human_player);
         }
+        static const bool kScanFastOld = std::getenv("OMC_LOCK_ON_OLD") != nullptr;
+        if (!kScanFastOld && !replay_drive_ && cast_policy_ && cfg_.human_player >= 0 && world_.tick() % 4 == 0)
+            cast_policy_->run_autocast(world_, cfg_.human_player);
         if (!replay_drive_) run_morph_autocast();
         if (!root_walks_.empty()) step_root_walks();
     }
@@ -9220,7 +9240,7 @@ bool MeleeGame::step(const render::InputState& in, float dt_ms,
                 }
             static const bool kVarById = std::getenv("OMC_UNIT_VARIATION_BY_ID") != nullptr;
             const int authored_var = (!kVarById && id < layout_.unit_variation.size()) ? layout_.unit_variation[id] : -1;
-            if (!m && !std::getenv("OMC_NO_UNIT_VARIATIONS"))
+            if (!m && !OMC_ENV_ONCE("OMC_NO_UNIT_VARIATIONS"))
                 m = models_->ensure_variation(*ui_store_, cid, authored_var >= 0 ? unsigned(authored_var) : unsigned(id));
             if (!m) m = models_->ensure(*ui_store_, cid);
             if (m) driver_.set_model(std::uint32_t(id), m);
@@ -9367,7 +9387,7 @@ bool MeleeGame::step(const render::InputState& in, float dt_ms,
                 }
             }
             const formats::Model* fm = models_->impact_model(*ui_store_, wid);
-            if (std::getenv("OMC_SHOT_TRACE")) {
+            if (OMC_ENV_ONCE("OMC_SHOT_TRACE")) {
                 static std::set<std::string> told_impact;
                 if (told_impact.insert(shooter.catalog_id + "/" + wid).second)
                     std::fprintf(stderr, "[impact] %s weapon '%s' hit -> %s (%zu clips)\n", shooter.catalog_id.c_str(), wid.c_str(), fm ? "an impact model" : "NO IMPACT",
@@ -9962,8 +9982,8 @@ void MeleeGame::update_minimap_fog(int viewed) {
         else if (cur > target) cur = std::max(target, cur - max_step);
         cell_a[i] = std::uint8_t(cur + 0.5f);
     }
-    const bool extra_veils = std::getenv("OMC_PLAYABLE_VEIL") || std::getenv("OMC_PIT_VEIL") || std::getenv("OMC_LEVEL_VEIL") ||
-                             std::getenv("OMC_PLAYABLE_RAMP") || std::getenv("OMC_FOG_FIELD_UNCACHED");
+    const bool extra_veils = OMC_ENV_ONCE("OMC_PLAYABLE_VEIL") || OMC_ENV_ONCE("OMC_PIT_VEIL") || OMC_ENV_ONCE("OMC_LEVEL_VEIL") ||
+                             OMC_ENV_ONCE("OMC_PLAYABLE_RAMP") || OMC_ENV_ONCE("OMC_FOG_FIELD_UNCACHED");
     const float field_key[6] = {map_w_, map_h_, playable_x0_, playable_y0_, playable_x1_, playable_y1_};
     if (!extra_veils && prev_game == this && prev_w == W && prev_h == H && ground_fog_field_.alpha.size() == std::size_t(W) * std::size_t(H) &&
         std::equal(field_key, field_key + 6, prev_key) && prev_cell_a == cell_a)
@@ -9980,11 +10000,11 @@ void MeleeGame::update_minimap_fog(int viewed) {
         }
     static const bool kRimBlurred = std::getenv("OMC_BOUNDS_VEIL_BLURRED") != nullptr;
     const auto lay_rim = [&]() {
-        if (map_w_ > 0.0f && map_h_ > 0.0f && !std::getenv("OMC_NO_BOUNDS_VEIL")) {
+        if (map_w_ > 0.0f && map_h_ > 0.0f && !OMC_ENV_ONCE("OMC_NO_BOUNDS_VEIL")) {
             const float cw = map_w_ / float(W), ch = map_h_ / float(H);
             static const float kInset = std::getenv("OMC_BOUNDS_VEIL_INSET") ? float(std::atof(std::getenv("OMC_BOUNDS_VEIL_INSET"))) : 1.5f;
             static bool traced = false;
-            if (!traced && std::getenv("OMC_BOUNDS_VEIL_TRACE")) {
+            if (!traced && OMC_ENV_ONCE("OMC_BOUNDS_VEIL_TRACE")) {
                 traced = true;
                 std::fprintf(stderr, "[bounds] map %.1f x %.1f playable %.1f %.1f %.1f %.1f inset %.1f\n", double(map_w_), double(map_h_), double(playable_x0_), double(playable_y0_),
                              double(playable_x1_), double(playable_y1_), double(kInset));
@@ -10014,7 +10034,7 @@ void MeleeGame::update_minimap_fog(int viewed) {
         }
     };
     if (kRimBlurred) lay_rim();
-    if (const char* pv = std::getenv("OMC_PLAYABLE_VEIL"); pv && playable_x1_ > playable_x0_ && playable_y1_ > playable_y0_ && map_w_ > 0.0f && map_h_ > 0.0f) {
+    if (const char* pv = OMC_ENV_ONCE("OMC_PLAYABLE_VEIL"); pv && playable_x1_ > playable_x0_ && playable_y1_ > playable_y0_ && map_w_ > 0.0f && map_h_ > 0.0f) {
         const int pa = std::min(255, std::max(0, std::atoi(pv)));
         const float cw = map_w_ / float(W), ch = map_h_ / float(H);
         for (int y = 0; y < H; ++y)
@@ -10028,7 +10048,7 @@ void MeleeGame::update_minimap_fog(int viewed) {
                 }
             }
     }
-    if (const char* pt = std::getenv("OMC_PIT_VEIL"); pt && world_.nav().configured() && world_.nav().has_levels() && playable_x1_ > playable_x0_ &&
+    if (const char* pt = OMC_ENV_ONCE("OMC_PIT_VEIL"); pt && world_.nav().configured() && world_.nav().has_levels() && playable_x1_ > playable_x0_ &&
                                                       playable_y1_ > playable_y0_ && map_w_ > 0.0f && map_h_ > 0.0f) {
         const int pa = std::min(255, std::max(0, std::atoi(pt)));
         const sim::NavGrid& nv = world_.nav();
@@ -10056,7 +10076,7 @@ void MeleeGame::update_minimap_fog(int viewed) {
             std::fprintf(stderr, "[pit] lowest level inside the playable rectangle %d, %zu field cells veiled\n", min_in, veiled);
         }
     }
-    if (const char* lv = std::getenv("OMC_LEVEL_VEIL"); lv && world_.nav().configured() && map_w_ > 0.0f && map_h_ > 0.0f) {
+    if (const char* lv = OMC_ENV_ONCE("OMC_LEVEL_VEIL"); lv && world_.nav().configured() && map_w_ > 0.0f && map_h_ > 0.0f) {
         int lvl = 0, pa = 0;
         if (std::sscanf(lv, "%d:%d", &lvl, &pa) == 2) {
             pa = std::min(255, std::max(0, pa));
@@ -10082,7 +10102,7 @@ void MeleeGame::update_minimap_fog(int viewed) {
             }
         }
     }
-    if (const char* pr = std::getenv("OMC_PLAYABLE_RAMP"); pr && playable_x1_ > playable_x0_ && playable_y1_ > playable_y0_ && map_w_ > 0.0f && map_h_ > 0.0f) {
+    if (const char* pr = OMC_ENV_ONCE("OMC_PLAYABLE_RAMP"); pr && playable_x1_ > playable_x0_ && playable_y1_ > playable_y0_ && map_w_ > 0.0f && map_h_ > 0.0f) {
         float d0 = 0.0f, rr = 1.0f;
         if (std::sscanf(pr, "%f:%f", &d0, &rr) == 2 && rr > 0.0f) {
             const float cw = map_w_ / float(W), ch = map_h_ / float(H);
@@ -10147,7 +10167,7 @@ void MeleeGame::ensure_overlay_font() {
 }
 
 const render::OverlayFont* MeleeGame::style_face(const std::string& font_path) {
-    if (font_path.empty() || !ui_store_ || std::getenv("OMC_NO_HEADER_FACE")) return nullptr;
+    if (font_path.empty() || !ui_store_ || OMC_ENV_ONCE("OMC_NO_HEADER_FACE")) return nullptr;
     auto it = style_faces_.find(font_path);
     if (it == style_faces_.end()) {
         it = style_faces_.emplace(font_path, render::OverlayFont{}).first;
@@ -10309,7 +10329,7 @@ void MeleeGame::build_overlay(std::uint32_t view_w, std::uint32_t view_h,
             std::fprintf(stderr, "equipment: lead %s cells %zu%s%s rect ok %d\n", lu.catalog_id.c_str(), content.equipment.size(),
                          content.equipment.empty() ? "" : " first ", content.equipment.empty() ? "" : content.equipment[0].icon.c_str(),
                          int(hud_authored_ && hud_authored_->equipment.ok()));
-    } else if (std::getenv("OMC_PORTRAIT_TRACE") && !selection_.empty()) {
+    } else if (OMC_ENV_ONCE("OMC_PORTRAIT_TRACE") && !selection_.empty()) {
         std::fprintf(stderr, "equipment: no cast lead for a selection of %zu\n", selection_.size());
     }
     if (const ui::StyleSet* ss = hud_style_set()) {
@@ -10487,9 +10507,9 @@ void MeleeGame::build_overlay(std::uint32_t view_w, std::uint32_t view_h,
     CameraFootprint cam;
     if (map_w_ > 0.0f && map_h_ > 0.0f) {
         Control ctrl = make_control(camctl_.view_proj(aspect), view_w, view_h, viewed);
-        if (!std::getenv("OMC_MINIMAP_QUAD_TERRAIN_HIT")) ctrl.set_ground_height(nullptr);
+        if (!OMC_ENV_ONCE("OMC_MINIMAP_QUAD_TERRAIN_HIT")) ctrl.set_ground_height(nullptr);
         const float cxs[4] = {0.0f, float(view_w), float(view_w), 0.0f};
-        const float quad_bottom = std::getenv("OMC_MINIMAP_QUAD_Z0") ? float(view_h) : float(view_h) * 0.75f;
+        const float quad_bottom = OMC_ENV_ONCE("OMC_MINIMAP_QUAD_Z0") ? float(view_h) : float(view_h) * 0.75f;
         const float cys[4] = {0.0f, 0.0f, quad_bottom, quad_bottom};
         cam.valid = true;
         for (int k = 0; k < 4 && cam.valid; ++k) {
@@ -10499,16 +10519,16 @@ void MeleeGame::build_overlay(std::uint32_t view_w, std::uint32_t view_h,
                 cam.y[k] = float(wy.to_double());
                 const render::Vec3 e = camctl_.eye();
                 const float gz = ground_z_at(camctl_.focus.x, camctl_.focus.y);
-                if (k == 0 && std::getenv("OMC_STATUS_ANCHOR_TRACE")) {
+                if (k == 0 && OMC_ENV_ONCE("OMC_STATUS_ANCHOR_TRACE")) {
                     static int quad_traced = 0;
                     if (quad_traced++ < 2)
                         std::fprintf(stderr, "[minimapquad] eye %.2f %.2f %.2f focus %.2f %.2f %.2f ground %.2f target z %.2f\n", double(e.x), double(e.y), double(e.z),
                                      double(camctl_.focus.x), double(camctl_.focus.y), double(camctl_.focus.z), double(gz), double(camctl_.target().z));
                 }
-                if (!std::getenv("OMC_MINIMAP_QUAD_Z0") && e.z > gz + 1.0f && e.z > 1.0f) {
+                if (!OMC_ENV_ONCE("OMC_MINIMAP_QUAD_Z0") && e.z > gz + 1.0f && e.z > 1.0f) {
                     const float x0 = cam.x[k], y0 = cam.y[k];
-                    float h = std::getenv("OMC_MINIMAP_QUAD_TERRAIN_HIT") ? gz : camctl_.target().z;
-                    if (std::getenv("OMC_MINIMAP_QUAD_TERRAIN"))
+                    float h = OMC_ENV_ONCE("OMC_MINIMAP_QUAD_TERRAIN_HIT") ? gz : camctl_.target().z;
+                    if (OMC_ENV_ONCE("OMC_MINIMAP_QUAD_TERRAIN"))
                         for (int it = 0; it < 4; ++it) {
                             const float tt = (e.z - h) / e.z;
                             h = ground_z_at(e.x + (x0 - e.x) * tt, e.y + (y0 - e.y) * tt);
@@ -10527,7 +10547,7 @@ void MeleeGame::build_overlay(std::uint32_t view_w, std::uint32_t view_h,
     update_minimap_fog(viewed);
     MinimapBackdrop backdrop;
     backdrop.extent = minimap_extent();
-    if (std::getenv("OMC_ENV_TRACE")) {
+    if (OMC_ENV_ONCE("OMC_ENV_TRACE")) {
         static bool traced = false;
         if (!traced) {
             traced = true;
@@ -10621,11 +10641,11 @@ void MeleeGame::build_overlay(std::uint32_t view_w, std::uint32_t view_h,
     std::vector<float> status_anchor_z(world_.units().size(), 0.0f);
     std::vector<float> status_bar_w(world_.units().size(), 0.0f);
     std::vector<float> status_bar_off(world_.units().size(), 0.0f);
-    const bool bar_offset_rule = cat_ && !std::getenv("OMC_STATUS_ANCHOR_OVERHEAD");
+    const bool bar_offset_rule = cat_ && !OMC_ENV_ONCE("OMC_STATUS_ANCHOR_OVERHEAD");
     static const bool kPrepUncached = std::getenv("OMC_STATUS_PREP_UNCACHED") != nullptr;
-    const bool anchor_bounds_once = std::getenv("OMC_STATUS_ANCHOR_BOUNDS") != nullptr;
-    const bool anchor_trace_once = std::getenv("OMC_STATUS_ANCHOR_TRACE") != nullptr;
-    const bool bar_by_radius_once = std::getenv("OMC_BAR_WIDTH_BY_RADIUS") != nullptr;
+    const bool anchor_bounds_once = OMC_ENV_ONCE("OMC_STATUS_ANCHOR_BOUNDS") != nullptr;
+    const bool anchor_trace_once = OMC_ENV_ONCE("OMC_STATUS_ANCHOR_TRACE") != nullptr;
+    const bool bar_by_radius_once = OMC_ENV_ONCE("OMC_BAR_WIDTH_BY_RADIUS") != nullptr;
     auto anchor_bounds = [&] { return kPrepUncached ? std::getenv("OMC_STATUS_ANCHOR_BOUNDS") != nullptr : anchor_bounds_once; };
     auto anchor_trace = [&] { return kPrepUncached ? std::getenv("OMC_STATUS_ANCHOR_TRACE") != nullptr : anchor_trace_once; };
     auto bar_by_radius = [&] { return kPrepUncached ? std::getenv("OMC_BAR_WIDTH_BY_RADIUS") != nullptr : bar_by_radius_once; };
@@ -10721,14 +10741,14 @@ void MeleeGame::build_overlay(std::uint32_t view_w, std::uint32_t view_h,
     render::UnitOverlay::StatusBarOptions status_opts;
     status_opts.mode = status_bar_mode_;
     status_opts.reveal_all = alt_held_;
-    status_opts.own_rows = !std::getenv("OMC_NO_OWN_STATUS_ROWS");
+    status_opts.own_rows = !OMC_ENV_ONCE("OMC_NO_OWN_STATUS_ROWS");
     status_opts.viewer_player = viewed;
     status_opts.selection = &status_sel;
     status_opts.anchor_z = &status_anchor_z;
     status_opts.bar_width = &status_bar_w;
     status_opts.bar_offset = &status_bar_off;
     std::vector<std::uint8_t> status_cargo_ok(world_.units().size(), 1);
-    if (cat_ && !std::getenv("OMC_CARGO_ROW_ALWAYS"))
+    if (cat_ && !OMC_ENV_ONCE("OMC_CARGO_ROW_ALWAYS"))
         for (const Unit& u : world_.units()) {
             if (!u.alive || u.cargo_space <= 0 || u.catalog_id.empty()) continue;
             static std::unordered_map<std::string, std::string> load_req;
@@ -11785,7 +11805,7 @@ void MeleeGame::build_overlay(std::uint32_t view_w, std::uint32_t view_h,
         const int fpx = std::max(6, int(16.0 * hsc + 0.5));
         draw::set_forced_font_px(fpx);
         const LabelLook tag_look = resolve_label_style(hud_style_set(), "TextTag", int(console_panel.race));
-        const FaceScope harvest_face(std::getenv("OMC_HARVEST_LABEL_DEFAULT_FACE")
+        const FaceScope harvest_face(OMC_ENV_ONCE("OMC_HARVEST_LABEL_DEFAULT_FACE")
                                          ? nullptr
                                          : style_face(tag_look.set && !tag_look.font.empty() ? tag_look.font : std::string("UI/Fonts/EurostileExt-Reg.otf")));
         const ShadowScope harvest_shadow(tag_look, hsc);

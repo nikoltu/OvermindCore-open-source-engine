@@ -69,6 +69,8 @@ struct AbilityBuild {
     bool require_energy = false;
     bool require_energy_pool = false;
     bool requires_ground = false;
+    bool requires_air = false;
+    std::vector<std::uint32_t> frame_refs;
     bool requires_spawner_target = false;
     std::vector<sim::VitalGate> vital_gates;
     std::vector<sim::VitalGate> autocast_caster_gates;
@@ -100,6 +102,14 @@ std::optional<AbilityBuild> make_ability(const data::Catalog& cat, const std::st
 std::optional<AbilityBuild> make_ability_flat(const data::Catalog& cat, const std::string& abil_id);
 std::optional<AbilityBuild> make_ability_ai(const data::Catalog& cat, const std::string& abil_id);
 void parse_ability_autocast_validators(const data::Catalog& cat, const std::string& abil_id, AbilityBuild& b);
+void compile_autocast_validators(const data::Catalog& cat, const std::string& abil_id, std::vector<sim::ValidatorOp>& ops,
+                                 std::vector<std::uint16_t>& roots);
+struct AutoCastFilter {
+    bool visible = false, exc_constructing = false, exc_invulnerable = false;
+    std::uint32_t req_attr = 0, exc_attr = 0;
+    std::uint8_t req_plane = 0, exc_plane = 0;
+};
+AutoCastFilter parse_autocast_filter(const data::Catalog& cat, const std::string& abil_id);
 
 sim::Fixed ability_energy_cost(const data::Catalog& cat, const std::string& abil_id);
 sim::Fixed ability_cooldown_sec(const data::Catalog& cat, const std::string& abil_id);

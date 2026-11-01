@@ -1,3 +1,4 @@
+#include "omc/core/env_once.hpp"
 #include <cstdlib>
 #include <cstdio>
 #include <cctype>
@@ -252,7 +253,7 @@ Model M3::decode_model() const {
             for (int a = 0; a < 4; ++a) m.tangents.push_back(float(p[stride - 4 + a]) / 255.0f * 2.0f - 1.0f);
         }
     }
-    if (has_uv && !std::getenv("OMC_NO_REGN_UV_SCALE")) {
+    if (has_uv && !OMC_ENV_ONCE("OMC_NO_REGN_UV_SCALE")) {
         std::vector<char> done(m.vertex_count, 0);
         for (const M3Region& reg : m.regions) {
             if (reg.uv_multiply == 16.0f && reg.uv_offset == 0.0f) continue;
@@ -662,7 +663,7 @@ void M3::decode_materials(Model& m) const {
             uint32_t mref = rd16(&data[r + 10]);
             if (region >= m.regions.size() || mref >= m.material_refs.size()) continue;
             const M3MaterialRef& mr = m.material_refs[mref];
-            if (std::getenv("OMC_BAT_TRACE")) std::fprintf(stderr, "bat region %u mref %u type %u index %u\n", region, mref, mr.type, mr.index);
+            if (OMC_ENV_ONCE("OMC_BAT_TRACE")) std::fprintf(stderr, "bat region %u mref %u type %u index %u\n", region, mref, mr.type, mr.index);
             if (mr.type == 1 && mr.index < m.materials.size())
                 m.region_material[region] = int(mr.index);
             if (mr.type == 2 && mr.index < dis_material.size()) m.region_material[region] = dis_material[mr.index];
@@ -1334,7 +1335,7 @@ std::vector<M3Particle> M3::decode_particles() const {
                 if (f.lifetime_init + 36 <= rec && base + f.lifetime_init + 36 <= data.size()) p.rand_life2 = rd32(&data[base + f.lifetime_init + 32]) != 0;
             }
             p.emission_rate = rf(base, f.rate_init);
-            if (std::getenv("OMC_PAR_OFFSETS"))
+            if (OMC_ENV_ONCE("OMC_PAR_OFFSETS"))
                 std::fprintf(stderr, "[paroff] v%u base %zu rate %zu life %zu size %zu %zu %zu color0 %zu color1 %zu color2 %zu maxp %zu\n", unsigned(s.version), std::size_t(base),
                              std::size_t(base + f.rate_init), std::size_t(base + f.lifetime_init), std::size_t(base + f.size_start), std::size_t(base + f.size_mid), std::size_t(base + f.size_end),
                              std::size_t(base + f.color_init[0]), std::size_t(base + f.color_init[1]), std::size_t(base + f.color_init[2]), std::size_t(base + f.max_particles));

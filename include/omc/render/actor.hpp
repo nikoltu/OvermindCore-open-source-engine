@@ -249,6 +249,8 @@ struct ActorDriver {
         bool moving = false;
         bool created_raised = false;
         bool destroyed_raised = false;
+        float dead_ms = 0.0f;
+        float parked_ms = 0.0f;
     };
     std::vector<Shadow> shadows;
     std::vector<ActorInstance> actors;

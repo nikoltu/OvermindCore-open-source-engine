@@ -13,6 +13,8 @@ namespace omc::casc {
 class Mndx {
 public:
     void parse(const std::vector<uint8_t>& root_blob);
+    bool save_cache(const std::string& path, const std::string& key) const;
+    bool load_cache(const std::string& path, const std::string& key);
 
     class Range {
     public:
