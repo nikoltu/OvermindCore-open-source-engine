@@ -6,6 +6,7 @@
 #include <cstdlib>
 #include <functional>
 #include <iterator>
+#include <set>
 
 #include "omc/casc/storage.hpp"
 #include "omc/data/melee_mods.hpp"
@@ -2598,6 +2599,36 @@ const std::vector<Catalog::ActorSubscription>& Catalog::actors_on(const std::str
                     actors_on_[r.head + "." + r.subject + "." + r.sub].push_back({id, fam, r.filters});
                 }
             }
+        static const bool kVisualsOld = std::getenv("OMC_ACTOR_VISUALS_OLD") != nullptr;
+        if (!kVisualsOld) {
+            std::set<std::string> marks;
+            for (const std::string& fam : fams)
+                for (const std::string& id : ids(fam)) {
+                    const Entry* e = find(fam, id);
+                    if (!e || e->is_default) continue;
+                    bool cand = false;
+                    for (const XmlNode& n : resolved(fam, id))
+                        if (n.name == "On")
+                            if (const std::string* t = n.attr("Terms"); t && (t->rfind("Effect.", 0) == 0 || t->rfind("Abil.", 0) == 0)) {
+                                cand = true;
+                                break;
+                            }
+                    if (!cand) continue;
+                    for (const ActorRule& r : actor_rules(id, fam, false)) {
+                        if (r.subject.empty() || r.subject.find('*') != std::string::npos) continue;
+                        if (r.head == "Effect" && (r.sub == "Start" || r.sub == "Stop")) {
+                            marks.insert(r.head + "." + r.subject + "." + r.sub);
+                        } else if (r.head == "Abil" && (r.sub == "SourceChannelStart" || r.sub == "SourceChannelStop")) {
+                            const std::string eff = scalar("CAbil", r.subject, "Effect").value_or("");
+                            const Entry* ee = eff.empty() ? nullptr : find("CEffect", eff);
+                            if (!ee || ee->tag != "CEffectCreatePersistent") continue;
+                            marks.insert("Effect." + eff + ".Start");
+                            marks.insert("Effect." + eff + ".Stop");
+                        }
+                    }
+                }
+            for (const std::string& key : marks) actors_on_[key].push_back({std::string(), std::string(), {}});
+        }
     }
     auto it = actors_on_.find(head + "." + subject + "." + sub);
     return it == actors_on_.end() ? kNone : it->second;
@@ -2771,6 +2802,30 @@ std::optional<std::array<float, 3>> Catalog::actor_tint(const std::string& unit_
 void Catalog::build_range_rings() const {
     if (range_rings_built_) return;
     range_rings_built_ = true;
+
+    static const bool kMinimapRingOld = std::getenv("OMC_MINIMAP_RANGE_OLD") != nullptr;
+    if (!kMinimapRingOld)
+        for (const std::string& id : ids("CActorRange")) {
+            bool on_minimap = false;
+            double radius = 0.0;
+            for (const XmlNode& n : resolved("CActorRange", id)) {
+                if (n.name == "RangeFlags" && n.attr_or("index", "") == "Minimap") on_minimap = n.attr_or("value", "") == "1";
+                if (n.name == "Range") radius = std::strtod(n.attr_or("value", "0").c_str(), nullptr);
+            }
+            if (!on_minimap || radius <= 0.0) continue;
+            std::vector<std::string> minimap_behaviors;
+            for (const ActorRule& r : actor_rules(id, "CActorRange"))
+                if (r.head == "Behavior" && r.sub == "On" && r.verb == "Create" && r.args.empty() && r.target.empty() &&
+                    !r.subject.empty() && r.subject.find('*') == std::string::npos)
+                    minimap_behaviors.push_back(r.subject);
+            if (minimap_behaviors.empty()) continue;
+            for (const std::string& unit : ids("CUnit"))
+                for (const std::string& b : array_links("CUnit", unit, "BehaviorArray"))
+                    if (std::find(minimap_behaviors.begin(), minimap_behaviors.end(), b) != minimap_behaviors.end()) {
+                        minimap_rings_[unit].push_back(radius);
+                        break;
+                    }
+        }
 
     auto in_placement_chain = [&](const std::string& actor_id) {
         std::string cur = actor_id;

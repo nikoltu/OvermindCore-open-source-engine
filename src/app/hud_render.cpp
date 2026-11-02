@@ -992,6 +992,24 @@ void HudRender::render_into(std::vector<std::uint8_t>& img, const HudContent& co
             }
         }
 
+        for (const HudContent::MinimapRange& rg : content.minimap_ranges) {
+            int cx, cy, ex, ey;
+            hud_minimap_world_to_pixel(mm, mext, rg.x, rg.y, cx, cy);
+            hud_minimap_world_to_pixel(mm, mext, rg.x + rg.radius, rg.y, ex, ey);
+            const float radius = float(std::abs(ex - cx));
+            if (radius < 1.0f) continue;
+            const int span = int(radius) + 2;
+            for (int dy = -span; dy <= span; ++dy)
+                for (int dx = -span; dx <= span; ++dx) {
+                    const float cover = 1.0f - std::fabs(std::sqrt(float(dx * dx + dy * dy)) - radius);
+                    if (cover <= 0.0f) continue;
+                    const int px = cx + dx, py = cy + dy;
+                    if (px >= mm.x0 && px < mm.x1 && py >= mm.y0 && py < mm.y1)
+                        blend(img, out_w, out_h, px, py, content.range_rgb[0], content.range_rgb[1], content.range_rgb[2],
+                              content.range_alpha * cover);
+                }
+        }
+
         for (const std::pair<float, float>& b : content.radar_blips) {
             int bx, by;
             hud_minimap_world_to_pixel(mm, mext, b.first, b.second, bx, by);

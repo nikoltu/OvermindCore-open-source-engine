@@ -284,8 +284,9 @@ uint32_t World::acquire_target(const Unit& u, Fixed max_range) const {
             if (d2 > reach * reach) continue;
         }
         if (o.attributes & kAttrStructure) {
-            const bool w1_ok = w1 && !u.wpn_acquire_no_structure;
-            const bool w2_ok = w2 && !u.wpn2_acquire_no_structure;
+            static const bool kRefuseOld = std::getenv("OMC_ATTACK_REFUSE_OLD") != nullptr;
+            const bool w1_ok = w1 && !u.wpn_acquire_no_structure && (kRefuseOld || !u.wpn_target_no_structure);
+            const bool w2_ok = w2 && !u.wpn2_acquire_no_structure && (kRefuseOld || !u.wpn2_target_no_structure);
             if (!w1_ok && !w2_ok) continue;
         }
         if ((o.burrowed || o.cloaked_effective()) && !detected_by(u.player, o)) continue;
@@ -484,6 +485,18 @@ void World::displace_from_force_field(const ForceFieldInstance& ff) {
         u.x = ff.x + dx * rim / len;
         u.y = ff.y + dy * rim / len;
     }
+}
+
+void World::glide_idle(Unit& u, Fixed step) {
+    Fixed c, s;
+    fixed_sincos(u.facing, c, s);
+    const Fixed nx = u.x + c * step, ny = u.y + s * step;
+    if (!u.flying && nav_.has_blocked() && !nav_.segment_walkable(u.x, u.y, nx, ny, u.walks_cliffs, u.radius)) {
+        u.cur_speed = Fixed();
+        return;
+    }
+    u.x = nx;
+    u.y = ny;
 }
 
 bool World::move_unit_toward(Unit& u, Fixed gx, Fixed gy, Fixed step) {
@@ -5337,6 +5350,18 @@ void World::step() {
         if (crushed || ff.timer.raw() <= 0) {
             for (const auto& c : ff.cells)
                 if (release_nav_cell(c.first, c.second)) nav_.mark_ff(c.first, c.second, false);
+            // The body created with the field ends with it; it has no life timer of its own and would otherwise stay
+            // for the rest of the match, blocking placement where the field stood.
+            static const bool kFieldBodyOld = std::getenv("OMC_FORCEFIELD_UNIT_OLD") != nullptr;
+            if (!kFieldBodyOld && ff.unit_tag != 0) {
+                const Fixed eps = Fixed::from_ratio(1, 8);
+                for (Unit& b : units_) {
+                    if (!b.alive || b.catalog_id.empty() || type_identity(b.catalog_id) != ff.unit_tag) continue;
+                    if (b.x < ff.x - eps || b.x > ff.x + eps || b.y < ff.y - eps || b.y > ff.y + eps) continue;
+                    b.hp = Fixed();
+                    b.alive = false;
+                }
+            }
             force_fields_.erase(force_fields_.begin() + i);
         } else {
             ++i;
@@ -5554,6 +5579,10 @@ void World::step() {
             u.addon_body = kNoTarget;
             u.addon = kAddonNone;
             u.train_slots = 1;
+            if (u.addon_building != 0) {
+                u.addon_building = 0;
+                u.addon_build_left = Fixed();
+            }
         }
         if (u.addon_building != 0) {
             u.addon_build_left = u.addon_build_left - dt;
@@ -5701,6 +5730,13 @@ void World::step() {
         }
 
         if (!u.orders.empty() && u.orders.front().type == OrderType::Unload) {
+            static const bool kSpotOld = std::getenv("OMC_UNLOAD_SPOT_OLD") != nullptr;
+            if (!kSpotOld && u.speed.raw() > 0 && u.unload_ring < 0) {
+                const Order& uo = u.orders.front();
+                const Fixed ux = uo.tx - u.x, uy = uo.ty - u.y;
+                if (ux * ux + uy * uy > Fixed::from_ratio(1, 64) && !move_unit_toward(u, uo.tx, uo.ty, move_step(u, dt)))
+                    continue;
+            }
             if (u.unload_period.raw() <= 0) {
                 unload_all(u.id);
                 u.orders.erase(u.orders.begin());
@@ -5731,6 +5767,20 @@ void World::step() {
 
         if (!u.orders.empty() && u.orders.front().type == OrderType::Load) {
             const uint32_t tid = u.orders.front().target;
+            if (u.cargo_space > 0 && tid < units_.size() && units_[tid].alive && units_[tid].cargo_space <= 0) {
+                Unit& p = units_[tid];
+                const Fixed reach = u.radius + p.radius + u.load_range;
+                if (p.loaded || p.cargo_size <= 0) {
+                    u.orders.erase(u.orders.begin());
+                } else if (dist2(u, p) <= reach * reach) {
+                    load_unit(u.id, tid);
+                    if (p.loaded) p.orders.clear();
+                    u.orders.erase(u.orders.begin());
+                } else {
+                    move_unit_toward(u, p.x, p.y, move_step(u, dt));
+                }
+                continue;
+            }
             if (tid >= units_.size() || !units_[tid].alive || units_[tid].cargo_space <= 0) {
                 u.orders.erase(u.orders.begin());
                 continue;
@@ -5806,6 +5856,7 @@ void World::step() {
             u.lift_lock = u.lift_lock - dt;
             if (u.lift_lock.raw() < 0) u.lift_lock = Fixed();
         }
+        if (u.relocate_addon != 0) step_relocate_addon(u);
         if (u.lift_t < u.lift_rise_delay + u.lift_rise) u.lift_t = u.lift_t + dt;
         if (u.wander_range.raw() > 0 && u.alive && u.orders.empty() && !u.constructing) {
             const bool conjoined = u.spawn_parent != kNoTarget && u.spawn_parent < units_.size() &&
@@ -6291,13 +6342,21 @@ void World::step() {
     }
 
     if (acceleration_) {
+        static const bool kStopGlideOld = std::getenv("OMC_STOP_GLIDE_OLD") != nullptr;
         for (Unit& u : units_) {
             if (u.alive && !u.moving_now && u.cur_speed.raw() > 0) {
+                // A unit told to Stop while moving keeps sliding along its facing while it brakes, instead of halting
+                // where the order ended. Orders that end on arrival or are taken over by other work do not slide.
                 Fixed d = u.decel.raw() > 0 ? u.decel : u.accel;
                 if (!u.behaviors.empty()) d = d * behavior_decel_mult(u);
                 u.cur_speed = u.cur_speed - d * dt;
                 if (u.cur_speed.raw() < 0) u.cur_speed = Fixed();
+                // the first sliding step is already slower than the last driven one, as measured
+                if (!kStopGlideOld && u.stop_slide && u.orders.empty() && !u.burrowed && !u.loaded &&
+                    u.cur_speed.raw() > 0)
+                    glide_idle(u, u.cur_speed * dt);
             }
+            if (u.moving_now || u.cur_speed.raw() == 0 || !u.orders.empty()) u.stop_slide = false;
             u.moving_now = false;
         }
     }

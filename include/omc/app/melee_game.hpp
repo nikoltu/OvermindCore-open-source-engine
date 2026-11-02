@@ -587,6 +587,7 @@ public:
     };
     bool human_build(std::uint32_t worker, const std::string& structure_unit_id);
     bool human_land_addon(std::uint32_t host, sim::Fixed x, sim::Fixed y, const std::string& addon);
+    bool human_relocate_addon(std::uint32_t host, sim::Fixed x, sim::Fixed y, const std::string& addon);
     std::vector<BuildCardEntry> selection_build_card();
 
     std::vector<BuildCardEntry> selection_build_products() const { return selection_build_entries(); }
@@ -1413,6 +1414,8 @@ private:
         int beam_bone = -1;
         int player = -1;
         float to[3] = {0, 0, 0};
+        const char* site = nullptr;
+        bool held = false;
     };
     std::vector<BeamFx> beams_;
     std::unordered_map<std::string, std::string> recharge_beam_;

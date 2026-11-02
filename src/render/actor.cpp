@@ -240,8 +240,34 @@ void ActorInstance::advance_tint(float dt_ms) {
     bus_tint_set = !tint_layers.empty() || tint_left_ms > 0.0f;
 }
 
+void ActorInstance::send(const std::string& verb, const std::vector<std::string>& args) {
+    std::vector<ActorEventRule> kept_rules = std::move(event_rules);
+    std::vector<ActorEvent> kept_queue = std::move(queued);
+    const int kept_route = route_sends;
+    ActorEventRule r;
+    r.head = "Send";
+    r.verb = verb;
+    r.args = args;
+    event_rules.clear();
+    event_rules.push_back(std::move(r));
+    queued.clear();
+    route_sends = 0;
+    raise("Send");
+    pump(0.0f);
+    route_sends = kept_route;
+    event_rules = std::move(kept_rules);
+    std::vector<ActorEvent> raised = std::move(queued);
+    queued = std::move(kept_queue);
+    queued.insert(queued.end(), raised.begin(), raised.end());
+}
+
 void ActorInstance::pump(float dt_ms) {
     if (tint_left_ms > 0.0f) advance_tint(dt_ms);
+    if (opacity_left_ms > 0.0f) {
+        opacity_left_ms = std::max(0.0f, opacity_left_ms - dt_ms);
+        const float f = opacity_blend_ms > 0.0f ? 1.0f - opacity_left_ms / opacity_blend_ms : 1.0f;
+        bus_opacity = opacity_from + (opacity_to - opacity_from) * f;
+    }
     if (event_rules.empty()) return;
 
     for (std::size_t i = 0; i < timers.size();) {
@@ -268,6 +294,16 @@ void ActorInstance::pump(float dt_ms) {
             if (!trigger_field_matches(r.subject, ev.subject)) continue;
             if (!trigger_field_matches(r.sub, ev.sub)) continue;
             if (!filters_match(r, ev, &unanswerable_filters, &status)) continue;
+            if (route_sends > 0) {
+                const bool material = r.verb.rfind("ModelMaterial", 0) == 0;
+                const bool aimed = !r.target.empty() && r.target != "::Self" && r.target != "::Main";
+                const bool unit_side = route_sends > 1 && ((r.verb == "Create" && !r.args.empty()) || r.verb.rfind("Anim", 0) == 0);
+                if (material || aimed || unit_side) {
+                    outbox.push_back(r);
+                    ++done;
+                    continue;
+                }
+            }
             static const bool kTargetOnHost = std::getenv("OMC_ACTOR_TARGET_ON_HOST") != nullptr;
             if (!kTargetOnHost && !r.target.empty() && r.target != "::Host" && r.target != "::Self" && r.target != "::Main") {
                 for (std::size_t ci = 0; ci < children.size(); ++ci) {
@@ -498,6 +534,13 @@ void ActorInstance::pump(float dt_ms) {
             } else if (host_owned && r.verb == "SetScale" && !r.args.empty()) {
                 bus_scale = float(std::atof(r.args[0].c_str()));
                 bus_scale_set = true;
+            } else if (host_owned && r.verb == "SetOpacity") {
+                opacity_from = bus_opacity_set ? bus_opacity : 1.0f;
+                opacity_to = r.args.empty() ? 0.0f : float(std::atof(r.args[0].c_str()));
+                opacity_blend_ms = r.args.size() >= 2 ? float(std::atof(r.args[1].c_str())) * 1000.0f : 0.0f;
+                opacity_left_ms = opacity_blend_ms;
+                bus_opacity = opacity_blend_ms > 0.0f ? opacity_from : opacity_to;
+                bus_opacity_set = true;
             } else if (host_owned && r.verb == "ModelSwap" && !r.args.empty()) {
                 if (bus_model_swap.empty()) bus_model_swap = r.args[0];
             } else {

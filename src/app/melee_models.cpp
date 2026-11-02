@@ -559,6 +559,17 @@ const formats::Model* MeleeModels::scaffold_model(casc::Storage& store, const st
         if (cat.find("CActorModel", actor_model_id)) {
             std::optional<std::string> model_id = cat.scalar("CActorModel", actor_model_id, "Model");
             if (!model_id || model_id->empty()) model_id = actor_model_id;
+            static const bool kScaffoldParentOld = std::getenv("OMC_SCAFFOLD_PARENT_OLD") != nullptr;
+            if (!kScaffoldParentOld && !cat.find("CModel", *model_id)) {
+                const data::Catalog::Entry* ae = cat.find("CActorModel", actor_model_id);
+                for (int hops = 0; ae && !ae->parent.empty() && hops < 16; ++hops) {
+                    if (cat.find("CModel", ae->parent)) {
+                        model_id = ae->parent;
+                        break;
+                    }
+                    ae = cat.find("CActorModel", ae->parent);
+                }
+            }
             if (auto path = cat.scalar("CModel", *model_id, "Model")) {
                 std::string rel = cat.expand_entry_tokens("CModel", *model_id, *path);
                 for (char& c : rel)
@@ -1043,6 +1054,37 @@ const formats::Model* MeleeModels::cmodel(casc::Storage& store, const std::strin
     }
     const formats::Model& fm = mit->second;
     return (fm.vertex_count > 0 || !fm.particles.empty() || !fm.ribbons.empty()) ? &fm : nullptr;
+}
+
+MeleeModels::Glazed MeleeModels::glazed_model(const formats::Model& body, const formats::Model& glaze) {
+    const auto key = std::make_pair(&body, &glaze);
+    auto it = glazed_.find(key);
+    if (it == glazed_.end()) {
+        formats::Model m = body;
+        m.materials = glaze.materials;
+        m.material_refs = glaze.material_refs;
+        m.composites.clear();
+        std::fill(m.region_material.begin(), m.region_material.end(), glaze.region_material.empty() ? 0 : glaze.region_material[0]);
+        std::fill(m.region_composite.begin(), m.region_composite.end(), -1);
+        std::fill(m.region_matref.begin(), m.region_matref.end(), glaze.region_matref.empty() ? 0 : glaze.region_matref[0]);
+        m.particles.clear();
+        m.ribbons.clear();
+        m.lights.clear();
+        m.projectors.clear();
+        m.caster_region_first = m.caster_region_end = 0;
+        const std::uint32_t first = std::uint32_t(m.sequences.size());
+        const std::uint32_t stc_base = std::uint32_t(m.stc.size());
+        m.stc.insert(m.stc.end(), glaze.stc.begin(), glaze.stc.end());
+        for (std::size_t i = 0; i < glaze.sequences.size(); ++i) {
+            m.sequences.push_back(glaze.sequences[i]);
+            formats::M3STG g = i < glaze.stg.size() ? glaze.stg[i] : formats::M3STG{};
+            for (std::uint32_t& c : g.stc_indices) c += stc_base;
+            while (m.stg.size() + 1 < m.sequences.size()) m.stg.push_back({});
+            m.stg.push_back(std::move(g));
+        }
+        it = glazed_.emplace(key, std::make_pair(std::move(m), first)).first;
+    }
+    return {&it->second.first, it->second.second};
 }
 
 const std::vector<MeleeModels::BurnState>& MeleeModels::burn_states(casc::Storage& store, const std::string& unit_id) {

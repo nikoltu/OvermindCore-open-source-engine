@@ -426,6 +426,8 @@ sim::Unit make_unit(const data::Catalog& cat, const std::string& unit_id,
             u.wpn_range = range;
             u.wpn_min_range = min_range;
             u.wpn_target_filter = filter;
+            if (auto tf = cat.scalar("CWeapon", w, "TargetFilters"); tf && !tf->empty())
+                u.wpn_target_no_structure = parse_acquire_no_structure(*tf);
             weapon_attribute_bonus(cat, w, u.wpn_bonus_attr, u.wpn_bonus_amount);
             u.wpn_damage_point = field(cat, "CWeapon", w, "DamagePoint", Fixed::from_double(0.1670));
             u.wpn_backswing = field(cat, "CWeapon", w, "Backswing", Fixed::from_double(0.5));
@@ -483,6 +485,8 @@ sim::Unit make_unit(const data::Catalog& cat, const std::string& unit_id,
             if (!close_missile && min_range.raw() == 0 && cat.hidden_sibling_covers_min_range(unit_id, w))
                 u.wpn2_close_range = field(cat, "CWeapon", w, "MinimumRange");
             u.wpn2_target_filter = filter;
+            if (auto tf = cat.scalar("CWeapon", w, "TargetFilters"); tf && !tf->empty())
+                u.wpn2_target_no_structure = parse_acquire_no_structure(*tf);
             weapon_attribute_bonus(cat, w, u.wpn2_bonus_attr, u.wpn2_bonus_amount);
             u.wpn2_damage_point = field(cat, "CWeapon", w, "DamagePoint", Fixed::from_double(0.1670));
             u.wpn2_backswing = field(cat, "CWeapon", w, "Backswing", Fixed::from_double(0.5));

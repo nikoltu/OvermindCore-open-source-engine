@@ -165,6 +165,12 @@ struct ActorInstance {
     float bus_scale = 1.0f;
     bool bus_scale_set = false;
     std::string bus_model_swap;
+    float bus_opacity = 1.0f;
+    bool bus_opacity_set = false;
+    float opacity_from = 1.0f, opacity_to = 1.0f, opacity_blend_ms = 0.0f, opacity_left_ms = 0.0f;
+    int route_sends = 0;
+    std::vector<ActorEventRule> outbox;
+    void send(const std::string& verb, const std::vector<std::string>& args);
     std::size_t unanswerable_filters = 0;
     std::map<std::string, int> status;
     void set_status(const std::string& name, int value, bool raise_set);

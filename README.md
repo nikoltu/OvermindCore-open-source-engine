@@ -11,7 +11,7 @@
 
 <p align="center">
   <img src="https://img.shields.io/badge/status-alpha-orange" alt="Status: alpha">
-  <img src="https://img.shields.io/badge/version-v0.1.12--alpha-blue" alt="Version v0.1.12-alpha">
+  <img src="https://img.shields.io/badge/version-v0.1.13--alpha-blue" alt="Version v0.1.13-alpha">
   <img src="https://img.shields.io/badge/platform-Windows-0078D6?logo=windows&logoColor=white" alt="Platform: Windows">
   <img src="https://img.shields.io/badge/melee%20vs%20AI-playable%20end%20to%20end-brightgreen" alt="Melee vs AI: playable end to end">
   <img src="https://img.shields.io/badge/license-GPL--3.0--or--later-blue" alt="License: GPL-3.0-or-later">
@@ -19,7 +19,17 @@
 
 OvermindCore ships no original game code and no original game assets. It reads the data of a copy of the game
 that you own and have installed - units, maps, models, textures, sounds, text and AI scripts - at runtime, from
-your own installation. Nothing from that installation is copied into this repository.
+your own installation. Nothing from that installation is copied into this repository; the screenshot below shows what the engine
+renders from such an installation.
+
+## In-engine screenshot
+
+<p align="center">
+  <img src="assets/screenshots/ingame_cc.png" width="960" alt="In-engine screenshot: a melee game against the AI, Command Center selected">
+</p>
+
+A melee game against the AI at 1:15, Command Center selected, rendered by OvermindCore from the game data of an
+installed copy.
 
 ## Requirements
 

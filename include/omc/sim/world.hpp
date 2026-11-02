@@ -592,7 +592,7 @@ struct KnockImpulse {
 };
 
 struct ForceFieldInstance {
-    Fixed x, y, radius, timer;
+    Fixed x, y, radius, timer, duration;
     std::vector<std::pair<int, int>> cells;
     std::uint32_t unit_tag = 0;
 };
@@ -1003,6 +1003,9 @@ struct Unit {
     Fixed land_x, land_y;
     Fixed land_timer;
     int32_t land_addon = 0;
+    int32_t relocate_addon = 0;
+    Fixed relocate_x, relocate_y, relocate_time;
+    int32_t relocate_minerals = 0, relocate_gas = 0;
     Fixed land_addon_time;
     int32_t land_addon_minerals = 0, land_addon_gas = 0;
     uint32_t attributes = 0;
@@ -1011,6 +1014,8 @@ struct Unit {
     uint8_t acquire_sort = kAcquireSortDefault;
     bool wpn_acquire_no_structure = false;
     bool wpn2_acquire_no_structure = false;
+    bool wpn_target_no_structure = false;
+    bool wpn2_target_no_structure = false;
     Fixed wpn_teleport_reset = Fixed::from_int(-1);
     Fixed wpn2_teleport_reset = Fixed::from_int(-1);
     int32_t target_priority = 0;
@@ -1145,6 +1150,7 @@ struct Unit {
     Fixed lateral_accel;
     Fixed cur_speed;
     bool moving_now = false;
+    bool stop_slide = false;  // stopped while moving: slides on along its facing until braked
     bool from_rest = false;
     bool moved_this_tick = false;
     Fixed stall_gx, stall_gy, stall_dist;
@@ -1643,6 +1649,7 @@ public:
         if (order_sink_ && !in_step_) order_sink_->on_stop(tick_, id);
         detach_builder(id);
         cancel_windup(units_[id]);
+        units_[id].stop_slide = units_[id].cur_speed.raw() > 0;
         units_[id].orders.clear();
     }
 
@@ -2110,7 +2117,33 @@ public:
         if (build_time.raw() <= 0) { attach_addon(building, kind); return true; }
         b.addon_building = kind;
         b.addon_build_left = build_time;
+        static const bool kEarlyOld = std::getenv("OMC_ADDON_BODY_EARLY_OLD") != nullptr;
+        if (!kEarlyOld) spawn_addon_site(building, kind, build_time);
         return true;
+    }
+    void spawn_addon_site(uint32_t building, int32_t kind, Fixed build_time) {
+        if (building >= units_.size() || !addon_body_factory_) return;
+        const Unit host = units_[building];
+        if (!host.alive || host.addon_body != kNoTarget) return;
+        Unit body;
+        if (!addon_body_factory_(host, kind, body)) return;
+        body.player = host.player;
+        addon_slot(host.x, host.y, body.x, body.y);
+        body.alive = true;
+        body.speed = Fixed();
+        body.addon_host = building;
+        body.addon_body_kind = kind;
+        Fixed start_hp = Fixed::from_raw(body.hp_max.raw() / 10);
+        if (start_hp.raw() <= 0) start_hp = Fixed::from_int(1);
+        body.constructing = true;
+        body.build_time = build_time;
+        body.build_progress = Fixed();
+        body.build_elapsed = Fixed();
+        body.build_hp0 = start_hp;
+        body.hp = start_hp;
+        const uint32_t id = add_unit(body);
+        units_[building].addon_body = id;
+        evict_from_site(units_[id], building);
     }
     void require_attached_techlab(std::string unit_id) { techlab_gated_.insert(std::move(unit_id)); }
 
@@ -2267,6 +2300,37 @@ public:
         u.land_addon_minerals = minerals;
         u.land_addon_gas = gas;
         return true;
+    }
+    bool relocate_for_addon(uint32_t id, int32_t kind, Fixed build_time, int32_t minerals, int32_t gas, Fixed lock,
+                            Fixed rise_delay, Fixed rise, Fixed tx, Fixed ty) {
+        if (id >= units_.size() || kind == kAddonNone) return false;
+        Unit& h = units_[id];
+        if (!h.alive || h.flying || h.constructing || h.addon != kAddonNone || h.addon_building != 0) return false;
+        Player& pl = player(h.player);
+        if (pl.minerals < minerals || pl.gas < gas) return false;
+        if (tx.raw() < 0 || ty.raw() < 0 || (tx == h.x && ty == h.y)) return false;
+        if (!creep_placement_ok(h, tx, ty) || site_blocked(h, tx, ty, id) || !addon_slot_clear(id, tx, ty, kind)) return false;
+        const Fixed bx = tx, by = ty;
+        if (!lift_off(id, lock, rise_delay, rise)) return false;
+        pl.minerals -= minerals;
+        pl.gas -= gas;
+        Unit& u = units_[id];
+        u.relocate_addon = kind;
+        u.relocate_x = bx;
+        u.relocate_y = by;
+        u.relocate_time = build_time;
+        u.relocate_minerals = minerals;
+        u.relocate_gas = gas;
+        return true;
+    }
+    void step_relocate_addon(Unit& u) {
+        if (u.relocate_addon == 0 || !u.alive || !u.flying || u.lift_lock.raw() > 0) return;
+        const int32_t kind = u.relocate_addon;
+        u.relocate_addon = 0;
+        Player& pl = player(u.player);
+        pl.minerals += u.relocate_minerals;
+        pl.gas += u.relocate_gas;
+        order_land_addon(u.id, u.relocate_x, u.relocate_y, kind, u.relocate_time, u.relocate_minerals, u.relocate_gas);
     }
     bool land(uint32_t id, Fixed x, Fixed y) {
         if (!can_land(id, x, y)) return false;
@@ -2445,6 +2509,7 @@ public:
         ff.y = y;
         ff.radius = radius;
         ff.timer = duration.raw() > 0 ? duration : Fixed::from_raw(1);
+        ff.duration = ff.timer;
         if (nav_.configured() && radius.raw() > 0) {
             int cx0, cy0, cx1, cy1;
             nav_.to_cell(x - radius, y - radius, cx0, cy0);
@@ -2850,14 +2915,29 @@ public:
             if (!u.alive || !u.loaded || !holds(transport, u)) continue;
             u.loaded = false;
             u.transport_id = kNoTarget;
-            u.x = units_[transport].x + Fixed::from_int(DX[ring & 7]);
-            u.y = units_[transport].y + Fixed::from_int(DY[ring & 7]);
+            static const bool kSpotOld = std::getenv("OMC_UNLOAD_SPOT_OLD") != nullptr;
+            const bool under = !kSpotOld && ring == 0;
+            u.x = units_[transport].x + (under ? Fixed() : Fixed::from_int(DX[ring & 7]));
+            u.y = units_[transport].y + (under ? Fixed() : Fixed::from_int(DY[ring & 7]));
             return u.id;
         }
         return kNoTarget;
     }
     int unload_all(uint32_t transport) {
         if (transport >= units_.size()) return 0;
+        static const bool kSpotOld = std::getenv("OMC_UNLOAD_SPOT_OLD") != nullptr;
+        if (!kSpotOld && units_[transport].alive && units_[transport].speed.raw() <= 0 &&
+            !transport_disabled(units_[transport])) {
+            int n = 0;
+            for (Unit& u : units_) {
+                if (!u.alive || !u.loaded || !holds(transport, u)) continue;
+                u.loaded = false;
+                u.transport_id = kNoTarget;
+                train_exit_point(units_[transport], u.radius, u.x, u.y);
+                ++n;
+            }
+            return n;
+        }
         return unload_all_at(transport, units_[transport].x, units_[transport].y);
     }
 
@@ -2925,6 +3005,22 @@ public:
     bool set_hangar_auto_build(uint32_t carrier, bool on);
     void hangar_view(uint32_t carrier, std::vector<QueueSlotView>& out) const;
     void step_interceptors(Fixed dt);
+    bool attack_target_refused(const Unit& u, const Unit& o) const {
+        if (power_disabled(u)) return true;
+        if (u.wpn_damage.raw() <= 0 && u.wpn2_damage.raw() <= 0 && !hosts_interceptors(u.id))
+            return true;
+        const uint32_t plane_bit = o.flying ? 2u : 1u;
+        const bool w1 = !weapon_disabled(u, u.wpn_tag) && (u.wpn_damage.raw() > 0 || hosts_interceptors(u.id)) &&
+                        (u.wpn_target_filter & plane_bit) != 0;
+        const bool w2 = !weapon_disabled(u, u.wpn2_tag) && u.wpn2_damage.raw() > 0 && (u.wpn2_target_filter & plane_bit) != 0;
+        if (!w1 && !w2) return true;
+        if (o.attributes & kAttrStructure) {
+            const bool w1_ok = w1 && !u.wpn_target_no_structure;
+            const bool w2_ok = w2 && !u.wpn2_target_no_structure;
+            if (!w1_ok && !w2_ok) return true;
+        }
+        return false;
+    }
     bool hosts_interceptors(uint32_t id) const {
         for (const auto& c : carriers_)
             if (c.carrier == id) return true;
@@ -3624,6 +3720,7 @@ private:
     static bool harvest_brake(bool drop);
     bool move_unit_toward(Unit& u, Fixed gx, Fixed gy, Fixed step);
     bool move_unit_toward_impl(Unit& u, Fixed gx, Fixed gy, Fixed step);
+    void glide_idle(Unit& u, Fixed step);
     bool advance_turn(Unit& u, Fixed tx, Fixed ty, Fixed fire_arc_deg = Fixed());
     bool advance_turret(Unit& u, Fixed tx, Fixed ty, Fixed fire_arc_deg);
     void apply_separation();

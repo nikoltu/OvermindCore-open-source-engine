@@ -2588,6 +2588,12 @@ public:
         auto it = range_rings_.find(unit_id);
         return it == range_rings_.end() ? kNone : it->second;
     }
+    const std::vector<double>& minimap_range_rings(const std::string& unit_id) const {
+        build_range_rings();
+        static const std::vector<double> kNone;
+        auto it = minimap_rings_.find(unit_id);
+        return it == minimap_rings_.end() ? kNone : it->second;
+    }
     std::optional<double> ability_range_ring(const std::string& abil_id) const {
         build_range_rings();
         auto it = abil_rings_.find(abil_id);
@@ -3953,6 +3959,7 @@ private:
     mutable bool power_field_links_built_ = false;
     mutable std::unordered_map<std::string, std::vector<RangeRing>> range_rings_;
     mutable std::unordered_map<std::string, double> abil_rings_;
+    mutable std::unordered_map<std::string, std::vector<double>> minimap_rings_;
     mutable bool range_rings_built_ = false;
     void build_range_rings() const;
     mutable std::unordered_map<std::string, std::vector<ActorSubscription>> actors_on_;

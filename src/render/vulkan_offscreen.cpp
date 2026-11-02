@@ -273,6 +273,8 @@ ConsoleTexture render_console_models(casc::Storage& store, const data::Catalog& 
         inst.seq = -1;
         for (std::size_t q = 0; q < models[std::size_t(i)].sequences.size(); ++q)
             if (models[std::size_t(i)].sequences[q].name == "Stand") { inst.seq = int(q); break; }
+        static const bool kConsoleStandOld = std::getenv("OMC_CONSOLE_STAND_OLD") != nullptr;
+        if (inst.seq < 0 && !kConsoleStandOld) inst.seq = render::select_sequence(models[std::size_t(i)], {"Stand"}, 0);
         scene.push_back(inst);
         for (int k = 0; k < 3; ++k) {
             const float a = models[std::size_t(i)].bounds_min[k] * scl[i][k] + pos[i][k];

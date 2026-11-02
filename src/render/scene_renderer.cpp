@@ -1147,7 +1147,12 @@ int SceneRenderer::resolve_texture(const formats::Model& m, int material, const 
     if ((u == "Diffuse" || ((u == "Normal" || u == "Specular") && kTriNormal && !kTriDiffuseOnly)) && !kNoTri)
         if (const formats::M3Layer* tl = layer_ptr_of(m, material, usage))
             triplanar = !tl->raw_record.empty() && tl->word40 >= 16 && tl->word40 <= 18;
-    const std::string cache_key = (srgb ? path + "#srgb" : path) + (triplanar ? "#tri" : "");
+    static const bool kAlphaOnlyOld = std::getenv("OMC_ACTOR_VISUALS_OLD") != nullptr;
+    bool alpha_only = false;
+    if (!kAlphaOnlyOld && (u == "Diffuse" || u == "Emissive") && material >= 0 && std::size_t(material) < m.materials.size() &&
+        formats::material_is_additive(m.materials[std::size_t(material)]))
+        if (const formats::M3Layer* al = layer_ptr_of(m, material, usage)) alpha_only = !al->raw_record.empty() && al->word44 == 2;
+    const std::string cache_key = (srgb ? path + "#srgb" : path) + (triplanar ? "#tri" : "") + (alpha_only ? "#aonly" : "");
     auto it = tex_index_.find(cache_key);
     if (it != tex_index_.end()) return it->second;
     int idx = def;
@@ -1167,7 +1172,15 @@ int SceneRenderer::resolve_texture(const formats::Model& m, int material, const 
         const DecodedTexture& d = *taken;
         if (d.ok) {
             OMC_PROF_SCOPE("sr.tex_upload");
-            try { idx = upload_texture(d.w, d.h, d.rgba, srgb); } catch (const std::exception&) {}
+            try {
+                if (alpha_only) {
+                    std::vector<uint8_t> mono = d.rgba;
+                    for (std::size_t px = 0; px + 3 < mono.size(); px += 4) mono[px] = mono[px + 1] = mono[px + 2] = mono[px + 3];
+                    idx = upload_texture(d.w, d.h, mono, srgb);
+                } else {
+                    idx = upload_texture(d.w, d.h, d.rgba, srgb);
+                }
+            } catch (const std::exception&) {}
         }
         if (idx == def && std::getenv("OMC_TEX_TRACE")) std::fprintf(stderr, "texmiss %s %s\n", usage ? usage : "", path.c_str());
         tex_index_[cache_key] = idx;
@@ -1569,7 +1582,9 @@ SceneRenderer::Mesh& SceneRenderer::ensure_mesh(const formats::Model& m, std::ui
                 const bool untiled = kMaskClamp && L.usage == "AlphaMask" && !screen && (L.word36 & 0xcu) == 0 && !L.image_path.empty();
                 static const bool kMaskOffset = std::getenv("OMC_MASK_NO_OFFSET") == nullptr;
                 const bool one_axis = kMaskOffset && L.usage == "AlphaMask" && !screen && !untiled && !L.image_path.empty() && (L.word36 & 0xcu) != 0xcu;
-                const bool offset = kMaskOffset && L.usage == "AlphaMask" && !screen && (a.uv_offset[0] != 0.0f || a.uv_offset[1] != 0.0f);
+                static const bool kMaskSweepMeshOld = std::getenv("OMC_ACTOR_VISUALS_OLD") != nullptr;
+                const bool offset = kMaskOffset && L.usage == "AlphaMask" && !screen &&
+                                    (a.uv_offset[0] != 0.0f || a.uv_offset[1] != 0.0f || (!kMaskSweepMeshOld && a.uv_offset_flags != 0));
                 if (L.usage == "AlphaMask" && (moved || screen || untiled || one_axis || offset) && a.uv_tiling[0] != 0.0f && a.uv_tiling[1] != 0.0f) {
                     mx[0] = a.uv_tiling[0];
                     mx[1] = a.uv_tiling[1];
@@ -3555,6 +3570,16 @@ void SceneRenderer::record(VkCommandBuffer cmd, const std::vector<const SceneIns
                     f.mask2_x[k] = mx[std::size_t(4 + k)];
                     f.mask_o[k] = mx[std::size_t(12 + k)];
                 }
+                static const bool kMaskSweepOld = std::getenv("OMC_ACTOR_VISUALS_OLD") != nullptr;
+                if (!kMaskSweepOld && inst.seq >= 0 && mesh.draws[d].material >= 0)
+                    if (const formats::M3Layer* ml = formats::material_alpha_mask(inst.model->materials[std::size_t(mesh.draws[d].material)]);
+                        ml && ml->usage == "AlphaMask" && ml->anim.uv_offset_flags != 0) {
+                        float mo[2] = {ml->anim.uv_offset[0], ml->anim.uv_offset[1]};
+                        animated_layer_field(*inst.model, std::uint32_t(inst.seq), ml->anim.uv_offset_interp, ml->anim.uv_offset_flags, ml->anim.uv_offset_id, inst.time_ms, 2,
+                                             ml->anim.uv_offset, mo, &inst.global_layers);
+                        f.mask_o[0] = mo[0];
+                        f.mask_o[1] = mo[1];
+                    }
                 f.mask2_lv[0] = mx[8];
                 f.mask2_lv[1] = mx[9];
                 f.mask2_lv[2] = mx[10];
@@ -5490,7 +5515,8 @@ void build_particles(SceneRenderer& sr, const std::vector<const SceneInstance*>&
                 animated_layer_field(m, rseq, rb.width_interp, rb.width_flags, rb.width_id, inst.time_ms, 3, rb.width, w3, glayers(inst));
             static const bool kTubeHalf = std::getenv("OMC_RIBBON_TUBE_HALF_WIDTH") != nullptr;
             static const bool kV6WidthOld = std::getenv("OMC_RIBBON_V6_WIDTH_OLD") != nullptr;
-            if (!kTubeHalf && rb.sides > 1 && (rb.version == 8 || (rb.version == 6 && !kV6WidthOld)))
+            static const bool kV9WidthOld = std::getenv("OMC_ACTOR_VISUALS_OLD") != nullptr;
+            if (!kTubeHalf && rb.sides > 1 && (rb.version == 8 || (rb.version == 9 && !kV9WidthOld) || (rb.version == 6 && !kV6WidthOld)))
                 for (float& w : w3) w *= 0.25f;
             static const bool kV6QuarterOld = std::getenv("OMC_RIBBON_V6_QUARTER_OLD") != nullptr;
             if (!kTubeHalf && !kV6QuarterOld && !kV6WidthOld && rb.sides > 1 && rb.version == 6 && !hang)

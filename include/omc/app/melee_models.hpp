@@ -57,6 +57,11 @@ public:
     };
     const std::vector<BurnState>& burn_states(casc::Storage& store, const std::string& unit_id);
     const formats::Model* cmodel(casc::Storage& store, const std::string& cmodel_id);
+    struct Glazed {
+        const formats::Model* model = nullptr;
+        std::uint32_t first_seq = 0;
+    };
+    Glazed glazed_model(const formats::Model& body, const formats::Model& glaze);
     BeamModel actor_beam_model(casc::Storage& store, const std::string& beam_actor_id);
     const formats::Model* death_model(casc::Storage& store, const std::string& actor_model_id);
     const formats::Model* scaffold_model(casc::Storage& store, const std::string& actor_model_id, float scale[3]);
@@ -111,6 +116,7 @@ private:
     std::map<std::string, formats::Model> launches_;
     struct BeamSlot { formats::Model model; bool continuous = false; float scale = 1.0f; };
     std::map<std::string, BeamSlot> beams_;
+    std::map<std::pair<const formats::Model*, const formats::Model*>, std::pair<formats::Model, std::uint32_t>> glazed_;
     std::map<std::string, std::string> weapon_beam_;
     std::map<std::string, std::vector<BurnState>> burn_;
     std::map<std::string, formats::Model> burn_models_;

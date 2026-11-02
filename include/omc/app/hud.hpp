@@ -102,6 +102,12 @@ struct HudContent {
     std::vector<std::uint8_t> minimap_priority;
 
     std::vector<std::pair<float, float>> radar_blips;
+    struct MinimapRange {
+        float x = 0.0f, y = 0.0f, radius = 0.0f;
+    };
+    std::vector<MinimapRange> minimap_ranges;
+    std::uint8_t range_rgb[3] = {255, 255, 255};
+    float range_alpha = 1.0f;
     std::uint8_t blip_rgb[3] = {255, 0, 0};
     float blip_alpha = 60.0f / 255.0f;
 
